@@ -1,0 +1,72 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/spoolframe-linux-core",
+    "crates/spoolframe-linux-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Andrey Cherkashin <andoriyu@gmail.com>"]
+# GPL, not the server's AGPL nor the protocol crates' MIT/Apache: the client
+# is free software that stays free, and it links only the permissive
+# spoolframe crates (ARCHITECTURE §56).
+license = "GPL-3.0-or-later"
+repository = "https://git.coldsteel.casa/Coldsteel/foundry"
+
+[workspace.dependencies]
+# Internal crates
+spoolframe-linux-core = { path = "crates/spoolframe-linux-core" }
+
+# The client-facing media model. A path dependency until the permissive
+# spoolframe crates are published to the coldsteel registry. Until then the
+# nix build cannot see it: a subflake is copied to the store without its
+# siblings, so spoolframe-linux has no nix package yet (see the root
+# flake.nix).
+spoolframe-types = { path = "../spoolframe/crates/spoolframe-types" }
+# The client protocol's types (home screen, playback plans and handles,
+# artwork sizes), which the SDK returns too. Same arrangement as above.
+spoolframe-protocol = { path = "../spoolframe/crates/spoolframe-protocol" }
+# The client side of the protocol: Iroh transport, saved servers, sessions.
+spoolframe-client-sdk = { path = "../spoolframe/crates/spoolframe-client-sdk" }
+# The SDK's Storage trait is an async-trait one.
+async-trait = "0.1"
+
+# UI: Relm4 over GTK 4 and libadwaita. v1_6 is the first libadwaita with
+# the CSS colour variables and the system accent colour that theming is
+# built on.
+relm4 = { version = "0.11", features = ["libadwaita"] }
+adw = { package = "libadwaita", version = "0.9", features = ["v1_6"] }
+gtk = { package = "gtk4", version = "0.11", features = ["v4_16"] }
+
+# Player: GstPlay drives playbin3. gtk4paintablesink is linked in rather
+# than loaded as a system plugin, so that it uses the app's own GTK: a
+# plugin built against another copy of GTK would load a second one.
+gst = { package = "gstreamer", version = "0.25" }
+gst-play = { package = "gstreamer-play", version = "0.25" }
+# The spoolframe:// source element is a BaseSrc subclass.
+gst-base = { package = "gstreamer-base", version = "0.25" }
+gst-plugin-gtk4 = { version = "0.15", features = ["gtk_v4_14"] }
+
+# The backend's connection state is a tokio watch channel, as in the SDK.
+# Relm4 runs its commands on tokio already.
+tokio = { version = "1", features = ["sync", "rt-multi-thread"] }
+
+# Secrets (the device key, session tokens) in the desktop's Secret
+# Service, never a plain file.
+oo7 = "0.6"
+
+# Artwork kept on this device, in memory and on disk.
+foyer = "0.22"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"

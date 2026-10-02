@@ -1,0 +1,29 @@
+[package]
+name = "spoolframe-linux-app"
+description = "Spoolframe Linux: the Relm4/libadwaita app."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "spoolframe-linux"
+path = "src/main.rs"
+
+[dependencies]
+spoolframe-linux-core = { workspace = true }
+spoolframe-types = { workspace = true }
+spoolframe-protocol = { workspace = true }
+spoolframe-client-sdk = { workspace = true }
+tokio = { workspace = true }
+relm4 = { workspace = true }
+adw = { workspace = true }
+gtk = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+gst = { workspace = true }
+gst-play = { workspace = true }
+gst-base = { workspace = true }
+gst-plugin-gtk4 = { workspace = true }

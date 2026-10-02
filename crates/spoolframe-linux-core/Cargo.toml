@@ -1,0 +1,22 @@
+[package]
+name = "spoolframe-linux-core"
+description = "The GTK-free part of Spoolframe Linux: themes, and the backend the UI reads from."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+spoolframe-types = { workspace = true }
+spoolframe-protocol = { workspace = true }
+spoolframe-client-sdk = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+oo7 = { workspace = true }
+foyer = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }

@@ -1,0 +1,209 @@
+/* The app's own styling. Colours come only from libadwaita's variables,
+   never a literal, so that "Follow system", the user's gtk.css and every
+   Catppuccin theme restyle these widgets too. tests/stylesheet.rs checks
+   this.
+
+   This sheet loads one step above the user's gtk.css (see theme.rs). A
+   legacy GTK theme imported there paints window surfaces with fixed
+   colours, which would beat libadwaita's own variable-driven rules; the
+   surfaces below restate those rules so the variables win. A gtk.css that
+   only sets libadwaita's variables still applies through them. */
+
+/* Surfaces */
+
+window.background,
+.sidebar-pane,
+toolbarview {
+  background-color: var(--window-bg-color);
+  color: var(--window-fg-color);
+}
+
+.sidebar-pane,
+.sidebar-pane toolbarview,
+.navigation-sidebar {
+  background-color: var(--sidebar-bg-color);
+  color: var(--sidebar-fg-color);
+}
+
+headerbar {
+  background-color: var(--headerbar-bg-color);
+  color: var(--headerbar-fg-color);
+  box-shadow: inset 0 -1px var(--headerbar-shade-color);
+}
+
+.sidebar-pane headerbar {
+  background-color: var(--sidebar-bg-color);
+}
+
+progressbar progress {
+  background-color: var(--accent-bg-color);
+}
+
+.navigation-sidebar > row {
+  border: none;
+  box-shadow: none;
+  outline: none;
+}
+
+.navigation-sidebar > row:selected {
+  background-color: alpha(currentColor, 0.1);
+  color: inherit;
+}
+
+/* Window buttons as libadwaita draws them: a faint circle behind a
+   symbolic icon. */
+windowcontrols > button {
+  background: none;
+  border: none;
+  box-shadow: none;
+  color: inherit;
+}
+
+windowcontrols > button > image {
+  background-color: alpha(currentColor, 0.1);
+  color: inherit;
+  border: none;
+  box-shadow: none;
+}
+
+windowcontrols > button:hover > image {
+  background-color: alpha(currentColor, 0.15);
+}
+
+/* Placeholder tiles, until artwork arrives (P1-05). */
+
+.tile {
+  border-radius: 10px;
+  padding: 12px;
+  color: var(--accent-fg-color);
+}
+
+.tile-title {
+  font-weight: 800;
+  color: var(--accent-fg-color);
+}
+
+.landscape .tile-title {
+  font-size: 1.5em;
+}
+
+.portrait .tile-title {
+  font-size: 1.15em;
+}
+
+.tile-blue { background-color: var(--accent-blue); }
+.tile-teal { background-color: var(--accent-teal); }
+.tile-green { background-color: var(--accent-green); }
+.tile-yellow { background-color: var(--accent-yellow); }
+.tile-orange { background-color: var(--accent-orange); }
+.tile-red { background-color: var(--accent-red); }
+.tile-pink { background-color: var(--accent-pink); }
+.tile-purple { background-color: var(--accent-purple); }
+
+/* A progress strip along a tile's bottom edge. */
+.tile-progress trough {
+  min-height: 4px;
+  border-radius: 0 0 10px 10px;
+  background-color: var(--shade-color);
+}
+
+.tile-progress progress {
+  min-height: 4px;
+  border-radius: 0 0 0 10px;
+  background-color: var(--window-fg-color);
+}
+
+.watched-badge {
+  min-width: 22px;
+  min-height: 22px;
+  border-radius: 11px;
+  background-color: var(--window-bg-color);
+  color: var(--accent-color);
+}
+
+/* Cards are flat buttons: focusable and clickable, without a frame. */
+.card-button {
+  padding: 0;
+  background: none;
+  border-radius: 10px;
+}
+
+/* Detail pages */
+
+.backdrop {
+  background-color: var(--card-bg-color);
+}
+
+.poster-large .tile-title {
+  font-size: 2em;
+}
+
+.square .tile-title {
+  font-size: 1.8em;
+}
+
+/* The player is dark in every theme, as video players are: a light
+   surround makes the picture look washed out. Black is the one colour here
+   not taken from a theme variable, on purpose. Its controls use
+   libadwaita's .osd style, which is dark in light and dark themes alike. */
+
+.player {
+  background-color: black;
+}
+
+.player-controls {
+  margin: 16px;
+  padding: 14px 18px;
+  border-radius: 14px;
+}
+
+.diagnostics {
+  padding: 14px 16px;
+  border-radius: 12px;
+}
+
+.buffering {
+  padding: 12px 20px;
+  border-radius: 12px;
+}
+
+.play-toggle {
+  min-width: 48px;
+  min-height: 48px;
+}
+
+/* Server picker and profiles */
+
+.pinned-badge {
+  padding: 3px 10px;
+  border-radius: 999px;
+  background-color: alpha(currentColor, 0.1);
+  color: var(--success-color);
+}
+
+.profiles-title {
+  font-size: 2.6em;
+}
+
+.profile-tile {
+  padding: 8px;
+  border-radius: 16px;
+}
+
+.add-profile {
+  background-color: alpha(currentColor, 0.08);
+}
+
+/* Library grids */
+
+.library-grid {
+  padding: 20px;
+}
+
+.library-grid > child {
+  padding: 8px;
+}
+
+.tile-placeholder {
+  background-color: var(--card-bg-color);
+}

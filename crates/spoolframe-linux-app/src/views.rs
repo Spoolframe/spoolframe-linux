@@ -1,0 +1,404 @@
+//! Widgets built from the media model, laid out as in the UI mockups. Tiles
+//! start as coloured placeholders; artwork replaces them as it loads.
+
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::rc::Rc;
+
+use gtk::prelude::*;
+use spoolframe_linux_core::backend::ArtworkSize;
+use spoolframe_linux_core::format;
+use spoolframe_types::{Artwork, ArtworkKind, Item, MediaId, PlaybackState};
+
+use crate::artwork::Art;
+
+const LANDSCAPE: (i32, i32) = (300, 169);
+const PORTRAIT: (i32, i32) = (140, 210);
+
+/// What a card does when clicked: open the item's page.
+pub type Open = Rc<dyn Fn(Item)>;
+
+/// What every card needs from the app: how to open its item, and where its
+/// artwork comes from (none before a session exists).
+pub struct Cards {
+    pub open: Open,
+    pub art: Option<Rc<Art>>,
+}
+
+impl Cards {
+    /// Draws the item's artwork over `tile` once it loads, if the item has
+    /// one of `kinds`.
+    pub fn art(
+        &self,
+        tile: &gtk::Overlay,
+        artwork: &[Artwork],
+        kinds: &[ArtworkKind],
+        size: ArtworkSize,
+    ) {
+        if let Some(art) = &self.art {
+            art.show(tile, artwork, kinds, size);
+        }
+    }
+}
+
+/// The hues a placeholder tile can take; see `.tile-*` in style.css.
+const TILE_HUES: [&str; 8] = [
+    "tile-teal",
+    "tile-purple",
+    "tile-yellow",
+    "tile-blue",
+    "tile-orange",
+    "tile-red",
+    "tile-green",
+    "tile-pink",
+];
+
+/// A heading over a horizontally scrolling row of cards, with ‹ › buttons
+/// in the heading for mouse users. A mouse wheel scrolls the page, not the
+/// row (see [`pass_vertical_scroll_to_page`]); shift+wheel and touchpad
+/// swipes still scroll the row directly.
+pub fn row(title: &str, cards: impl IntoIterator<Item = gtk::Widget>) -> gtk::Box {
+    let cards_box = gtk::Box::new(gtk::Orientation::Horizontal, 16);
+    for card in cards {
+        cards_box.append(&card);
+    }
+    let scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .vscrollbar_policy(gtk::PolicyType::Never)
+        .child(&cards_box)
+        .build();
+    pass_vertical_scroll_to_page(&scroller);
+
+    let back = row_button("go-previous-symbolic", "Scroll back", &scroller, -1.0);
+    let forward = row_button("go-next-symbolic", "Scroll forward", &scroller, 1.0);
+    let adjustment = scroller.hadjustment();
+    let update = {
+        let (back, forward) = (back.clone(), forward.clone());
+        // The adjustment changes while GTK lays the row out, so the
+        // buttons keep their space and only fade out: hiding them would
+        // change the heading's height in the middle of that layout.
+        move |a: &gtk::Adjustment| {
+            let overflows = a.upper() - a.lower() > a.page_size() + 0.5;
+            for button in [&back, &forward] {
+                button.set_opacity(if overflows { 1.0 } else { 0.0 });
+                button.set_can_target(overflows);
+                button.set_can_focus(overflows);
+            }
+            back.set_sensitive(a.value() > a.lower() + 0.5);
+            forward.set_sensitive(a.value() + a.page_size() < a.upper() - 0.5);
+        }
+    };
+    update(&adjustment);
+    adjustment.connect_changed(update.clone());
+    adjustment.connect_value_changed(update);
+
+    let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    header.append(&heading(title));
+    header.append(&back);
+    header.append(&forward);
+
+    let section = gtk::Box::new(gtk::Orientation::Vertical, 14);
+    section.append(&header);
+    section.append(&scroller);
+    section
+}
+
+/// A ‹ or › button that scrolls the row by most of what is visible, so the
+/// last card of one view is still in sight as the first of the next.
+fn row_button(icon: &str, label: &str, row: &gtk::ScrolledWindow, direction: f64) -> gtk::Button {
+    let button = gtk::Button::builder()
+        .icon_name(icon)
+        .tooltip_text(label)
+        .valign(gtk::Align::Center)
+        .css_classes(["circular", "flat"])
+        .build();
+    let adjustment = row.hadjustment();
+    button.connect_clicked(move |_| {
+        let target = adjustment.value() + direction * adjustment.page_size() * 0.8;
+        adjustment.set_value(target.clamp(
+            adjustment.lower(),
+            adjustment.upper() - adjustment.page_size(),
+        ));
+    });
+    button
+}
+
+/// A row scrolls only sideways, but a scrolled window takes every wheel
+/// event, so the page would stop scrolling whenever the pointer is over a
+/// row. A vertical wheel over a row scrolls the page when the page has
+/// somewhere to go; sideways scrolling still moves the row.
+fn pass_vertical_scroll_to_page(row: &gtk::ScrolledWindow) {
+    let controller = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let row_widget = row.clone();
+    controller.connect_scroll(move |controller, _dx, dy| {
+        let Some(page) = row_widget
+            .parent()
+            .and_then(|p| p.ancestor(gtk::ScrolledWindow::static_type()))
+            .and_downcast::<gtk::ScrolledWindow>()
+        else {
+            return gtk::glib::Propagation::Proceed;
+        };
+        let adjustment = page.vadjustment();
+        if adjustment.upper() - adjustment.lower() <= adjustment.page_size() {
+            return gtk::glib::Propagation::Proceed;
+        }
+        // A wheel reports whole notches; GTK scrolls page_size^(2/3) per
+        // notch. A touchpad reports pixels.
+        let step = match controller.unit() {
+            gtk::gdk::ScrollUnit::Wheel => adjustment.page_size().powf(2.0 / 3.0),
+            _ => 1.0,
+        };
+        adjustment.set_value(adjustment.value() + dy * step);
+        gtk::glib::Propagation::Stop
+    });
+    row.add_controller(controller);
+}
+
+/// A heading over a wrapping grid of cards.
+pub fn grid(title: &str, cards: impl IntoIterator<Item = gtk::Widget>) -> gtk::Box {
+    let flow = gtk::FlowBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .column_spacing(16)
+        .row_spacing(24)
+        .halign(gtk::Align::Start)
+        .max_children_per_line(12)
+        .build();
+    for card in cards {
+        flow.append(&card);
+    }
+    titled(title, &flow)
+}
+
+fn titled(title: &str, body: &impl IsA<gtk::Widget>) -> gtk::Box {
+    let section = gtk::Box::new(gtk::Orientation::Vertical, 14);
+    section.append(&heading(title));
+    section.append(body);
+    section
+}
+
+fn heading(title: &str) -> gtk::Label {
+    gtk::Label::builder()
+        .label(title)
+        .xalign(0.0)
+        .hexpand(true)
+        .css_classes(["title-2"])
+        .build()
+}
+
+/// A 16:9 card for "Continue watching": the title on the tile, a progress
+/// strip along its bottom edge, and below it what the item is and how much
+/// is left.
+pub fn continue_card(item: &Item, cards: &Cards) -> gtk::Widget {
+    let facts = Facts::of(item);
+    let tile = tile(item.id(), &facts.title, "landscape", LANDSCAPE);
+    cards.art(
+        &tile,
+        facts.artwork,
+        &[
+            ArtworkKind::Thumb,
+            ArtworkKind::Background,
+            ArtworkKind::Poster,
+        ],
+        ArtworkSize::Small,
+    );
+    if let (Some(length), Some(position)) = (facts.length, facts.position()) {
+        let strip = gtk::ProgressBar::builder()
+            .fraction(format::progress(length, position))
+            .valign(gtk::Align::End)
+            .css_classes(["tile-progress"])
+            .build();
+        tile.add_overlay(&strip);
+    }
+
+    let caption = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    caption.append(
+        &gtk::Label::builder()
+            .label(facts.caption())
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .css_classes(["heading"])
+            .build(),
+    );
+    if let (Some(length), Some(position)) = (facts.length, facts.position()) {
+        caption.append(
+            &gtk::Label::builder()
+                .label(format::remaining(length, position))
+                .css_classes(["dim-label", "caption"])
+                .build(),
+        );
+    }
+    card(item, &tile, &caption, LANDSCAPE.0, &cards.open)
+}
+
+/// A 2:3 poster card: the title on the tile, a badge when watched, and the
+/// title and year below.
+pub fn poster_card(item: &Item, cards: &Cards) -> gtk::Widget {
+    let facts = Facts::of(item);
+    let tile = tile(item.id(), &facts.title, "portrait", PORTRAIT);
+    cards.art(
+        &tile,
+        facts.artwork,
+        &[ArtworkKind::Poster],
+        ArtworkSize::Small,
+    );
+    if facts.playback.is_some_and(|p| p.watched) {
+        let badge = gtk::Image::builder()
+            .icon_name("object-select-symbolic")
+            .halign(gtk::Align::End)
+            .valign(gtk::Align::Start)
+            .margin_top(8)
+            .margin_end(8)
+            .css_classes(["watched-badge"])
+            .tooltip_text("Watched")
+            .build();
+        tile.add_overlay(&badge);
+    }
+
+    let caption = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    caption.append(
+        &gtk::Label::builder()
+            .label(&facts.title)
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .css_classes(["heading"])
+            .build(),
+    );
+    if let Some(detail) = &facts.detail {
+        caption.append(
+            &gtk::Label::builder()
+                .label(detail)
+                .xalign(0.0)
+                .css_classes(["dim-label", "caption"])
+                .build(),
+        );
+    }
+    card(item, &tile, &caption, PORTRAIT.0, &cards.open)
+}
+
+/// A poster-sized blank for an item whose page has not loaded yet.
+pub fn placeholder_card() -> gtk::Widget {
+    let tile = gtk::Box::builder()
+        .width_request(PORTRAIT.0)
+        .height_request(PORTRAIT.1)
+        .css_classes(["tile", "tile-placeholder"])
+        .build();
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    body.append(&tile);
+    // The caption's height, so rows do not jump when the page arrives.
+    body.append(&gtk::Box::builder().height_request(38).build());
+    body.upcast()
+}
+
+/// A clickable card: a tile over a caption.
+fn card(
+    item: &Item,
+    tile: &gtk::Overlay,
+    caption: &gtk::Box,
+    width: i32,
+    open: &Open,
+) -> gtk::Widget {
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    body.append(tile);
+    body.append(caption);
+    let button = gtk::Button::builder()
+        .child(&body)
+        .width_request(width)
+        .valign(gtk::Align::Start)
+        .css_classes(["card-button", "flat"])
+        .build();
+    let (item, open) = (item.clone(), open.clone());
+    button.connect_clicked(move |_| open(item.clone()));
+    button.upcast()
+}
+
+/// A placeholder tile in a hue picked from the item's ID, so an item keeps
+/// its colour from one screen to the next.
+pub fn tile(id: &MediaId, title: &str, shape: &str, (width, height): (i32, i32)) -> gtk::Overlay {
+    let mut hasher = DefaultHasher::new();
+    id.hash(&mut hasher);
+    let hue = TILE_HUES[(hasher.finish() % TILE_HUES.len() as u64) as usize];
+
+    let background = gtk::Box::builder()
+        .width_request(width)
+        .height_request(height)
+        .css_classes(["tile", shape, hue])
+        .build();
+    let label = gtk::Label::builder()
+        .label(title)
+        .wrap(true)
+        .xalign(0.0)
+        .halign(gtk::Align::Start)
+        .valign(gtk::Align::End)
+        .margin_start(14)
+        .margin_end(14)
+        .margin_bottom(16)
+        .css_classes(["tile-title"])
+        .build();
+    let overlay = gtk::Overlay::builder()
+        .child(&background)
+        .css_classes([shape])
+        .overflow(gtk::Overflow::Hidden)
+        .build();
+    overlay.add_overlay(&label);
+    overlay
+}
+
+/// What a card shows of an item.
+pub struct Facts<'a> {
+    pub title: String,
+    /// The year, or "S2 · E4" for an episode.
+    pub detail: Option<String>,
+    pub playback: Option<&'a PlaybackState>,
+    pub length: Option<std::time::Duration>,
+    pub artwork: &'a [Artwork],
+    /// For an episode, its show-relative label for captions.
+    episode: Option<String>,
+}
+
+impl<'a> Facts<'a> {
+    pub fn of(item: &'a Item) -> Self {
+        let year = |y: Option<u16>| y.map(|y| y.to_string());
+        let plain = |title: &str, detail, artwork| Facts {
+            title: title.to_owned(),
+            detail,
+            playback: None,
+            length: None,
+            artwork,
+            episode: None,
+        };
+        match item {
+            Item::Movie(m) => Facts {
+                playback: Some(&m.playback),
+                length: m.duration,
+                ..plain(&m.title, year(m.year), &m.artwork)
+            },
+            Item::Episode(e) => Facts {
+                playback: Some(&e.playback),
+                length: e.duration,
+                episode: Some(format!("S{} · E{} · {}", e.season, e.episode, e.title)),
+                ..plain(
+                    &e.title,
+                    Some(format!("S{} · E{}", e.season, e.episode)),
+                    &e.artwork,
+                )
+            },
+            Item::Show(s) => plain(&s.title, year(s.year), &s.artwork),
+            Item::Season(s) => plain(&s.title, None, &s.artwork),
+            Item::Artist(a) => plain(&a.name, None, &a.artwork),
+            Item::Album(a) => plain(&a.title, year(a.year), &a.artwork),
+            Item::Track(t) => plain(&t.title, t.track.map(|n| format!("Track {n}")), &[]),
+        }
+    }
+
+    /// Where playback stopped, for an item started and not finished.
+    pub fn position(&self) -> Option<std::time::Duration> {
+        self.playback
+            .filter(|p| !p.watched)
+            .and_then(|p| p.position)
+    }
+
+    fn caption(&self) -> String {
+        self.episode.clone().unwrap_or_else(|| self.title.clone())
+    }
+}

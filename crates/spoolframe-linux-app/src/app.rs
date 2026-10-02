@@ -1,0 +1,1166 @@
+//! The main window. It opens on "Choose a server" (or straight on "Who's
+//! watching" for the server used last), then shows the library: a sidebar
+//! of Home, Search and the libraries, and a navigation stack on the right.
+//! The stack's root is the page the sidebar picks; a card pushes its item's
+//! page on top, with a Back button and swipe-back.
+
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Duration;
+
+use adw::prelude::*;
+use gtk::glib;
+use relm4::{Component, ComponentParts, ComponentSender};
+use spoolframe_linux_core::backend::{
+    BackendError, ChosenTracks, Client, ConnectionState, HomeScreen, Profile, Selection, Server,
+    ServerKey, Session,
+};
+use spoolframe_linux_core::theme::Theme;
+use spoolframe_types::{
+    Album, Artist, Item, Library, LibraryKind, MediaId, MediaTracks, Season, Show, TrackPreferences,
+};
+
+use crate::artwork::Art;
+use crate::settings::Settings;
+use crate::theme::ThemeApplier;
+use crate::views::Cards;
+use crate::{library, pages, player, preferences, start, views};
+use spoolframe_linux_core::artcache::ArtworkCache;
+
+/// What the app starts with.
+pub struct Init {
+    pub client: Arc<dyn Client>,
+    /// A line for the sign-in dialog: the fake's accounts, when on it.
+    pub sign_in_hint: Option<String>,
+    /// The device's artwork cache, if it could be opened.
+    pub artwork_cache: Option<Arc<ArtworkCache>>,
+}
+
+/// What to play, before a session is attached: see [`player::Playlist`].
+#[derive(Debug)]
+pub struct PlayRequest {
+    pub items: Vec<Item>,
+    pub index: usize,
+    pub from: Option<Duration>,
+    /// `None` lets the server choose from the user's preferences.
+    pub selection: Option<Selection>,
+    pub tracks: Option<MediaTracks>,
+}
+
+impl PlayRequest {
+    fn one(
+        item: Item,
+        from: Option<Duration>,
+        selection: Option<Selection>,
+        tracks: Option<MediaTracks>,
+    ) -> Self {
+        Self {
+            items: vec![item],
+            index: 0,
+            from,
+            selection,
+            tracks,
+        }
+    }
+}
+
+pub struct App {
+    client: Arc<dyn Client>,
+    sign_in_hint: Option<String>,
+    artwork_cache: Option<Arc<ArtworkCache>>,
+    /// The signed-in user's session, once a profile is chosen.
+    session: Option<Arc<dyn Session>>,
+    /// The server being used, once one is chosen.
+    server: Option<Server>,
+    libraries: Vec<Library>,
+    settings: Settings,
+    theme: ThemeApplier,
+    /// Given to every card: opens its item, loads its artwork.
+    cards: Rc<Cards>,
+    /// Follows the connection to the server in use; replaced on switching.
+    connection_watch: Option<glib::JoinHandle<()>>,
+    /// What the search page last asked for; older answers are dropped.
+    search_query: String,
+    /// Bumped on each sidebar choice, so a library that loads late does
+    /// not replace a newer page.
+    root_generation: Rc<std::cell::Cell<u64>>,
+}
+
+pub struct AppWidgets {
+    /// "servers", "profiles" or "library".
+    screens: gtk::Stack,
+    servers: adw::Bin,
+    profiles: adw::Bin,
+    toasts: adw::ToastOverlay,
+    profile_avatar: adw::Avatar,
+    profile_name: gtk::Label,
+    profile_server: gtk::Label,
+    /// Says when the connection is not up.
+    banner: adw::Banner,
+    sign_in: Option<start::SignIn>,
+    add_server: Option<start::AddServer>,
+    sidebar: gtk::ListBox,
+    stack: adw::NavigationView,
+    root_page: adw::NavigationPage,
+    /// The root page's scrolled area: `content`, or a library's grid,
+    /// which must be the scrolled child itself to load row by row.
+    scroller: gtk::ScrolledWindow,
+    content: gtk::Box,
+    search_entry: gtk::SearchEntry,
+    search_results: gtk::Box,
+}
+
+#[derive(Debug)]
+pub enum Msg {
+    ShowServers,
+    ChooseServer(Server),
+    OpenAddServer,
+    AddServer(String, String),
+    ChooseProfile(Profile),
+    OpenSignIn,
+    SubmitSignIn(String, String),
+    /// Back to "Who's watching" from the library.
+    SwitchProfile,
+    /// A sidebar row was activated: see the `ROW_*` constants.
+    Select(usize),
+    Search(String),
+    Open(Box<Item>),
+    Play(Box<PlayRequest>),
+    SetWatched(MediaId, bool),
+    /// Remember these tracks for the item (an episode: its series).
+    RememberTracks(MediaId, Selection),
+    /// Forget them, and reopen the item's page with the server's choice.
+    ForgetTracks(Box<Item>),
+    SetTrackPreferences(Box<TrackPreferences>),
+    ConnectionChanged(ConnectionState),
+    OpenPreferences,
+    SetTheme(Theme),
+}
+
+/// Sidebar rows before the libraries.
+const ROW_HOME: usize = 0;
+const ROW_SEARCH: usize = 1;
+const FIRST_LIBRARY_ROW: usize = 2;
+
+/// How many search results to show.
+const SEARCH_LIMIT: u32 = 60;
+
+/// A season with its episodes.
+type SeasonEpisodes = (Season, Vec<Item>);
+
+#[derive(Debug)]
+pub enum Loaded {
+    Servers(Result<Vec<Server>, BackendError>),
+    ServerAdded(Result<Server, BackendError>),
+    Profiles(Server, Result<Vec<Profile>, BackendError>),
+    SignedIn(Result<Profile, BackendError>),
+    Libraries(Result<Vec<Library>, BackendError>),
+    Home(Result<HomeScreen, BackendError>),
+    Search(String, Result<Vec<Item>, BackendError>),
+    /// A movie or episode, what it belongs to (an episode's show), and its
+    /// tracks for the pickers.
+    Playable(
+        Item,
+        Option<String>,
+        Result<MediaTracks, BackendError>,
+        Option<ChosenTracks>,
+    ),
+    Show(Show, Result<Vec<SeasonEpisodes>, BackendError>),
+    Season(Season, Result<Vec<Item>, BackendError>),
+    Artist(Artist, Result<Vec<Item>, BackendError>),
+    /// An album, its artist's name and its tracks.
+    Album(Album, Result<(String, Vec<Item>), BackendError>),
+    WatchChanged(Result<(), BackendError>),
+    /// A change the user does not need to hear about unless it failed.
+    Saved(Result<(), BackendError>),
+    TracksForgotten(Box<Item>, Result<(), BackendError>),
+    Preferences(Result<TrackPreferences, BackendError>),
+}
+
+impl Loaded {
+    /// Whether the session behind this answer is gone. Any session call
+    /// can find out; the app then asks the user to sign in again.
+    fn sign_in_required(&self) -> bool {
+        let gone = |e: &BackendError| *e == BackendError::SignInRequired;
+        match self {
+            Loaded::Libraries(Err(e))
+            | Loaded::Home(Err(e))
+            | Loaded::Search(_, Err(e))
+            | Loaded::Show(_, Err(e))
+            | Loaded::Season(_, Err(e))
+            | Loaded::Artist(_, Err(e))
+            | Loaded::Album(_, Err(e))
+            | Loaded::WatchChanged(Err(e))
+            | Loaded::Saved(Err(e))
+            | Loaded::TracksForgotten(_, Err(e))
+            | Loaded::Preferences(Err(e)) => gone(e),
+            _ => false,
+        }
+    }
+}
+
+impl Component for App {
+    type Init = Init;
+    type Input = Msg;
+    type Output = ();
+    type CommandOutput = Loaded;
+    type Root = adw::ApplicationWindow;
+    type Widgets = AppWidgets;
+
+    fn init_root() -> Self::Root {
+        adw::ApplicationWindow::builder()
+            .title("Spoolframe")
+            .default_width(1280)
+            .default_height(800)
+            .build()
+    }
+
+    fn init(
+        Init {
+            client,
+            sign_in_hint,
+            artwork_cache,
+        }: Self::Init,
+        root: Self::Root,
+        sender: ComponentSender<Self>,
+    ) -> ComponentParts<Self> {
+        let settings = Settings::load();
+        let theme = ThemeApplier::new();
+        theme.apply(settings.theme());
+
+        let sidebar = gtk::ListBox::builder()
+            .css_classes(["navigation-sidebar"])
+            .build();
+        sidebar.append(&sidebar_row("Home", "go-home-symbolic"));
+        sidebar.append(&sidebar_row("Search", "system-search-symbolic"));
+        {
+            let sender = sender.clone();
+            sidebar.connect_row_activated(move |_, row| {
+                sender.input(Msg::Select(row.index() as usize));
+            });
+        }
+        // Who is watching, at the foot of the sidebar; it switches profile.
+        let profile_avatar = adw::Avatar::new(34, None, true);
+        let profile_name = gtk::Label::builder()
+            .xalign(0.0)
+            .css_classes(["heading"])
+            .build();
+        let profile_server = gtk::Label::builder()
+            .xalign(0.0)
+            .css_classes(["dim-label", "caption"])
+            .build();
+        let names = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .hexpand(true)
+            .build();
+        names.append(&profile_name);
+        names.append(&profile_server);
+        let profile_body = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        profile_body.append(&profile_avatar);
+        profile_body.append(&names);
+        profile_body.append(&gtk::Image::from_icon_name("pan-down-symbolic"));
+        let profile_button = gtk::Button::builder()
+            .child(&profile_body)
+            .tooltip_text("Switch profile")
+            .margin_top(6)
+            .margin_bottom(6)
+            .margin_start(6)
+            .margin_end(6)
+            .css_classes(["flat"])
+            .build();
+        {
+            let sender = sender.clone();
+            profile_button.connect_clicked(move |_| sender.input(Msg::SwitchProfile));
+        }
+        let sidebar_toolbar = toolbar(
+            &adw::HeaderBar::new(),
+            &gtk::ScrolledWindow::builder()
+                .child(&sidebar)
+                .vexpand(true)
+                .build(),
+        );
+        sidebar_toolbar.add_bottom_bar(&profile_button);
+        let sidebar_page = adw::NavigationPage::builder()
+            .title("Spoolframe")
+            .child(&sidebar_toolbar)
+            .build();
+
+        // The main menu, as in every libadwaita app; its items are window
+        // actions.
+        let preferences = gtk::gio::SimpleAction::new("preferences", None);
+        {
+            let sender = sender.clone();
+            preferences.connect_activate(move |_, _| sender.input(Msg::OpenPreferences));
+        }
+        root.add_action(&preferences);
+        let menu = gtk::gio::Menu::new();
+        menu.append(Some("Preferences"), Some("win.preferences"));
+        let menu_button = gtk::MenuButton::builder()
+            .icon_name("open-menu-symbolic")
+            .tooltip_text("Main menu")
+            .menu_model(&menu)
+            .primary(true)
+            .build();
+        let header = adw::HeaderBar::new();
+        header.pack_end(&menu_button);
+        let content = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(32)
+            .margin_top(28)
+            .margin_bottom(28)
+            .margin_start(28)
+            .margin_end(28)
+            .build();
+        let banner = adw::Banner::new("");
+        let scroller = gtk::ScrolledWindow::builder()
+            .child(&content)
+            .vexpand(true)
+            .build();
+        let root_toolbar = toolbar(&header, &scroller);
+        root_toolbar.add_top_bar(&banner);
+        let root_page = adw::NavigationPage::builder()
+            .title("Home")
+            .child(&root_toolbar)
+            .build();
+        let stack = adw::NavigationView::new();
+        stack.add(&root_page);
+        let content_page = adw::NavigationPage::builder()
+            .title("Spoolframe")
+            .child(&stack)
+            .build();
+
+        let search_entry = gtk::SearchEntry::builder()
+            .placeholder_text("Movies, shows, episodes, music")
+            .hexpand(true)
+            .build();
+        {
+            let sender = sender.clone();
+            // search-changed is already debounced by the entry.
+            search_entry.connect_search_changed(move |entry| {
+                sender.input(Msg::Search(entry.text().trim().to_owned()));
+            });
+        }
+        let search_results = gtk::Box::new(gtk::Orientation::Vertical, 24);
+
+        let split = adw::NavigationSplitView::builder()
+            .sidebar(&sidebar_page)
+            .content(&content_page)
+            .build();
+
+        let servers = adw::Bin::new();
+        let profiles = adw::Bin::new();
+        let screens = gtk::Stack::builder()
+            .transition_type(gtk::StackTransitionType::Crossfade)
+            .build();
+        screens.add_named(&servers, Some("servers"));
+        screens.add_named(&profiles, Some("profiles"));
+        screens.add_named(&split, Some("library"));
+        let toasts = adw::ToastOverlay::new();
+        toasts.set_child(Some(&screens));
+        root.set_content(Some(&toasts));
+
+        let model = App {
+            client,
+            sign_in_hint,
+            artwork_cache,
+            session: None,
+            server: None,
+            libraries: Vec::new(),
+            settings,
+            theme,
+            cards: Rc::new(Cards {
+                open: open_with(&sender),
+                art: None,
+            }),
+            connection_watch: None,
+            search_query: String::new(),
+            root_generation: Rc::new(std::cell::Cell::new(0)),
+        };
+        model.load_servers(&sender);
+        ComponentParts {
+            model,
+            widgets: AppWidgets {
+                screens,
+                servers,
+                profiles,
+                toasts,
+                profile_avatar,
+                profile_name,
+                profile_server,
+                banner,
+                sign_in: None,
+                add_server: None,
+                sidebar,
+                stack,
+                root_page,
+                scroller,
+                content,
+                search_entry,
+                search_results,
+            },
+        }
+    }
+
+    fn update_with_view(
+        &mut self,
+        widgets: &mut Self::Widgets,
+        msg: Self::Input,
+        sender: ComponentSender<Self>,
+        root: &Self::Root,
+    ) {
+        match msg {
+            Msg::ShowServers => {
+                widgets.screens.set_visible_child_name("servers");
+                self.load_servers(&sender);
+            }
+            Msg::ChooseServer(server) => self.load_profiles(server, &sender),
+            Msg::OpenAddServer => {
+                let submit: Rc<dyn Fn(String, String)> = {
+                    let sender = sender.clone();
+                    Rc::new(move |key, address| sender.input(Msg::AddServer(key, address)))
+                };
+                let dialog = start::AddServer::new(submit);
+                dialog.dialog.present(Some(root));
+                widgets.add_server = Some(dialog);
+            }
+            Msg::AddServer(key, address) => {
+                if let Some(dialog) = &widgets.add_server {
+                    if key.is_empty() || address.is_empty() {
+                        return dialog.refuse("Both the key and an address are needed.");
+                    }
+                    dialog.set_busy(true);
+                }
+                let client = self.client.clone();
+                sender.oneshot_command(async move {
+                    Loaded::ServerAdded(client.add_address(&ServerKey(key), &address).await)
+                });
+            }
+            Msg::ChooseProfile(profile) => self.enter(profile, widgets, &sender),
+            Msg::OpenSignIn => {
+                let Some(server) = &self.server else { return };
+                let submit: Rc<dyn Fn(String, String)> = {
+                    let sender = sender.clone();
+                    Rc::new(move |u, p| sender.input(Msg::SubmitSignIn(u, p)))
+                };
+                let dialog = start::SignIn::new(server, self.sign_in_hint.as_deref(), submit);
+                dialog.dialog.present(Some(root));
+                widgets.sign_in = Some(dialog);
+            }
+            Msg::SubmitSignIn(username, password) => {
+                let Some(server) = self.server.clone() else {
+                    return;
+                };
+                if let Some(dialog) = &widgets.sign_in {
+                    dialog.set_busy(true);
+                }
+                let client = self.client.clone();
+                sender.oneshot_command(async move {
+                    Loaded::SignedIn(client.sign_in(&server.key, &username, &password).await)
+                });
+            }
+            Msg::SwitchProfile => {
+                if let Some(server) = self.server.clone() {
+                    self.load_profiles(server, &sender);
+                }
+            }
+            Msg::Select(ROW_HOME) => {
+                self.root_generation.set(self.root_generation.get() + 1);
+                widgets.stack.pop_to_page(&widgets.root_page);
+                self.load_home(&sender);
+            }
+            Msg::Select(ROW_SEARCH) => {
+                self.root_generation.set(self.root_generation.get() + 1);
+                widgets.stack.pop_to_page(&widgets.root_page);
+                widgets.root_page.set_title("Search");
+                show_content(widgets);
+                clear(&widgets.content);
+                widgets.content.append(&widgets.search_entry);
+                widgets.content.append(&widgets.search_results);
+                widgets.search_entry.grab_focus();
+            }
+            Msg::Select(row) => {
+                let Some(library) = self.libraries.get(row - FIRST_LIBRARY_ROW).cloned() else {
+                    return;
+                };
+                let Some(session) = self.session.clone() else {
+                    return;
+                };
+                widgets.stack.pop_to_page(&widgets.root_page);
+                widgets.root_page.set_title(&library.title);
+                show_content(widgets);
+                clear(&widgets.content);
+                // A newer choice in the sidebar makes this one stale.
+                let generation = self.root_generation.get() + 1;
+                self.root_generation.set(generation);
+                let current = self.root_generation.clone();
+                let (scroller, content) = (widgets.scroller.clone(), widgets.content.clone());
+                let cards = self.cards.clone();
+                glib::spawn_future_local(async move {
+                    let grid = library::grid(session, library, cards).await;
+                    if current.get() != generation {
+                        return;
+                    }
+                    match grid {
+                        Ok(grid) => scroller.set_child(Some(&grid)),
+                        Err(e) => content.append(&error_status(&e)),
+                    }
+                });
+            }
+            Msg::Search(query) => {
+                self.search_query = query.clone();
+                if query.is_empty() {
+                    clear(&widgets.search_results);
+                    return;
+                }
+                let Some(session) = self.session.clone() else {
+                    return;
+                };
+                sender.oneshot_command(async move {
+                    let items = session.search(&query, SEARCH_LIMIT).await;
+                    Loaded::Search(query, items)
+                });
+            }
+            Msg::Open(item) => self.open_item(*item, &sender),
+            Msg::Play(request) => {
+                let Some(session) = self.session.clone() else {
+                    return;
+                };
+                let PlayRequest {
+                    items,
+                    index,
+                    from,
+                    selection,
+                    tracks,
+                } = *request;
+                widgets.stack.push(&player::page(player::Playlist {
+                    session,
+                    items,
+                    index,
+                    from,
+                    selection,
+                    tracks,
+                }));
+            }
+            Msg::SetWatched(id, watched) => {
+                let Some(session) = self.session.clone() else {
+                    return;
+                };
+                sender.oneshot_command(async move {
+                    let done = if watched {
+                        session.mark_watched(&id).await
+                    } else {
+                        session.mark_unwatched(&id).await
+                    };
+                    Loaded::WatchChanged(done)
+                });
+            }
+            Msg::ConnectionChanged(state) => show_connection(widgets, self.server.as_ref(), state),
+            Msg::RememberTracks(id, selection) => {
+                let Some(session) = self.session.clone() else {
+                    return;
+                };
+                sender.oneshot_command(async move {
+                    Loaded::Saved(session.set_track_override(&id, selection).await)
+                });
+            }
+            Msg::ForgetTracks(item) => {
+                let Some(session) = self.session.clone() else {
+                    return;
+                };
+                sender.oneshot_command(async move {
+                    let done = session.clear_track_override(item.id()).await;
+                    Loaded::TracksForgotten(item, done)
+                });
+            }
+            Msg::SetTrackPreferences(preferences) => {
+                let Some(session) = self.session.clone() else {
+                    return;
+                };
+                sender.oneshot_command(async move {
+                    Loaded::Saved(session.set_track_preferences(&preferences).await)
+                });
+            }
+            Msg::OpenPreferences => match self.session.clone() {
+                // The Playback page shows the user's preferences, from the
+                // server.
+                Some(session) => sender.oneshot_command(async move {
+                    Loaded::Preferences(session.track_preferences().await)
+                }),
+                None => self.preferences_dialog(None, &sender).present(Some(root)),
+            },
+            Msg::SetTheme(theme) => {
+                self.theme.apply(theme);
+                self.settings.set_theme(theme);
+            }
+        }
+    }
+
+    fn update_cmd_with_view(
+        &mut self,
+        widgets: &mut Self::Widgets,
+        loaded: Self::CommandOutput,
+        sender: ComponentSender<Self>,
+        _root: &Self::Root,
+    ) {
+        if loaded.sign_in_required() {
+            return self.signed_out(widgets, &sender);
+        }
+        let cards = self.cards.clone();
+        let cards = cards.as_ref();
+        match loaded {
+            Loaded::Servers(Ok(servers)) => {
+                // Open on the server used last, if this device still knows it.
+                let last = self.settings.server();
+                if self.server.is_none()
+                    && let Some(server) = servers.iter().find(|s| Some(&s.key.0) == last.as_ref())
+                {
+                    self.load_profiles(server.clone(), &sender);
+                }
+                let choose: start::Choose<Server> = {
+                    let sender = sender.clone();
+                    Rc::new(move |s| sender.input(Msg::ChooseServer(s)))
+                };
+                let add: Rc<dyn Fn()> = {
+                    let sender = sender.clone();
+                    Rc::new(move || sender.input(Msg::OpenAddServer))
+                };
+                widgets
+                    .servers
+                    .set_child(Some(&start::servers(&servers, &choose, &add)));
+                if self.server.is_none() {
+                    widgets.screens.set_visible_child_name("servers");
+                }
+            }
+            Loaded::Servers(Err(e)) => toast(widgets, &e),
+            Loaded::ServerAdded(Ok(server)) => {
+                if let Some(dialog) = widgets.add_server.take() {
+                    dialog.dialog.close();
+                }
+                self.load_servers(&sender);
+                self.load_profiles(server, &sender);
+            }
+            Loaded::ServerAdded(Err(e)) => match &widgets.add_server {
+                Some(dialog) => dialog.refuse(&e.to_string()),
+                None => toast(widgets, &e),
+            },
+            Loaded::Profiles(server, Ok(profiles)) => {
+                let choose: start::Choose<Profile> = {
+                    let sender = sender.clone();
+                    Rc::new(move |p| sender.input(Msg::ChooseProfile(p)))
+                };
+                let sign_in: Rc<dyn Fn()> = {
+                    let sender = sender.clone();
+                    Rc::new(move || sender.input(Msg::OpenSignIn))
+                };
+                let back: Rc<dyn Fn()> = {
+                    let sender = sender.clone();
+                    Rc::new(move || sender.input(Msg::ShowServers))
+                };
+                widgets.profiles.set_child(Some(&start::profiles(
+                    &server, &profiles, &choose, &sign_in, &back,
+                )));
+                widgets.screens.set_visible_child_name("profiles");
+                self.server = Some(server);
+                // Nobody signed in here yet: go straight to signing in.
+                if profiles.is_empty() {
+                    sender.input(Msg::OpenSignIn);
+                }
+            }
+            Loaded::Profiles(server, Err(e)) => {
+                tracing::warn!(server = %server.name, error = %e, "cannot list profiles");
+                toast(widgets, &e);
+                widgets.screens.set_visible_child_name("servers");
+            }
+            Loaded::SignedIn(Ok(profile)) => {
+                if let Some(dialog) = widgets.sign_in.take() {
+                    dialog.dialog.close();
+                }
+                self.enter(profile, widgets, &sender);
+            }
+            Loaded::SignedIn(Err(e)) => match &widgets.sign_in {
+                Some(dialog) => dialog.refuse(&e.to_string()),
+                None => toast(widgets, &e),
+            },
+            Loaded::Libraries(Ok(libraries)) => {
+                for library in &libraries {
+                    widgets
+                        .sidebar
+                        .append(&sidebar_row(&library.title, library_icon(library.kind)));
+                }
+                self.libraries = libraries;
+            }
+            Loaded::Libraries(Err(e)) => show_error(widgets, "Home", &e),
+            Loaded::Home(Ok(home)) => {
+                let mut rows = Vec::new();
+                // A row with nothing in it is left out, not shown empty.
+                if !home.continue_watching.is_empty() {
+                    rows.push(views::row(
+                        "Continue watching",
+                        home.continue_watching
+                            .iter()
+                            .map(|i| views::continue_card(i, cards)),
+                    ));
+                }
+                if !home.next_up.is_empty() {
+                    rows.push(views::row(
+                        "Next up",
+                        home.next_up.iter().map(|i| views::continue_card(i, cards)),
+                    ));
+                }
+                if !home.recently_added.is_empty() {
+                    rows.push(views::row(
+                        "Recently added",
+                        home.recently_added
+                            .iter()
+                            .map(|i| views::poster_card(i, cards)),
+                    ));
+                }
+                show(widgets, "Home", rows);
+            }
+            Loaded::Home(Err(e)) => show_error(widgets, "Home", &e),
+            Loaded::Search(query, result) => {
+                // An answer to an older query, overtaken while typing.
+                if query != self.search_query {
+                    return;
+                }
+                clear(&widgets.search_results);
+                match result {
+                    Ok(items) if items.is_empty() => widgets.search_results.append(
+                        &adw::StatusPage::builder()
+                            .icon_name("system-search-symbolic")
+                            .title("Nothing found")
+                            .description(format!("Nothing matches “{query}”."))
+                            .build(),
+                    ),
+                    Ok(items) => widgets.search_results.append(&views::grid(
+                        "Results",
+                        items.iter().map(|i| views::poster_card(i, cards)),
+                    )),
+                    Err(e) => widgets.search_results.append(&error_status(&e)),
+                }
+            }
+            Loaded::Playable(item, context, tracks, chosen) => {
+                let title = views::Facts::of(&item).title;
+                // The page opens without pickers if the tracks cannot be
+                // had; playback then takes the server's choice.
+                let tracks = tracks
+                    .inspect_err(|e| tracing::warn!(error = %e, "no track list"))
+                    .ok();
+                let play: pages::Play = {
+                    let (sender, item, tracks) = (sender.clone(), item.clone(), tracks.clone());
+                    Rc::new(move |from, selection| {
+                        sender.input(Msg::Play(Box::new(PlayRequest::one(
+                            item.clone(),
+                            from,
+                            selection,
+                            tracks.clone(),
+                        ))))
+                    })
+                };
+                let id = item.id().clone();
+                let actions = pages::PlayableActions {
+                    play,
+                    set_watched: {
+                        let (sender, id) = (sender.clone(), id.clone());
+                        Rc::new(move |watched| sender.input(Msg::SetWatched(id.clone(), watched)))
+                    },
+                    remember: {
+                        let (sender, id) = (sender.clone(), id.clone());
+                        Rc::new(move |selection| {
+                            sender.input(Msg::RememberTracks(id.clone(), selection))
+                        })
+                    },
+                    forget: {
+                        let (sender, item) = (sender.clone(), item.clone());
+                        Rc::new(move || sender.input(Msg::ForgetTracks(Box::new(item.clone()))))
+                    },
+                };
+                push(
+                    widgets,
+                    &title,
+                    &pages::playable(
+                        &item,
+                        context.as_deref(),
+                        tracks.as_ref(),
+                        chosen.as_ref(),
+                        actions,
+                        cards,
+                    ),
+                );
+            }
+            Loaded::Show(show, Ok(seasons)) => {
+                push(widgets, &show.title, &pages::show(&show, &seasons, cards));
+            }
+            Loaded::Show(show, Err(e)) => push_error(widgets, &show.title, &e),
+            Loaded::Season(season, Ok(episodes)) => {
+                push(
+                    widgets,
+                    &season.title,
+                    &pages::season(&season, &episodes, cards),
+                );
+            }
+            Loaded::Season(season, Err(e)) => push_error(widgets, &season.title, &e),
+            Loaded::Artist(artist, Ok(albums)) => {
+                push(
+                    widgets,
+                    &artist.name,
+                    &pages::artist(&artist, &albums, cards),
+                );
+            }
+            Loaded::Artist(artist, Err(e)) => push_error(widgets, &artist.name, &e),
+            Loaded::Album(album, Ok((artist, tracks))) => {
+                let play: pages::PlayTracks = {
+                    let sender = sender.clone();
+                    Rc::new(move |items, index| {
+                        sender.input(Msg::Play(Box::new(PlayRequest {
+                            items,
+                            index,
+                            from: None,
+                            selection: None,
+                            tracks: None,
+                        })))
+                    })
+                };
+                push(
+                    widgets,
+                    &album.title,
+                    &pages::album(&album, &artist, &tracks, play, cards),
+                );
+            }
+            Loaded::Album(album, Err(e)) => push_error(widgets, &album.title, &e),
+            Loaded::WatchChanged(Ok(())) => {}
+            Loaded::WatchChanged(Err(e)) => toast(widgets, &e),
+            Loaded::Saved(Ok(())) => {}
+            Loaded::Saved(Err(e)) => toast(widgets, &e),
+            Loaded::TracksForgotten(item, Ok(())) => {
+                toast_text(widgets, "Back to your default tracks");
+                // Reopen the page so its pickers show the server's choice.
+                widgets.stack.pop();
+                self.open_item(*item, &sender);
+            }
+            Loaded::TracksForgotten(_, Err(e)) => toast(widgets, &e),
+            Loaded::Preferences(result) => {
+                // Without the server's preferences, the dialog still has
+                // Appearance.
+                let tracks = result
+                    .inspect_err(|e| tracing::warn!(error = %e, "no track preferences"))
+                    .ok();
+                self.preferences_dialog(tracks, &sender)
+                    .present(Some(_root));
+            }
+        }
+    }
+}
+
+impl App {
+    fn preferences_dialog(
+        &self,
+        tracks: Option<TrackPreferences>,
+        sender: &ComponentSender<Self>,
+    ) -> adw::PreferencesDialog {
+        let set_theme: Rc<dyn Fn(Theme)> = {
+            let sender = sender.clone();
+            Rc::new(move |theme| sender.input(Msg::SetTheme(theme)))
+        };
+        let set_tracks: Rc<dyn Fn(TrackPreferences)> = {
+            let sender = sender.clone();
+            Rc::new(move |p| sender.input(Msg::SetTrackPreferences(Box::new(p))))
+        };
+        preferences::dialog(self.settings.theme(), tracks, set_theme, set_tracks)
+    }
+
+    fn load_servers(&self, sender: &ComponentSender<Self>) {
+        let client = self.client.clone();
+        sender.oneshot_command(async move { Loaded::Servers(client.servers().await) });
+    }
+
+    fn load_profiles(&self, server: Server, sender: &ComponentSender<Self>) {
+        let client = self.client.clone();
+        sender.oneshot_command(async move {
+            let profiles = client.profiles(&server.key).await;
+            Loaded::Profiles(server, profiles)
+        });
+    }
+
+    /// Opens the library as `profile`: its own session on the same
+    /// connection, a fresh sidebar and Home.
+    fn enter(
+        &mut self,
+        profile: Profile,
+        widgets: &mut AppWidgets,
+        sender: &ComponentSender<Self>,
+    ) {
+        let session = match self.client.session(&profile) {
+            Ok(session) => session,
+            Err(e) => return toast(widgets, &e),
+        };
+        self.cards = Rc::new(Cards {
+            open: open_with(sender),
+            art: Some(Art::new(
+                session.clone(),
+                profile.server.clone(),
+                self.artwork_cache.clone(),
+            )),
+        });
+        self.session = Some(session);
+        self.settings.set_server(&profile.server.0);
+        widgets.profile_avatar.set_text(Some(&profile.display_name));
+        widgets.profile_name.set_label(&profile.display_name);
+        self.watch_connection(&profile.server, sender);
+        while let Some(row) = widgets.sidebar.row_at_index(FIRST_LIBRARY_ROW as i32) {
+            widgets.sidebar.remove(&row);
+        }
+        self.libraries.clear();
+        self.search_query.clear();
+        widgets.search_entry.set_text("");
+        clear(&widgets.search_results);
+        widgets.stack.pop_to_page(&widgets.root_page);
+        clear(&widgets.content);
+        widgets.screens.set_visible_child_name("library");
+        self.load_libraries(sender);
+        self.load_home(sender);
+    }
+
+    /// Follows the connection to `server` and shows its state, replacing
+    /// the watch on the previous server.
+    fn watch_connection(&mut self, server: &ServerKey, sender: &ComponentSender<Self>) {
+        if let Some(watch) = self.connection_watch.take() {
+            watch.abort();
+        }
+        let mut states = self.client.connection(server);
+        let sender = sender.clone();
+        self.connection_watch = Some(glib::spawn_future_local(async move {
+            loop {
+                let state = *states.borrow_and_update();
+                sender.input(Msg::ConnectionChanged(state));
+                if states.changed().await.is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// The session is gone: back to "Who's watching", where the profile
+    /// can be signed in again.
+    fn signed_out(&mut self, widgets: &mut AppWidgets, sender: &ComponentSender<Self>) {
+        self.session = None;
+        toast(widgets, &BackendError::SignInRequired);
+        if let Some(server) = self.server.clone() {
+            self.load_profiles(server, sender);
+        } else {
+            sender.input(Msg::ShowServers);
+        }
+    }
+
+    fn load_libraries(&self, sender: &ComponentSender<Self>) {
+        let Some(session) = self.session.clone() else {
+            return;
+        };
+        sender.oneshot_command(async move { Loaded::Libraries(session.libraries().await) });
+    }
+
+    fn load_home(&self, sender: &ComponentSender<Self>) {
+        let Some(session) = self.session.clone() else {
+            return;
+        };
+        sender.oneshot_command(async move { Loaded::Home(session.home().await) });
+    }
+
+    /// Loads what the item's page needs, then pushes the page.
+    fn open_item(&self, item: Item, sender: &ComponentSender<Self>) {
+        let Some(backend) = self.session.clone() else {
+            return;
+        };
+        match item {
+            Item::Movie(ref m) => {
+                let id = m.id.clone();
+                sender.oneshot_command(async move {
+                    let tracks = backend.tracks(&id).await;
+                    let chosen = server_choice(backend.as_ref(), &id).await;
+                    Loaded::Playable(item, None, tracks, chosen)
+                });
+            }
+            Item::Episode(ref e) => {
+                let (id, show) = (e.id.clone(), e.show_id.clone());
+                sender.oneshot_command(async move {
+                    // The show's title is context, not essential: the page
+                    // opens without it if the show cannot be loaded.
+                    let context = match backend.item(&show).await {
+                        Ok((Item::Show(s), _)) => Some(s.title),
+                        _ => None,
+                    };
+                    let tracks = backend.tracks(&id).await;
+                    let chosen = server_choice(backend.as_ref(), &id).await;
+                    Loaded::Playable(item, context, tracks, chosen)
+                });
+            }
+            Item::Show(show) => sender.oneshot_command(async move {
+                let seasons = async {
+                    let mut seasons = Vec::new();
+                    for child in backend.item(&show.id).await?.1 {
+                        if let Item::Season(season) = child {
+                            let episodes = backend.item(&season.id).await?.1;
+                            seasons.push((season, episodes));
+                        }
+                    }
+                    Ok(seasons)
+                }
+                .await;
+                Loaded::Show(show, seasons)
+            }),
+            Item::Season(season) => sender.oneshot_command(async move {
+                let episodes = backend.item(&season.id).await.map(|(_, c)| c);
+                Loaded::Season(season, episodes)
+            }),
+            Item::Artist(artist) => sender.oneshot_command(async move {
+                let albums = backend.item(&artist.id).await.map(|(_, c)| c);
+                Loaded::Artist(artist, albums)
+            }),
+            Item::Album(album) => sender.oneshot_command(async move {
+                let loaded = async {
+                    let artist = match backend.item(&album.artist_id).await?.0 {
+                        Item::Artist(a) => a.name,
+                        other => other.id().to_string(),
+                    };
+                    let tracks = backend.item(&album.id).await?.1;
+                    Ok((artist, tracks))
+                }
+                .await;
+                Loaded::Album(album, loaded)
+            }),
+            // A track found by search plays on its own.
+            Item::Track(_) => sender.input(Msg::Play(Box::new(PlayRequest::one(
+                item, None, None, None,
+            )))),
+        }
+    }
+}
+
+fn open_with(sender: &ComponentSender<App>) -> views::Open {
+    let sender = sender.clone();
+    Rc::new(move |item| sender.input(Msg::Open(Box::new(item))))
+}
+
+fn show_connection(widgets: &AppWidgets, server: Option<&Server>, state: ConnectionState) {
+    let name = server.map_or("the server", |s| s.name.as_str());
+    let (status, banner) = match state {
+        ConnectionState::Connected => ("connected".to_owned(), None),
+        ConnectionState::Connecting => (
+            "connecting…".to_owned(),
+            Some(format!("Connecting to {name}…")),
+        ),
+        ConnectionState::Reconnecting { attempt } => (
+            format!("reconnecting ({attempt})…"),
+            Some(format!(
+                "Lost the connection to {name}; reconnecting (attempt {attempt})…"
+            )),
+        ),
+        ConnectionState::Closed => (
+            "offline".to_owned(),
+            Some(format!("Not connected to {name}.")),
+        ),
+    };
+    widgets
+        .profile_server
+        .set_label(&format!("{name} · {status}"));
+    match banner {
+        Some(text) => {
+            widgets.banner.set_title(&text);
+            widgets.banner.set_revealed(true);
+        }
+        None => widgets.banner.set_revealed(false),
+    }
+}
+
+fn toolbar(header: &adw::HeaderBar, content: &impl IsA<gtk::Widget>) -> adw::ToolbarView {
+    let view = adw::ToolbarView::new();
+    view.add_top_bar(header);
+    view.set_content(Some(content));
+    view
+}
+
+fn sidebar_row(title: &str, icon: &str) -> gtk::Box {
+    let row = gtk::Box::builder()
+        .spacing(12)
+        .margin_top(6)
+        .margin_bottom(6)
+        .build();
+    row.append(&gtk::Image::from_icon_name(icon));
+    row.append(&gtk::Label::builder().label(title).xalign(0.0).build());
+    row
+}
+
+fn library_icon(kind: LibraryKind) -> &'static str {
+    match kind {
+        LibraryKind::Movies => "camera-video-symbolic",
+        LibraryKind::Shows => "video-display-symbolic",
+        LibraryKind::Music => "audio-x-generic-symbolic",
+    }
+}
+
+fn clear(content: &gtk::Box) {
+    while let Some(child) = content.first_child() {
+        content.remove(&child);
+    }
+}
+
+/// Puts the root page's ordinary content back in its scrolled area, in
+/// place of a library grid.
+fn show_content(widgets: &AppWidgets) {
+    if widgets.scroller.child().as_ref() != Some(widgets.content.upcast_ref()) {
+        widgets.scroller.set_child(Some(&widgets.content));
+    }
+}
+
+fn show(widgets: &AppWidgets, title: &str, sections: impl IntoIterator<Item = gtk::Box>) {
+    show_content(widgets);
+    widgets.root_page.set_title(title);
+    clear(&widgets.content);
+    for section in sections {
+        widgets.content.append(&section);
+    }
+}
+
+fn show_error(widgets: &AppWidgets, title: &str, error: &BackendError) {
+    show_content(widgets);
+    widgets.root_page.set_title(title);
+    clear(&widgets.content);
+    widgets.content.append(&error_status(error));
+}
+
+fn push(widgets: &AppWidgets, title: &str, body: &impl IsA<gtk::Widget>) {
+    widgets.stack.push(&pages::page(title, body));
+}
+
+fn push_error(widgets: &AppWidgets, title: &str, error: &BackendError) {
+    push(widgets, title, &error_status(error));
+}
+
+fn toast(widgets: &AppWidgets, error: &BackendError) {
+    toast_text(widgets, &error.to_string());
+}
+
+fn toast_text(widgets: &AppWidgets, text: &str) {
+    widgets.toasts.add_toast(adw::Toast::new(text));
+}
+
+fn error_status(error: &BackendError) -> adw::StatusPage {
+    adw::StatusPage::builder()
+        .icon_name("dialog-error-symbolic")
+        .title("Could not load this page")
+        .description(error.to_string())
+        .vexpand(true)
+        .build()
+}
+
+/// The tracks the server would choose for `id`, and why. The page opens
+/// without them if the server cannot say.
+async fn server_choice(session: &dyn Session, id: &MediaId) -> Option<ChosenTracks> {
+    match session.playback_plan(id, None).await {
+        Ok((_, chosen)) => chosen,
+        Err(e) => {
+            tracing::warn!(error = %e, "no track choice from the server");
+            None
+        }
+    }
+}

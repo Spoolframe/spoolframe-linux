@@ -1,0 +1,718 @@
+//! Random access to a playback's file over the session's range reads
+//! (P1-08, P1-16).
+//!
+//! GStreamer asks for many small reads (a few KiB, often out of order while
+//! it probes the container) on its streaming thread, and wants the bytes
+//! back on that thread. The server serves at most 16 MiB a read, with a
+//! network round trip each. So the reader fetches whole blocks and keeps a
+//! time's worth of them ahead of the playhead. A read blocks its caller
+//! until its block arrives, which is fine on a streaming thread and never
+//! happens on the main thread.
+//!
+//! How far ahead is a matter of time, not bytes: the file's size over its
+//! length gives its bitrate, and the reader aims for [`TARGET_AHEAD`] of
+//! playback, within a memory cap. When steady playback catches up with the
+//! fetching anyway (a slow link), the read reports buffering and waits
+//! until [`RESUME_AHEAD`] is ready again, so playback resumes smoothly
+//! instead of stuttering block by block.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+
+use spoolframe_types::MediaId;
+
+use crate::backend::{
+    BackendError, BoxFuture, MAX_READ, PlaybackHandle, PlaybackStart, Selection, Session,
+};
+
+/// How much one fetch reads. Half the server's limit, so a fetch is quick
+/// to arrive after a seek.
+pub const BLOCK: u64 = 8 * 1024 * 1024;
+const _: () = assert!(BLOCK <= MAX_READ);
+/// How much playback the reader keeps fetched ahead of the playhead.
+pub const TARGET_AHEAD: Duration = Duration::from_secs(20);
+/// After an underrun, how much must be ready before playback goes on.
+pub const RESUME_AHEAD: Duration = Duration::from_secs(4);
+/// The most memory the read-ahead may take, whatever the bitrate.
+pub const MAX_AHEAD_BYTES: u64 = 256 * 1024 * 1024;
+/// Read-ahead without a known length: four blocks.
+const UNKNOWN_AHEAD_BLOCKS: u64 = 4;
+/// Blocks kept behind the playhead, for small seeks back.
+const BEHIND: u64 = 2;
+/// Fetches in flight at once.
+pub const MAX_IN_FLIGHT: usize = 4;
+/// How often a waiting read reports progress while buffering.
+const REPORT_EVERY: Duration = Duration::from_millis(250);
+
+/// Runs a fetch somewhere it can await the network: the app passes its
+/// tokio runtime, tests a thread.
+pub type Spawn = Arc<dyn Fn(BoxFuture<'static, ()>) + Send + Sync>;
+
+/// Why a read returned no bytes.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ReadError {
+    /// The reader was told to stop waiting (a seek or a stop).
+    #[error("flushing")]
+    Flushing,
+    #[error(transparent)]
+    Backend(#[from] BackendError),
+}
+
+/// How the read-ahead is doing, for the player's diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Status {
+    /// Bytes ready from the playhead on, without a gap.
+    pub ready_bytes: u64,
+    /// The same as playback time, when the bitrate is known.
+    pub ready: Option<Duration>,
+    /// What the reader aims for.
+    pub target: Option<Duration>,
+    pub in_flight: usize,
+    /// Recent fetch throughput, bytes per second.
+    pub throughput: Option<f64>,
+}
+
+/// Blocks to keep fetched ahead: `target` of playback at the file's
+/// average bitrate, at least two blocks, at most the memory cap.
+pub fn ahead_blocks(size: u64, length: Option<Duration>, target: Duration) -> u64 {
+    let Some(length) = length.filter(|l| !l.is_zero()) else {
+        return UNKNOWN_AHEAD_BLOCKS;
+    };
+    let bytes_per_second = size as f64 / length.as_secs_f64();
+    let bytes = (bytes_per_second * target.as_secs_f64()) as u64;
+    bytes.clamp(2 * BLOCK, MAX_AHEAD_BYTES).div_ceil(BLOCK)
+}
+
+/// Whether waiting for block `index` means steady playback outran the
+/// fetching (the block next to the last one read), rather than a jump: a
+/// seek, or GStreamer probing the container. Only an underrun waits for
+/// [`RESUME_AHEAD`]; a jump waits only for its block.
+pub fn is_underrun(last: Option<u64>, index: u64) -> bool {
+    last.is_some_and(|last| index == last || index == last + 1)
+}
+
+pub struct MediaReader {
+    shared: Arc<Shared>,
+}
+
+struct Shared {
+    session: Arc<dyn Session>,
+    item: MediaId,
+    selection: Selection,
+    size: u64,
+    /// Bytes per second of playback, when the length is known.
+    bitrate: Option<f64>,
+    ahead: u64,
+    spawn: Spawn,
+    state: Mutex<State>,
+    changed: Condvar,
+}
+
+struct State {
+    handle: PlaybackHandle,
+    /// Bumped on each restart, so two fetches that both find the handle
+    /// expired restart it once.
+    generation: u64,
+    blocks: HashMap<u64, Arc<Vec<u8>>>,
+    pending: HashSet<u64>,
+    failed: HashMap<u64, BackendError>,
+    flushing: bool,
+    /// Where the last read ended, and its block.
+    playhead: u64,
+    last_block: Option<u64>,
+    /// An average of recent fetch throughput, bytes per second.
+    throughput: Option<f64>,
+}
+
+impl MediaReader {
+    /// A reader for a started playback of `item`. `selection` is what
+    /// plays (the server's choice, when it chose); a restart asks for those
+    /// same tracks, so they do not change mid-play. Without a length, the
+    /// read-ahead is a fixed few blocks; see [`MediaReader::with_length`].
+    pub fn new(
+        session: Arc<dyn Session>,
+        item: MediaId,
+        selection: Selection,
+        start: PlaybackStart,
+        spawn: Spawn,
+    ) -> Self {
+        Self::build(session, item, selection, start, spawn, None)
+    }
+
+    /// The same, with the item's length, so the read-ahead is a time.
+    pub fn with_length(
+        session: Arc<dyn Session>,
+        item: MediaId,
+        selection: Selection,
+        start: PlaybackStart,
+        spawn: Spawn,
+        length: Option<Duration>,
+    ) -> Self {
+        Self::build(session, item, selection, start, spawn, length)
+    }
+
+    fn build(
+        session: Arc<dyn Session>,
+        item: MediaId,
+        selection: Selection,
+        start: PlaybackStart,
+        spawn: Spawn,
+        length: Option<Duration>,
+    ) -> Self {
+        let size = start.size;
+        let length = length.filter(|l| !l.is_zero());
+        MediaReader {
+            shared: Arc::new(Shared {
+                session,
+                item,
+                selection,
+                size,
+                bitrate: length.map(|l| size as f64 / l.as_secs_f64()),
+                ahead: ahead_blocks(size, length, TARGET_AHEAD),
+                spawn,
+                state: Mutex::new(State {
+                    handle: start.handle,
+                    generation: 0,
+                    blocks: HashMap::new(),
+                    pending: HashSet::new(),
+                    failed: HashMap::new(),
+                    flushing: false,
+                    playhead: 0,
+                    last_block: None,
+                    throughput: None,
+                }),
+                changed: Condvar::new(),
+            }),
+        }
+    }
+
+    /// The file's size in bytes.
+    pub fn size(&self) -> u64 {
+        self.shared.size
+    }
+
+    /// Up to `length` bytes from `offset`; fewer only at the end of the
+    /// file, none past it. Blocks until the bytes are here.
+    pub fn read(&self, offset: u64, length: u64) -> Result<Vec<u8>, ReadError> {
+        self.read_reporting(offset, length, &mut |_| {})
+    }
+
+    /// [`MediaReader::read`], calling `buffering` with a percentage while
+    /// it waits through an underrun, and with 100 when it is over.
+    pub fn read_reporting(
+        &self,
+        offset: u64,
+        length: u64,
+        buffering: &mut dyn FnMut(u8),
+    ) -> Result<Vec<u8>, ReadError> {
+        let end = offset.saturating_add(length).min(self.shared.size);
+        let mut bytes = Vec::with_capacity(end.saturating_sub(offset) as usize);
+        let mut at = offset;
+        while at < end {
+            let index = at / BLOCK;
+            let block = self.block(index, buffering)?;
+            let start = (at - index * BLOCK) as usize;
+            let stop = ((end - index * BLOCK) as usize).min(block.len());
+            if start >= stop {
+                // The server sent less than the file's size promised.
+                return Err(BackendError::Other(format!(
+                    "short read at {at} of {} bytes",
+                    self.shared.size
+                ))
+                .into());
+            }
+            bytes.extend_from_slice(&block[start..stop]);
+            at = index * BLOCK + stop as u64;
+        }
+        let mut state = self.shared.lock();
+        state.playhead = at;
+        state.last_block = Some(at.saturating_sub(1) / BLOCK);
+        Ok(bytes)
+    }
+
+    /// Makes waiting reads return [`ReadError::Flushing`] until called with
+    /// `false`. GStreamer's unlock and unlock_stop.
+    pub fn set_flushing(&self, flushing: bool) {
+        self.shared.lock().flushing = flushing;
+        self.shared.changed.notify_all();
+    }
+
+    /// How far ahead the reader is.
+    pub fn status(&self) -> Status {
+        let state = self.shared.lock();
+        let ready_bytes = self.shared.ready_from(&state, state.playhead);
+        Status {
+            ready_bytes,
+            ready: self
+                .shared
+                .bitrate
+                .map(|rate| Duration::from_secs_f64(ready_bytes as f64 / rate)),
+            target: self.shared.bitrate.map(|_| TARGET_AHEAD),
+            in_flight: state.pending.len(),
+            throughput: state.throughput,
+        }
+    }
+
+    /// Block `index`, fetched now if needed, with the read-ahead after it
+    /// queued. Through an underrun, waits until enough is ready to go on.
+    fn block(&self, index: u64, buffering: &mut dyn FnMut(u8)) -> Result<Arc<Vec<u8>>, ReadError> {
+        let shared = &self.shared;
+        let mut state = shared.lock();
+        shared.evict(&mut state, index);
+        shared.top_up(&shared.clone(), &mut state, index);
+        let underrun = !state.blocks.contains_key(&index) && is_underrun(state.last_block, index);
+        // Bytes to have ready before an underrun ends: RESUME_AHEAD of
+        // playback, or the rest of the file if that is less.
+        let resume_bytes = shared
+            .bitrate
+            .map_or(BLOCK, |rate| (rate * RESUME_AHEAD.as_secs_f64()) as u64)
+            .max(1)
+            .min(shared.size.saturating_sub(index * BLOCK));
+        let mut reported = false;
+        loop {
+            if state.flushing {
+                return Err(ReadError::Flushing);
+            }
+            if let Some(error) = state.failed.remove(&index) {
+                return Err(error.into());
+            }
+            if !state.blocks.contains_key(&index) && !state.pending.contains(&index) {
+                // Evicted or failed and forgotten between two waits.
+                shared.top_up(&shared.clone(), &mut state, index);
+            }
+            if let Some(block) = state.blocks.get(&index) {
+                let ready = shared.ready_from(&state, index * BLOCK);
+                if !underrun || ready >= resume_bytes {
+                    let block = block.clone();
+                    drop(state);
+                    if reported {
+                        buffering(100);
+                    }
+                    return Ok(block);
+                }
+            }
+            if underrun {
+                let ready = shared.ready_from(&state, index * BLOCK);
+                let percent = (ready * 100 / resume_bytes).min(99) as u8;
+                // Reported without the lock: GStreamer handles a posted
+                // message on this thread, and fetches must not wait on it.
+                drop(state);
+                buffering(percent);
+                reported = true;
+                state = shared.lock();
+            }
+            state = shared
+                .changed
+                .wait_timeout(state, REPORT_EVERY)
+                .expect("reader state is never poisoned")
+                .0;
+        }
+    }
+
+    /// Starts fetches up to the in-flight limit, nearest first; for tests
+    /// and for the player to warm up before playing.
+    pub fn prefetch(&self, offset: u64) {
+        let mut state = self.shared.lock();
+        self.shared
+            .top_up(&self.shared.clone(), &mut state, offset / BLOCK);
+    }
+}
+
+impl Shared {
+    fn lock(&self) -> MutexGuard<'_, State> {
+        self.state.lock().expect("reader state is never poisoned")
+    }
+
+    /// The last block of the file.
+    fn last_index(&self) -> u64 {
+        self.size.saturating_sub(1) / BLOCK
+    }
+
+    /// Bytes ready from `offset` on, without a gap.
+    fn ready_from(&self, state: &State, offset: u64) -> u64 {
+        let mut index = offset / BLOCK;
+        let mut ready = 0;
+        while let Some(block) = state.blocks.get(&index) {
+            ready += block.len() as u64;
+            index += 1;
+        }
+        ready.saturating_sub(offset - (offset / BLOCK) * BLOCK)
+    }
+
+    /// Drops blocks too far from `from`, the block being read, to be read
+    /// soon. Only a read evicts: a fetch arriving for a block a read
+    /// jumped to must stay until that read takes it.
+    fn evict(&self, state: &mut State, from: u64) {
+        let keep = from.saturating_sub(BEHIND)..=from + self.ahead;
+        state.blocks.retain(|index, _| keep.contains(index));
+    }
+
+    /// Queues the blocks from `from` through the read-ahead, nearest
+    /// first, up to the in-flight limit.
+    fn top_up(&self, this: &Arc<Self>, state: &mut State, from: u64) {
+        let last = (from + self.ahead).min(self.last_index());
+        for index in from..=last {
+            if state.pending.len() >= MAX_IN_FLIGHT {
+                break;
+            }
+            if state.blocks.contains_key(&index) || state.pending.contains(&index) {
+                continue;
+            }
+            state.pending.insert(index);
+            state.failed.remove(&index);
+            let shared = this.clone();
+            (self.spawn)(Box::pin(async move { shared.fetch(index).await }));
+        }
+    }
+
+    async fn fetch(self: Arc<Self>, index: u64) {
+        let started = Instant::now();
+        let result = self.read_block(index).await;
+        let elapsed = started.elapsed().as_secs_f64();
+        let mut state = self.lock();
+        state.pending.remove(&index);
+        match result {
+            Ok(bytes) => {
+                if elapsed > 0.0 {
+                    let rate = bytes.len() as f64 / elapsed;
+                    state.throughput = Some(match state.throughput {
+                        Some(old) => old * 0.7 + rate * 0.3,
+                        None => rate,
+                    });
+                }
+                state.blocks.insert(index, Arc::new(bytes));
+                // Keep the read-ahead going from where playback is.
+                let from = state.last_block.unwrap_or(index);
+                self.top_up(&self, &mut state, from);
+            }
+            Err(error) => {
+                state.failed.insert(index, error);
+            }
+        }
+        drop(state);
+        self.changed.notify_all();
+    }
+
+    /// Reads a whole block. The server may answer a read with fewer bytes
+    /// than asked; the rest is asked for from where it stopped. On an
+    /// expired handle, the playback is started again (once, whoever finds
+    /// out first) and the read goes on.
+    async fn read_block(&self, index: u64) -> Result<Vec<u8>, BackendError> {
+        let start = index * BLOCK;
+        let want = BLOCK.min(self.size.saturating_sub(start));
+        let mut bytes = Vec::with_capacity(want as usize);
+        let mut restarted = false;
+        while (bytes.len() as u64) < want {
+            let (handle, generation) = {
+                let state = self.lock();
+                (state.handle.clone(), state.generation)
+            };
+            let got = bytes.len() as u64;
+            match self.session.read(&handle, start + got, want - got).await {
+                Ok(more) if more.is_empty() => break,
+                Ok(more) => bytes.extend_from_slice(&more),
+                Err(BackendError::PlaybackExpired) if !restarted => {
+                    restarted = true;
+                    self.restart(generation).await?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(bytes)
+    }
+
+    async fn restart(&self, seen: u64) -> Result<(), BackendError> {
+        if self.lock().generation != seen {
+            return Ok(());
+        }
+        let start = self
+            .session
+            .start_playback(&self.item, Some(self.selection))
+            .await?;
+        let mut state = self.lock();
+        if state.generation == seen {
+            tracing::debug!("playback handle expired; started again");
+            state.handle = start.handle;
+            state.generation += 1;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::Future;
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::pin::pin;
+    use std::task::{Context, Poll, Waker};
+
+    use spoolframe_types::{MediaKind, Namespace};
+
+    use super::*;
+    use crate::backend::{Client, PlaybackPlan, Profile, ServerKey};
+    use crate::fake::FakeClient;
+
+    /// The fake's futures finish without waiting, so a fetch completes on
+    /// a plain thread polling it.
+    fn thread_spawn() -> Spawn {
+        Arc::new(|future| {
+            std::thread::spawn(move || {
+                let mut future = future;
+                loop {
+                    if let Poll::Ready(()) =
+                        pin!(&mut future).poll(&mut Context::from_waker(Waker::noop()))
+                    {
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+            });
+        })
+    }
+
+    fn ready<T>(future: impl Future<Output = T>) -> T {
+        match pin!(future).poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(value) => value,
+            Poll::Pending => panic!("the fake backend never waits"),
+        }
+    }
+
+    /// A file of `len` bytes where each byte is its offset modulo 251, so a
+    /// misplaced range shows.
+    fn media_file(name: &str, len: usize) -> (PathBuf, Vec<u8>) {
+        let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let path =
+            std::env::temp_dir().join(format!("spoolframe-reader-{}-{name}", std::process::id()));
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+        (path, bytes)
+    }
+
+    fn reader_for(path: PathBuf) -> (MediaReader, Arc<dyn Session>) {
+        let client = FakeClient::new(Some(path));
+        let profile = Profile {
+            server: ServerKey("k5d2r8w1tqz7m3c0vnh4q7fa".into()),
+            username: "andrey".into(),
+            display_name: "Andrey".into(),
+        };
+        let session = client.session(&profile).unwrap();
+        let item = MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap();
+        let start = ready(session.start_playback(&item, None)).unwrap();
+        let reader = MediaReader::new(
+            session.clone(),
+            item,
+            Selection::default(),
+            start,
+            thread_spawn(),
+        );
+        (reader, session)
+    }
+
+    #[test]
+    fn a_small_read_returns_exactly_its_range() {
+        let (path, bytes) = media_file("small", 10_000);
+        let (reader, _) = reader_for(path);
+        assert_eq!(reader.read(4_000, 100).unwrap(), bytes[4_000..4_100]);
+    }
+
+    #[test]
+    fn a_read_across_a_block_boundary_joins_both_blocks() {
+        let len = (BLOCK + 1_000) as usize;
+        let (path, bytes) = media_file("boundary", len);
+        let (reader, _) = reader_for(path);
+        let from = BLOCK as usize - 500;
+        assert_eq!(
+            reader.read(from as u64, 1_000).unwrap(),
+            bytes[from..from + 1_000]
+        );
+    }
+
+    #[test]
+    fn a_read_at_the_end_returns_what_is_left() {
+        let (path, bytes) = media_file("end", 5_000);
+        let (reader, _) = reader_for(path);
+        assert_eq!(reader.read(4_990, 100).unwrap(), bytes[4_990..]);
+    }
+
+    #[test]
+    fn a_read_past_the_end_is_empty() {
+        let (path, _) = media_file("past", 5_000);
+        let (reader, _) = reader_for(path);
+        assert_eq!(reader.read(6_000, 100).unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn an_expired_handle_is_started_again_and_the_read_succeeds() {
+        let (path, bytes) = media_file("expired", 3_000);
+        let client = FakeClient::new(Some(path));
+        let profile = Profile {
+            server: ServerKey("k5d2r8w1tqz7m3c0vnh4q7fa".into()),
+            username: "andrey".into(),
+            display_name: "Andrey".into(),
+        };
+        let session = client.session(&profile).unwrap();
+        let item = MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap();
+        // A handle the fake never issued reads as expired.
+        let stale = PlaybackStart {
+            handle: PlaybackHandle("long-gone".into()),
+            plan: PlaybackPlan::Unknown,
+            size: 3_000,
+            chosen: None,
+        };
+        let reader = MediaReader::new(session, item, Selection::default(), stale, thread_spawn());
+        assert_eq!(reader.read(0, 10).unwrap(), bytes[..10]);
+    }
+
+    #[test]
+    fn short_reads_are_asked_again_until_the_block_is_whole() {
+        let (path, bytes) = media_file("short", 50_000);
+        let client = FakeClient::new(Some(path)).with_read_limit(4_096);
+        let profile = Profile {
+            server: ServerKey("k5d2r8w1tqz7m3c0vnh4q7fa".into()),
+            username: "andrey".into(),
+            display_name: "Andrey".into(),
+        };
+        let session = client.session(&profile).unwrap();
+        let item = MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap();
+        let start = ready(session.start_playback(&item, None)).unwrap();
+        let reader = MediaReader::new(session, item, Selection::default(), start, thread_spawn());
+        assert_eq!(reader.read(40_000, 9_000).unwrap(), bytes[40_000..49_000]);
+    }
+
+    #[test]
+    fn a_flushing_reader_stops_waiting() {
+        let (path, _) = media_file("flushing", 1_000);
+        let (reader, _) = reader_for(path);
+        reader.set_flushing(true);
+        assert_eq!(reader.read(0, 10), Err(ReadError::Flushing));
+    }
+
+    #[test]
+    fn a_low_bitrate_file_reads_ahead_the_two_block_minimum() {
+        // 1 GiB over two hours: 20 s is about 3 MiB.
+        let blocks = ahead_blocks(1 << 30, Some(Duration::from_secs(7200)), TARGET_AHEAD);
+        assert_eq!(blocks, 2);
+    }
+
+    #[test]
+    fn a_high_bitrate_file_reads_ahead_twenty_seconds() {
+        // About 10 MB/s (an 80 Mbit/s remux): 20 s is 200 MB, 24 blocks.
+        let blocks = ahead_blocks(
+            72_000_000_000,
+            Some(Duration::from_secs(7200)),
+            TARGET_AHEAD,
+        );
+        assert_eq!(blocks, 24);
+    }
+
+    #[test]
+    fn the_read_ahead_never_passes_the_memory_cap() {
+        let blocks = ahead_blocks(
+            500_000_000_000,
+            Some(Duration::from_secs(3600)),
+            TARGET_AHEAD,
+        );
+        assert_eq!(blocks, MAX_AHEAD_BYTES / BLOCK);
+    }
+
+    #[test]
+    fn without_a_length_the_read_ahead_is_a_few_blocks() {
+        assert_eq!(
+            ahead_blocks(1 << 30, None, TARGET_AHEAD),
+            UNKNOWN_AHEAD_BLOCKS
+        );
+    }
+
+    #[test]
+    fn waiting_for_the_next_block_is_an_underrun() {
+        assert!(is_underrun(Some(4), 5));
+    }
+
+    #[test]
+    fn a_jump_is_not_an_underrun() {
+        assert!(!is_underrun(Some(4), 40));
+        assert!(!is_underrun(None, 0));
+    }
+
+    /// A spawn that holds fetches without running them: the reader's
+    /// queueing shows without any arriving.
+    fn held_spawn() -> (Spawn, Arc<Mutex<usize>>) {
+        let spawned = Arc::new(Mutex::new(0));
+        let count = spawned.clone();
+        let spawn: Spawn = Arc::new(move |future| {
+            *count.lock().unwrap() += 1;
+            std::mem::forget(future);
+        });
+        (spawn, spawned)
+    }
+
+    #[test]
+    fn no_more_than_the_limit_are_fetched_at_once() {
+        let (path, _) = media_file("in-flight", 10);
+        let client = FakeClient::new(Some(path));
+        let profile = Profile {
+            server: ServerKey("k5d2r8w1tqz7m3c0vnh4q7fa".into()),
+            username: "andrey".into(),
+            display_name: "Andrey".into(),
+        };
+        let session = client.session(&profile).unwrap();
+        let item = MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap();
+        let mut start = ready(session.start_playback(&item, None)).unwrap();
+        // Pretend the file is large and fast, so the read-ahead is long.
+        start.size = 100 * BLOCK;
+        let (spawn, spawned) = held_spawn();
+        let reader = MediaReader::with_length(
+            session,
+            item,
+            Selection::default(),
+            start,
+            spawn,
+            Some(Duration::from_secs(60)),
+        );
+        reader.prefetch(0);
+        assert_eq!(*spawned.lock().unwrap(), MAX_IN_FLIGHT);
+        assert_eq!(reader.status().in_flight, MAX_IN_FLIGHT);
+    }
+
+    #[test]
+    fn after_a_read_the_status_counts_the_bytes_ready_ahead() {
+        let (path, _) = media_file("status", 10_000);
+        let (reader, _) = reader_for(path);
+        reader.read(0, 1_000).unwrap();
+        assert_eq!(reader.status().ready_bytes, 9_000);
+    }
+
+    #[test]
+    fn a_jump_past_the_read_ahead_gets_its_block() {
+        // Four blocks over ten hours: the read-ahead is the two-block
+        // minimum, so the last block is outside it. A container probe
+        // reads there; the read-ahead's own fetches finishing must not
+        // evict the block before the probe takes it.
+        let len = 3 * BLOCK as usize + 1_000;
+        let (path, bytes) = media_file("jump", len);
+        let client = FakeClient::new(Some(path));
+        let profile = Profile {
+            server: ServerKey("k5d2r8w1tqz7m3c0vnh4q7fa".into()),
+            username: "andrey".into(),
+            display_name: "Andrey".into(),
+        };
+        let session = client.session(&profile).unwrap();
+        let item = MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap();
+        let start = ready(session.start_playback(&item, None)).unwrap();
+        let reader = MediaReader::with_length(
+            session,
+            item,
+            Selection::default(),
+            start,
+            thread_spawn(),
+            Some(Duration::from_secs(36_000)),
+        );
+        reader.read(0, 100).unwrap();
+        let at = len as u64 - 500;
+        assert_eq!(reader.read(at, 500).unwrap(), bytes[at as usize..]);
+    }
+}
