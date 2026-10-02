@@ -84,6 +84,17 @@ pub fn ahead_blocks(size: u64, length: Option<Duration>, target: Duration) -> u6
     bytes.clamp(2 * BLOCK, MAX_AHEAD_BYTES).div_ceil(BLOCK)
 }
 
+/// Where `at` probably is in a file of `size` bytes lasting `length`: its
+/// share of the bytes, less a block for the keyframe before it and the
+/// bitrate's swings. A guess to read ahead from, not a seek.
+pub fn guess_offset(size: u64, length: Duration, at: Duration) -> u64 {
+    if length.is_zero() {
+        return 0;
+    }
+    let share = (at.as_secs_f64() / length.as_secs_f64()).clamp(0.0, 1.0);
+    ((size as f64 * share) as u64).saturating_sub(BLOCK)
+}
+
 /// Whether waiting for block `index` means steady playback outran the
 /// fetching (the block next to the last one read), rather than a jump: a
 /// seek, or GStreamer probing the container. Only an underrun waits for
@@ -121,6 +132,9 @@ struct State {
     /// Where the last read ended, and its block.
     playhead: u64,
     last_block: Option<u64>,
+    /// Where reading is expected to go next (a resume), held against
+    /// eviction until a read reaches it; see [`MediaReader::expect`].
+    expected: Option<u64>,
     /// An average of recent fetch throughput, bytes per second.
     throughput: Option<f64>,
 }
@@ -180,6 +194,7 @@ impl MediaReader {
                     flushing: false,
                     playhead: 0,
                     last_block: None,
+                    expected: None,
                     throughput: None,
                 }),
                 changed: Condvar::new(),
@@ -227,7 +242,14 @@ impl MediaReader {
         }
         let mut state = self.shared.lock();
         state.playhead = at;
-        state.last_block = Some(at.saturating_sub(1) / BLOCK);
+        let last = at.saturating_sub(1) / BLOCK;
+        state.last_block = Some(last);
+        // Reading reached the expected place: ordinary read-ahead from here.
+        if let Some(expected) = state.expected
+            && (expected.saturating_sub(BEHIND)..=expected + self.shared.ahead).contains(&last)
+        {
+            state.expected = None;
+        }
         Ok(bytes)
     }
 
@@ -271,11 +293,19 @@ impl MediaReader {
             .min(shared.size.saturating_sub(index * BLOCK));
         let mut reported = false;
         loop {
-            if state.flushing {
-                return Err(ReadError::Flushing);
-            }
-            if let Some(error) = state.failed.remove(&index) {
-                return Err(error.into());
+            // Leaving early still ends a buffering this read started:
+            // GstPlay pauses under 100 and plays again only at 100.
+            let early = if state.flushing {
+                Some(ReadError::Flushing)
+            } else {
+                state.failed.remove(&index).map(ReadError::from)
+            };
+            if let Some(error) = early {
+                drop(state);
+                if reported {
+                    buffering(100);
+                }
+                return Err(error);
             }
             if !state.blocks.contains_key(&index) && !state.pending.contains(&index) {
                 // Evicted or failed and forgotten between two waits.
@@ -312,6 +342,17 @@ impl MediaReader {
 
     /// Starts fetches up to the in-flight limit, nearest first; for tests
     /// and for the player to warm up before playing.
+    /// Starts reading ahead from `offset` before anything asks for it, and
+    /// keeps what arrives until a read gets there. For a resume: the
+    /// demuxer reads the header and index first, then seeks, and by then
+    /// the blocks around the resume point are on their way or here.
+    pub fn expect(&self, offset: u64) {
+        let index = offset.min(self.shared.size.saturating_sub(1)) / BLOCK;
+        let mut state = self.shared.lock();
+        state.expected = Some(index);
+        self.shared.top_up(&self.shared.clone(), &mut state, index);
+    }
+
     pub fn prefetch(&self, offset: u64) {
         let mut state = self.shared.lock();
         self.shared
@@ -344,8 +385,11 @@ impl Shared {
     /// soon. Only a read evicts: a fetch arriving for a block a read
     /// jumped to must stay until that read takes it.
     fn evict(&self, state: &mut State, from: u64) {
-        let keep = from.saturating_sub(BEHIND)..=from + self.ahead;
-        state.blocks.retain(|index, _| keep.contains(index));
+        let near = |at: u64| at.saturating_sub(BEHIND)..=at + self.ahead;
+        let (keep, expected) = (near(from), state.expected.map(near));
+        state.blocks.retain(|index, _| {
+            keep.contains(index) || expected.as_ref().is_some_and(|e| e.contains(index))
+        });
     }
 
     /// Queues the blocks from `from` through the read-ahead, nearest
@@ -382,9 +426,13 @@ impl Shared {
                     });
                 }
                 state.blocks.insert(index, Arc::new(bytes));
-                // Keep the read-ahead going from where playback is.
+                // Keep the read-ahead going from where playback is, and
+                // from where it is expected to go.
                 let from = state.last_block.unwrap_or(index);
                 self.top_up(&self, &mut state, from);
+                if let Some(expected) = state.expected {
+                    self.top_up(&self, &mut state, expected);
+                }
             }
             Err(error) => {
                 state.failed.insert(index, error);
@@ -714,5 +762,127 @@ mod tests {
         reader.read(0, 100).unwrap();
         let at = len as u64 - 500;
         assert_eq!(reader.read(at, 500).unwrap(), bytes[at as usize..]);
+    }
+
+    /// A seek (flushing) in the middle of an underrun still ends the
+    /// buffering: GstPlay pauses on a buffering message under 100 and
+    /// plays again only on 100, so without it playback stayed paused until
+    /// the user pressed play.
+    #[test]
+    fn a_flush_during_an_underrun_ends_the_buffering() {
+        let len = BLOCK as usize + 1_000;
+        let (path, _) = media_file("flush-underrun", len);
+        let client = FakeClient::new(Some(path));
+        let profile = Profile {
+            server: ServerKey("k5d2r8w1tqz7m3c0vnh4q7fa".into()),
+            username: "andrey".into(),
+            display_name: "Andrey".into(),
+        };
+        let session = client.session(&profile).unwrap();
+        let item = MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap();
+        let start = ready(session.start_playback(&item, None)).unwrap();
+        // Only the first fetch runs; the second block never arrives.
+        let first = Arc::new(Mutex::new(true));
+        let threads = thread_spawn();
+        let spawn: Spawn = Arc::new(move |future| {
+            if std::mem::replace(&mut *first.lock().unwrap(), false) {
+                threads(future);
+            } else {
+                std::mem::forget(future);
+            }
+        });
+        let reader = Arc::new(MediaReader::new(
+            session,
+            item,
+            Selection::default(),
+            start,
+            spawn,
+        ));
+        reader.read(BLOCK - 100, 100).unwrap();
+        {
+            let reader = reader.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                reader.set_flushing(true);
+            });
+        }
+        let mut reports = Vec::new();
+        let read = reader.read_reporting(BLOCK, 100, &mut |p| reports.push(p));
+        assert_eq!(read, Err(ReadError::Flushing));
+        assert_eq!(reports.last(), Some(&100), "reports: {reports:?}");
+    }
+
+    #[test]
+    fn a_resume_point_is_guessed_by_its_share_of_the_file() {
+        // Half way through 100 blocks: block 50, less one.
+        let offset = guess_offset(
+            100 * BLOCK,
+            Duration::from_secs(100),
+            Duration::from_secs(50),
+        );
+        assert_eq!(offset, 49 * BLOCK);
+    }
+
+    #[test]
+    fn a_guess_near_the_start_is_the_start() {
+        assert_eq!(
+            guess_offset(100 * BLOCK, Duration::from_secs(100), Duration::ZERO),
+            0
+        );
+    }
+
+    /// Reading the header must not throw away what was fetched for the
+    /// resume point: the read there is served from memory.
+    #[test]
+    fn what_was_fetched_for_a_resume_survives_reading_the_header() {
+        let len = 5 * BLOCK as usize;
+        let (path, bytes) = media_file("expect", len);
+        let client = FakeClient::new(Some(path));
+        let profile = Profile {
+            server: ServerKey("k5d2r8w1tqz7m3c0vnh4q7fa".into()),
+            username: "andrey".into(),
+            display_name: "Andrey".into(),
+        };
+        let session = client.session(&profile).unwrap();
+        let item = MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap();
+        let start = ready(session.start_playback(&item, None)).unwrap();
+        let fetches = Arc::new(Mutex::new(0usize));
+        let spawn: Spawn = {
+            let (fetches, threads) = (fetches.clone(), thread_spawn());
+            Arc::new(move |future| {
+                *fetches.lock().unwrap() += 1;
+                threads(future);
+            })
+        };
+        // Ten hours: the read-ahead is two blocks, so block 4 is far from
+        // block 0.
+        let reader = MediaReader::with_length(
+            session,
+            item,
+            Selection::default(),
+            start,
+            spawn,
+            Some(Duration::from_secs(36_000)),
+        );
+        reader.expect(4 * BLOCK);
+        reader.read(0, 100).unwrap();
+        // Let the fetches for block 4 land.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !reader.shared.lock().blocks.contains_key(&4) && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        reader.read(BLOCK, 100).unwrap();
+        let before = *fetches.lock().unwrap();
+        let at = 4 * BLOCK + 10;
+        assert_eq!(
+            reader.read(at, 10).unwrap(),
+            bytes[at as usize..at as usize + 10]
+        );
+        assert_eq!(
+            *fetches.lock().unwrap(),
+            before,
+            "block 4 was fetched again"
+        );
     }
 }

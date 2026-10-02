@@ -130,9 +130,14 @@ pub fn profiles(
         tile.connect_clicked(move |_| choose(profile.clone()));
         tiles.append(&tile);
     }
-    let add = adw::Avatar::builder()
-        .size(128)
+    // A plain circle, not an avatar: libadwaita colours every avatar from
+    // its name, which no stylesheet rule reliably undoes.
+    let add = gtk::Image::builder()
         .icon_name(crate::icons::ADD)
+        .pixel_size(48)
+        .width_request(128)
+        .height_request(128)
+        .halign(gtk::Align::Center)
         .css_classes(["add-profile"])
         .build();
     let add_tile = profile_tile(&add, "Sign in", "Another account");
@@ -159,7 +164,7 @@ pub fn profiles(
     page(&header, &column)
 }
 
-fn profile_tile(avatar: &adw::Avatar, name: &str, detail: &str) -> gtk::Button {
+fn profile_tile(avatar: &impl IsA<gtk::Widget>, name: &str, detail: &str) -> gtk::Button {
     let body = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(8)

@@ -6,7 +6,6 @@
 //! caps. Mapped to the shared codec vocabulary, which the server maps
 //! ffprobe's names to.
 
-use gst::glib;
 use spoolframe_types::{AudioCodec, ClientCapabilities, Container, SubtitleFormat, VideoCodec};
 
 const VIDEO: &[(&str, VideoCodec)] = &[
@@ -78,12 +77,16 @@ pub fn capabilities() -> ClientCapabilities {
     // count, however installed.
     let decoders = elements(gst::ElementFactoryType::DECODER);
     let demuxers = elements(gst::ElementFactoryType::DEMUXER | gst::ElementFactoryType::PARSER);
-    // Subtitles are decoded, parsed (subparse) or overlaid as raw text.
-    let subtitle_handlers = elements(
+    // Text subtitles are decoded or parsed (subparse). Bitmap ones (PGS,
+    // VobSub, DVB) are drawn by overlays, dvdspu and dvbsuboverlay, which
+    // playbin's subtitleoverlay plugs in: without them the client never
+    // said it plays PGS, and the server refused files that had it.
+    let mut subtitle_handlers = elements(
         gst::ElementFactoryType::DECODER
             | gst::ElementFactoryType::PARSER
             | gst::ElementFactoryType::DEMUXER,
     );
+    subtitle_handlers.extend(overlays());
     let mut caps = ClientCapabilities {
         video: supported(VIDEO, &decoders),
         audio: supported(AUDIO, &decoders),
@@ -98,13 +101,32 @@ pub fn capabilities() -> ClientCapabilities {
     caps
 }
 
-fn elements(kind: gst::ElementFactoryType) -> glib::List<gst::ElementFactory> {
+fn elements(kind: gst::ElementFactoryType) -> Vec<gst::ElementFactory> {
     gst::ElementFactory::factories_with_type(kind, gst::Rank::MARGINAL)
+        .into_iter()
+        .collect()
+}
+
+/// Elements that draw onto video (their class has "Overlay"), at a rank
+/// playbin plugs in. From the whole registry: dvdspu's class starts with
+/// "Mixer", which no element-type filter covers.
+fn overlays() -> Vec<gst::ElementFactory> {
+    use gst::prelude::*;
+    gst::Registry::get()
+        .features(gst::ElementFactory::static_type())
+        .into_iter()
+        .filter_map(|feature| feature.downcast::<gst::ElementFactory>().ok())
+        .filter(|f| f.rank() >= gst::Rank::MARGINAL)
+        .filter(|f| {
+            f.metadata(gst::ELEMENT_METADATA_KLASS)
+                .is_some_and(|klass| klass.split('/').any(|part| part == "Overlay"))
+        })
+        .collect()
 }
 
 fn supported<T: Ord + Copy>(
     table: &[(&str, T)],
-    factories: &glib::List<gst::ElementFactory>,
+    factories: &[gst::ElementFactory],
 ) -> std::collections::BTreeSet<T> {
     table
         .iter()
@@ -152,10 +174,171 @@ mod tests {
         assert!(caps.containers.contains(&Container::Matroska), "{caps:?}");
     }
 
+    /// Bitmap subtitles are drawn by overlays (dvdspu, dvbsuboverlay),
+    /// which playbin's subtitleoverlay plugs in; -bad has them.
+    #[test]
+    fn the_dev_shell_draws_bitmap_subtitles() {
+        let caps = caps();
+        for format in [
+            SubtitleFormat::Pgs,
+            SubtitleFormat::VobSub,
+            SubtitleFormat::DvbSub,
+        ] {
+            assert!(caps.subtitles.contains(&format), "{format:?} in {caps:?}");
+        }
+    }
+
     #[test]
     fn unknown_is_never_claimed() {
         let caps = caps();
         assert!(!caps.video.contains(&VideoCodec::Unknown));
         assert!(!caps.audio.contains(&AudioCodec::Unknown));
+    }
+
+    /// PGS as a `.sup` stream: one white `w`×`h` box at (`x`, `y`) on a
+    /// 640×360 frame, shown from `from` to `to` (90 kHz ticks). The
+    /// smallest display sets the format allows: PCS, WDS, PDS, ODS, END.
+    fn pgs_box(x: u16, y: u16, w: u16, h: u16, from: u32, to: u32) -> Vec<u8> {
+        fn segment(out: &mut Vec<u8>, pts: u32, kind: u8, data: &[u8]) {
+            out.extend_from_slice(b"PG");
+            out.extend_from_slice(&pts.to_be_bytes());
+            out.extend_from_slice(&0u32.to_be_bytes());
+            out.push(kind);
+            out.extend_from_slice(&(data.len() as u16).to_be_bytes());
+            out.extend_from_slice(data);
+        }
+        let be = |v: u16| v.to_be_bytes();
+        let window = [&[1u8, 0][..], &be(x), &be(y), &be(w), &be(h)].concat();
+        let mut out = Vec::new();
+        // Shown: an epoch start with one object.
+        let pcs = [
+            &be(640)[..],
+            &be(360),
+            &[0x10],
+            &be(0),
+            &[0x80, 0, 0, 1],
+            &be(0),
+            &[0, 0],
+            &be(x),
+            &be(y),
+        ]
+        .concat();
+        segment(&mut out, from, 0x16, &pcs);
+        segment(&mut out, from, 0x17, &window);
+        // Palette entry 1: white (Y, Cr, Cb, alpha).
+        segment(&mut out, from, 0x14, &[0, 0, 1, 235, 128, 128, 255]);
+        let mut rle = Vec::new();
+        for _ in 0..h {
+            // A run of colour 1, then the end of the line.
+            rle.extend_from_slice(&[0x00, 0xC0 | (w >> 8) as u8, (w & 0xff) as u8, 0x01, 0, 0]);
+        }
+        let length = (rle.len() + 4) as u32;
+        let ods = [
+            &be(0)[..],
+            &[0, 0xC0],
+            &length.to_be_bytes()[1..],
+            &be(w),
+            &be(h),
+            &rle,
+        ]
+        .concat();
+        segment(&mut out, from, 0x15, &ods);
+        segment(&mut out, from, 0x80, &[]);
+        // Cleared: no objects.
+        let clear = [&be(640)[..], &be(360), &[0x10], &be(1), &[0, 0, 0, 0]].concat();
+        segment(&mut out, to, 0x16, &clear);
+        segment(&mut out, to, 0x17, &window);
+        segment(&mut out, to, 0x80, &[]);
+        out
+    }
+
+    /// Plays `path` through playbin3 to the end, with its default streams
+    /// (subtitles included), and says for each point whether any frame was
+    /// white (`true`) or ever anything but dark (`false` = always dark) there.
+    fn frames_at(path: &std::path::Path, points: &[(usize, usize)]) -> Vec<(bool, bool)> {
+        use gst::prelude::*;
+        use std::sync::{Arc, Mutex};
+        let sink = gst::parse::bin_from_description(
+            "videoconvert ! video/x-raw,format=RGBA,width=640 ! \
+             fakesink name=frames sync=false signal-handoffs=true",
+            true,
+        )
+        .unwrap();
+        let seen = Arc::new(Mutex::new(vec![(false, true); points.len()]));
+        {
+            let (seen, points) = (seen.clone(), points.to_vec());
+            sink.by_name("frames")
+                .unwrap()
+                .connect("handoff", false, move |values| {
+                    let buffer = values[1].get::<gst::Buffer>().unwrap();
+                    let map = buffer.map_readable().unwrap();
+                    let mut seen = seen.lock().unwrap();
+                    for (i, (x, y)) in points.iter().enumerate() {
+                        let p = (y * 640 + x) * 4;
+                        let rgb = &map[p..p + 3];
+                        seen[i].0 |= rgb.iter().all(|c| *c > 200);
+                        seen[i].1 &= rgb.iter().all(|c| *c < 40);
+                    }
+                    None
+                });
+        }
+        let playbin = gst::ElementFactory::make("playbin3")
+            .property("uri", gst::glib::filename_to_uri(path, None).unwrap())
+            .property("video-sink", &sink)
+            .property(
+                "audio-sink",
+                gst::ElementFactory::make("fakesink").build().unwrap(),
+            )
+            .build()
+            .unwrap();
+        let bus = playbin.bus().unwrap();
+        playbin.set_state(gst::State::Playing).unwrap();
+        bus.timed_pop_filtered(
+            gst::ClockTime::from_seconds(30),
+            &[gst::MessageType::Eos, gst::MessageType::Error],
+        )
+        .expect("the clip plays to its end");
+        playbin.set_state(gst::State::Null).unwrap();
+        seen.lock().unwrap().clone()
+    }
+
+    /// A PGS subtitle in Matroska is drawn into the picture by the pipeline
+    /// the player uses, now that the client says it plays PGS.
+    #[test]
+    #[ignore = "needs ffmpeg to mux the PGS stream into Matroska"]
+    fn a_pgs_subtitle_is_drawn() {
+        use gst::prelude::*;
+        gst::init().unwrap();
+        let dir = std::env::temp_dir().join(format!("spoolframe-pgs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (video, sup, muxed) = (dir.join("v.mkv"), dir.join("s.sup"), dir.join("m.mkv"));
+        // Three seconds of black.
+        let pipeline = gst::parse::launch(&format!(
+            "videotestsrc pattern=black num-buffers=90 ! video/x-raw,width=640,height=360,framerate=30/1 \
+             ! videoconvert ! x264enc ! h264parse ! matroskamux ! filesink location={}",
+            video.display()
+        ))
+        .unwrap();
+        let bus = pipeline.bus().unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        bus.timed_pop_filtered(gst::ClockTime::from_seconds(30), &[gst::MessageType::Eos])
+            .unwrap();
+        pipeline.set_state(gst::State::Null).unwrap();
+        // A white box from 1 s to 2.5 s.
+        std::fs::write(&sup, pgs_box(200, 260, 240, 40, 90_000, 225_000)).unwrap();
+        let status = std::process::Command::new("ffmpeg")
+            .args(["-loglevel", "error", "-y", "-i"])
+            .arg(&video)
+            .arg("-i")
+            .arg(&sup)
+            .args(["-map", "0", "-map", "1", "-c", "copy"])
+            .arg(&muxed)
+            .status()
+            .expect("ffmpeg runs");
+        assert!(status.success());
+
+        let seen = frames_at(&muxed, &[(320, 280), (320, 100)]);
+        assert!(seen[0].0, "the box was never drawn");
+        assert!(seen[1].1, "something was drawn outside the box");
     }
 }

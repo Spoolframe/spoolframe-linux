@@ -1,12 +1,13 @@
 //! The full player page, a window onto a [`Playback`]: the video under a
-//! top bar (back, the title, Minimize) and the controls (seek bar,
+//! top bar (back, the title) and the controls (seek bar,
 //! transport, tracks, diagnostics, fullscreen), as in the design. The bars
 //! fade out while the video plays and come back on a mouse move. Music
 //! has its own page, Now Playing.
 //!
-//! Minimize leaves the page and keeps playing in the bar along the bottom
-//! of the window; back stops. The page holds its widgets and the playback
-//! only through the page itself, so leaving frees the page.
+//! Going back (the button, Esc, the window's back gesture) leaves the page
+//! and keeps playing in the bar along the bottom of the window; the bar's
+//! stop ends playback. The page holds its widgets and the playback only
+//! through the page itself, so leaving frees the page.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -22,13 +23,12 @@ use spoolframe_types::Item;
 
 use crate::playback::{Change, Playback, VideoSink};
 use crate::tracks;
+use crate::volume::Volume;
 
 /// What the page asks of the app.
 pub struct Actions {
     /// Leave the page and keep playing in the bar.
     pub minimize: Rc<dyn Fn()>,
-    /// The page was left any other way: stop.
-    pub close: Rc<dyn Fn()>,
 }
 
 /// How long the controls stay after the mouse last moved, while playing.
@@ -71,8 +71,7 @@ pub fn page(playback: &Rc<Playback>, actions: Actions) -> adw::NavigationPage {
         .build();
     video.add_overlay(&error);
 
-    let minimizing = Rc::new(Cell::new(false));
-    let top = TopBar::new(&actions, &minimizing);
+    let top = TopBar::new();
     let top_revealer = fade(&top.bar, gtk::Align::Start);
     video.add_overlay(&top_revealer);
 
@@ -93,7 +92,7 @@ pub fn page(playback: &Rc<Playback>, actions: Actions) -> adw::NavigationPage {
         .child(&video)
         .css_classes(["player-page"])
         .build();
-    follow_fullscreen(&page, &video, &controls.fullscreen, &minimizing, &actions);
+    follow_fullscreen(&page, &video, &controls.fullscreen, &actions);
     hide_when_idle(
         &video,
         &[top_revealer.clone(), bottom_revealer.clone()],
@@ -136,25 +135,53 @@ pub fn page(playback: &Rc<Playback>, actions: Actions) -> adw::NavigationPage {
             let (Some(view), Some(playback)) = (view.upgrade(), weak_playback.upgrade()) else {
                 return glib::ControlFlow::Break;
             };
-            if view.diagnostics.panel.is_visible() {
-                if let Some(status) = playback.reader_status() {
+            if let Some(status) = playback.reader_status() {
+                view.controls.show_buffered(status.ready);
+                if view.diagnostics.panel.is_visible() {
                     view.diagnostics.show_reader(&status);
                 }
+            }
+            if view.diagnostics.panel.is_visible() {
                 view.diagnostics.show_video(playback.video_sink());
             }
             glib::ControlFlow::Continue
         });
     }
 
-    let close = actions.close.clone();
+    // Leaving the page keeps playing, in the bar.
+    // The spinner stays until a picture arrives: from opening, or a resume
+    // seek, the screen is black until the first frame.
+    let frames = {
+        let (spinner, buffering) = (view.starting.downgrade(), view.buffering.downgrade());
+        playback.paintable().connect_invalidate_contents(move |_| {
+            let (Some(spinner), Some(buffering)) = (spinner.upgrade(), buffering.upgrade()) else {
+                return;
+            };
+            if spinner.is_visible() && !buffering.is_visible() {
+                spinner.set_visible(false);
+            }
+        })
+    };
+    let paintable = playback.paintable().clone();
+    let frames = std::cell::Cell::new(Some(frames));
+    // The player's keys (Space, the arrows, f, Esc) reach it only when
+    // something in it has the focus; nothing did until the first click.
+    video.set_focusable(true);
+    page.connect_shown(glib::clone!(
+        #[weak]
+        video,
+        move |_| {
+            video.grab_focus();
+        }
+    ));
     page.connect_hidden(move |page| {
         // The page owns its view.
         let _ = &view;
+        if let Some(frames) = frames.take() {
+            paintable.disconnect(frames);
+        }
         if let Some(window) = page.root().and_downcast::<gtk::Window>() {
             window.unfullscreen();
-        }
-        if !minimizing.get() {
-            close();
         }
     });
     page
@@ -182,7 +209,6 @@ impl View {
                 self.error.set_visible(false);
             }
             Change::Playing(playing) => {
-                self.starting.set_visible(false);
                 self.controls.show_playing(*playing);
                 if *playing {
                     self.diagnostics.show_decoders(&playback.pipeline());
@@ -191,6 +217,8 @@ impl View {
             Change::Position { at, length } => self.controls.show_position(*at, *length),
             Change::MediaInfo(info) => self.media_info(playback, info),
             Change::Buffering(percent) => {
+                // The picture freezes or stays black meanwhile: say why.
+                self.starting.set_visible(*percent < 100);
                 self.buffering.set_visible(*percent < 100);
                 self.buffering.set_label(&format!("Buffering… {percent}%"));
             }
@@ -199,7 +227,8 @@ impl View {
                 self.error.set_description(Some(error));
                 self.error.set_visible(true);
             }
-            Change::Volume(_) | Change::Modes { .. } | Change::Queue => {}
+            Change::Volume(_) | Change::Muted(_) => self.controls.volume.show(change),
+            Change::Modes { .. } | Change::Queue => {}
         }
     }
 
@@ -300,9 +329,12 @@ fn hide_when_idle(
     {
         let show = show.clone();
         motion.connect_motion(move |_, x, y| {
-            // GTK repeats the last position when widgets change under a
-            // still pointer; only a real move counts.
-            if last.replace((x, y)) != (x, y) {
+            // GTK repeats the pointer's position, give or take a fraction,
+            // when widgets change under a still pointer (the bars fading);
+            // only a move of a pixel or more counts.
+            let (lx, ly) = last.get();
+            if lx.is_nan() || (x - lx).abs() >= 1.0 || (y - ly).abs() >= 1.0 {
+                last.set((x, y));
                 show();
             }
         });
@@ -314,10 +346,22 @@ fn hide_when_idle(
         click.connect_pressed(move |_, _, _, _| show());
     }
     video.add_controller(click);
+    // The first countdown runs out before playback has started, finding
+    // nothing playing; start it again each time playback starts.
+    {
+        let (show, page_video) = (show.clone(), video.downgrade());
+        playback.subscribe(move |change| {
+            if let Change::Playing(true) = change {
+                show();
+            }
+            // Ends with the page.
+            page_video.upgrade().is_some()
+        });
+    }
     show();
 }
 
-/// Along the top: back (stops), the title and Minimize.
+/// Along the top: back (keeps playing in the bar) and the title.
 struct TopBar {
     bar: gtk::Box,
     title: gtk::Label,
@@ -325,10 +369,10 @@ struct TopBar {
 }
 
 impl TopBar {
-    fn new(actions: &Actions, minimizing: &Rc<Cell<bool>>) -> Self {
+    fn new() -> Self {
         let back = gtk::Button::builder()
             .icon_name(crate::icons::BACK)
-            .tooltip_text("Stop and go back")
+            .tooltip_text("Back (Esc) · keeps playing in the bar")
             .valign(gtk::Align::Center)
             .css_classes(["circular", "flat"])
             .build();
@@ -351,31 +395,12 @@ impl TopBar {
             .build();
         titles.append(&title);
         titles.append(&detail);
-        let minimize = gtk::Button::builder()
-            .child(
-                &adw::ButtonContent::builder()
-                    .icon_name(crate::icons::DOWN)
-                    .label("Minimize")
-                    .build(),
-            )
-            .tooltip_text("Minimize to the bar and keep playing")
-            .valign(gtk::Align::Center)
-            .css_classes(["pill", "player-minimize"])
-            .build();
-        {
-            let (minimize_action, minimizing) = (actions.minimize.clone(), minimizing.clone());
-            minimize.connect_clicked(move |_| {
-                minimizing.set(true);
-                minimize_action();
-            });
-        }
         let bar = gtk::Box::builder()
             .spacing(14)
-            .css_classes(["osd", "player-top"])
+            .css_classes(["player-top"])
             .build();
         bar.append(&back);
         bar.append(&titles);
-        bar.append(&minimize);
         Self { bar, title, detail }
     }
 }
@@ -393,7 +418,6 @@ fn follow_fullscreen(
     page: &adw::NavigationPage,
     video: &gtk::Overlay,
     button: &gtk::ToggleButton,
-    minimizing: &Rc<Cell<bool>>,
     actions: &Actions,
 ) {
     let apply = {
@@ -444,7 +468,7 @@ fn follow_fullscreen(
     let keys = gtk::EventControllerKey::builder()
         .propagation_phase(gtk::PropagationPhase::Capture)
         .build();
-    let (minimize, minimizing) = (actions.minimize.clone(), minimizing.clone());
+    let minimize = actions.minimize.clone();
     let play_pause = button.clone();
     keys.connect_key_pressed(move |keys, key, _, modifiers| {
         let Some(widget) = keys.widget() else {
@@ -463,10 +487,7 @@ fn follow_fullscreen(
         match key {
             gtk::gdk::Key::f => toggle(&widget),
             gtk::gdk::Key::Escape if fullscreen => toggle(&widget),
-            gtk::gdk::Key::Escape => {
-                minimizing.set(true);
-                minimize();
-            }
+            gtk::gdk::Key::Escape => minimize(),
             gtk::gdk::Key::space => action("player.toggle"),
             gtk::gdk::Key::Left => action("player.back"),
             gtk::gdk::Key::Right => action("player.forward"),
@@ -498,6 +519,7 @@ struct Controls {
     tracks: gtk::MenuButton,
     diagnostics: gtk::ToggleButton,
     fullscreen: gtk::ToggleButton,
+    volume: Volume,
 }
 
 impl Controls {
@@ -517,7 +539,7 @@ impl Controls {
         toggle.set_action_name(Some("player.toggle"));
         let forward = round_button("Forward 30 seconds", crate::icons::FORWARD_30, &["flat"]);
         forward.set_action_name(Some("player.forward"));
-        let transport = gtk::Box::builder().spacing(8).hexpand(true).build();
+        let transport = gtk::Box::builder().spacing(8).build();
         transport.append(&back);
         transport.append(&toggle);
         transport.append(&forward);
@@ -552,19 +574,25 @@ impl Controls {
                 _ => {}
             }
         });
+        let volume = Volume::of(playback, 120);
         let extras = gtk::Box::builder().spacing(8).build();
         extras.append(&tracks);
         extras.append(&diagnostics);
         extras.append(&fullscreen);
 
-        let button_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        button_row.append(&transport);
-        button_row.append(&extras);
+        // As designed: volume at the left, the transport in the middle,
+        // tracks, diagnostics and fullscreen at the right.
+        extras.set_halign(gtk::Align::End);
+        let button_row = gtk::CenterBox::builder()
+            .start_widget(&volume.row)
+            .center_widget(&transport)
+            .end_widget(&extras)
+            .build();
 
         let bar = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(14)
-            .css_classes(["osd", "player-bottom"])
+            .css_classes(["player-bottom"])
             .build();
         bar.append(&seek_row);
         bar.append(&button_row);
@@ -579,6 +607,7 @@ impl Controls {
             tracks,
             diagnostics,
             fullscreen,
+            volume,
         }
     }
 
@@ -590,6 +619,14 @@ impl Controls {
         });
         self.toggle
             .set_tooltip_text(Some(if playing { "Pause" } else { "Play" }));
+    }
+
+    /// Shades what is buffered ahead of the playhead, when the read-ahead
+    /// can say it in time.
+    fn show_buffered(&self, ready: Option<Duration>) {
+        let Some(ready) = ready else { return };
+        self.scale
+            .set_fill_level(self.scale.value() + ready.as_secs_f64());
     }
 
     fn show_position(&self, at: Duration, length: Duration) {
@@ -630,6 +667,9 @@ fn seek_scale(playback: &Rc<Playback>) -> gtk::Scale {
         .adjustment(&gtk::Adjustment::new(0.0, 0.0, 0.0, 1.0, 10.0, 0.0))
         .hexpand(true)
         .css_classes(["seek"])
+        .show_fill_level(true)
+        .restrict_to_fill_level(false)
+        .fill_level(0.0)
         .build();
     // change-value fires only for the user's moves, never for set_value.
     let weak = Rc::downgrade(playback);
@@ -713,7 +753,7 @@ impl Diagnostics {
             .margin_top(80)
             .margin_end(20)
             .visible(false)
-            .css_classes(["osd", "diagnostics"])
+            .css_classes(["diagnostics"])
             .build();
         panel.append(&header);
         panel.append(&grid);

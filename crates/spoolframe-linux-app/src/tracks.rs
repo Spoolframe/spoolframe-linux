@@ -65,7 +65,7 @@ pub fn select_subtitle(
 }
 
 /// Subtitle lists longer than this get a search field.
-pub const SEARCH_FROM: usize = 8;
+pub const SEARCH_FROM: usize = 3;
 
 /// The player's audio and subtitle menu: lists to pick one from, with a
 /// check mark on what plays. `subtitles_on` is shared with the player,
@@ -109,10 +109,22 @@ pub fn menu(
         )
         .collect();
     let subtitles = PickList::new(&subtitle_names);
-    column.append(&heading("Subtitles"));
+    let subtitles_heading = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let title = heading("Subtitles");
+    title.set_hexpand(true);
+    subtitles_heading.append(&title);
+    column.append(&subtitles_heading);
     if subtitle_names.len() > SEARCH_FROM {
+        // As designed: how many tracks match, beside the heading.
+        let total = subtitle_names.len() - 1;
+        let count = gtk::Label::builder()
+            .label(count_label(total, total))
+            .css_classes(["dim-label", "caption"])
+            .build();
+        subtitles_heading.append(&count);
         let search = gtk::SearchEntry::builder()
             .placeholder_text("Search subtitles")
+            .css_classes(["track-search"])
             .build();
         let names = Rc::new(subtitle_names.clone());
         let query = Rc::new(RefCell::new(String::new()));
@@ -126,7 +138,11 @@ pub fn menu(
         }
         let list = subtitles.list.clone();
         search.connect_search_changed(move |entry| {
-            query.replace(entry.text().to_string());
+            let text = entry.text().to_string();
+            // "Off" is not a track.
+            let shown = names[1..].iter().filter(|n| matches(n, &text)).count();
+            count.set_label(&count_label(shown, total));
+            query.replace(text);
             list.invalidate_filter();
         });
         column.append(&search);
@@ -222,7 +238,7 @@ impl PickList {
         let list = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::None)
             .activate_on_single_click(true)
-            .css_classes(["boxed-list"])
+            .css_classes(["pick-list"])
             .build();
         let mut checks = Vec::new();
         for name in names {
@@ -237,7 +253,7 @@ impl PickList {
                 .margin_start(10)
                 .margin_end(10)
                 .build();
-            row.append(&check);
+            // As designed: the name, and the check at the right.
             row.append(
                 &gtk::Label::builder()
                     .label(name)
@@ -246,6 +262,8 @@ impl PickList {
                     .ellipsize(gtk::pango::EllipsizeMode::End)
                     .build(),
             );
+            check.add_css_class("accent");
+            row.append(&check);
             list.append(&row);
             checks.push(check);
         }
@@ -255,20 +273,34 @@ impl PickList {
         }
     }
 
+    /// Checks and fills the picked row.
     fn mark(&self, picked: Option<usize>) {
         for (i, check) in self.checks.iter().enumerate() {
-            check.set_opacity(if Some(i) == picked { 1.0 } else { 0.0 });
+            let on = Some(i) == picked;
+            check.set_opacity(if on { 1.0 } else { 0.0 });
+            if let Some(row) = self.list.row_at_index(i as i32) {
+                if on {
+                    row.add_css_class("picked");
+                } else {
+                    row.remove_css_class("picked");
+                }
+            }
         }
     }
 }
 
 fn heading(text: &str) -> gtk::Label {
     gtk::Label::builder()
-        .label(text)
+        .label(text.to_uppercase())
         .xalign(0.0)
-        .margin_top(4)
-        .css_classes(["heading"])
+        .margin_top(6)
+        .css_classes(["caption-heading", "dim-label"])
         .build()
+}
+
+/// "3 of 41": the subtitle tracks a search shows, of all of them.
+pub fn count_label(shown: usize, total: usize) -> String {
+    format!("{shown} of {total}")
 }
 
 /// A stream's name in the menu: language, codec and channels, whichever
@@ -423,5 +455,10 @@ mod tests {
     #[test]
     fn a_search_with_a_missing_word_does_not_match() {
         assert!(!matches("English · SubRip", "english sdh"));
+    }
+
+    #[test]
+    fn the_count_says_how_many_tracks_a_search_shows() {
+        assert_eq!(count_label(3, 41), "3 of 41");
     }
 }

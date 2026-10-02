@@ -152,13 +152,19 @@ windowcontrols > button:hover > image {
 }
 
 /* The bars over the video, as in the design: a band along the top (back,
-   title, Minimize) and the controls along the bottom. They carry .osd for
-   its light text on dark in every theme; the bands are flat, edge to
-   edge. */
+   title, Minimize) and the controls along the bottom, in the theme's own
+   colours. Not libadwaita's .osd: it redefines the accent as a fixed
+   white, so the play button and the seek bar lost the theme's colour. */
+.player-top,
+.player-bottom,
+.diagnostics {
+  color: var(--window-fg-color);
+}
+
 .player-top {
   min-height: 64px;
   padding: 0 20px;
-  background-color: alpha(black, 0.8);
+  background-color: alpha(var(--window-bg-color), 0.8);
 }
 
 .player-title {
@@ -166,51 +172,106 @@ windowcontrols > button:hover > image {
   font-size: 1.15em;
 }
 
-.player-minimize {
-  background-color: alpha(currentColor, 0.15);
-}
-
 .player-bottom {
   padding: 20px 24px 22px;
-  background-color: alpha(black, 0.86);
+  background-color: alpha(var(--window-bg-color), 0.87);
 }
 
-.player-play {
+button.player-play {
   min-width: 52px;
   min-height: 52px;
   background-color: var(--accent-bg-color);
   color: var(--accent-fg-color);
 }
 
-.player-square {
+button.player-play:hover {
+  background-color: alpha(var(--accent-bg-color), 0.85);
+}
+
+.player-bottom button.circular.flat {
   min-width: 44px;
   min-height: 44px;
+}
+
+/* Tracks and diagnostics: equal 44 px squares on a surface; fullscreen
+   flat. A menu button's square is its inner button. */
+button.player-square,
+.player-square > button {
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0;
   border-radius: 10px;
 }
 
-.player-square:not(.flat) > button,
-button.player-square:not(.flat) {
-  background-color: alpha(currentColor, 0.15);
+button.player-square:not(.flat),
+.player-square:not(.flat) > button {
+  background-color: alpha(currentColor, 0.12);
 }
 
-.player-square:checked {
+/* Icon buttons answer a hover, a press or being on (diagnostics open, a
+   menu showing, shuffle, repeat) by turning their icon the accent colour,
+   never with a background: no circle behind the 10 s jumps, no darker
+   square. The squares keep their own fill. */
+button.flat.image-button:hover,
+button.flat.image-button:active,
+button.flat.image-button:checked,
+menubutton.flat > button:hover,
+menubutton.flat > button:checked,
+button.toggle.image-button:checked {
+  background: none;
+  box-shadow: none;
   color: var(--accent-color);
 }
 
+button.player-square:hover,
+button.player-square:active,
+button.player-square:checked,
+.player-square > button:hover,
+.player-square > button:checked {
+  background-color: alpha(currentColor, 0.12);
+  color: var(--accent-color);
+}
+
+button.player-square.flat:hover,
+button.player-square.flat:active,
+button.player-square.flat:checked {
+  background: none;
+}
+
+/* The seek bar: the track, what is buffered ahead, and what has played. */
 scale.seek trough {
   min-height: 6px;
   border-radius: 3px;
+  background-color: alpha(currentColor, 0.15);
+}
+
+scale.seek fill {
+  border-radius: 3px;
+  background-color: alpha(currentColor, 0.3);
 }
 
 scale.seek highlight {
+  border-radius: 3px;
   background-color: var(--accent-bg-color);
 }
 
+scale.seek slider {
+  min-width: 16px;
+  min-height: 16px;
+  margin: -5px;
+}
+
+/* The diagnostics and tracks panels let the picture show through. */
 .diagnostics {
   padding: 14px 16px;
   border-radius: 12px;
-  background-color: alpha(black, 0.88);
-  border: 1px solid alpha(currentColor, 0.12);
+  background-color: alpha(var(--sidebar-bg-color), 0.7);
+  border: 1px solid alpha(currentColor, 0.1);
+}
+
+.player-page popover > contents {
+  background-color: alpha(var(--sidebar-bg-color), 0.7);
+  border: 1px solid alpha(currentColor, 0.1);
 }
 
 .buffering {
@@ -242,6 +303,27 @@ scale.seek highlight {
   border-radius: 10px;
 }
 
+/* The tracks menu: rows to pick one from, the picked one filled. */
+.pick-list {
+  background: none;
+}
+
+.pick-list row {
+  min-height: 38px;
+  border-radius: 8px;
+}
+
+.pick-list row.picked {
+  background-color: alpha(currentColor, 0.12);
+}
+
+.track-search {
+  min-height: 36px;
+  border-radius: 8px;
+  background-color: alpha(var(--window-bg-color), 0.55);
+  box-shadow: inset 0 0 0 1px var(--accent-color);
+}
+
 /* Now Playing: the music player. */
 .now-cover {
   border-radius: 16px;
@@ -251,11 +333,6 @@ scale.seek highlight {
 .player-play.large {
   min-width: 64px;
   min-height: 64px;
-}
-
-button.mode:checked {
-  background: none;
-  color: var(--accent-color);
 }
 
 .chip {
@@ -333,13 +410,52 @@ button.action.outlined:hover {
   border-radius: 16px;
 }
 
-/* A neutral circle, not one of the avatar colours. The background has to
-   be round itself: the avatar node is square. */
-avatar.add-profile {
+/* The Sign in tile: a neutral circle with a plus. */
+.add-profile {
   border-radius: 9999px;
-  background-image: none;
   background-color: alpha(currentColor, 0.1);
-  color: inherit;
+}
+
+/* A card lifts on hover, and while its menu shows: a little up and
+   larger, its picture casting a soft shadow. */
+.lift {
+  transition: transform 150ms ease-out;
+}
+
+.lift > box > overlay {
+  border-radius: 10px;
+  transition: box-shadow 150ms ease-out;
+}
+
+.lift:hover,
+.lift.menu-open {
+  transform: translateY(-4px) scale(1.02);
+}
+
+.lift:hover > box > overlay,
+.lift.menu-open > box > overlay {
+  box-shadow: 0 14px 30px var(--shade-color);
+}
+
+.card-menu > contents {
+  padding: 6px;
+  border-radius: 12px;
+}
+
+.card-menu-item {
+  min-height: 36px;
+  padding: 0 10px;
+  border-radius: 8px;
+}
+
+/* A library page while its first page loads: blank posters, pulsing. */
+@keyframes loading-pulse {
+  from { opacity: 0.35; }
+  to { opacity: 0.8; }
+}
+
+.loading .tile-placeholder {
+  animation: loading-pulse 900ms ease-in-out infinite alternate;
 }
 
 /* Library grids */

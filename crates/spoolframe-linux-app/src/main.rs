@@ -16,6 +16,7 @@ mod start;
 mod theme;
 mod tracks;
 mod views;
+mod volume;
 
 use std::sync::Arc;
 
@@ -100,6 +101,7 @@ fn main() -> Result<()> {
         sign_in_hint,
         artwork_cache: artwork_cache.clone(),
     });
+    playback::shutdown();
     if let Some(cache) = artwork_cache {
         runtime.block_on(cache.close());
     }

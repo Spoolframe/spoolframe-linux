@@ -20,6 +20,7 @@ use crate::nowplaying::Transport;
 use crate::playback::{Change, Playback};
 use crate::player::{mono, round_button};
 use crate::views::Cards;
+use crate::volume::Volume;
 
 /// The live picture's size in the bar.
 const THUMB: (i32, i32) = (128, 72);
@@ -44,7 +45,10 @@ pub struct MiniBar {
     scale: gtk::Scale,
     position: gtk::Label,
     length: gtk::Label,
-    volume: gtk::Scale,
+    volume: Volume,
+    tracks: gtk::MenuButton,
+    /// The audio and subtitle stream counts the menu was built for.
+    tracks_built: Cell<Option<(usize, usize)>>,
     current: Current,
     /// Bumped on each attach and detach, so an old playback's listener
     /// lets go.
@@ -92,7 +96,9 @@ impl MiniBar {
         let open = gtk::Button::builder()
             .child(&what)
             .tooltip_text("Back to the full player")
-            .width_request(320)
+            .width_request(340)
+            // Never focused, so Space (play/pause) cannot press it.
+            .focusable(false)
             .css_classes(["flat", "mini-open"])
             .build();
         {
@@ -154,21 +160,10 @@ impl MiniBar {
         centre.append(&music_slot);
         centre.append(&seek_row);
 
-        let volume = gtk::Scale::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .adjustment(&gtk::Adjustment::new(1.0, 0.0, 1.0, 0.05, 0.1, 0.0))
-            .width_request(96)
-            .tooltip_text("Volume")
-            .build();
-        {
+        let volume = {
             let current = current.clone();
-            volume.connect_change_value(move |_, _, value| {
-                if let Some(playback) = current.borrow().as_ref() {
-                    playback.set_volume(value);
-                }
-                glib::Propagation::Proceed
-            });
-        }
+            Volume::new(Rc::new(move || current.borrow().clone()), 96)
+        };
         let expand_button = gtk::Button::builder()
             .icon_name(crate::icons::UP)
             .tooltip_text("Back to the full player")
@@ -183,17 +178,23 @@ impl MiniBar {
             .css_classes(["flat"])
             .build();
         stop_button.connect_clicked(move |_| stop());
+        // Video's audio and subtitles, built when its streams are known.
+        let tracks = gtk::MenuButton::builder()
+            .direction(gtk::ArrowType::Up)
+            .icon_name(crate::icons::TRACKS)
+            .tooltip_text("Audio and subtitles")
+            .valign(gtk::Align::Center)
+            .css_classes(["flat"])
+            .visible(false)
+            .build();
         let end = gtk::Box::builder()
             .spacing(6)
+            .width_request(300)
+            .halign(gtk::Align::End)
             .valign(gtk::Align::Center)
             .build();
-        end.append(
-            &gtk::Image::builder()
-                .icon_name(crate::icons::VOLUME)
-                .css_classes(["dim-label"])
-                .build(),
-        );
-        end.append(&volume);
+        end.append(&volume.row);
+        end.append(&tracks);
         end.append(&expand_button);
         end.append(&stop_button);
 
@@ -221,6 +222,8 @@ impl MiniBar {
             position,
             length,
             volume,
+            tracks,
+            tracks_built: Cell::new(None),
             current,
             generation: Rc::new(Cell::new(0)),
         })
@@ -234,9 +237,10 @@ impl MiniBar {
 
         let video = playback.is_video();
         if video {
+            // Wrapped: the video's own size would size the bar.
             let picture = gtk::Picture::builder()
-                .paintable(playback.paintable())
-                .content_fit(gtk::ContentFit::Cover)
+                .paintable(&crate::artwork::Unsized::new(playback.paintable()))
+                .content_fit(gtk::ContentFit::Fill)
                 .width_request(THUMB.0)
                 .height_request(THUMB.1)
                 .css_classes(["mini-video"])
@@ -257,6 +261,9 @@ impl MiniBar {
         // Video jumps within the film; music skips between tracks, with
         // shuffle and repeat.
         self.video_transport.set_visible(video);
+        self.tracks.set_visible(video);
+        self.tracks.set_popover(None::<&gtk::Popover>);
+        self.tracks_built.set(None);
         let music = (!video).then(|| Transport::new(playback, false));
         self.music_slot.set_child(music.as_ref().map(|t| &t.row));
         self.music.replace(music);
@@ -274,6 +281,12 @@ impl MiniBar {
             true
         });
         self.revealer.set_reveal_child(true);
+    }
+
+    /// Plays or pauses what the bar shows; false when it shows nothing.
+    pub fn toggle(&self) -> bool {
+        let playback = self.current.borrow().clone();
+        playback.map(|p| p.toggle()).is_some()
     }
 
     /// Hides the bar and lets go of the playback.
@@ -329,7 +342,17 @@ impl MiniBar {
                 self.position.set_label(&format::timestamp(*at));
                 self.length.set_label(&format::timestamp(*length));
             }
-            Change::Volume(volume) => self.volume.set_value(*volume),
+            Change::Volume(_) | Change::Muted(_) => self.volume.show(change),
+            Change::MediaInfo(info) if playback.is_video() => {
+                let counts = (info.audio_streams().len(), info.subtitle_streams().len());
+                if counts != (0, 0) && self.tracks_built.replace(Some(counts)) != Some(counts) {
+                    self.tracks.set_popover(Some(&crate::tracks::menu(
+                        playback.play(),
+                        info,
+                        playback.subtitles_on(),
+                    )));
+                }
+            }
             Change::Starting
             | Change::MediaInfo(_)
             | Change::Buffering(_)

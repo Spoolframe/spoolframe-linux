@@ -83,7 +83,11 @@ pub fn playable(
     if let Some(context) = context {
         info.append(&label(context, &["dim-label", "heading"]));
     }
-    info.append(&label(&title, &["page-title"]));
+    let title = label(&title, &["page-title"]);
+    // A long title wraps; unwrapped it made the page wider than the window.
+    title.set_wrap(true);
+    title.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    info.append(&title);
 
     let meta: Vec<String> = [facts.detail.clone(), facts.length.map(format::length)]
         .into_iter()

@@ -11,7 +11,7 @@ set -euo pipefail
 VERSION=1.50.0
 ICONS=(
   play pause rotate-ccw rotate-cw captions activity maximize minimize
-  volume-2 chevron-down chevron-up chevron-left x
+  volume-2 volume-x chevron-down chevron-up chevron-left x
   skip-back skip-forward shuffle repeat repeat-1
   house search film tv music
   eye check plus menu

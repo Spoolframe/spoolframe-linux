@@ -22,6 +22,9 @@ pub type Open = Rc<dyn Fn(Item)>;
 pub struct Cards {
     pub open: Open,
     pub art: Option<Rc<Art>>,
+    /// Marks an item watched (`true`) or clears its progress (`false`),
+    /// from a Continue watching card's menu; none before a session exists.
+    pub set_watched: Option<Rc<dyn Fn(MediaId, bool)>>,
 }
 
 impl Cards {
@@ -53,9 +56,8 @@ const TILE_HUES: [&str; 8] = [
 ];
 
 /// A heading over a horizontally scrolling row of cards, with ‹ › buttons
-/// in the heading for mouse users. A mouse wheel scrolls the page, not the
-/// row (see [`pass_vertical_scroll_to_page`]); shift+wheel and touchpad
-/// swipes still scroll the row directly.
+/// in the heading. The wheel over the row scrolls the row (see
+/// [`wheel_scrolls_row`]); elsewhere it scrolls the page.
 pub fn row(title: &str, cards: impl IntoIterator<Item = gtk::Widget>) -> gtk::Box {
     // Cards keep their own width: a caption's hexpand would otherwise
     // stretch a lone card across the row.
@@ -71,7 +73,7 @@ pub fn row(title: &str, cards: impl IntoIterator<Item = gtk::Widget>) -> gtk::Bo
         .vscrollbar_policy(gtk::PolicyType::Never)
         .child(&cards_box)
         .build();
-    pass_vertical_scroll_to_page(&scroller);
+    wheel_scrolls_row(&scroller);
 
     let back = row_button(crate::icons::BACK, "Scroll back", &scroller, -1.0);
     let forward = row_button(crate::icons::RIGHT, "Scroll forward", &scroller, 1.0);
@@ -127,26 +129,16 @@ fn row_button(icon: &str, label: &str, row: &gtk::ScrolledWindow, direction: f64
     button
 }
 
-/// A row scrolls only sideways, but a scrolled window takes every wheel
-/// event, so the page would stop scrolling whenever the pointer is over a
-/// row. A vertical wheel over a row scrolls the page when the page has
-/// somewhere to go; sideways scrolling still moves the row.
-fn pass_vertical_scroll_to_page(row: &gtk::ScrolledWindow) {
+/// The wheel over a row scrolls that row, sideways; anywhere else on the
+/// page it scrolls the page, as the user asked. A wheel turns only up and
+/// down, so its turns move the row along; sideways scrolling (a touchpad,
+/// a tilting wheel) moves it as ever.
+fn wheel_scrolls_row(row: &gtk::ScrolledWindow) {
     let controller = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
     controller.set_propagation_phase(gtk::PropagationPhase::Capture);
     let row_widget = row.clone();
     controller.connect_scroll(move |controller, _dx, dy| {
-        let Some(page) = row_widget
-            .parent()
-            .and_then(|p| p.ancestor(gtk::ScrolledWindow::static_type()))
-            .and_downcast::<gtk::ScrolledWindow>()
-        else {
-            return gtk::glib::Propagation::Proceed;
-        };
-        let adjustment = page.vadjustment();
-        if adjustment.upper() - adjustment.lower() <= adjustment.page_size() {
-            return gtk::glib::Propagation::Proceed;
-        }
+        let adjustment = row_widget.hadjustment();
         // A wheel reports whole notches; GTK scrolls page_size^(2/3) per
         // notch. A touchpad reports pixels.
         let step = match controller.unit() {
@@ -246,7 +238,12 @@ pub fn continue_card(item: &Item, cards: &Cards) -> gtk::Widget {
                 .build(),
         );
     }
-    card(item, &tile, &below, LANDSCAPE.0, &cards.open)
+    let card = card(item, &tile, &below, LANDSCAPE.0, &cards.open);
+    card.add_css_class("continue-card");
+    if let Some(set_watched) = &cards.set_watched {
+        card_menu(&card, item.id(), set_watched);
+    }
+    card
 }
 
 /// A 2:3 poster card: the title on the tile, a badge when watched, and the
@@ -323,11 +320,91 @@ fn card(
         .child(&body)
         .width_request(width)
         .valign(gtk::Align::Start)
-        .css_classes(["card-button", "flat"])
+        // Every card lifts on hover: Continue watching, posters in rows
+        // and in library grids alike.
+        .css_classes(["card-button", "flat", "lift"])
         .build();
     let (item, open) = (item.clone(), open.clone());
     button.connect_clicked(move |_| open(item.clone()));
     button.upcast()
+}
+
+/// A Continue watching card's menu, on a right-click or a long press, at
+/// the pointer: mark watched, or reset the progress. While it shows, the
+/// card stays lifted.
+fn card_menu(card: &gtk::Widget, id: &MediaId, set_watched: &Rc<dyn Fn(MediaId, bool)>) {
+    // Rows of icon and label, as designed: GTK's own menu drops the icon
+    // of any item that has a label.
+    let rows = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .build();
+    let popover = gtk::Popover::builder()
+        .child(&rows)
+        .has_arrow(false)
+        .halign(gtk::Align::Start)
+        .css_classes(["card-menu"])
+        .build();
+    for (label, icon, watched) in [
+        ("Mark as watched", crate::icons::WATCHED, true),
+        ("Reset watch progress", crate::icons::BACK_10, false),
+    ] {
+        let row = gtk::Button::builder()
+            .child(
+                &adw::ButtonContent::builder()
+                    .icon_name(icon)
+                    .label(label)
+                    .halign(gtk::Align::Start)
+                    .build(),
+            )
+            .css_classes(["flat", "card-menu-item"])
+            .build();
+        let (id, set_watched, popover) = (id.clone(), set_watched.clone(), popover.downgrade());
+        row.connect_clicked(move |_| {
+            if let Some(popover) = popover.upgrade() {
+                popover.popdown();
+            }
+            set_watched(id.clone(), watched);
+        });
+        rows.append(&row);
+    }
+    popover.set_parent(card);
+    {
+        let card = card.downgrade();
+        popover.connect_visible_notify(move |popover| {
+            if let Some(card) = card.upgrade() {
+                if popover.is_visible() {
+                    card.add_css_class("menu-open");
+                } else {
+                    card.remove_css_class("menu-open");
+                }
+            }
+        });
+    }
+    // The popover is the card's child, and goes when the card does.
+    {
+        let popover = popover.clone();
+        card.connect_destroy(move |_| popover.unparent());
+    }
+    let open_at = {
+        let popover = popover.clone();
+        move |x: f64, y: f64| {
+            popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            popover.popup();
+        }
+    };
+    let right_click = gtk::GestureClick::builder().button(3).build();
+    {
+        let open_at = open_at.clone();
+        right_click.connect_pressed(move |gesture, _, x, y| {
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            open_at(x, y);
+        });
+    }
+    card.add_controller(right_click);
+    let long_press = gtk::GestureLongPress::builder().touch_only(true).build();
+    long_press.connect_pressed(move |_, x, y| open_at(x, y));
+    card.add_controller(long_press);
 }
 
 /// A placeholder tile in a hue picked from the item's ID, so an item keeps

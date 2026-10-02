@@ -86,6 +86,8 @@ pub struct App {
     connection_watch: Option<glib::JoinHandle<()>>,
     /// What plays, shown full or in the bar; dropping it stops it.
     playback: Option<Rc<Playback>>,
+    /// The session's libraries as far as fetched, kept between visits.
+    library_cache: Option<Rc<library::Cache>>,
     /// Whether the server used last has been opened already. It may be
     /// heard only on a later listing; it is opened once, not on every
     /// change after.
@@ -394,11 +396,30 @@ impl Component for App {
             .sidebar(&sidebar_page)
             .content(&content_page)
             .build();
+        // A narrow window shows one pane at a time, sidebar or content.
+        let narrow = adw::Breakpoint::new(
+            adw::BreakpointCondition::parse("max-width: 760sp").expect("a valid condition"),
+        );
+        narrow.add_setter(&split, "collapsed", Some(&true.to_value()));
+        root.add_breakpoint(narrow);
+        // Collapsed, picking a row goes on to its pane.
+        sidebar.connect_row_activated(glib::clone!(
+            #[weak]
+            split,
+            move |_, _| split.set_show_content(true)
+        ));
+        // Breakpoints need a smallest size to measure against.
+        root.set_size_request(360, 480);
 
         let servers = adw::Bin::new();
         let profiles = adw::Bin::new();
+        // Each screen is as wide as it needs: a stack is as wide as its
+        // widest child by default, so in a narrow window the library's
+        // width pushed "Who's watching" off centre.
         let screens = gtk::Stack::builder()
             .transition_type(gtk::StackTransitionType::Crossfade)
+            .hhomogeneous(false)
+            .vhomogeneous(false)
             .build();
         screens.add_named(&servers, Some("servers"));
         screens.add_named(&profiles, Some("profiles"));
@@ -420,8 +441,31 @@ impl Component for App {
             .title("Spoolframe")
             .child(&library)
             .build();
+        // Space plays and pauses what plays, wherever the focus is (the
+        // library, the player, Now Playing), except where Space types (a
+        // search entry, a dialog field).
+        let space_keys = {
+            let keys = gtk::EventControllerKey::builder()
+                .propagation_phase(gtk::PropagationPhase::Capture)
+                .build();
+            let bar = mini_bar.clone();
+            keys.connect_key_pressed(move |keys, key, _, modifiers| {
+                let typing = keys
+                    .widget()
+                    .and_then(|w| w.root())
+                    .and_then(|root| root.focus())
+                    .is_some_and(|focus| focus.is::<gtk::Text>() || focus.is::<gtk::TextView>());
+                if key == gtk::gdk::Key::space && modifiers.is_empty() && !typing && bar.toggle() {
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
+            });
+            keys
+        };
         let window_stack = adw::NavigationView::new();
         window_stack.add(&library_page);
+        window_stack.add_controller(space_keys);
         screens.add_named(&window_stack, Some("library"));
         let toasts = adw::ToastOverlay::new();
         toasts.set_child(Some(&screens));
@@ -439,9 +483,11 @@ impl Component for App {
             cards: Rc::new(Cards {
                 open: open_with(&sender),
                 art: None,
+                set_watched: None,
             }),
             connection_watch: None,
             playback: None,
+            library_cache: None,
             opened_last_server: false,
             search_query: String::new(),
             root_generation: Rc::new(std::cell::Cell::new(0)),
@@ -571,13 +617,19 @@ impl Component for App {
                 let Some(library) = self.libraries.get(row - FIRST_LIBRARY_ROW).cloned() else {
                     return;
                 };
-                let Some(session) = self.session.clone() else {
+                let Some(cache) = self.library_cache.clone() else {
                     return;
                 };
                 widgets.stack.pop_to_page(&widgets.root_page);
                 widgets.root_page.set_title(&library.title);
                 show_content(widgets);
                 clear(&widgets.content);
+                // Pulsing blank posters until the first page arrives, so
+                // the library does not land on an empty page all at once.
+                let skeleton =
+                    views::grid(&library.title, (0..18).map(|_| views::placeholder_card()));
+                skeleton.add_css_class("loading");
+                widgets.content.append(&skeleton);
                 // A newer choice in the sidebar makes this one stale.
                 let generation = self.root_generation.get() + 1;
                 self.root_generation.set(generation);
@@ -585,13 +637,16 @@ impl Component for App {
                 let (scroller, content) = (widgets.scroller.clone(), widgets.content.clone());
                 let cards = self.cards.clone();
                 glib::spawn_future_local(async move {
-                    let grid = library::grid(session, library, cards).await;
+                    let grid = cache.grid(library, cards).await;
                     if current.get() != generation {
                         return;
                     }
                     match grid {
                         Ok(grid) => scroller.set_child(Some(&grid)),
-                        Err(e) => content.append(&error_status(&e)),
+                        Err(e) => {
+                            clear(&content);
+                            content.append(&error_status(&e));
+                        }
                     }
                 });
             }
@@ -806,6 +861,12 @@ impl Component for App {
                         .sidebar
                         .append(&sidebar_row(&library.title, library_icon(library.kind)));
                 }
+                // Fetched ahead, so opening one rarely waits.
+                if let Some(cache) = &self.library_cache {
+                    for library in &libraries {
+                        cache.prefetch(library.clone());
+                    }
+                }
                 self.libraries = libraries;
             }
             Loaded::Libraries(Err(e)) => show_error(widgets, "Home", &e),
@@ -948,7 +1009,15 @@ impl Component for App {
                 );
             }
             Loaded::Album(album, Err(e)) => push_error(widgets, &album.title, &e),
-            Loaded::WatchChanged(Ok(())) => {}
+            // Home shows watch state (Continue watching, Next up): show it
+            // again, if it is what is on screen.
+            Loaded::WatchChanged(Ok(())) => {
+                let on_home = widgets.root_page.title() == "Home"
+                    && widgets.stack.visible_page().as_ref() == Some(&widgets.root_page);
+                if on_home {
+                    self.load_home(&sender);
+                }
+            }
             Loaded::WatchChanged(Err(e)) => toast(widgets, &e),
             Loaded::Saved(Ok(())) => {}
             Loaded::Saved(Err(e)) => toast(widgets, &e),
@@ -1021,7 +1090,12 @@ impl App {
                 profile.server.clone(),
                 self.artwork_cache.clone(),
             )),
+            set_watched: Some({
+                let sender = sender.clone();
+                Rc::new(move |id, watched| sender.input(Msg::SetWatched(id, watched)))
+            }),
         });
+        self.library_cache = Some(library::Cache::new(session.clone()));
         self.session = Some(session);
         self.settings.set_server(&profile.server.0);
         widgets.profile_avatar.set_text(Some(&profile.display_name));
@@ -1297,8 +1371,8 @@ async fn server_choice(session: &dyn Session, id: &MediaId) -> Option<ChosenTrac
     }
 }
 
-/// The full player for `playback`: minimizing keeps it playing in the bar,
-/// leaving any other way stops it.
+/// The full player for `playback`. Leaving it, however, keeps it playing
+/// in the bar; the bar's stop ends it.
 fn player_page(
     playback: &Rc<Playback>,
     sender: &ComponentSender<App>,
@@ -1308,11 +1382,7 @@ fn player_page(
         let sender = sender.clone();
         Rc::new(move || sender.input(Msg::MinimizePlayer)) as Rc<dyn Fn()>
     };
-    let close = {
-        let sender = sender.clone();
-        Rc::new(move || sender.input(Msg::StopPlayback)) as Rc<dyn Fn()>
-    };
-    let actions = player::Actions { minimize, close };
+    let actions = player::Actions { minimize };
     if playback.is_video() {
         player::page(playback, actions)
     } else {

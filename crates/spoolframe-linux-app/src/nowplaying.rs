@@ -1,7 +1,7 @@
 //! Now Playing, the full player for music, as in the design: the cover,
 //! the track, its artist and album, the seek bar, shuffle, previous,
 //! play, next and repeat, volume and what the file is, beside the queue
-//! ("Up next"). Collapsing it keeps playing in the bar; back stops.
+//! ("Up next"). Leaving it keeps playing in the bar.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -17,21 +17,18 @@ use spoolframe_types::{ArtworkKind, Item};
 use crate::playback::{Change, Playback, Repeat};
 use crate::player::{Actions, mono, round_button};
 use crate::views::Cards;
+use crate::volume::Volume;
 
 const COVER: (i32, i32) = (360, 360);
 
 pub fn page(playback: &Rc<Playback>, actions: Actions, cards: &Cards) -> adw::NavigationPage {
-    let minimizing = Rc::new(Cell::new(false));
     let collapse = gtk::Button::builder()
         .icon_name(crate::icons::DOWN)
-        .tooltip_text("Collapse to the bar and keep playing")
+        .tooltip_text("Back (Esc) · keeps playing in the bar")
         .build();
     {
-        let (minimize, minimizing) = (actions.minimize.clone(), minimizing.clone());
-        collapse.connect_clicked(move |_| {
-            minimizing.set(true);
-            minimize();
-        });
+        let minimize = actions.minimize.clone();
+        collapse.connect_clicked(move |_| minimize());
     }
     let header = adw::HeaderBar::builder()
         .title_widget(&adw::WindowTitle::new("Now Playing", ""))
@@ -117,7 +114,7 @@ pub fn page(playback: &Rc<Playback>, actions: Actions, cards: &Cards) -> adw::Na
     let transport = Transport::new(playback, true);
     transport.row.set_halign(gtk::Align::Center);
 
-    let volume = volume_row(playback);
+    let volume = Volume::of(playback, 180);
     volume.row.set_halign(gtk::Align::Center);
 
     let chips = gtk::Box::builder()
@@ -189,12 +186,9 @@ pub fn page(playback: &Rc<Playback>, actions: Actions, cards: &Cards) -> adw::Na
         });
     }
 
-    let close = actions.close.clone();
+    // Leaving keeps playing, in the bar. The page owns its view.
     page.connect_hidden(move |_| {
         let _ = &view;
-        if !minimizing.get() {
-            close();
-        }
     });
     page
 }
@@ -259,7 +253,7 @@ impl View {
                     self.format_chip.set_visible(!label.is_empty());
                 }
             }
-            Change::Volume(volume) => self.volume.scale.set_value(*volume),
+            Change::Volume(_) | Change::Muted(_) => self.volume.show(change),
             Change::Modes { shuffle, repeat } => self.transport.show_modes(*shuffle, *repeat),
             Change::Starting | Change::Buffering(_) | Change::Failed(_) => {}
         }
@@ -394,36 +388,6 @@ impl Transport {
         self.repeat.set_icon_name(icon);
         self.repeat.set_tooltip_text(Some(tip));
     }
-}
-
-struct Volume {
-    row: gtk::Box,
-    scale: gtk::Scale,
-}
-
-fn volume_row(playback: &Rc<Playback>) -> Volume {
-    let scale = gtk::Scale::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .adjustment(&gtk::Adjustment::new(1.0, 0.0, 1.0, 0.05, 0.1, 0.0))
-        .width_request(180)
-        .tooltip_text("Volume")
-        .build();
-    let weak = Rc::downgrade(playback);
-    scale.connect_change_value(move |_, _, value| {
-        if let Some(playback) = weak.upgrade() {
-            playback.set_volume(value);
-        }
-        glib::Propagation::Proceed
-    });
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-    row.append(
-        &gtk::Image::builder()
-            .icon_name(crate::icons::VOLUME)
-            .css_classes(["dim-label"])
-            .build(),
-    );
-    row.append(&scale);
-    Volume { row, scale }
 }
 
 /// "Up next": the queue in play order, the current track marked; a click

@@ -28,6 +28,7 @@ pub const DIAGNOSTICS: &str = "lucide-activity-symbolic";
 pub const FULLSCREEN: &str = "lucide-maximize-symbolic";
 pub const LEAVE_FULLSCREEN: &str = "lucide-minimize-symbolic";
 pub const VOLUME: &str = "lucide-volume-2-symbolic";
+pub const MUTED: &str = "lucide-volume-x-symbolic";
 pub const DOWN: &str = "lucide-chevron-down-symbolic";
 pub const UP: &str = "lucide-chevron-up-symbolic";
 pub const BACK: &str = "lucide-chevron-left-symbolic";
@@ -66,6 +67,7 @@ const ALL: &[&str] = &[
     FULLSCREEN,
     LEAVE_FULLSCREEN,
     VOLUME,
+    MUTED,
     DOWN,
     UP,
     BACK,

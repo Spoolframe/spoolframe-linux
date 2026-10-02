@@ -316,6 +316,10 @@ pub struct FakeSession {
     media: Option<PathBuf>,
     /// The most one read returns, like a server that answers short.
     read_limit: u64,
+    /// Set by [`FakeClient::go_away`]: the server stopped answering.
+    gone: Arc<std::sync::atomic::AtomicBool>,
+    /// Every progress report, in order, for tests.
+    reports: Mutex<Vec<(MediaId, Duration)>>,
     playbacks: Mutex<HashMap<PlaybackHandle, Playback>>,
     next_handle: AtomicU64,
     preferences: Mutex<TrackPreferences>,
@@ -329,12 +333,15 @@ impl FakeSession {
         username: &str,
         media_file: Option<PathBuf>,
         read_limit: u64,
+        gone: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         let session = FakeSession {
             catalog,
             watch: Mutex::new(WatchState::default()),
             media: media_file,
             read_limit,
+            gone,
+            reports: Mutex::new(Vec::new()),
             playbacks: Mutex::new(HashMap::new()),
             next_handle: AtomicU64::new(1),
             preferences: Mutex::new(TrackPreferences::default()),
@@ -807,6 +814,9 @@ impl Session for FakeSession {
         length: u64,
     ) -> BoxFuture<'a, Result<Vec<u8>, BackendError>> {
         Box::pin(async move {
+            if self.gone.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(BackendError::Unreachable("Home Media".into()));
+            }
             self.playback(handle)?;
             let path = self.media.as_ref().ok_or(BackendError::PlaybackExpired)?;
             let io =
@@ -854,6 +864,10 @@ impl Session for FakeSession {
     ) -> BoxFuture<'a, Result<(), BackendError>> {
         Box::pin(async move {
             let item = self.catalog.get(id)?;
+            self.reports
+                .lock()
+                .expect("fake state is never poisoned")
+                .push((id.clone(), position));
             // Music has no watch state in Phase 1 (P1-14).
             if matches!(item, Item::Movie(_) | Item::Episode(_)) {
                 self.watch().progress(id, length_of(item), position);
@@ -952,6 +966,7 @@ pub struct FakeClient {
     connections: Mutex<HashMap<ServerKey, watch::Sender<ConnectionState>>>,
     /// The fake has no LAN: its list changes only when an address is added.
     servers_changed: watch::Sender<()>,
+    gone: Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn home_media() -> ServerKey {
@@ -975,6 +990,7 @@ impl FakeClient {
             catalog: Arc::new(Catalog::new()),
             media,
             read_limit: MAX_READ,
+            gone: Arc::default(),
             servers: Mutex::new(vec![
                 Server {
                     key: home_media(),
@@ -1006,6 +1022,35 @@ impl FakeClient {
 
     /// Reads answer at most `limit` bytes, like a server that sends less
     /// than asked: clients must ask again from where a read stopped.
+    /// The progress reports `profile`'s session has had, in order.
+    pub fn progress_reports(&self, profile: &Profile) -> Vec<(MediaId, Duration)> {
+        self.sessions
+            .lock()
+            .expect("fake state is never poisoned")
+            .get(&(profile.server.clone(), profile.username.clone()))
+            .map(|s| {
+                s.reports
+                    .lock()
+                    .expect("fake state is never poisoned")
+                    .clone()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The server stops answering, as when it is shut down mid-play: every
+    /// read fails as unreachable, and connections say closed.
+    pub fn go_away(&self) {
+        self.gone.store(true, std::sync::atomic::Ordering::SeqCst);
+        for state in self
+            .connections
+            .lock()
+            .expect("fake state is never poisoned")
+            .values()
+        {
+            state.send_replace(ConnectionState::Closed);
+        }
+    }
+
     pub fn with_read_limit(mut self, limit: u64) -> Self {
         self.read_limit = limit;
         self
@@ -1143,6 +1188,7 @@ impl Client for FakeClient {
                     &profile.username,
                     self.media.clone(),
                     self.read_limit,
+                    self.gone.clone(),
                 ))
             });
         Ok(session.clone())

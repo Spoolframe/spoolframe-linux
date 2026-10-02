@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- @license lucide-static v1.50.0 - ISC -->
+
+<svg
+   class="lucide lucide-volume-x"
+   width="24"
+   height="24"
+   viewBox="0 0 24 24"
+   version="1.1"
+   id="svg3"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <defs
+     id="defs3" />
+  <path
+     style="baseline-shift:baseline;display:inline;overflow:visible;vector-effect:none;fill:#000000;stroke:none;stroke-linecap:butt;stroke-linejoin:miter;enable-background:accumulate;stop-color:#000000;stop-opacity:1;opacity:1"
+     d="M 9.9824219,3.0273438 C 9.650849,3.0897285 9.3303124,3.2471445 9.078125,3.5078125 L 5.7050781,6.8789062 a 1.0001,1.0001 0 0 0 -0.00195,0.00391 C 5.6274753,6.9589145 5.5252734,7.0003145 5.4179687,7 a 1.0001,1.0001 0 0 0 -0.00195,0 H 3 C 1.9072751,7 1,7.9072751 1,9 v 6 c 0,1.092725 0.9072751,2 2,2 h 2.4160156 a 1.0001,1.0001 0 0 0 0.00195,0 c 0.1073047,-3.15e-4 0.2095066,0.04108 0.2851563,0.117187 a 1.0001,1.0001 0 0 0 0.00195,0.002 l 3.3710938,3.371093 C 9.580577,21.013831 10.363106,21.124585 10.951172,20.880859 11.539238,20.637134 12.013866,20.006198 12,19.279297 V 4.71875 C 12.011686,3.9934579 11.538256,3.3621728 10.951172,3.1191406 10.65763,2.9976245 10.313995,2.964959 9.9824219,3.0273438 Z M 10,5.4160156 V 18.585937 L 7.1230469,15.707031 C 6.6711169,15.252399 6.0531459,14.998121 5.4121094,15 H 3 V 9 h 2.4121094 c 0.6395281,0.00187 1.2553943,-0.2524518 1.7070312,-0.7050781 z"
+     id="path1" />
+  <path
+     style="baseline-shift:baseline;display:inline;overflow:visible;vector-effect:none;fill:#000000;stroke:none;stroke-linecap:butt;stroke-linejoin:miter;enable-background:accumulate;stop-color:#000000;stop-opacity:1;opacity:1"
+     d="m 20.792969,8.7929688 -5,5.0000002 a 1,1 0 0 0 0,1.414062 1,1 0 0 0 1.414062,0 l 5,-5 a 1,1 0 0 0 0,-1.4140622 1,1 0 0 0 -1.414062,0 z"
+     id="path2" />
+  <path
+     style="baseline-shift:baseline;display:inline;overflow:visible;vector-effect:none;fill:#000000;stroke:none;stroke-linecap:butt;stroke-linejoin:miter;enable-background:accumulate;stop-color:#000000;stop-opacity:1;opacity:1"
+     d="m 15.792969,8.7929688 a 1,1 0 0 0 0,1.4140622 l 5,5 a 1,1 0 0 0 1.414062,0 1,1 0 0 0 0,-1.414062 l -5,-5.0000002 a 1,1 0 0 0 -1.414062,0 z"
+     id="path3" />
+</svg>

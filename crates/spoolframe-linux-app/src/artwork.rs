@@ -118,7 +118,7 @@ fn paint(tile: &gtk::Overlay, texture: &gdk::Texture) {
         .map_or((-1, -1), |c| (c.width_request(), c.height_request()));
     let picture = gtk::Picture::builder()
         .paintable(&Unsized::new(texture))
-        .content_fit(gtk::ContentFit::Cover)
+        .content_fit(gtk::ContentFit::Fill)
         .width_request(width)
         .height_request(height)
         .css_classes(["tile-image"])
@@ -134,19 +134,48 @@ fn paint(tile: &gtk::Overlay, texture: &gdk::Texture) {
 }
 
 glib::wrapper! {
-    /// A texture that asks for no size of its own, only its shape. A
+    /// A paintable that asks for no size of its own, only its shape. A
     /// picture is as large as its paintable by default, and width and height
     /// requests only set a minimum, so a full-size poster pushed the page
-    /// out. Wrapped, the picture takes the placeholder's size and covers
-    /// it, cropping the image.
+    /// out, and the live video filled the bar. Wrapped, the picture takes
+    /// the size it is given and covers it. Changes to the wrapped paintable
+    /// (each new video frame) pass through.
     pub struct Unsized(ObjectSubclass<imp::Unsized>) @implements gdk::Paintable;
 }
 
 impl Unsized {
-    fn new(texture: &gdk::Texture) -> Self {
+    pub fn new(inner: &impl IsA<gdk::Paintable>) -> Self {
         let paintable: Self = glib::Object::new();
-        paintable.imp().texture.replace(Some(texture.clone()));
+        let weak = paintable.downgrade();
+        inner.connect_invalidate_contents(move |_| {
+            if let Some(outer) = weak.upgrade() {
+                outer.invalidate_contents();
+            }
+        });
+        let weak = paintable.downgrade();
+        inner.connect_invalidate_size(move |_| {
+            if let Some(outer) = weak.upgrade() {
+                outer.invalidate_size();
+            }
+        });
+        paintable.imp().inner.replace(Some(inner.clone().upcast()));
         paintable
+    }
+}
+
+/// Where to draw content of shape `aspect` (width over height) so it
+/// covers a `width`×`height` area, centred and cropped: (x, y, w, h).
+/// Without a shape, it fills the area.
+fn cover(aspect: f64, width: f64, height: f64) -> (f64, f64, f64, f64) {
+    if aspect <= 0.0 || height <= 0.0 {
+        return (0.0, 0.0, width, height);
+    }
+    if width / height > aspect {
+        let h = width / aspect;
+        (0.0, (height - h) / 2.0, width, h)
+    } else {
+        let w = height * aspect;
+        ((width - w) / 2.0, 0.0, w, height)
     }
 }
 
@@ -159,12 +188,12 @@ mod imp {
 
     #[derive(Default)]
     pub struct Unsized {
-        pub texture: RefCell<Option<gdk::Texture>>,
+        pub inner: RefCell<Option<gdk::Paintable>>,
     }
 
     #[glib::object_subclass]
     impl ObjectSubclass for Unsized {
-        const NAME: &'static str = "SpoolframeUnsizedTexture";
+        const NAME: &'static str = "SpoolframeUnsized";
         type Type = super::Unsized;
         type Interfaces = (gdk::Paintable,);
     }
@@ -172,17 +201,30 @@ mod imp {
     impl ObjectImpl for Unsized {}
 
     impl PaintableImpl for Unsized {
-        fn intrinsic_aspect_ratio(&self) -> f64 {
-            self.texture
-                .borrow()
-                .as_ref()
-                .map_or(0.0, |t| f64::from(t.width()) / f64::from(t.height().max(1)))
-        }
+        // No intrinsic size and no shape: a picture asks the paintable for
+        // both, and with a shape alone it still sizes its height from its
+        // width (a 970 px backdrop in a wide window). The cover crop is
+        // done here instead.
 
         fn snapshot(&self, snapshot: &gdk::Snapshot, width: f64, height: f64) {
-            if let Some(texture) = self.texture.borrow().as_ref() {
-                texture.snapshot(snapshot, width, height);
-            }
+            let Some(inner) = self.inner.borrow().clone() else {
+                return;
+            };
+            let Some(snapshot) = snapshot.downcast_ref::<gtk::Snapshot>() else {
+                return inner.snapshot(snapshot, width, height);
+            };
+            let (x, y, w, h) = super::cover(inner.intrinsic_aspect_ratio(), width, height);
+            snapshot.push_clip(&gtk::graphene::Rect::new(
+                0.0,
+                0.0,
+                width as f32,
+                height as f32,
+            ));
+            snapshot.save();
+            snapshot.translate(&gtk::graphene::Point::new(x as f32, y as f32));
+            inner.snapshot(snapshot, w, h);
+            snapshot.restore();
+            snapshot.pop();
         }
     }
 }
@@ -207,8 +249,33 @@ mod tests {
     }
 
     #[test]
-    fn a_wrapped_texture_keeps_its_shape() {
+    fn a_wrapped_texture_has_no_shape_to_size_by() {
         let paintable = Unsized::new(&poster());
-        assert!((paintable.intrinsic_aspect_ratio() - 2.0 / 3.0).abs() < 1e-9);
+        assert_eq!(paintable.intrinsic_aspect_ratio(), 0.0);
+    }
+
+    #[test]
+    fn a_tall_poster_covers_a_wide_area_cropped_top_and_bottom() {
+        // 2:3 into 300×100: 300 wide, 450 tall, centred.
+        assert_eq!(cover(2.0 / 3.0, 300.0, 100.0), (0.0, -175.0, 300.0, 450.0));
+    }
+
+    #[test]
+    fn a_wide_backdrop_covers_a_tall_area_cropped_at_the_sides() {
+        // 16:9 into 90×90: 160 wide, centred.
+        assert_eq!(cover(16.0 / 9.0, 90.0, 90.0), (-35.0, 0.0, 160.0, 90.0));
+    }
+
+    #[test]
+    fn a_change_to_the_wrapped_paintable_passes_through() {
+        let inner = Unsized::new(&poster());
+        let outer = Unsized::new(&inner);
+        let heard = std::rc::Rc::new(std::cell::Cell::new(false));
+        {
+            let heard = heard.clone();
+            outer.connect_invalidate_contents(move |_| heard.set(true));
+        }
+        inner.invalidate_contents();
+        assert!(heard.get());
     }
 }

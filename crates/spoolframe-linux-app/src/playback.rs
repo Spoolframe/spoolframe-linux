@@ -70,6 +70,7 @@ pub enum Change<'a> {
     Buffering(i32),
     Failed(&'a str),
     Volume(f64),
+    Muted(bool),
     /// Shuffle and repeat, as set now.
     Modes {
         shuffle: bool,
@@ -90,6 +91,23 @@ pub enum Repeat {
 }
 
 type Listener = Box<dyn Fn(&Change) -> bool>;
+
+thread_local! {
+    /// Every playback started, for `shutdown`.
+    static LIVE: RefCell<Vec<Weak<Playback>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Stops every playback still alive. Call once the app's main loop has
+/// returned, before the process exits. Relm4 does not drop the app's
+/// state at quit, so a playback it holds would otherwise keep its GL
+/// context and GStreamer threads into the exit handlers, where libEGL's
+/// teardown then crashed on them (a segfault on quitting mid-play).
+pub fn shutdown() {
+    let live = LIVE.with(|live| std::mem::take(&mut *live.borrow_mut()));
+    for playback in live.iter().filter_map(Weak::upgrade) {
+        playback.stop();
+    }
+}
 
 /// How often progress goes to the server while playing (P1-14 throttles
 /// on its side too).
@@ -172,6 +190,11 @@ impl Playback {
             listeners: RefCell::new(Vec::new()),
         });
         connect(&adapter, &playback);
+        LIVE.with(|live| {
+            let mut live = live.borrow_mut();
+            live.retain(|p| p.strong_count() > 0);
+            live.push(Rc::downgrade(&playback));
+        });
 
         let weak = Rc::downgrade(&playback);
         glib::timeout_add_seconds_local(PROGRESS_EVERY, move || {
@@ -206,6 +229,7 @@ impl Playback {
             }
             listener(&Change::Playing(self.playing.get()))
                 && listener(&Change::Volume(self.play.volume()))
+                && listener(&Change::Muted(self.play.is_muted()))
                 && listener(&Change::Modes {
                     shuffle: self.shuffle.get(),
                     repeat: self.repeat.get(),
@@ -339,6 +363,14 @@ impl Playback {
         self.play.set_volume(volume.clamp(0.0, 1.0));
     }
 
+    pub fn is_muted(&self) -> bool {
+        self.play.is_muted()
+    }
+
+    pub fn set_muted(&self, muted: bool) {
+        self.play.set_mute(muted);
+    }
+
     pub fn has_next(&self) -> bool {
         self.index.get() + 1 < self.items.len()
             || (self.repeat.get() == Repeat::All && self.items.len() > 1)
@@ -383,6 +415,11 @@ impl Playback {
         if !self.stopped.replace(true) {
             self.report_progress();
             self.play.stop();
+            // Down to NULL, not just stopped: the sink lets go of its GL
+            // context, and the pipeline of its threads, now rather than
+            // whenever the last reference goes (see `shutdown`).
+            let _ = self.play.pipeline().set_state(gst::State::Null);
+            let _ = self.video.gtk.set_state(gst::State::Null);
         }
     }
 
@@ -472,6 +509,7 @@ impl Playback {
                 }
             );
             let handle = start.handle.clone();
+            let size = start.size;
             let reader = MediaReader::with_length(
                 playback.session.clone(),
                 item.id().clone(),
@@ -480,6 +518,12 @@ impl Playback {
                 spawn(),
                 length,
             );
+            // Resuming: start reading ahead from about where the resume
+            // point is in the file while the demuxer reads the header, so
+            // the seek finds its data on the way or here.
+            if let (Some(at), Some(length)) = (playback.resume.get(), length) {
+                reader.expect(reader::guess_offset(size, length, at));
+            }
             let published = Published::new(reader);
             playback.play.set_uri(Some(&published.uri()));
             playback.published.replace(Some(published));
@@ -488,8 +532,26 @@ impl Playback {
             } else {
                 playback.play.set_subtitle_uri(None);
             }
-            playback.play.play();
+            // Resuming: preroll paused, seek there once the length is
+            // known, then play. Playing at once read and decoded the start
+            // of the file first, only to jump away from it.
+            if playback.resume.get().is_some() {
+                playback.play.pause();
+            } else {
+                playback.play.play();
+            }
         });
+    }
+
+    /// Seeks to where the user stopped and plays, once the length is
+    /// known (a seek before that does not land).
+    fn resume_if_ready(&self) {
+        if !self.length.get().is_zero()
+            && let Some(at) = self.resume.take()
+        {
+            self.seek(at);
+            self.play.play();
+        }
     }
 
     /// Fetches the playback's external subtitle and hands it to GstPlay as a
@@ -558,13 +620,7 @@ impl Playback {
     fn duration_changed(&self, duration: Option<gst::ClockTime>) {
         let length = duration.map_or(Duration::ZERO, |d| Duration::from_nanos(d.nseconds()));
         self.length.set(length);
-        // Seek to where the user stopped once the length is known, which is
-        // when a seek can land.
-        if !length.is_zero()
-            && let Some(at) = self.resume.take()
-        {
-            self.seek(at);
-        }
+        self.resume_if_ready();
         self.emit(&Change::Position {
             at: self.position.get(),
             length,
@@ -582,6 +638,14 @@ impl Playback {
     }
 
     fn state_changed(&self, state: gst_play::PlayState) {
+        // Prerolled for a resume: seek and play, or, with no length to
+        // seek in, play from the start rather than stay paused.
+        if state == gst_play::PlayState::Paused && self.resume.get().is_some() {
+            self.resume_if_ready();
+            if self.resume.take().is_some() {
+                self.play.play();
+            }
+        }
         let playing = state == gst_play::PlayState::Playing;
         let paused = self.playing.replace(playing) && !playing;
         if paused && !self.stopped.get() {
@@ -718,6 +782,12 @@ fn connect(adapter: &gst_play::PlaySignalAdapter, playback: &Rc<Playback>) {
         }
     });
     let g = guard();
+    adapter.connect_mute_changed(move |_, muted| {
+        if let Some(p) = with(&g) {
+            p.emit(&Change::Muted(muted))
+        }
+    });
+    let g = guard();
     adapter.connect_error(move |_, e, _| {
         if let Some(p) = with(&g) {
             p.failed(&e.to_string())
@@ -843,13 +913,112 @@ mod tests {
         done()
     }
 
-    /// A movie of the fake catalog played from `clip`: it starts, plays,
-    /// moves on, tells a view that attaches late where it is, and stops.
+    /// Playback on the fake server, end to end. One test: GTK binds itself
+    /// to the first thread that starts it, and each test has its own.
     #[test]
     #[ignore = "needs a display for gtk4paintablesink"]
-    fn a_playback_plays_and_tells_a_late_view_where_it_is() {
+    fn playback_on_the_fake_server() {
         gtk::init().unwrap();
         init().unwrap();
+        a_playback_plays_and_tells_a_late_view_where_it_is();
+        a_server_that_goes_away_fails_the_playback();
+        pausing_saves_where_playback_got_to();
+        resuming_plays_from_where_it_stopped();
+    }
+
+    /// A resume prerolls paused, seeks, and plays from there by itself.
+    fn resuming_plays_from_where_it_stopped() {
+        let path =
+            std::env::temp_dir().join(format!("spoolframe-resume-{}.mkv", std::process::id()));
+        clip(&path);
+        let client = FakeClient::new(Some(path));
+        let profile = Profile {
+            server: ServerKey("k5d2r8w1tqz7m3c0vnh4q7fa".into()),
+            username: "andrey".into(),
+            display_name: "Andrey".into(),
+        };
+        let session = client.session(&profile).unwrap();
+        let item = first_movie(&session);
+        let playback = Playback::start(Playlist {
+            session,
+            items: vec![item],
+            index: 0,
+            from: Some(Duration::from_secs(2)),
+            selection: None,
+            tracks: None,
+            album: None,
+        })
+        .unwrap();
+        let played = Rc::new(Cell::new(Duration::ZERO));
+        {
+            let played = played.clone();
+            playback.subscribe(move |change| {
+                if let Change::Position { at, .. } = change {
+                    played.set(*at);
+                }
+                true
+            });
+        }
+        assert!(
+            run_until(Duration::from_secs(20), || playback.is_playing()
+                && played.get() > Duration::from_millis(2_200)),
+            "playing {} at {:?}",
+            playback.is_playing(),
+            played.get()
+        );
+        playback.stop();
+    }
+
+    /// Pausing reports the position at once, not at the next 10 s tick.
+    fn pausing_saves_where_playback_got_to() {
+        let path =
+            std::env::temp_dir().join(format!("spoolframe-pause-{}.mkv", std::process::id()));
+        clip(&path);
+        let client = FakeClient::new(Some(path));
+        let profile = Profile {
+            server: ServerKey("k5d2r8w1tqz7m3c0vnh4q7fa".into()),
+            username: "andrey".into(),
+            display_name: "Andrey".into(),
+        };
+        let session = client.session(&profile).unwrap();
+        let item = first_movie(&session);
+        let playback = Playback::start(Playlist {
+            session,
+            items: vec![item],
+            index: 0,
+            from: None,
+            selection: None,
+            tracks: None,
+            album: None,
+        })
+        .unwrap();
+        let played = Rc::new(Cell::new(Duration::ZERO));
+        {
+            let played = played.clone();
+            playback.subscribe(move |change| {
+                if let Change::Position { at, .. } = change {
+                    played.set(*at);
+                }
+                true
+            });
+        }
+        assert!(run_until(Duration::from_secs(20), || played.get()
+            > Duration::from_secs(1)));
+        playback.toggle();
+        assert!(
+            run_until(Duration::from_secs(3), || !client
+                .progress_reports(&profile)
+                .is_empty()),
+            "pausing reported nothing"
+        );
+        let (_, position) = client.progress_reports(&profile)[0].clone();
+        assert!(position >= Duration::from_secs(1), "reported {position:?}");
+        playback.stop();
+    }
+
+    /// A movie of the fake catalog played from `clip`: it starts, plays,
+    /// moves on, tells a view that attaches late where it is, and stops.
+    fn a_playback_plays_and_tells_a_late_view_where_it_is() {
         let path =
             std::env::temp_dir().join(format!("spoolframe-playback-{}.mkv", std::process::id()));
         clip(&path);
@@ -907,6 +1076,49 @@ mod tests {
 
         playback.stop();
         run_until(Duration::from_secs(2), || !playback.is_playing());
+        assert!(!playback.is_playing());
+    }
+
+    /// The server goes away before the file is read: the playback says it
+    /// failed (the player shows the error) instead of waiting forever, and
+    /// shutting down afterwards releases it.
+    fn a_server_that_goes_away_fails_the_playback() {
+        let path = std::env::temp_dir().join(format!("spoolframe-gone-{}.mkv", std::process::id()));
+        clip(&path);
+        let client = FakeClient::new(Some(path));
+        let profile = Profile {
+            server: ServerKey("k5d2r8w1tqz7m3c0vnh4q7fa".into()),
+            username: "andrey".into(),
+            display_name: "Andrey".into(),
+        };
+        let session = client.session(&profile).unwrap();
+        let item = first_movie(&session);
+        client.go_away();
+        let playback = Playback::start(Playlist {
+            session,
+            items: vec![item],
+            index: 0,
+            from: None,
+            selection: None,
+            tracks: None,
+            album: None,
+        })
+        .unwrap();
+        let failed = Rc::new(RefCell::new(None::<String>));
+        {
+            let failed = failed.clone();
+            playback.subscribe(move |change| {
+                if let Change::Failed(error) = change {
+                    failed.replace(Some(error.to_string()));
+                }
+                true
+            });
+        }
+        assert!(
+            run_until(Duration::from_secs(20), || failed.borrow().is_some()),
+            "the playback never said it failed"
+        );
+        shutdown();
         assert!(!playback.is_playing());
     }
 
