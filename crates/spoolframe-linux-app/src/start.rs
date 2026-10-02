@@ -63,7 +63,7 @@ fn server_row(server: &Server, choose: &Choose<Server>, nearby: bool) -> adw::Ac
         .subtitle(subtitle)
         .activatable(true)
         .build();
-    row.add_prefix(&gtk::Image::from_icon_name("network-server-symbolic"));
+    row.add_prefix(&gtk::Image::from_icon_name(crate::icons::SERVER));
     if nearby {
         let connect = gtk::Button::builder()
             .label("Connect")
@@ -105,7 +105,7 @@ pub fn profiles(
         .title_widget(&adw::WindowTitle::new(&server.name, "Direct · LAN"))
         .build();
     let back_button = gtk::Button::builder()
-        .icon_name("go-previous-symbolic")
+        .icon_name(crate::icons::BACK)
         .tooltip_text("Choose another server")
         .build();
     let back = back.clone();
@@ -117,7 +117,10 @@ pub fn profiles(
         .halign(gtk::Align::Center)
         .column_spacing(40)
         .row_spacing(32)
-        .max_children_per_line(6)
+        // As many columns as tiles, up to six: a flow box is as wide as its
+        // most columns, and centring a six-column box leaves two tiles on
+        // its left.
+        .max_children_per_line((profiles.len() as u32 + 1).min(6))
         .homogeneous(true)
         .build();
     for profile in profiles {
@@ -129,7 +132,7 @@ pub fn profiles(
     }
     let add = adw::Avatar::builder()
         .size(128)
-        .icon_name("list-add-symbolic")
+        .icon_name(crate::icons::ADD)
         .css_classes(["add-profile"])
         .build();
     let add_tile = profile_tile(&add, "Sign in", "Another account");

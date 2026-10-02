@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- @license lucide-static v1.50.0 - ISC -->
+
+<svg
+   class="lucide lucide-music"
+   width="24"
+   height="24"
+   viewBox="0 0 24 24"
+   version="1.1"
+   id="svg2"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <defs
+     id="defs2" />
+  <path
+     style="baseline-shift:baseline;display:inline;overflow:visible;vector-effect:none;fill:#000000;stroke:none;stroke-linecap:butt;stroke-linejoin:miter;enable-background:accumulate;stop-color:#000000;stop-opacity:1;opacity:1"
+     d="m 20.835937,2.0136719 -11.9999995,2 A 1.0001,1.0001 0 0 0 8,5 v 13 a 1,1 0 0 0 1,1 1,1 0 0 0 1,-1 V 5.8476562 L 20,4.1796875 V 16 a 1,1 0 0 0 1,1 1,1 0 0 0 1,-1 V 3 A 1.0001,1.0001 0 0 0 20.835937,2.0136719 Z"
+     id="path1" />
+  <path
+     style="baseline-shift:baseline;display:inline;overflow:visible;vector-effect:none;fill:#000000;stroke:none;stroke-linecap:butt;stroke-linejoin:miter;enable-background:accumulate;stop-color:#000000;stop-opacity:1;opacity:1"
+     d="m 6,14 c -2.1972944,0 -4,1.802706 -4,4 0,2.197294 1.8027056,4 4,4 2.1972944,0 4,-1.802706 4,-4 0,-2.197294 -1.8027056,-4 -4,-4 z m 0,2 c 1.1164141,0 2,0.883586 2,2 0,1.116414 -0.8835859,2 -2,2 -1.1164141,0 -2,-0.883586 -2,-2 0,-1.116414 0.8835859,-2 2,-2 z"
+     id="circle1" />
+  <path
+     style="baseline-shift:baseline;display:inline;overflow:visible;vector-effect:none;fill:#000000;stroke:none;stroke-linecap:butt;stroke-linejoin:miter;enable-background:accumulate;stop-color:#000000;stop-opacity:1;opacity:1"
+     d="m 18,12 c -2.197294,0 -4,1.802706 -4,4 0,2.197294 1.802706,4 4,4 2.197294,0 4,-1.802706 4,-4 0,-2.197294 -1.802706,-4 -4,-4 z m 0,2 c 1.116414,0 2,0.883586 2,2 0,1.116414 -0.883586,2 -2,2 -1.116414,0 -2,-0.883586 -2,-2 0,-1.116414 0.883586,-2 2,-2 z"
+     id="circle2" />
+</svg>

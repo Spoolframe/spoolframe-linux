@@ -10,9 +10,11 @@
   craneLib,
   src,
   pkg-config,
+  glib,
   wrapGAppsHook4,
   gtk4,
   libadwaita,
+  libGL,
   gst_all_1,
   lib,
 }: let
@@ -41,8 +43,10 @@
       cd "$sourceRoot/spoolframe-linux"
       sourceRoot="."
     '';
-    nativeBuildInputs = [pkg-config wrapGAppsHook4];
-    buildInputs = [gtk4 libadwaita] ++ gstPlugins;
+    # glib: glib-compile-resources, which build.rs runs for the icons.
+    nativeBuildInputs = [pkg-config glib wrapGAppsHook4];
+    # libGL: egl.pc, for the video sink's GL path (see devenv.nix).
+    buildInputs = [gtk4 libadwaita libGL] ++ gstPlugins;
   };
 
   # Build dependencies separately for caching.

@@ -77,6 +77,43 @@ fn title(item: &Item) -> String {
     }
 }
 
+/// A client opened before it has heard anything lists the server once
+/// discovery says the list changed, without being given an address.
+#[test]
+#[ignore = "needs a running Spoolframe server on this LAN; see the module docs"]
+fn the_server_list_changes_when_the_lan_server_is_heard() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let device = sdk::Device {
+        name: "spoolframe-linux discovery test".into(),
+        client_name: "spoolframe-linux".into(),
+        client_version: env!("CARGO_PKG_VERSION").into(),
+        capabilities: capabilities(),
+    };
+    let client = runtime
+        .block_on(sdk::Client::open(
+            Arc::new(sdk::MemoryStorage::default()),
+            device,
+        ))
+        .unwrap();
+    let client = SdkClient::new(client, runtime.handle().clone());
+    let key = ServerKey(env("SPOOLFRAME_TEST_KEY"));
+    let mut changes = client.servers_changed();
+    let heard = runtime.block_on(async {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let servers = client.servers().await.unwrap();
+                if servers.iter().any(|s| s.key == key && s.on_network) {
+                    return servers.len();
+                }
+                changes.changed().await.expect("the client is open");
+            }
+        })
+        .await
+    });
+    let listed = heard.expect("the server is listed within ten seconds");
+    eprintln!("discovery: {listed} servers listed after a change");
+}
+
 #[test]
 #[ignore = "needs a running Spoolframe server; see the module docs"]
 fn the_app_backend_works_against_a_live_server() {

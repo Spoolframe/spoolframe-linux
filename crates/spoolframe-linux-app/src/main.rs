@@ -1,14 +1,20 @@
 mod app;
 mod artwork;
 mod capabilities;
+mod icons;
 mod library;
+mod logo;
+mod minibar;
+mod nowplaying;
 mod pages;
+mod playback;
 mod player;
 mod preferences;
 mod settings;
 mod source;
 mod start;
 mod theme;
+mod tracks;
 mod views;
 
 use std::sync::Arc;
@@ -64,7 +70,8 @@ fn main() -> Result<()> {
 
     // clap has parsed the arguments; GTK gets none, or it would reject ours.
     let app = RelmApp::new(APP_ID).with_args(Vec::new());
-    player::init()?;
+    playback::init()?;
+    icons::register();
 
     // The SDK's runtime: its tasks (discovery, reconnecting) run here for
     // as long as the app does. Kept in scope until the app returns.

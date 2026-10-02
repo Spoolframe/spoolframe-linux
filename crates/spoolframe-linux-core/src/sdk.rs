@@ -136,16 +136,26 @@ pub struct SdkClient {
     handle: Handle,
     sessions: Sessions,
     states: Mutex<HashMap<ServerKey, watch::Sender<ConnectionState>>>,
+    servers_changed: watch::Sender<()>,
 }
 
 impl SdkClient {
     /// `handle` is the runtime `client` was opened in; it must outlive this.
     pub fn new(client: sdk::Client, handle: Handle) -> Self {
+        let servers_changed = watch::Sender::new(());
+        let mut changes = client.watch_servers();
+        let forward = servers_changed.clone();
+        handle.spawn(async move {
+            while changes.changed().await {
+                forward.send_replace(());
+            }
+        });
         Self {
             client,
             handle,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             states: Mutex::new(HashMap::new()),
+            servers_changed,
         }
     }
 
@@ -267,6 +277,10 @@ impl Client for SdkClient {
         }
         states.insert(key.clone(), sender);
         receiver
+    }
+
+    fn servers_changed(&self) -> watch::Receiver<()> {
+        self.servers_changed.subscribe()
     }
 }
 

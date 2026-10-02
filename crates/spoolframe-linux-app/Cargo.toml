@@ -27,3 +27,6 @@ gst = { workspace = true }
 gst-play = { workspace = true }
 gst-base = { workspace = true }
 gst-plugin-gtk4 = { workspace = true }
+
+[build-dependencies]
+glib-build-tools = { workspace = true }

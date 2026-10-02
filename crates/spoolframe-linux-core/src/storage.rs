@@ -82,21 +82,29 @@ impl DataStore {
                 _ => Ok(()),
             };
         };
-        std::fs::create_dir_all(&self.dir).map_err(file_error(&self.dir))?;
-        let partial = self.dir.join(format!(".{key}.partial"));
+        // A key with a `/` lives in a subdirectory; the temporary file goes
+        // next to the value, so the rename never crosses directories.
+        let dir = path.parent().unwrap_or(&self.dir).to_path_buf();
+        std::fs::create_dir_all(&dir).map_err(file_error(&dir))?;
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let partial = dir.join(format!(".{name}.partial"));
         std::fs::write(&partial, value).map_err(file_error(&partial))?;
         std::fs::rename(&partial, &path).map_err(file_error(&path))
     }
 }
 
-/// A key is a file name: lowercase letters, digits, `.`, `-` and `_`, not
-/// starting with a dot.
+/// A key is a relative path of `/`-separated names (the SDK keeps one
+/// server's sessions under `sessions/<server key>`). Each name is
+/// lowercase letters, digits, `.`, `-` and `_`, not empty and not starting
+/// with a dot, so no key is hidden or climbs out with `..`.
 fn check_key(key: &str) -> Result<(), StorageError> {
-    let fine = !key.is_empty()
-        && !key.starts_with('.')
-        && key
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "._-".contains(c));
+    let fine = key.split('/').all(|name| {
+        !name.is_empty()
+            && !name.starts_with('.')
+            && name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "._-".contains(c))
+    });
     if fine {
         Ok(())
     } else {
@@ -223,6 +231,32 @@ mod tests {
     }
 
     #[test]
+    fn a_key_with_a_directory_round_trips() {
+        let store = temp_store("nested");
+        store.set("sessions/9e80325910d054d2", Some(b"x")).unwrap();
+        assert_eq!(
+            store.get("sessions/9e80325910d054d2").unwrap(),
+            Some(b"x".to_vec())
+        );
+    }
+
+    #[test]
+    fn a_key_cannot_climb_out_through_a_directory() {
+        assert!(matches!(
+            check_key("sessions/../servers"),
+            Err(StorageError::BadKey(_))
+        ));
+    }
+
+    #[test]
+    fn a_key_cannot_have_an_empty_name() {
+        assert!(matches!(
+            check_key("sessions//x"),
+            Err(StorageError::BadKey(_))
+        ));
+    }
+
+    #[test]
     fn a_key_cannot_be_hidden() {
         assert!(matches!(
             check_key(".servers"),
@@ -236,7 +270,8 @@ mod tests {
     #[ignore = "needs a running Secret Service"]
     async fn a_secret_round_trips_through_the_keyring() {
         let storage = Storage::open(temp_store("keyring")).await.unwrap();
-        let key = "test-roundtrip";
+        // Shaped like the SDK's session keys, which have a `/`.
+        let key = "sessions/test-roundtrip";
         storage
             .set_secret(key, Some(b"hunter2".to_vec()))
             .await

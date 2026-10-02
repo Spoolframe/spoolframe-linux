@@ -151,15 +151,66 @@ windowcontrols > button:hover > image {
   background-color: black;
 }
 
-.player-controls {
-  margin: 16px;
-  padding: 14px 18px;
-  border-radius: 14px;
+/* The bars over the video, as in the design: a band along the top (back,
+   title, Minimize) and the controls along the bottom. They carry .osd for
+   its light text on dark in every theme; the bands are flat, edge to
+   edge. */
+.player-top {
+  min-height: 64px;
+  padding: 0 20px;
+  background-color: alpha(black, 0.8);
+}
+
+.player-title {
+  font-weight: 600;
+  font-size: 1.15em;
+}
+
+.player-minimize {
+  background-color: alpha(currentColor, 0.15);
+}
+
+.player-bottom {
+  padding: 20px 24px 22px;
+  background-color: alpha(black, 0.86);
+}
+
+.player-play {
+  min-width: 52px;
+  min-height: 52px;
+  background-color: var(--accent-bg-color);
+  color: var(--accent-fg-color);
+}
+
+.player-square {
+  min-width: 44px;
+  min-height: 44px;
+  border-radius: 10px;
+}
+
+.player-square:not(.flat) > button,
+button.player-square:not(.flat) {
+  background-color: alpha(currentColor, 0.15);
+}
+
+.player-square:checked {
+  color: var(--accent-color);
+}
+
+scale.seek trough {
+  min-height: 6px;
+  border-radius: 3px;
+}
+
+scale.seek highlight {
+  background-color: var(--accent-bg-color);
 }
 
 .diagnostics {
   padding: 14px 16px;
   border-radius: 12px;
+  background-color: alpha(black, 0.88);
+  border: 1px solid alpha(currentColor, 0.12);
 }
 
 .buffering {
@@ -167,9 +218,101 @@ windowcontrols > button:hover > image {
   border-radius: 12px;
 }
 
-.play-toggle {
-  min-width: 48px;
-  min-height: 48px;
+/* The bar along the bottom of the window while the player is minimized. */
+.mini-bar {
+  min-height: 88px;
+  padding: 0 20px 0 12px;
+  background-color: var(--sidebar-bg-color);
+  border-top: 1px solid var(--shade-color);
+}
+
+.mini-bar .player-play {
+  min-width: 40px;
+  min-height: 40px;
+}
+
+.mini-video,
+.mini-cover {
+  border-radius: 8px;
+  background-color: black;
+}
+
+.mini-open {
+  padding: 4px;
+  border-radius: 10px;
+}
+
+/* Now Playing: the music player. */
+.now-cover {
+  border-radius: 16px;
+  box-shadow: 0 24px 48px var(--shade-color);
+}
+
+.player-play.large {
+  min-width: 64px;
+  min-height: 64px;
+}
+
+button.mode:checked {
+  background: none;
+  color: var(--accent-color);
+}
+
+.chip {
+  padding: 4px 10px;
+  border-radius: 999px;
+  background-color: alpha(currentColor, 0.1);
+}
+
+.chip.success {
+  color: var(--success-color);
+}
+
+.queue-aside {
+  background-color: var(--sidebar-bg-color);
+  border-left: 1px solid var(--shade-color);
+}
+
+.queue row.playing {
+  color: var(--accent-color);
+  font-weight: 600;
+}
+
+.queue row.played {
+  opacity: 0.55;
+}
+
+.brand {
+  font-weight: 600;
+  font-size: 1.25em;
+}
+
+/* Item pages, as designed: a large title, square-cornered actions, and
+   the poster framed over the backdrop. */
+.page-title {
+  font-size: 2.5em;
+  font-weight: 600;
+}
+
+button.action {
+  min-height: 44px;
+  padding: 0 20px;
+  border-radius: 10px;
+  font-weight: 600;
+}
+
+button.action.outlined {
+  background: none;
+  box-shadow: inset 0 0 0 1px alpha(currentColor, 0.25);
+}
+
+button.action.outlined:hover {
+  background-color: alpha(currentColor, 0.07);
+}
+
+.framed {
+  border: 4px solid var(--window-bg-color);
+  border-radius: 12px;
 }
 
 /* Server picker and profiles */
@@ -190,8 +333,13 @@ windowcontrols > button:hover > image {
   border-radius: 16px;
 }
 
-.add-profile {
-  background-color: alpha(currentColor, 0.08);
+/* A neutral circle, not one of the avatar colours. The background has to
+   be round itself: the avatar node is square. */
+avatar.add-profile {
+  border-radius: 9999px;
+  background-image: none;
+  background-color: alpha(currentColor, 0.1);
+  color: inherit;
 }
 
 /* Library grids */
@@ -206,4 +354,11 @@ windowcontrols > button:hover > image {
 
 .tile-placeholder {
   background-color: var(--card-bg-color);
+}
+
+/* The item page's watched button: filled with the accent once watched. */
+button.watched-toggle.watched {
+  background-color: var(--accent-bg-color);
+  color: var(--accent-fg-color);
+  box-shadow: none;
 }

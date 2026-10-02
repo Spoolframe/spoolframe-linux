@@ -148,6 +148,12 @@ pub trait Client: Send + Sync {
 
     /// The state of the connection to `server`, as it changes.
     fn connection(&self, server: &ServerKey) -> watch::Receiver<ConnectionState>;
+
+    /// Changes when [`Client::servers`] would answer differently: a server
+    /// heard, changed or gone on the LAN, an address added, a pin saved or
+    /// forgotten. Discovery takes a moment after opening, so the first
+    /// answer is often empty; list again on each change.
+    fn servers_changed(&self) -> watch::Receiver<()>;
 }
 
 /// One signed-in user's view of a server: the catalog, their watch state

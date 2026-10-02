@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use foyer::{
     BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder,
-    HybridCachePolicy,
+    HybridCachePolicy, PsyncIoEngineConfig,
 };
 use spoolframe_types::ArtworkId;
 
@@ -79,6 +79,10 @@ impl ArtworkCache {
             .with_weighter(|key: &String, value: &Vec<u8>| key.len() + value.len())
             .storage()
             .with_engine_config(BlockEngineConfig::new(device))
+            // Plain reads and writes on a thread pool, said outright: tens
+            // of KiB a poster need nothing faster, and foyer logs a notice
+            // when left to pick this default.
+            .with_io_engine_config(PsyncIoEngineConfig::new())
             .build()
             .await
             .map_err(|e| error(e.to_string()))?;

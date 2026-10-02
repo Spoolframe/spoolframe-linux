@@ -21,10 +21,12 @@ use spoolframe_types::{
 };
 
 use crate::artwork::Art;
+use crate::minibar::MiniBar;
+use crate::playback::{Playback, Playlist};
 use crate::settings::Settings;
 use crate::theme::ThemeApplier;
 use crate::views::Cards;
-use crate::{library, pages, player, preferences, start, views};
+use crate::{library, nowplaying, pages, player, preferences, start, views};
 use spoolframe_linux_core::artcache::ArtworkCache;
 
 /// What the app starts with.
@@ -36,7 +38,7 @@ pub struct Init {
     pub artwork_cache: Option<Arc<ArtworkCache>>,
 }
 
-/// What to play, before a session is attached: see [`player::Playlist`].
+/// What to play, before a session is attached: see [`Playlist`].
 #[derive(Debug)]
 pub struct PlayRequest {
     pub items: Vec<Item>,
@@ -45,6 +47,8 @@ pub struct PlayRequest {
     /// `None` lets the server choose from the user's preferences.
     pub selection: Option<Selection>,
     pub tracks: Option<MediaTracks>,
+    /// The album the tracks are from, for its cover and name.
+    pub album: Option<Album>,
 }
 
 impl PlayRequest {
@@ -60,6 +64,7 @@ impl PlayRequest {
             from,
             selection,
             tracks,
+            album: None,
         }
     }
 }
@@ -79,6 +84,12 @@ pub struct App {
     cards: Rc<Cards>,
     /// Follows the connection to the server in use; replaced on switching.
     connection_watch: Option<glib::JoinHandle<()>>,
+    /// What plays, shown full or in the bar; dropping it stops it.
+    playback: Option<Rc<Playback>>,
+    /// Whether the server used last has been opened already. It may be
+    /// heard only on a later listing; it is opened once, not on every
+    /// change after.
+    opened_last_server: bool,
     /// What the search page last asked for; older answers are dropped.
     search_query: String,
     /// Bumped on each sidebar choice, so a library that loads late does
@@ -101,6 +112,12 @@ pub struct AppWidgets {
     add_server: Option<start::AddServer>,
     sidebar: gtk::ListBox,
     stack: adw::NavigationView,
+    /// Above the split view: the player is pushed here, over the whole
+    /// window, so the sidebar is not beside the video.
+    window_stack: adw::NavigationView,
+    library_page: adw::NavigationPage,
+    /// What plays while the player is minimized, under the library.
+    mini_bar: Rc<MiniBar>,
     root_page: adw::NavigationPage,
     /// The root page's scrolled area: `content`, or a library's grid,
     /// which must be the scrolled child itself to load row by row.
@@ -133,8 +150,15 @@ pub enum Msg {
     ForgetTracks(Box<Item>),
     SetTrackPreferences(Box<TrackPreferences>),
     ConnectionChanged(ConnectionState),
+    /// The client's server list changed (a server heard on the LAN).
+    ServersChanged,
     OpenPreferences,
     SetTheme(Theme),
+    /// Leave the full player and keep playing in the bar.
+    MinimizePlayer,
+    /// Back to the full player from the bar.
+    ExpandPlayer,
+    StopPlayback,
 }
 
 /// Sidebar rows before the libraries.
@@ -231,8 +255,22 @@ impl Component for App {
         let sidebar = gtk::ListBox::builder()
             .css_classes(["navigation-sidebar"])
             .build();
-        sidebar.append(&sidebar_row("Home", "go-home-symbolic"));
-        sidebar.append(&sidebar_row("Search", "system-search-symbolic"));
+        sidebar.append(&sidebar_row("Home", crate::icons::HOME));
+        sidebar.append(&sidebar_row("Search", crate::icons::SEARCH));
+        // A rule between Home and Search and the libraries, as designed.
+        sidebar.set_header_func(|row, _| {
+            let first_library = row.index() == FIRST_LIBRARY_ROW as i32;
+            row.set_header(
+                first_library
+                    .then(|| {
+                        gtk::Separator::builder()
+                            .margin_top(8)
+                            .margin_bottom(8)
+                            .build()
+                    })
+                    .as_ref(),
+            );
+        });
         {
             let sender = sender.clone();
             sidebar.connect_row_activated(move |_, row| {
@@ -258,7 +296,7 @@ impl Component for App {
         let profile_body = gtk::Box::new(gtk::Orientation::Horizontal, 10);
         profile_body.append(&profile_avatar);
         profile_body.append(&names);
-        profile_body.append(&gtk::Image::from_icon_name("pan-down-symbolic"));
+        profile_body.append(&gtk::Image::from_icon_name(crate::icons::DOWN));
         let profile_button = gtk::Button::builder()
             .child(&profile_body)
             .tooltip_text("Switch profile")
@@ -272,8 +310,18 @@ impl Component for App {
             let sender = sender.clone();
             profile_button.connect_clicked(move |_| sender.input(Msg::SwitchProfile));
         }
+        // The mark and the name head the sidebar.
+        let brand = gtk::Box::builder().spacing(10).build();
+        brand.append(&crate::logo::mark(26));
+        brand.append(
+            &gtk::Label::builder()
+                .label("Spoolframe")
+                .css_classes(["brand"])
+                .build(),
+        );
+        let sidebar_header = adw::HeaderBar::builder().title_widget(&brand).build();
         let sidebar_toolbar = toolbar(
-            &adw::HeaderBar::new(),
+            &sidebar_header,
             &gtk::ScrolledWindow::builder()
                 .child(&sidebar)
                 .vexpand(true)
@@ -296,7 +344,7 @@ impl Component for App {
         let menu = gtk::gio::Menu::new();
         menu.append(Some("Preferences"), Some("win.preferences"));
         let menu_button = gtk::MenuButton::builder()
-            .icon_name("open-menu-symbolic")
+            .icon_name(crate::icons::MENU)
             .tooltip_text("Main menu")
             .menu_model(&menu)
             .primary(true)
@@ -354,7 +402,27 @@ impl Component for App {
             .build();
         screens.add_named(&servers, Some("servers"));
         screens.add_named(&profiles, Some("profiles"));
-        screens.add_named(&split, Some("library"));
+        let mini_bar = MiniBar::new(
+            {
+                let sender = sender.clone();
+                Rc::new(move || sender.input(Msg::ExpandPlayer))
+            },
+            {
+                let sender = sender.clone();
+                Rc::new(move || sender.input(Msg::StopPlayback))
+            },
+        );
+        let library = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        split.set_vexpand(true);
+        library.append(&split);
+        library.append(&mini_bar.revealer);
+        let library_page = adw::NavigationPage::builder()
+            .title("Spoolframe")
+            .child(&library)
+            .build();
+        let window_stack = adw::NavigationView::new();
+        window_stack.add(&library_page);
+        screens.add_named(&window_stack, Some("library"));
         let toasts = adw::ToastOverlay::new();
         toasts.set_child(Some(&screens));
         root.set_content(Some(&toasts));
@@ -373,10 +441,21 @@ impl Component for App {
                 art: None,
             }),
             connection_watch: None,
+            playback: None,
+            opened_last_server: false,
             search_query: String::new(),
             root_generation: Rc::new(std::cell::Cell::new(0)),
         };
         model.load_servers(&sender);
+        // Discovery hears servers a moment after the client opens, so the
+        // first list is often empty; it is listed again on each change.
+        let mut changes = model.client.servers_changed();
+        let changed = sender.clone();
+        glib::spawn_future_local(async move {
+            while changes.changed().await.is_ok() {
+                changed.input(Msg::ServersChanged);
+            }
+        });
         ComponentParts {
             model,
             widgets: AppWidgets {
@@ -393,6 +472,9 @@ impl Component for App {
                 sidebar,
                 stack,
                 root_page,
+                window_stack,
+                library_page,
+                mini_bar,
                 scroller,
                 content,
                 search_entry,
@@ -412,6 +494,13 @@ impl Component for App {
             Msg::ShowServers => {
                 widgets.screens.set_visible_child_name("servers");
                 self.load_servers(&sender);
+            }
+            // Listed again only while the picker shows; elsewhere the
+            // list is fetched fresh when the picker opens.
+            Msg::ServersChanged => {
+                if widgets.screens.visible_child_name().as_deref() == Some("servers") {
+                    self.load_servers(&sender);
+                }
             }
             Msg::ChooseServer(server) => self.load_profiles(server, &sender),
             Msg::OpenAddServer => {
@@ -531,16 +620,44 @@ impl Component for App {
                     from,
                     selection,
                     tracks,
+                    album,
                 } = *request;
-                widgets.stack.push(&player::page(player::Playlist {
+                self.stop_playback(widgets);
+                match Playback::start(Playlist {
                     session,
                     items,
                     index,
                     from,
                     selection,
                     tracks,
-                }));
+                    album,
+                }) {
+                    Ok(playback) => {
+                        widgets.mini_bar.attach(&playback, &self.cards);
+                        widgets
+                            .window_stack
+                            .push(&player_page(&playback, &sender, &self.cards));
+                        self.playback = Some(playback);
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "cannot build the player");
+                        toast_text(widgets, &format!("Cannot play: {e}"));
+                    }
+                }
             }
+            Msg::MinimizePlayer => {
+                widgets.window_stack.pop_to_page(&widgets.library_page);
+            }
+            Msg::ExpandPlayer => {
+                if let Some(playback) = &self.playback
+                    && widgets.window_stack.visible_page().as_ref() == Some(&widgets.library_page)
+                {
+                    widgets
+                        .window_stack
+                        .push(&player_page(playback, &sender, &self.cards));
+                }
+            }
+            Msg::StopPlayback => self.stop_playback(widgets),
             Msg::SetWatched(id, watched) => {
                 let Some(session) = self.session.clone() else {
                     return;
@@ -612,8 +729,10 @@ impl Component for App {
                 // Open on the server used last, if this device still knows it.
                 let last = self.settings.server();
                 if self.server.is_none()
+                    && !self.opened_last_server
                     && let Some(server) = servers.iter().find(|s| Some(&s.key.0) == last.as_ref())
                 {
+                    self.opened_last_server = true;
                     self.load_profiles(server.clone(), &sender);
                 }
                 let choose: start::Choose<Server> = {
@@ -727,7 +846,7 @@ impl Component for App {
                 match result {
                     Ok(items) if items.is_empty() => widgets.search_results.append(
                         &adw::StatusPage::builder()
-                            .icon_name("system-search-symbolic")
+                            .icon_name(crate::icons::SEARCH)
                             .title("Nothing found")
                             .description(format!("Nothing matches “{query}”."))
                             .build(),
@@ -810,7 +929,7 @@ impl Component for App {
             Loaded::Artist(artist, Err(e)) => push_error(widgets, &artist.name, &e),
             Loaded::Album(album, Ok((artist, tracks))) => {
                 let play: pages::PlayTracks = {
-                    let sender = sender.clone();
+                    let (sender, album) = (sender.clone(), album.clone());
                     Rc::new(move |items, index| {
                         sender.input(Msg::Play(Box::new(PlayRequest {
                             items,
@@ -818,6 +937,7 @@ impl Component for App {
                             from: None,
                             selection: None,
                             tracks: None,
+                            album: Some(album.clone()),
                         })))
                     })
                 };
@@ -914,6 +1034,7 @@ impl App {
         self.search_query.clear();
         widgets.search_entry.set_text("");
         clear(&widgets.search_results);
+        self.stop_playback(widgets);
         widgets.stack.pop_to_page(&widgets.root_page);
         clear(&widgets.content);
         widgets.screens.set_visible_child_name("library");
@@ -940,10 +1061,21 @@ impl App {
         }));
     }
 
+    /// Stops what plays, closing the full player and the bar.
+    fn stop_playback(&mut self, widgets: &mut AppWidgets) {
+        if let Some(playback) = self.playback.take() {
+            playback.stop();
+        }
+        widgets.mini_bar.detach();
+        widgets.window_stack.pop_to_page(&widgets.library_page);
+    }
+
     /// The session is gone: back to "Who's watching", where the profile
     /// can be signed in again.
     fn signed_out(&mut self, widgets: &mut AppWidgets, sender: &ComponentSender<Self>) {
         self.session = None;
+        // A player still open would keep playing behind "Who's watching".
+        self.stop_playback(widgets);
         toast(widgets, &BackendError::SignInRequired);
         if let Some(server) = self.server.clone() {
             self.load_profiles(server, sender);
@@ -1092,9 +1224,9 @@ fn sidebar_row(title: &str, icon: &str) -> gtk::Box {
 
 fn library_icon(kind: LibraryKind) -> &'static str {
     match kind {
-        LibraryKind::Movies => "camera-video-symbolic",
-        LibraryKind::Shows => "video-display-symbolic",
-        LibraryKind::Music => "audio-x-generic-symbolic",
+        LibraryKind::Movies => crate::icons::MOVIES,
+        LibraryKind::Shows => crate::icons::SHOWS,
+        LibraryKind::Music => crate::icons::MUSIC,
     }
 }
 
@@ -1146,7 +1278,7 @@ fn toast_text(widgets: &AppWidgets, text: &str) {
 
 fn error_status(error: &BackendError) -> adw::StatusPage {
     adw::StatusPage::builder()
-        .icon_name("dialog-error-symbolic")
+        .icon_name(crate::icons::ERROR)
         .title("Could not load this page")
         .description(error.to_string())
         .vexpand(true)
@@ -1162,5 +1294,28 @@ async fn server_choice(session: &dyn Session, id: &MediaId) -> Option<ChosenTrac
             tracing::warn!(error = %e, "no track choice from the server");
             None
         }
+    }
+}
+
+/// The full player for `playback`: minimizing keeps it playing in the bar,
+/// leaving any other way stops it.
+fn player_page(
+    playback: &Rc<Playback>,
+    sender: &ComponentSender<App>,
+    cards: &Cards,
+) -> adw::NavigationPage {
+    let minimize = {
+        let sender = sender.clone();
+        Rc::new(move || sender.input(Msg::MinimizePlayer)) as Rc<dyn Fn()>
+    };
+    let close = {
+        let sender = sender.clone();
+        Rc::new(move || sender.input(Msg::StopPlayback)) as Rc<dyn Fn()>
+    };
+    let actions = player::Actions { minimize, close };
+    if playback.is_video() {
+        player::page(playback, actions)
+    } else {
+        nowplaying::page(playback, actions, cards)
     }
 }

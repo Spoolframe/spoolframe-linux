@@ -144,6 +144,7 @@ impl Catalog {
         catalog.add(Item::Album(Album {
             id: album.clone(),
             artist_id: artist.clone(),
+            artist_name: Some("The Night Shift".into()),
             title: "Low Tide".into(),
             year: Some(2021),
             artwork: Vec::new(),
@@ -218,18 +219,21 @@ impl Catalog {
         self.add(Item::Season(Season {
             id: season_id.clone(),
             show_id: show.clone(),
+            show_title: Some(title.into()),
             season,
             title: format!("Season {season}"),
             artwork: Vec::new(),
         }));
         self.children.insert(show.clone(), vec![season_id.clone()]);
         let mut ids = Vec::new();
+        let show_title = title;
         for (i, title) in episodes.iter().enumerate() {
             let id = media(MediaKind::Episode, &(base + 2 + i as u32).to_string());
             ids.push(id.clone());
             self.add(Item::Episode(Episode {
                 id,
                 show_id: show.clone(),
+                show_title: Some(show_title.into()),
                 season_id: season_id.clone(),
                 season,
                 episode: i as u32 + 1,
@@ -946,6 +950,8 @@ pub struct FakeClient {
     sessions: Mutex<HashMap<(ServerKey, String), Arc<FakeSession>>>,
     failed_sign_ins: Mutex<(u32, Option<Instant>)>,
     connections: Mutex<HashMap<ServerKey, watch::Sender<ConnectionState>>>,
+    /// The fake has no LAN: its list changes only when an address is added.
+    servers_changed: watch::Sender<()>,
 }
 
 fn home_media() -> ServerKey {
@@ -994,6 +1000,7 @@ impl FakeClient {
             sessions: Mutex::new(HashMap::new()),
             failed_sign_ins: Mutex::new((0, None)),
             connections: Mutex::new(HashMap::new()),
+            servers_changed: watch::Sender::new(()),
         }
     }
 
@@ -1095,6 +1102,7 @@ impl Client for FakeClient {
             };
             if !entry.addresses.iter().any(|a| a == address) {
                 entry.addresses.push(address.into());
+                self.servers_changed.send_replace(());
             }
             Ok(entry.clone())
         })
@@ -1152,6 +1160,10 @@ impl Client for FakeClient {
             .entry(server.clone())
             .or_insert_with(|| watch::Sender::new(state))
             .subscribe()
+    }
+
+    fn servers_changed(&self) -> watch::Receiver<()> {
+        self.servers_changed.subscribe()
     }
 }
 
@@ -1449,6 +1461,25 @@ mod tests {
             (server.addresses, server.pinned, server.on_network),
             (vec!["10.0.0.5:4433".to_owned()], false, false)
         );
+    }
+
+    #[test]
+    fn adding_an_address_changes_the_server_list() {
+        let client = FakeClient::new(None);
+        let changes = client.servers_changed();
+        let key = ServerKey("abcdefghijklmnop".into());
+        ready(client.add_address(&key, "10.0.0.5:4433")).unwrap();
+        assert!(changes.has_changed().unwrap());
+    }
+
+    #[test]
+    fn adding_a_known_address_again_changes_nothing() {
+        let client = FakeClient::new(None);
+        let key = ServerKey("abcdefghijklmnop".into());
+        ready(client.add_address(&key, "10.0.0.5:4433")).unwrap();
+        let changes = client.servers_changed();
+        ready(client.add_address(&key, "10.0.0.5:4433")).unwrap();
+        assert!(!changes.has_changed().unwrap());
     }
 
     #[test]

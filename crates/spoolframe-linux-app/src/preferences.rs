@@ -67,7 +67,7 @@ fn appearance(current: Theme, set_theme: Rc<dyn Fn(Theme)>) -> adw::PreferencesP
     group.add(&row);
     let page = adw::PreferencesPage::builder()
         .title("Appearance")
-        .icon_name("applications-graphics-symbolic")
+        .icon_name(crate::icons::APPEARANCE)
         .build();
     page.add(&group);
     page
@@ -205,7 +205,7 @@ fn playback(
 
     let page = adw::PreferencesPage::builder()
         .title("Playback")
-        .icon_name("media-playback-start-symbolic")
+        .icon_name(crate::icons::PLAY)
         .description("Kept on the server, for all your devices.")
         .build();
     page.add(&audio);

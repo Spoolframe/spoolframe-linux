@@ -27,6 +27,9 @@ in {
       pkgs.pkg-config
       pkgs.gtk4
       pkgs.libadwaita
+      # egl.pc: the video sink's GL path (gst-plugin-gtk4's wayland and
+      # x11egl features) links GStreamer's EGL library.
+      pkgs.libGL
     ]
     ++ gstPlugins;
 

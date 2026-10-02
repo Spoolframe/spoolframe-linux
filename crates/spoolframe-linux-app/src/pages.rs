@@ -1,5 +1,6 @@
 //! The pages a card opens, laid out as in the UI mockups.
 
+use std::cell::Cell;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -13,6 +14,8 @@ use crate::views::{self, Cards, Facts};
 const POSTER_LARGE: (i32, i32) = (220, 330);
 const SQUARE: (i32, i32) = (300, 300);
 const BACKDROP_HEIGHT: i32 = 240;
+/// How far a page's poster reaches up into the backdrop.
+const POSTER_OVER_BACKDROP: i32 = 150;
 
 /// Starts playback of the page's item, from a position or the start, with
 /// the tracks picked on the page, or with the server's choice (`None`).
@@ -80,7 +83,7 @@ pub fn playable(
     if let Some(context) = context {
         info.append(&label(context, &["dim-label", "heading"]));
     }
-    info.append(&label(&title, &["title-1"]));
+    info.append(&label(&title, &["page-title"]));
 
     let meta: Vec<String> = [facts.detail.clone(), facts.length.map(format::length)]
         .into_iter()
@@ -133,7 +136,9 @@ pub fn playable(
     poster.set_halign(gtk::Align::Start);
     poster.set_valign(gtk::Align::Start);
     poster.set_margin_start(48);
-    poster.set_margin_top(BACKDROP_HEIGHT - POSTER_LARGE.1 / 2);
+    // Over the backdrop's lower edge, framed in the page's colour.
+    poster.add_css_class("framed");
+    poster.set_margin_top(BACKDROP_HEIGHT - POSTER_OVER_BACKDROP);
     let overlay = gtk::Overlay::builder().child(&column).build();
     overlay.add_overlay(&poster);
     overlay.upcast()
@@ -159,14 +164,17 @@ impl TrackPickers {
     ) -> Self {
         let start = chosen.map(|c| c.selection);
         let row = gtk::Box::builder().spacing(14).homogeneous(true).build();
-        let audio = (tracks.audio.len() > 1).then(|| {
+        // Shown with a single track too, so it says what will play.
+        let audio = (!tracks.audio.is_empty()).then(|| {
             let names: Vec<String> = tracks.audio.iter().map(format::audio_track).collect();
             let selected = start
                 .and_then(|s| s.audio)
                 .map(|i| i as usize)
                 .or_else(|| tracks.audio.iter().position(|t| t.default))
                 .unwrap_or(0);
-            picker(&row, "Audio", &names, selected)
+            let dropdown = picker(&row, "Audio", &names, selected);
+            dropdown.set_sensitive(names.len() > 1);
+            dropdown
         });
         let subtitles = (!tracks.subtitles.is_empty()).then(|| {
             let names: Vec<String> = std::iter::once("Off".to_owned())
@@ -261,8 +269,21 @@ fn picker(row: &gtk::Box, title: &str, names: &[String], selected: usize) -> gtk
         .model(&gtk::StringList::new(&names))
         .selected(selected as u32)
         .build();
+    // Long lists (dozens of subtitle languages) can be searched.
+    if names.len() > crate::tracks::SEARCH_FROM {
+        dropdown.set_expression(Some(gtk::PropertyExpression::new(
+            gtk::StringObject::static_type(),
+            None::<gtk::Expression>,
+            "string",
+        )));
+        dropdown.set_enable_search(true);
+        dropdown.set_search_match_mode(gtk::StringFilterMatchMode::Substring);
+    }
     let column = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    column.append(&label(title, &["caption-heading", "dim-label"]));
+    column.append(&label(
+        &title.to_uppercase(),
+        &["caption-heading", "dim-label"],
+    ));
     column.append(&dropdown);
     row.append(&column);
     dropdown
@@ -281,7 +302,7 @@ fn playback_buttons(
     };
     buttons.append(&play_button(
         &resume,
-        &["pill", "suggested-action"],
+        &["action", "suggested-action"],
         position,
         actions,
         &pickers,
@@ -289,33 +310,14 @@ fn playback_buttons(
     if position.is_some() {
         buttons.append(&play_button(
             "Play from start",
-            &["pill"],
+            &["action", "outlined"],
             None,
             actions,
             &pickers,
         ));
     }
     let watched = facts.playback.is_some_and(|p| p.watched);
-    let toggle = gtk::ToggleButton::builder()
-        .icon_name("object-select-symbolic")
-        .active(watched)
-        .valign(gtk::Align::Center)
-        .css_classes(["circular"])
-        .build();
-    let tooltip = |watched| {
-        if watched {
-            "Watched"
-        } else {
-            "Mark as watched"
-        }
-    };
-    toggle.set_tooltip_text(Some(tooltip(watched)));
-    let set_watched = actions.set_watched.clone();
-    toggle.connect_toggled(move |toggle| {
-        toggle.set_tooltip_text(Some(tooltip(toggle.is_active())));
-        set_watched(toggle.is_active());
-    });
-    buttons.append(&toggle);
+    buttons.append(&watched_button(watched, &actions.set_watched));
     if let (Some(length), Some(position)) = (facts.length, facts.position()) {
         buttons.append(
             &gtk::ProgressBar::builder()
@@ -329,6 +331,49 @@ fn playback_buttons(
     buttons
 }
 
+/// Watched or not, as an eye and a word. A watched item's button is filled
+/// with the accent colour, so the state reads at a glance; a check mark on
+/// a barely tinted circle did not.
+fn watched_button(watched: bool, set_watched: &Rc<dyn Fn(bool)>) -> gtk::Button {
+    let content = adw::ButtonContent::builder()
+        .icon_name(crate::icons::WATCHED)
+        .build();
+    let button = gtk::Button::builder()
+        .child(&content)
+        .valign(gtk::Align::Center)
+        .css_classes(["action", "outlined", "watched-toggle"])
+        .build();
+    let show = {
+        let (button, content) = (button.downgrade(), content.downgrade());
+        move |watched: bool| {
+            let (Some(button), Some(content)) = (button.upgrade(), content.upgrade()) else {
+                return;
+            };
+            content.set_label(if watched { "Watched" } else { "Mark watched" });
+            button.set_tooltip_text(Some(if watched {
+                "Watched; click to mark unwatched"
+            } else {
+                "Mark as watched"
+            }));
+            if watched {
+                button.add_css_class("watched");
+            } else {
+                button.remove_css_class("watched");
+            }
+        }
+    };
+    show(watched);
+    let state = Rc::new(Cell::new(watched));
+    let set_watched = set_watched.clone();
+    button.connect_clicked(move |_| {
+        let watched = !state.get();
+        state.set(watched);
+        show(watched);
+        set_watched(watched);
+    });
+    button
+}
+
 fn play_button(
     label: &str,
     classes: &[&str],
@@ -336,10 +381,18 @@ fn play_button(
     actions: &PlayableActions,
     pickers: &Option<TrackPickers>,
 ) -> gtk::Button {
-    let button = gtk::Button::builder()
-        .label(label)
-        .css_classes(classes)
-        .build();
+    let button = gtk::Button::builder().css_classes(classes).build();
+    // The main action carries the play mark, as designed.
+    if classes.contains(&"suggested-action") {
+        button.set_child(Some(
+            &adw::ButtonContent::builder()
+                .icon_name(crate::icons::PLAY)
+                .label(label)
+                .build(),
+        ));
+    } else {
+        button.set_label(label);
+    }
     let (play, remember, pickers) = (
         actions.play.clone(),
         actions.remember.clone(),
@@ -420,9 +473,9 @@ fn episode_list(title: &str, episodes: &[Item], cards: &Cards) -> gtk::Box {
             .activatable(true)
             .build();
         if e.playback.watched {
-            row.add_suffix(&gtk::Image::from_icon_name("object-select-symbolic"));
+            row.add_suffix(&gtk::Image::from_icon_name(crate::icons::CHECK));
         }
-        row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+        row.add_suffix(&gtk::Image::from_icon_name(crate::icons::RIGHT));
         let (episode, open) = (episode.clone(), cards.open.clone());
         row.connect_activated(move |_| open(episode.clone()));
         list.append(&row);
@@ -493,7 +546,7 @@ pub fn album(
     let buttons = gtk::Box::builder().spacing(10).homogeneous(true).build();
     let play_all = gtk::Button::builder()
         .label("Play")
-        .css_classes(["pill", "suggested-action"])
+        .css_classes(["action", "suggested-action"])
         .build();
     {
         let (play, tracks) = (play.clone(), tracks.to_vec());
@@ -501,7 +554,7 @@ pub fn album(
     }
     let shuffle = gtk::Button::builder()
         .label("Shuffle")
-        .css_classes(["pill"])
+        .css_classes(["action", "outlined"])
         .build();
     {
         let (play, tracks) = (play.clone(), tracks.to_vec());

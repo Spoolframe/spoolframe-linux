@@ -57,7 +57,12 @@ const TILE_HUES: [&str; 8] = [
 /// row (see [`pass_vertical_scroll_to_page`]); shift+wheel and touchpad
 /// swipes still scroll the row directly.
 pub fn row(title: &str, cards: impl IntoIterator<Item = gtk::Widget>) -> gtk::Box {
-    let cards_box = gtk::Box::new(gtk::Orientation::Horizontal, 16);
+    // Cards keep their own width: a caption's hexpand would otherwise
+    // stretch a lone card across the row.
+    let cards_box = gtk::Box::builder()
+        .spacing(16)
+        .halign(gtk::Align::Start)
+        .build();
     for card in cards {
         cards_box.append(&card);
     }
@@ -68,8 +73,8 @@ pub fn row(title: &str, cards: impl IntoIterator<Item = gtk::Widget>) -> gtk::Bo
         .build();
     pass_vertical_scroll_to_page(&scroller);
 
-    let back = row_button("go-previous-symbolic", "Scroll back", &scroller, -1.0);
-    let forward = row_button("go-next-symbolic", "Scroll forward", &scroller, 1.0);
+    let back = row_button(crate::icons::BACK, "Scroll back", &scroller, -1.0);
+    let forward = row_button(crate::icons::RIGHT, "Scroll forward", &scroller, 1.0);
     let adjustment = scroller.hadjustment();
     let update = {
         let (back, forward) = (back.clone(), forward.clone());
@@ -228,7 +233,20 @@ pub fn continue_card(item: &Item, cards: &Cards) -> gtk::Widget {
                 .build(),
         );
     }
-    card(item, &tile, &caption, LANDSCAPE.0, &cards.open)
+    // An episode under its show's name: which one, and its title.
+    let below = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    below.append(&caption);
+    if let (Some(_), Some(episode)) = (&facts.parent, &facts.episode) {
+        below.append(
+            &gtk::Label::builder()
+                .label(episode)
+                .xalign(0.0)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .css_classes(["dim-label", "caption"])
+                .build(),
+        );
+    }
+    card(item, &tile, &below, LANDSCAPE.0, &cards.open)
 }
 
 /// A 2:3 poster card: the title on the tile, a badge when watched, and the
@@ -244,7 +262,7 @@ pub fn poster_card(item: &Item, cards: &Cards) -> gtk::Widget {
     );
     if facts.playback.is_some_and(|p| p.watched) {
         let badge = gtk::Image::builder()
-            .icon_name("object-select-symbolic")
+            .icon_name(crate::icons::CHECK)
             .halign(gtk::Align::End)
             .valign(gtk::Align::Start)
             .margin_top(8)
@@ -354,6 +372,8 @@ pub struct Facts<'a> {
     pub artwork: &'a [Artwork],
     /// For an episode, its show-relative label for captions.
     episode: Option<String>,
+    /// The show an episode or season belongs to, the artist of an album.
+    pub parent: Option<String>,
 }
 
 impl<'a> Facts<'a> {
@@ -366,6 +386,7 @@ impl<'a> Facts<'a> {
             length: None,
             artwork,
             episode: None,
+            parent: None,
         };
         match item {
             Item::Movie(m) => Facts {
@@ -377,16 +398,30 @@ impl<'a> Facts<'a> {
                 playback: Some(&e.playback),
                 length: e.duration,
                 episode: Some(format!("S{} · E{} · {}", e.season, e.episode, e.title)),
+                parent: e.show_title.clone(),
                 ..plain(
                     &e.title,
-                    Some(format!("S{} · E{}", e.season, e.episode)),
+                    Some(joined(&[
+                        e.show_title.clone(),
+                        Some(format!("S{} · E{}", e.season, e.episode)),
+                    ])),
                     &e.artwork,
                 )
             },
             Item::Show(s) => plain(&s.title, year(s.year), &s.artwork),
-            Item::Season(s) => plain(&s.title, None, &s.artwork),
+            Item::Season(s) => Facts {
+                parent: s.show_title.clone(),
+                ..plain(&s.title, s.show_title.clone(), &s.artwork)
+            },
             Item::Artist(a) => plain(&a.name, None, &a.artwork),
-            Item::Album(a) => plain(&a.title, year(a.year), &a.artwork),
+            Item::Album(a) => Facts {
+                parent: a.artist_name.clone(),
+                ..plain(
+                    &a.title,
+                    Some(joined(&[a.artist_name.clone(), year(a.year)])).filter(|d| !d.is_empty()),
+                    &a.artwork,
+                )
+            },
             Item::Track(t) => plain(&t.title, t.track.map(|n| format!("Track {n}")), &[]),
         }
     }
@@ -398,7 +433,70 @@ impl<'a> Facts<'a> {
             .and_then(|p| p.position)
     }
 
+    /// What a landscape card says first: the show for an episode (its
+    /// episode label goes under it), otherwise the title.
     fn caption(&self) -> String {
+        if let Some(parent) = self.parent.as_ref().filter(|_| self.episode.is_some()) {
+            return parent.clone();
+        }
         self.episode.clone().unwrap_or_else(|| self.title.clone())
+    }
+}
+
+/// The parts that are there, joined with " · ".
+fn joined(parts: &[Option<String>]) -> String {
+    parts
+        .iter()
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+#[cfg(test)]
+mod tests {
+    use spoolframe_types::{Episode, MediaId, MediaKind, Namespace, PlaybackState};
+
+    use super::*;
+
+    fn id(kind: MediaKind, key: &str) -> MediaId {
+        MediaId::new(Namespace::Plex, kind, key).unwrap()
+    }
+
+    fn episode(show_title: Option<&str>) -> Item {
+        Item::Episode(Episode {
+            id: id(MediaKind::Episode, "3"),
+            show_id: id(MediaKind::Show, "1"),
+            show_title: show_title.map(Into::into),
+            season_id: id(MediaKind::Season, "2"),
+            season: 1,
+            episode: 4,
+            title: "Seven".into(),
+            summary: None,
+            duration: None,
+            artwork: Vec::new(),
+            playback: PlaybackState::default(),
+        })
+    }
+
+    #[test]
+    fn an_episode_card_leads_with_its_show() {
+        let item = episode(Some("12 Monkeys"));
+        assert_eq!(Facts::of(&item).caption(), "12 Monkeys");
+    }
+
+    #[test]
+    fn an_episode_without_a_show_name_leads_with_its_label() {
+        let item = episode(None);
+        assert_eq!(Facts::of(&item).caption(), "S1 · E4 · Seven");
+    }
+
+    #[test]
+    fn an_episodes_detail_names_its_show() {
+        let item = episode(Some("12 Monkeys"));
+        assert_eq!(
+            Facts::of(&item).detail.as_deref(),
+            Some("12 Monkeys · S1 · E4")
+        );
     }
 }
