@@ -16,6 +16,8 @@ ICONS=(
   house search film tv music
   eye check plus menu
   chevron-right server circle-alert palette
+  shield-check circle-x
+  list-start list-plus ellipsis grip-vertical
 )
 
 here="$(cd "$(dirname "$0")" && pwd)"

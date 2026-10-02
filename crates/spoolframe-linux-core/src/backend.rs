@@ -49,6 +49,14 @@ pub enum BackendError {
     /// Something the server depends on is down (Plex, a media mount).
     #[error("unavailable: {0}")]
     Unavailable(String),
+    /// The server is not saved on this device yet: its fingerprint has to
+    /// be checked and the server pinned first (P1-21).
+    #[error("{0} is not saved on this device yet")]
+    NotPinned(String),
+    /// A saved server answered with another key (P1-13): reinstalled, or
+    /// another server. Both are keys, hex; the user may trust the new one.
+    #[error("the server answered with another key")]
+    IdentityChanged { saved: String, now: String },
     #[error("{0}")]
     Other(String),
 }
@@ -80,6 +88,12 @@ pub struct Server {
     pub addresses: Vec<String>,
     /// Whether this device has pinned the server's key (§19).
     pub pinned: bool,
+    /// The key's fingerprint, to compare with the server's own
+    /// (`spoolframe-server fingerprint`, P1-21).
+    pub fingerprint: String,
+    /// Pinned after the user said the fingerprint matched; a pinned server
+    /// that is not shows "Not verified".
+    pub verified: bool,
     /// Whether it answered on this network just now (mDNS).
     pub on_network: bool,
 }
@@ -127,6 +141,26 @@ pub trait Client: Send + Sync {
         &'a self,
         server: &'a ServerKey,
         address: &'a str,
+    ) -> BoxFuture<'a, Result<Server, BackendError>>;
+
+    /// Connects to `server` and says who it is, its fingerprint included,
+    /// without saving anything (P1-21): the user checks it first.
+    fn connect<'a>(&'a self, server: &'a ServerKey) -> BoxFuture<'a, Result<Server, BackendError>>;
+
+    /// Saves `server` with its key pinned, verified or not; on a saved
+    /// server, only marks it verified.
+    fn pin<'a>(
+        &'a self,
+        server: &'a ServerKey,
+        verified: bool,
+    ) -> BoxFuture<'a, Result<Server, BackendError>>;
+
+    /// Replaces saved server `saved`'s pin with `now`, which answered in its
+    /// place, after the user checked it (P1-13). Its sessions are gone.
+    fn trust_new_identity<'a>(
+        &'a self,
+        saved: &'a ServerKey,
+        now: &'a ServerKey,
     ) -> BoxFuture<'a, Result<Server, BackendError>>;
 
     /// The users signed in on `server` from this device.
@@ -236,6 +270,18 @@ pub trait Session: Send + Sync {
     fn mark_watched<'a>(&'a self, id: &'a MediaId) -> BoxFuture<'a, Result<(), BackendError>>;
 
     fn mark_unwatched<'a>(&'a self, id: &'a MediaId) -> BoxFuture<'a, Result<(), BackendError>>;
+
+    /// Takes `id` out of Continue watching and Next up for this user, its
+    /// progress kept (P1-22); an episode takes its whole show. It comes
+    /// back with its next progress or mark.
+    fn hide_from_continue<'a>(&'a self, id: &'a MediaId)
+    -> BoxFuture<'a, Result<(), BackendError>>;
+
+    /// Undoes [`Session::hide_from_continue`].
+    fn unhide_from_continue<'a>(
+        &'a self,
+        id: &'a MediaId,
+    ) -> BoxFuture<'a, Result<(), BackendError>>;
 
     /// The user's audio and subtitle preferences.
     fn track_preferences(&self) -> BoxFuture<'_, Result<TrackPreferences, BackendError>>;

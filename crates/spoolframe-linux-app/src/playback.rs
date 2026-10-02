@@ -23,6 +23,8 @@ use spoolframe_linux_core::reader::{self, MediaReader, Spawn};
 use spoolframe_protocol::{PlannedSubtitle, SubtitleDelivery};
 use spoolframe_types::{Album, Item, MediaTracks, SubtitleFormat};
 
+pub use crate::queue::Repeat;
+use crate::queue::{Queue, Queued};
 use crate::source::Published;
 use crate::tracks;
 
@@ -36,11 +38,13 @@ pub fn init() -> anyhow::Result<()> {
 }
 
 /// What to play: items of one session, from one of them. A movie or an
-/// episode is a list of one; an album is its tracks.
+/// episode is a list of one; an album is its tracks. That is the context;
+/// `queued` is the play queue (P1-23), carried from the playback before.
 pub struct Playlist {
     pub session: Arc<dyn Session>,
     pub items: Vec<Item>,
     pub index: usize,
+    pub queued: Vec<Queued>,
     /// Where to start the first item; later items start at the beginning.
     pub from: Option<Duration>,
     /// The tracks picked for the first item; `None` lets the server choose
@@ -51,6 +55,14 @@ pub struct Playlist {
     pub tracks: Option<MediaTracks>,
     /// The album the tracks are from, for its cover and name.
     pub album: Option<Album>,
+}
+
+/// How the first item starts: see [`Playlist`].
+struct Start {
+    from: Option<Duration>,
+    selection: Option<Selection>,
+    tracks: Option<MediaTracks>,
+    autoplay: bool,
 }
 
 /// What a view hears from the playback.
@@ -76,18 +88,22 @@ pub enum Change<'a> {
         shuffle: bool,
         repeat: Repeat,
     },
-    /// The play order changed (shuffle turned on or off).
+    /// What plays next changed: the queue, or the context's order.
     Queue,
+    /// A queued item could not play and was passed over; what to tell
+    /// the user.
+    Skipped(&'a str),
 }
 
-/// What happens at the end of the queue, or of the item.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Repeat {
-    Off,
-    /// The queue again from the top.
-    All,
-    /// The same item again.
-    One,
+/// What plays after the current item, for "Up next".
+pub struct UpNext {
+    /// The hand-added items, in the order they play.
+    pub queued: Vec<Queued>,
+    /// The rest of the context, each with its position for
+    /// [`Playback::play_context_at`].
+    pub context: Vec<(usize, Item)>,
+    /// The context's album, for "Next from: <album>".
+    pub from: Option<Album>,
 }
 
 type Listener = Box<dyn Fn(&Change) -> bool>;
@@ -120,14 +136,8 @@ pub struct Playback {
     video: VideoSink,
     paintable: gtk::gdk::Paintable,
     session: Arc<dyn Session>,
-    items: Vec<Item>,
-    album: Option<Album>,
-    /// The play order, as positions in `items`: in order, or shuffled.
-    order: RefCell<Vec<usize>>,
-    /// Where playback is in `order`.
-    index: Cell<usize>,
-    shuffle: Cell<bool>,
-    repeat: Cell<Repeat>,
+    /// What plays, and what plays next.
+    queue: RefCell<Queue>,
     /// Where to seek once the current item's length is known.
     resume: Cell<Option<Duration>>,
     /// The tracks to ask the server for; `None` lets it choose.
@@ -147,12 +157,52 @@ pub struct Playback {
     media_info: RefCell<Option<gst_play::PlayMediaInfo>>,
     failure: RefCell<Option<String>>,
     stopped: Cell<bool>,
+    /// Whether the current item plays once ready. False for a queue
+    /// restored at start-up, which waits, paused, for Play.
+    autoplay: Cell<bool>,
     listeners: RefCell<Vec<Listener>>,
 }
 
 impl Playback {
     /// Starts the playlist.
     pub fn start(playlist: Playlist) -> anyhow::Result<Rc<Self>> {
+        let queue = Queue::new(
+            playlist.items,
+            playlist.index,
+            playlist.album,
+            playlist.queued,
+        );
+        let start = Start {
+            from: playlist.from,
+            selection: playlist.selection,
+            tracks: playlist.tracks,
+            autoplay: true,
+        };
+        Self::build(playlist.session, queue, start)
+    }
+
+    /// Brings back a queue saved at the last run (P1-23): the current item
+    /// prerolled at `at`, paused, waiting for Play.
+    pub fn restore(
+        session: Arc<dyn Session>,
+        queue: Queue,
+        at: Duration,
+    ) -> anyhow::Result<Rc<Self>> {
+        let start = Start {
+            from: (!at.is_zero()).then_some(at),
+            selection: None,
+            tracks: None,
+            autoplay: false,
+        };
+        Self::build(session, queue, start)
+    }
+
+    /// The queue as it stands, to save.
+    pub fn snapshot(&self) -> Queue {
+        self.queue.borrow().clone()
+    }
+
+    fn build(session: Arc<dyn Session>, queue: Queue, start: Start) -> anyhow::Result<Rc<Self>> {
         let video = VideoSink::new()?;
         let paintable = video.gtk.property::<gtk::gdk::Paintable>("paintable");
         let renderer = gst_play::PlayVideoOverlayVideoRenderer::with_sink(&video.outer);
@@ -161,23 +211,17 @@ impl Playback {
         config.set_position_update_interval(250);
         play.set_config(config)?;
         let adapter = gst_play::PlaySignalAdapter::new(&play);
-        let count = playlist.items.len();
         let playback = Rc::new(Self {
             play,
             _adapter: adapter.clone(),
             video,
             paintable,
-            session: playlist.session,
-            items: playlist.items,
-            album: playlist.album,
-            order: RefCell::new((0..count).collect()),
-            index: Cell::new(playlist.index),
-            shuffle: Cell::new(false),
-            repeat: Cell::new(Repeat::Off),
-            resume: Cell::new(playlist.from),
-            requested: Cell::new(playlist.selection),
+            session,
+            queue: RefCell::new(queue),
+            resume: Cell::new(start.from),
+            requested: Cell::new(start.selection),
             pending: Cell::new(None),
-            track_list: RefCell::new(playlist.tracks),
+            track_list: RefCell::new(start.tracks),
             published: RefCell::new(None),
             subtitle_file: RefCell::new(None),
             subtitles_on: Rc::new(Cell::new(false)),
@@ -187,6 +231,7 @@ impl Playback {
             media_info: RefCell::new(None),
             failure: RefCell::new(None),
             stopped: Cell::new(false),
+            autoplay: Cell::new(start.autoplay),
             listeners: RefCell::new(Vec::new()),
         });
         connect(&adapter, &playback);
@@ -215,7 +260,7 @@ impl Playback {
     pub fn subscribe(&self, listener: impl Fn(&Change) -> bool + 'static) {
         let replay = || -> bool {
             if let Some(item) = self.current()
-                && !listener(&Change::Item(item))
+                && !listener(&Change::Item(&item))
             {
                 return false;
             }
@@ -231,8 +276,8 @@ impl Playback {
                 && listener(&Change::Volume(self.play.volume()))
                 && listener(&Change::Muted(self.play.is_muted()))
                 && listener(&Change::Modes {
-                    shuffle: self.shuffle.get(),
-                    repeat: self.repeat.get(),
+                    shuffle: self.is_shuffled(),
+                    repeat: self.repeat(),
                 })
                 && listener(&Change::Position {
                     at: self.position.get(),
@@ -254,66 +299,108 @@ impl Playback {
         *current = listeners;
     }
 
-    pub fn current(&self) -> Option<&Item> {
-        let position = *self.order.borrow().get(self.index.get())?;
-        self.items.get(position)
+    pub fn current(&self) -> Option<Item> {
+        self.queue.borrow().current().cloned()
     }
 
-    /// The items in play order, and where playback is among them.
-    pub fn queue(&self) -> (Vec<Item>, usize) {
-        let order = self.order.borrow();
-        let items = order.iter().map(|&i| self.items[i].clone()).collect();
-        (items, self.index.get())
+    /// The album of what plays, for its cover and name: the context's, or
+    /// a queued track's own.
+    pub fn album(&self) -> Option<Album> {
+        self.queue.borrow().current_album().cloned()
     }
 
-    /// Plays the item at `position` in the queue.
-    pub fn play_at(self: &Rc<Self>, position: usize) {
-        if position < self.items.len() && position != self.index.get() {
-            self.report_progress();
-            self.go_to(position);
+    /// What plays after the current item: the queue, then the context.
+    pub fn up_next(&self) -> UpNext {
+        let queue = self.queue.borrow();
+        UpNext {
+            queued: queue.queued().cloned().collect(),
+            context: queue
+                .context_ahead()
+                .into_iter()
+                .map(|(pos, item)| (pos, item.clone()))
+                .collect(),
+            from: queue.album().cloned(),
         }
     }
 
-    /// Shuffles what is still to come, or puts the queue back in order,
-    /// keeping the current item playing.
+    /// The queue, to carry into the playback that replaces this one.
+    pub fn carry(&self) -> Vec<Queued> {
+        self.queue.borrow().carry()
+    }
+
+    /// Plays the queued item `id`; it leaves the queue.
+    pub fn play_queued(self: &Rc<Self>, id: u64) {
+        self.report_progress();
+        self.step(|q| q.play_queued(id));
+    }
+
+    /// Jumps the context to `pos` (from [`UpNext::context`]), keeping the
+    /// queue.
+    pub fn play_context_at(self: &Rc<Self>, pos: usize) {
+        self.report_progress();
+        self.step(|q| q.play_context_at(pos));
+    }
+
+    /// "Play next": `items` (of `album`) after the current item.
+    pub fn play_next(&self, items: Vec<Item>, album: Option<Album>) {
+        self.queue.borrow_mut().play_next(items, album);
+        self.emit(&Change::Queue);
+    }
+
+    /// "Add to queue": `items` (of `album`) after what is queued already.
+    pub fn add_to_queue(&self, items: Vec<Item>, album: Option<Album>) {
+        self.queue.borrow_mut().add(items, album);
+        self.emit(&Change::Queue);
+    }
+
+    pub fn remove_queued(&self, id: u64) {
+        if self.queue.borrow_mut().remove(id) {
+            self.emit(&Change::Queue);
+        }
+    }
+
+    pub fn move_queued(&self, id: u64, index: usize) {
+        self.queue.borrow_mut().move_to(id, index);
+        self.emit(&Change::Queue);
+    }
+
+    pub fn clear_queue(&self) {
+        self.queue.borrow_mut().clear();
+        self.emit(&Change::Queue);
+    }
+
+    /// Shuffles what is still to come in the context, or puts it back in
+    /// order, keeping the current item playing. The queue is never
+    /// shuffled.
     pub fn toggle_shuffle(&self) {
-        let on = !self.shuffle.get();
-        self.shuffle.set(on);
-        let current = self.order.borrow().get(self.index.get()).copied();
-        let order = if on {
-            shuffled_after(&self.order.borrow(), self.index.get(), |n| {
-                glib::random_int_range(0, n as i32) as usize
-            })
-        } else {
-            (0..self.items.len()).collect()
-        };
-        if !on && let Some(current) = current {
-            self.index.set(current);
-        }
-        self.order.replace(order);
+        let on = !self.is_shuffled();
+        self.queue
+            .borrow_mut()
+            .set_shuffle(on, |n| glib::random_int_range(0, n as i32) as usize);
         self.emit_modes();
         self.emit(&Change::Queue);
     }
 
-    /// Off, then the whole queue, then the one item, then off again.
+    pub fn is_shuffled(&self) -> bool {
+        self.queue.borrow().shuffle()
+    }
+
+    pub fn repeat(&self) -> Repeat {
+        self.queue.borrow().repeat()
+    }
+
+    /// Off, then the whole context, then the one item, then off again.
     pub fn cycle_repeat(&self) {
-        self.repeat.set(match self.repeat.get() {
-            Repeat::Off => Repeat::All,
-            Repeat::All => Repeat::One,
-            Repeat::One => Repeat::Off,
-        });
+        self.queue.borrow_mut().cycle_repeat();
         self.emit_modes();
+        self.emit(&Change::Queue);
     }
 
     fn emit_modes(&self) {
         self.emit(&Change::Modes {
-            shuffle: self.shuffle.get(),
-            repeat: self.repeat.get(),
+            shuffle: self.is_shuffled(),
+            repeat: self.repeat(),
         });
-    }
-
-    pub fn album(&self) -> Option<&Album> {
-        self.album.as_ref()
     }
 
     /// Whether this is video rather than music: by the item, before the
@@ -339,7 +426,13 @@ impl Playback {
         self.playing.get()
     }
 
+    /// Where playback is in the current item, as last reported.
+    pub fn position(&self) -> Duration {
+        self.position.get()
+    }
+
     pub fn toggle(&self) {
+        self.autoplay.set(true);
         if self.playing.get() {
             self.play.pause();
         } else {
@@ -371,42 +464,43 @@ impl Playback {
         self.play.set_mute(muted);
     }
 
+    /// Whether Next plays something. Video goes on through its context
+    /// (a show's episodes) only; the queue is music's.
     pub fn has_next(&self) -> bool {
-        self.index.get() + 1 < self.items.len()
-            || (self.repeat.get() == Repeat::All && self.items.len() > 1)
-    }
-
-    /// Where the next item is in the queue, wrapping round on repeat.
-    fn next_position(&self) -> Option<usize> {
-        let next = self.index.get() + 1;
-        if next < self.items.len() {
-            Some(next)
-        } else if self.repeat.get() == Repeat::All && self.items.len() > 1 {
-            Some(0)
+        let queue = self.queue.borrow();
+        if self.is_video() {
+            queue.context_has_next()
         } else {
-            None
+            queue.has_next()
         }
     }
 
     pub fn has_previous(&self) -> bool {
-        self.index.get() > 0
+        self.queue.borrow().has_previous()
     }
 
-    /// The next item in the playlist, if there is one.
+    /// The first queued item, else the context's next, if there is one.
     pub fn next(self: &Rc<Self>) {
-        if let Some(next) = self.next_position() {
-            self.report_progress();
-            self.go_to(next);
+        self.report_progress();
+        self.advance();
+    }
+
+    /// Moves on from the current item; false at the end.
+    fn advance(self: &Rc<Self>) -> bool {
+        if self.is_video() {
+            self.step(Queue::next_in_context)
+        } else {
+            self.step(Queue::next)
         }
     }
 
-    /// The previous item, or the start of this one when it has played a
+    /// What played before, or the start of this one when it has played a
     /// few seconds, as music players do.
     pub fn previous(self: &Rc<Self>) {
         if self.position.get() > Duration::from_secs(3) || !self.has_previous() {
             self.seek(Duration::ZERO);
         } else {
-            self.go_to(self.index.get() - 1);
+            self.step(Queue::previous);
         }
     }
 
@@ -439,20 +533,27 @@ impl Playback {
             .map(|p| p.reader().status())
     }
 
-    fn go_to(self: &Rc<Self>, index: usize) {
-        self.index.set(index);
+    /// Moves the queue with `step` and starts what it then points at; false,
+    /// with nothing changed, when `step` does not move.
+    fn step(self: &Rc<Self>, step: impl FnOnce(&mut Queue) -> bool) -> bool {
+        if !step(&mut self.queue.borrow_mut()) {
+            return false;
+        }
+        self.autoplay.set(true);
         self.resume.set(None);
         self.requested.set(None);
         self.pending.set(None);
         self.track_list.replace(None);
         self.play.stop();
         self.start_current();
+        self.emit(&Change::Queue);
+        true
     }
 
     /// Starts the current item: the server plans it and opens a playback,
     /// then GstPlay reads it through the spoolframe:// source.
     fn start_current(self: &Rc<Self>) {
-        let Some(item) = self.current().cloned() else {
+        let Some(item) = self.current() else {
             return;
         };
         self.subtitles_on.set(false);
@@ -461,6 +562,12 @@ impl Playback {
         self.position.set(Duration::ZERO);
         self.length.set(Duration::ZERO);
         self.emit(&Change::Item(&item));
+        // The new item starts at nothing: views showed the last one's
+        // position and length until GStreamer reported the new ones.
+        self.emit(&Change::Position {
+            at: Duration::ZERO,
+            length: Duration::ZERO,
+        });
         self.emit(&Change::Starting);
         let length = crate::views::Facts::of(&item).length;
         let requested = self.requested.get();
@@ -487,8 +594,11 @@ impl Playback {
             }
             let (start, tracks) = match result {
                 Ok((Ok(start), tracks)) => (start, tracks),
-                Ok((Err(e), _)) => return playback.failed(&e.to_string()),
-                Err(e) => return playback.failed(&format!("starting playback failed: {e}")),
+                Ok((Err(e), _)) => return playback.could_not_start(&item, &e.to_string()),
+                Err(e) => {
+                    return playback
+                        .could_not_start(&item, &format!("starting playback failed: {e}"));
+                }
             };
             if tracks.is_some() {
                 playback.track_list.replace(tracks);
@@ -535,7 +645,8 @@ impl Playback {
             // Resuming: preroll paused, seek there once the length is
             // known, then play. Playing at once read and decoded the start
             // of the file first, only to jump away from it.
-            if playback.resume.get().is_some() {
+            // A restored queue prerolls and waits.
+            if playback.resume.get().is_some() || !playback.autoplay.get() {
                 playback.play.pause();
             } else {
                 playback.play.play();
@@ -550,7 +661,17 @@ impl Playback {
             && let Some(at) = self.resume.take()
         {
             self.seek(at);
-            self.play.play();
+            if self.autoplay.get() {
+                self.play.play();
+            } else {
+                // Paused, GstPlay reports no position; views would show
+                // the start until Play.
+                self.position.set(at);
+                self.emit(&Change::Position {
+                    at,
+                    length: self.length.get(),
+                });
+            }
         }
     }
 
@@ -642,7 +763,7 @@ impl Playback {
         // seek in, play from the start rather than stay paused.
         if state == gst_play::PlayState::Paused && self.resume.get().is_some() {
             self.resume_if_ready();
-            if self.resume.take().is_some() {
+            if self.resume.take().is_some() && self.autoplay.get() {
                 self.play.play();
             }
         }
@@ -708,11 +829,26 @@ impl Playback {
                 });
             }
         }
-        if self.repeat.get() == Repeat::One {
+        if self.repeat() == Repeat::One {
             self.seek(Duration::ZERO);
             self.play.play();
-        } else if let Some(next) = self.next_position() {
-            self.go_to(next);
+        } else {
+            self.advance();
+        }
+    }
+
+    /// The server would not start `item`. A queued item is passed over,
+    /// with a word, for what comes after it (P1-23); anything else fails
+    /// the playback.
+    fn could_not_start(self: &Rc<Self>, item: &Item, error: &str) {
+        if !self.queue.borrow().current_is_queued() {
+            return self.failed(error);
+        }
+        tracing::warn!(error, "skipping a queued item");
+        let title = crate::views::Facts::of(item).title;
+        self.emit(&Change::Skipped(&format!("Skipped {title}: {error}")));
+        if !self.advance() {
+            self.failed(error);
         }
     }
 
@@ -795,23 +931,6 @@ fn connect(adapter: &gst_play::PlaySignalAdapter, playback: &Rc<Playback>) {
     });
 }
 
-/// `order` with everything after `keep` shuffled (Fisher–Yates);
-/// `random(n)` is a number below `n`. What has played and what plays stay
-/// where they are.
-fn shuffled_after(
-    order: &[usize],
-    keep: usize,
-    mut random: impl FnMut(usize) -> usize,
-) -> Vec<usize> {
-    let mut order = order.to_vec();
-    let start = (keep + 1).min(order.len());
-    let rest = &mut order[start..];
-    for i in (1..rest.len()).rev() {
-        rest.swap(i, random(i + 1));
-    }
-    order
-}
-
 /// Fetches run on Relm4's tokio runtime, where the SDK's networking lives.
 fn spawn() -> Spawn {
     Arc::new(|future| {
@@ -878,27 +997,6 @@ mod tests {
         pipeline.set_state(gst::State::Null).unwrap();
     }
 
-    #[test]
-    fn shuffling_keeps_what_has_played_and_what_plays() {
-        let order: Vec<usize> = (0..6).collect();
-        let shuffled = shuffled_after(&order, 2, |n| n - 1 - (n - 1) / 2);
-        assert_eq!(shuffled[..3], [0, 1, 2]);
-    }
-
-    #[test]
-    fn shuffling_keeps_every_item_once() {
-        let order: Vec<usize> = (0..6).collect();
-        let mut shuffled = shuffled_after(&order, 0, |n| n / 2);
-        shuffled.sort();
-        assert_eq!(shuffled, order);
-    }
-
-    #[test]
-    fn shuffling_at_the_last_item_changes_nothing() {
-        let order: Vec<usize> = (0..3).collect();
-        assert_eq!(shuffled_after(&order, 2, |_| 0), order);
-    }
-
     /// Runs the main loop until `done` or `limit`.
     fn run_until(limit: Duration, done: impl Fn() -> bool) -> bool {
         let context = glib::MainContext::default();
@@ -924,6 +1022,50 @@ mod tests {
         a_server_that_goes_away_fails_the_playback();
         pausing_saves_where_playback_got_to();
         resuming_plays_from_where_it_stopped();
+        a_restored_queue_waits_paused_where_it_was();
+    }
+
+    /// A queue saved at the last run comes back prerolled at its position,
+    /// paused, and plays on Play (P1-23).
+    fn a_restored_queue_waits_paused_where_it_was() {
+        let path =
+            std::env::temp_dir().join(format!("spoolframe-restore-{}.mkv", std::process::id()));
+        clip(&path);
+        let client = FakeClient::new(Some(path));
+        let profile = Profile {
+            server: ServerKey("k5d2r8w1tqz7m3c0vnh4q7fa".into()),
+            username: "andrey".into(),
+            display_name: "Andrey".into(),
+        };
+        let session = client.session(&profile).unwrap();
+        let item = first_movie(&session);
+        let queue = Queue::new(vec![item], 0, None, Vec::new());
+        let playback = Playback::restore(session, queue, Duration::from_secs(2)).unwrap();
+        let played = Rc::new(Cell::new(Duration::ZERO));
+        {
+            let played = played.clone();
+            playback.subscribe(move |change| {
+                if let Change::Position { at, .. } = change {
+                    played.set(*at);
+                }
+                true
+            });
+        }
+        // Prerolled and sought, then left paused for a while.
+        run_until(Duration::from_secs(5), || false);
+        assert!(
+            !playback.is_playing() && played.get() >= Duration::from_secs(2),
+            "playing {} at {:?}",
+            playback.is_playing(),
+            played.get()
+        );
+        playback.toggle();
+        assert!(
+            run_until(Duration::from_secs(10), || playback.is_playing()
+                && played.get() > Duration::from_millis(2_200)),
+            "Play did not play on from the saved position"
+        );
+        playback.stop();
     }
 
     /// A resume prerolls paused, seeks, and plays from there by itself.
@@ -943,6 +1085,7 @@ mod tests {
             session,
             items: vec![item],
             index: 0,
+            queued: Vec::new(),
             from: Some(Duration::from_secs(2)),
             selection: None,
             tracks: None,
@@ -986,6 +1129,7 @@ mod tests {
             session,
             items: vec![item],
             index: 0,
+            queued: Vec::new(),
             from: None,
             selection: None,
             tracks: None,
@@ -1034,6 +1178,7 @@ mod tests {
             session,
             items: vec![item],
             index: 0,
+            queued: Vec::new(),
             from: None,
             selection: None,
             tracks: None,
@@ -1098,6 +1243,7 @@ mod tests {
             session,
             items: vec![item],
             index: 0,
+            queued: Vec::new(),
             from: None,
             selection: None,
             tracks: None,

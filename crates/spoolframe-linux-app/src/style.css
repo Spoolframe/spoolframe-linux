@@ -448,6 +448,10 @@ button.action.outlined:hover {
   border-radius: 8px;
 }
 
+.card-menu-item.destructive {
+  color: var(--destructive-color);
+}
+
 /* A library page while its first page loads: blank posters, pulsing. */
 @keyframes loading-pulse {
   from { opacity: 0.35; }
@@ -456,6 +460,43 @@ button.action.outlined:hover {
 
 .loading .tile-placeholder {
   animation: loading-pulse 900ms ease-in-out infinite alternate;
+}
+
+/* The fingerprint check and the identity alert (P1-21, P1-13). */
+.check-icon {
+  border-radius: 14px;
+  background-color: var(--window-bg-color);
+  color: var(--accent-color);
+}
+
+.fingerprint-box {
+  padding: 14px 22px;
+  border-radius: 12px;
+  background-color: var(--window-bg-color);
+}
+
+.fingerprint {
+  font-size: 1.7em;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--accent-color);
+}
+
+.identity-row {
+  padding: 8px 12px;
+  border-radius: 8px;
+  background-color: var(--window-bg-color);
+}
+
+.identity-new {
+  color: var(--warning-color);
+}
+
+.unverified-badge {
+  padding: 3px 10px;
+  border-radius: 999px;
+  background-color: alpha(currentColor, 0.1);
+  color: var(--warning-color);
 }
 
 /* Library grids */

@@ -1,10 +1,12 @@
 //! The Preferences dialog: Appearance (the app's theme, kept on this
-//! device) and, when signed in, Playback (the user's audio and subtitle
-//! preferences, kept on the server for every device, P1-20).
+//! device), Server (the fingerprint of the server in use, P1-21) and, when
+//! signed in, Playback (the user's audio and subtitle preferences, kept on
+//! the server for every device, P1-20).
 
 use std::rc::Rc;
 
 use adw::prelude::*;
+use spoolframe_linux_core::backend::Server;
 use spoolframe_linux_core::format;
 use spoolframe_linux_core::theme::Theme;
 use spoolframe_types::{AudioRole, SdhPreference, SubtitleMode, TrackPreferences};
@@ -35,15 +37,69 @@ const SDH: [(SdhPreference, &str); 3] = [
 pub fn dialog(
     theme: Theme,
     tracks: Option<TrackPreferences>,
+    server: Option<(Server, Rc<dyn Fn()>)>,
     set_theme: Rc<dyn Fn(Theme)>,
     set_tracks: Rc<dyn Fn(TrackPreferences)>,
 ) -> adw::PreferencesDialog {
     let dialog = adw::PreferencesDialog::new();
     dialog.add(&appearance(theme, set_theme));
+    if let Some((server, verify)) = server {
+        dialog.add(&server_page(&server, verify));
+    }
     if let Some(tracks) = tracks {
         dialog.add(&playback(tracks, set_tracks));
     }
     dialog
+}
+
+/// The server in use: its name, its fingerprint always (P1-21), so it can
+/// be checked again at any time, and whether it was verified.
+fn server_page(server: &Server, verify: Rc<dyn Fn()>) -> adw::PreferencesPage {
+    let group = adw::PreferencesGroup::builder()
+        .title(&server.name)
+        .description("Compare the code with the server's log or `spoolframe-server fingerprint`.")
+        .build();
+    let fingerprint = adw::ActionRow::builder()
+        .title("Fingerprint")
+        .subtitle(&server.fingerprint)
+        .subtitle_selectable(true)
+        .css_classes(["property", "monospace"])
+        .build();
+    group.add(&fingerprint);
+    let status = adw::ActionRow::builder()
+        .title(if server.verified {
+            "Verified"
+        } else {
+            "Not verified"
+        })
+        .subtitle(if server.verified {
+            "You confirmed this code when you added the server"
+        } else {
+            "The code was not checked when the server was added"
+        })
+        .build();
+    if !server.verified {
+        let check = gtk::Button::builder()
+            .label("Verify now")
+            .valign(gtk::Align::Center)
+            .css_classes(["flat"])
+            .build();
+        check.connect_clicked(move |button| {
+            // Close preferences so the check shows over the window.
+            if let Some(dialog) = button.ancestor(adw::Dialog::static_type()) {
+                dialog.downcast::<adw::Dialog>().expect("a dialog").close();
+            }
+            verify();
+        });
+        status.add_suffix(&check);
+    }
+    group.add(&status);
+    let page = adw::PreferencesPage::builder()
+        .title("Server")
+        .icon_name(crate::icons::SERVER)
+        .build();
+    page.add(&group);
+    page
 }
 
 fn appearance(current: Theme, set_theme: Rc<dyn Fn(Theme)>) -> adw::PreferencesPage {

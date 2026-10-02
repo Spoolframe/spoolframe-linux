@@ -50,6 +50,10 @@ pub struct MiniBar {
     /// The audio and subtitle stream counts the menu was built for.
     tracks_built: Cell<Option<(usize, usize)>>,
     current: Current,
+    /// Draws a music cover; set on attach.
+    art: RefCell<Option<Rc<crate::artwork::Art>>>,
+    /// The album whose cover shows, so the next track of it keeps it.
+    cover_album: RefCell<Option<spoolframe_types::MediaId>>,
     /// Bumped on each attach and detach, so an old playback's listener
     /// lets go.
     generation: Rc<Cell<u64>>,
@@ -225,6 +229,8 @@ impl MiniBar {
             tracks,
             tracks_built: Cell::new(None),
             current,
+            art: RefCell::new(None),
+            cover_album: RefCell::new(None),
             generation: Rc::new(Cell::new(0)),
         })
     }
@@ -246,18 +252,12 @@ impl MiniBar {
                 .css_classes(["mini-video"])
                 .build();
             self.thumb.set_child(Some(&picture));
-        } else if let Some(item) = playback.current() {
-            let cover = crate::views::tile(item.id(), "", "mini-cover", (COVER, COVER));
-            if let Some(album) = playback.album() {
-                cards.art(
-                    &cover,
-                    &album.artwork,
-                    &[ArtworkKind::Poster, ArtworkKind::Thumb],
-                    ArtworkSize::Small,
-                );
-            }
-            self.thumb.set_child(Some(&cover));
+        } else {
+            // Music's cover is set on each track (see `show_cover`).
+            self.thumb.set_child(None::<&gtk::Widget>);
         }
+        self.art.replace(cards.art.clone());
+        self.cover_album.replace(None);
         // Video jumps within the film; music skips between tracks, with
         // shuffle and repeat.
         self.video_transport.set_visible(video);
@@ -299,9 +299,38 @@ impl MiniBar {
         self.revealer.set_reveal_child(false);
     }
 
+    /// The album's cover, for music: a queued track may be from another
+    /// album than the one before it (P1-23).
+    fn show_cover(&self, item: &Item, playback: &Playback) {
+        let album = playback.album();
+        let id = album.as_ref().map(|a| a.id.clone());
+        if *self.cover_album.borrow() == id && self.thumb.child().is_some() {
+            return;
+        }
+        let cover = crate::views::tile(
+            id.as_ref().unwrap_or(item.id()),
+            "",
+            "mini-cover",
+            (COVER, COVER),
+        );
+        if let (Some(art), Some(album)) = (self.art.borrow().as_ref(), &album) {
+            art.show(
+                &cover,
+                &album.artwork,
+                &[ArtworkKind::Poster, ArtworkKind::Thumb],
+                ArtworkSize::Small,
+            );
+        }
+        self.thumb.set_child(Some(&cover));
+        self.cover_album.replace(id);
+    }
+
     fn update(&self, playback: &Playback, change: &Change) {
         match change {
             Change::Item(item) => {
+                if !playback.is_video() {
+                    self.show_cover(item, playback);
+                }
                 let facts = crate::views::Facts::of(item);
                 self.title.set_label(&facts.title);
                 let detail = match (item, playback.album()) {
@@ -357,7 +386,8 @@ impl MiniBar {
             | Change::MediaInfo(_)
             | Change::Buffering(_)
             | Change::Failed(_)
-            | Change::Queue => {}
+            | Change::Queue
+            | Change::Skipped(_) => {}
         }
     }
 }

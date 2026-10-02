@@ -54,6 +54,13 @@ pub const RIGHT: &str = "lucide-chevron-right-symbolic";
 pub const SERVER: &str = "lucide-server-symbolic";
 pub const ERROR: &str = "lucide-circle-alert-symbolic";
 pub const APPEARANCE: &str = "lucide-palette-symbolic";
+pub const VERIFIED: &str = "lucide-shield-check-symbolic";
+pub const REMOVE: &str = "lucide-circle-x-symbolic";
+// The play queue (P1-23).
+pub const PLAY_NEXT: &str = "lucide-list-start-symbolic";
+pub const ADD_TO_QUEUE: &str = "lucide-list-plus-symbolic";
+pub const MORE: &str = "lucide-ellipsis-symbolic";
+pub const DRAG: &str = "lucide-grip-vertical-symbolic";
 
 /// Every name above, for the tests.
 #[cfg(test)]
@@ -90,6 +97,12 @@ const ALL: &[&str] = &[
     SERVER,
     ERROR,
     APPEARANCE,
+    VERIFIED,
+    REMOVE,
+    PLAY_NEXT,
+    ADD_TO_QUEUE,
+    MORE,
+    DRAG,
 ];
 
 #[cfg(test)]

@@ -25,6 +25,20 @@ pub struct Cards {
     /// Marks an item watched (`true`) or clears its progress (`false`),
     /// from a Continue watching card's menu; none before a session exists.
     pub set_watched: Option<Rc<dyn Fn(MediaId, bool)>>,
+    /// Takes an item out of Continue watching (P1-22).
+    pub hide: Option<Rc<dyn Fn(Item)>>,
+    /// Puts a track, an album or an artist's albums in the play queue
+    /// (P1-23), from its card's menu.
+    pub enqueue: Option<Rc<dyn Fn(Item, Enqueue)>>,
+}
+
+/// Where in the play queue (P1-23) items go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Enqueue {
+    /// "Play next": the front of the queue.
+    Next,
+    /// "Add to queue": the end of it.
+    Last,
 }
 
 impl Cards {
@@ -240,8 +254,8 @@ pub fn continue_card(item: &Item, cards: &Cards) -> gtk::Widget {
     }
     let card = card(item, &tile, &below, LANDSCAPE.0, &cards.open);
     card.add_css_class("continue-card");
-    if let Some(set_watched) = &cards.set_watched {
-        card_menu(&card, item.id(), set_watched);
+    if let (Some(set_watched), Some(hide)) = (&cards.set_watched, &cards.hide) {
+        card_menu(&card, item, set_watched, hide);
     }
     card
 }
@@ -288,7 +302,14 @@ pub fn poster_card(item: &Item, cards: &Cards) -> gtk::Widget {
                 .build(),
         );
     }
-    card(item, &tile, &caption, PORTRAIT.0, &cards.open)
+    let card = card(item, &tile, &caption, PORTRAIT.0, &cards.open);
+    let music = matches!(item, Item::Album(_) | Item::Artist(_) | Item::Track(_));
+    if music && let Some(enqueue) = &cards.enqueue {
+        let (item, enqueue) = (item.clone(), enqueue.clone());
+        let popover = menu_popover(vec![enqueue_entries(move |at| enqueue(item.clone(), at))]);
+        context_menu(&card, &popover);
+    }
+    card
 }
 
 /// A poster-sized blank for an item whose page has not loaded yet.
@@ -329,12 +350,76 @@ fn card(
     button.upcast()
 }
 
-/// A Continue watching card's menu, on a right-click or a long press, at
-/// the pointer: mark watched, or reset the progress. While it shows, the
-/// card stays lifted.
-fn card_menu(card: &gtk::Widget, id: &MediaId, set_watched: &Rc<dyn Fn(MediaId, bool)>) {
-    // Rows of icon and label, as designed: GTK's own menu drops the icon
-    // of any item that has a label.
+/// A Continue watching card's menu: mark watched, or reset the progress;
+/// below a rule, in red, out of Continue watching (progress kept).
+fn card_menu(
+    card: &gtk::Widget,
+    item: &Item,
+    set_watched: &Rc<dyn Fn(MediaId, bool)>,
+    hide: &Rc<dyn Fn(Item)>,
+) {
+    let watch = |label, icon, watched| {
+        let (id, set_watched) = (item.id().clone(), set_watched.clone());
+        MenuEntry::new(label, icon, move || set_watched(id.clone(), watched))
+    };
+    let remove = {
+        let (item, hide) = (item.clone(), hide.clone());
+        MenuEntry {
+            destructive: true,
+            ..MenuEntry::new(
+                "Remove from Continue watching",
+                crate::icons::REMOVE,
+                move || hide(item.clone()),
+            )
+        }
+    };
+    let popover = menu_popover(vec![
+        vec![
+            watch("Mark as watched", crate::icons::WATCHED, true),
+            watch("Reset watch progress", crate::icons::BACK_10, false),
+        ],
+        vec![remove],
+    ]);
+    context_menu(card, &popover);
+}
+
+/// One row of a menu built by [`menu_popover`].
+pub struct MenuEntry {
+    pub label: &'static str,
+    pub icon: &'static str,
+    /// Drawn in red.
+    pub destructive: bool,
+    pub run: Rc<dyn Fn()>,
+}
+
+impl MenuEntry {
+    pub fn new(label: &'static str, icon: &'static str, run: impl Fn() + 'static) -> Self {
+        Self {
+            label,
+            icon,
+            destructive: false,
+            run: Rc::new(run),
+        }
+    }
+}
+
+/// "Play next" and "Add to queue", calling `run` with where.
+pub fn enqueue_entries(run: impl Fn(Enqueue) + 'static) -> Vec<MenuEntry> {
+    let run = Rc::new(run);
+    let entry = |label, icon, at| {
+        let run = run.clone();
+        MenuEntry::new(label, icon, move || run(at))
+    };
+    vec![
+        entry("Play next", crate::icons::PLAY_NEXT, Enqueue::Next),
+        entry("Add to queue", crate::icons::ADD_TO_QUEUE, Enqueue::Last),
+    ]
+}
+
+/// A menu of icon-and-label rows, in groups with a rule between them, as
+/// designed: GTK's own menu drops the icon of any item that has a label.
+/// A row closes the menu, then runs.
+pub fn menu_popover(groups: Vec<Vec<MenuEntry>>) -> gtk::Popover {
     let rows = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(2)
@@ -345,46 +430,75 @@ fn card_menu(card: &gtk::Widget, id: &MediaId, set_watched: &Rc<dyn Fn(MediaId, 
         .halign(gtk::Align::Start)
         .css_classes(["card-menu"])
         .build();
-    for (label, icon, watched) in [
-        ("Mark as watched", crate::icons::WATCHED, true),
-        ("Reset watch progress", crate::icons::BACK_10, false),
-    ] {
-        let row = gtk::Button::builder()
-            .child(
-                &adw::ButtonContent::builder()
-                    .icon_name(icon)
-                    .label(label)
-                    .halign(gtk::Align::Start)
+    for (n, group) in groups.into_iter().enumerate() {
+        if n > 0 {
+            rows.append(
+                &gtk::Separator::builder()
+                    .margin_top(4)
+                    .margin_bottom(4)
                     .build(),
-            )
-            .css_classes(["flat", "card-menu-item"])
-            .build();
-        let (id, set_watched, popover) = (id.clone(), set_watched.clone(), popover.downgrade());
-        row.connect_clicked(move |_| {
-            if let Some(popover) = popover.upgrade() {
-                popover.popdown();
+            );
+        }
+        for entry in group {
+            let row = gtk::Button::builder()
+                .child(
+                    &adw::ButtonContent::builder()
+                        .icon_name(entry.icon)
+                        .label(entry.label)
+                        .halign(gtk::Align::Start)
+                        .build(),
+                )
+                .css_classes(["flat", "card-menu-item"])
+                .build();
+            if entry.destructive {
+                row.add_css_class("destructive");
             }
-            set_watched(id.clone(), watched);
-        });
-        rows.append(&row);
+            let (run, popover) = (entry.run, popover.downgrade());
+            row.connect_clicked(move |_| {
+                if let Some(popover) = popover.upgrade() {
+                    popover.popdown();
+                }
+                run();
+            });
+            rows.append(&row);
+        }
     }
-    popover.set_parent(card);
+    popover
+}
+
+/// A "⋯" button that opens `popover`.
+pub fn menu_button(popover: &gtk::Popover, tooltip: &str) -> gtk::MenuButton {
+    popover.set_halign(gtk::Align::Fill);
+    gtk::MenuButton::builder()
+        .icon_name(crate::icons::MORE)
+        .tooltip_text(tooltip)
+        .popover(popover)
+        .valign(gtk::Align::Center)
+        .css_classes(["flat", "circular"])
+        .build()
+}
+
+/// Opens `popover` at the pointer on a right-click or a long press on
+/// `widget`. While it shows, the widget keeps its hover look (a card stays
+/// lifted).
+pub fn context_menu(widget: &gtk::Widget, popover: &gtk::Popover) {
+    popover.set_parent(widget);
     {
-        let card = card.downgrade();
+        let widget = widget.downgrade();
         popover.connect_visible_notify(move |popover| {
-            if let Some(card) = card.upgrade() {
+            if let Some(widget) = widget.upgrade() {
                 if popover.is_visible() {
-                    card.add_css_class("menu-open");
+                    widget.add_css_class("menu-open");
                 } else {
-                    card.remove_css_class("menu-open");
+                    widget.remove_css_class("menu-open");
                 }
             }
         });
     }
-    // The popover is the card's child, and goes when the card does.
+    // The popover is the widget's child, and goes when the widget does.
     {
         let popover = popover.clone();
-        card.connect_destroy(move |_| popover.unparent());
+        widget.connect_destroy(move |_| popover.unparent());
     }
     let open_at = {
         let popover = popover.clone();
@@ -401,10 +515,10 @@ fn card_menu(card: &gtk::Widget, id: &MediaId, set_watched: &Rc<dyn Fn(MediaId, 
             open_at(x, y);
         });
     }
-    card.add_controller(right_click);
+    widget.add_controller(right_click);
     let long_press = gtk::GestureLongPress::builder().touch_only(true).build();
     long_press.connect_pressed(move |_, x, y| open_at(x, y));
-    card.add_controller(long_press);
+    widget.add_controller(long_press);
 }
 
 /// A placeholder tile in a hue picked from the item's ID, so an item keeps
@@ -512,7 +626,7 @@ impl<'a> Facts<'a> {
 
     /// What a landscape card says first: the show for an episode (its
     /// episode label goes under it), otherwise the title.
-    fn caption(&self) -> String {
+    pub fn caption(&self) -> String {
         if let Some(parent) = self.parent.as_ref().filter(|_| self.episode.is_some()) {
             return parent.clone();
         }

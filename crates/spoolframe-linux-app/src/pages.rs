@@ -9,7 +9,7 @@ use spoolframe_linux_core::backend::{ArtworkSize, ChosenTracks, Selection, Track
 use spoolframe_linux_core::format;
 use spoolframe_types::{Album, Artist, ArtworkKind, Item, MediaTracks, Season, Show};
 
-use crate::views::{self, Cards, Facts};
+use crate::views::{self, Cards, Enqueue, Facts};
 
 const POSTER_LARGE: (i32, i32) = (220, 330);
 const SQUARE: (i32, i32) = (300, 300);
@@ -21,8 +21,11 @@ const POSTER_OVER_BACKDROP: i32 = 150;
 /// the tracks picked on the page, or with the server's choice (`None`).
 pub type Play = Rc<dyn Fn(Option<Duration>, Option<Selection>)>;
 
-/// Plays a list of tracks from one of them, as a queue.
+/// Plays a list of tracks from one of them, as the context.
 pub type PlayTracks = Rc<dyn Fn(Vec<Item>, usize)>;
+
+/// Puts tracks of the page's album in the play queue (P1-23).
+pub type EnqueueTracks = Rc<dyn Fn(Vec<Item>, Enqueue)>;
 
 /// What the details page of a movie or an episode can do.
 pub struct PlayableActions {
@@ -487,10 +490,19 @@ fn episode_list(title: &str, episodes: &[Item], cards: &Cards) -> gtk::Box {
     titled(title, &list)
 }
 
-/// An artist: their albums as a grid.
+/// An artist: their albums as a grid, and a "⋯" to queue them all.
 pub fn artist(artist: &Artist, albums: &[Item], cards: &Cards) -> gtk::Widget {
     let body = content();
-    body.append(&label(&artist.name, &["title-1"]));
+    let heading = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    heading.append(&label(&artist.name, &["title-1"]));
+    if let Some(enqueue) = &cards.enqueue {
+        let (item, enqueue) = (Item::Artist(artist.clone()), enqueue.clone());
+        let popover = views::menu_popover(vec![views::enqueue_entries(move |at| {
+            enqueue(item.clone(), at)
+        })]);
+        heading.append(&views::menu_button(&popover, "More"));
+    }
+    body.append(&heading);
     body.append(&views::grid(
         "Albums",
         albums.iter().map(|a| views::poster_card(a, cards)),
@@ -499,12 +511,14 @@ pub fn artist(artist: &Artist, albums: &[Item], cards: &Cards) -> gtk::Widget {
 }
 
 /// An album: the cover and facts on the left, the tracks on the right.
-/// Play and Shuffle queue the whole album; a track plays the album from it.
+/// Play and Shuffle play the whole album; a track plays the album from
+/// it. "⋯" on the album or a track puts it in the play queue.
 pub fn album(
     album: &Album,
     artist: &str,
     tracks: &[Item],
     play: PlayTracks,
+    enqueue: EnqueueTracks,
     cards: &Cards,
 ) -> gtk::Widget {
     let body = gtk::Box::builder()
@@ -566,7 +580,17 @@ pub fn album(
     }
     buttons.append(&play_all);
     buttons.append(&shuffle);
-    side.append(&buttons);
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    buttons.set_hexpand(true);
+    actions.append(&buttons);
+    {
+        let (enqueue, tracks) = (enqueue.clone(), tracks.to_vec());
+        let popover = views::menu_popover(vec![views::enqueue_entries(move |at| {
+            enqueue(tracks.clone(), at)
+        })]);
+        actions.append(&views::menu_button(&popover, "More"));
+    }
+    side.append(&actions);
     body.append(&side);
 
     let list = gtk::ListBox::builder()
@@ -592,6 +616,13 @@ pub fn album(
                 &["dim-label", "numeric"],
             ));
         }
+        let menu = {
+            let (enqueue, track) = (enqueue.clone(), track.clone());
+            views::menu_popover(vec![views::enqueue_entries(move |at| {
+                enqueue(vec![track.clone()], at)
+            })])
+        };
+        row.add_suffix(&views::menu_button(&menu, "More"));
         let (play, tracks) = (play.clone(), tracks.to_vec());
         row.connect_activated(move |_| play(tracks.clone(), index));
         list.append(&row);

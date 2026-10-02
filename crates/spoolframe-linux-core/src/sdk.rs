@@ -39,6 +39,8 @@ pub fn backend_error(error: sdk::SdkError) -> BackendError {
         E::CannotPlay { reasons } => BackendError::CannotPlay(reasons),
         E::PlaybackExpired => BackendError::PlaybackExpired,
         E::NotFound(what) => BackendError::NotFound(what),
+        E::NotPinned(id) => BackendError::NotPinned(id),
+        E::IdentityChanged { saved, now } => BackendError::IdentityChanged { saved, now },
         // The server's own "unavailable" (Plex or a media mount down)
         // arrives as a server error with its message.
         E::Server(message) => match message.strip_prefix("unavailable: ") {
@@ -65,6 +67,8 @@ fn server(entry: sdk::ServerEntry) -> Server {
         name: entry.name,
         addresses: entry.addrs.iter().map(SocketAddr::to_string).collect(),
         pinned: entry.pinned,
+        fingerprint: entry.fingerprint,
+        verified: entry.verified,
         on_network: entry.on_network,
     }
 }
@@ -192,12 +196,57 @@ impl Client for SdkClient {
             let client = self.client.clone();
             let id = key.0.clone();
             // The SDK lists an address-only server once it has connected:
-            // connecting checks the key, pins it and learns the name.
+            // connecting checks the key and learns the name and fingerprint.
+            // Nothing is saved until the user has checked the fingerprint.
             let entry = on_runtime(&self.handle, async move {
                 client.add_address(&id, vec![address])?;
                 client.connect(&id).await
             })
             .await?;
+            Ok(server(entry))
+        })
+    }
+
+    fn connect<'a>(&'a self, key: &'a ServerKey) -> BoxFuture<'a, Result<Server, BackendError>> {
+        Box::pin(async move {
+            let (client, id) = (self.client.clone(), key.0.clone());
+            on_runtime(&self.handle, async move { client.connect(&id).await })
+                .await
+                .map(server)
+        })
+    }
+
+    fn pin<'a>(
+        &'a self,
+        key: &'a ServerKey,
+        verified: bool,
+    ) -> BoxFuture<'a, Result<Server, BackendError>> {
+        Box::pin(async move {
+            let (client, id) = (self.client.clone(), key.0.clone());
+            let entry =
+                on_runtime(&self.handle, async move { client.pin(&id, verified).await }).await?;
+            self.servers_changed.send_replace(());
+            Ok(server(entry))
+        })
+    }
+
+    fn trust_new_identity<'a>(
+        &'a self,
+        saved: &'a ServerKey,
+        now: &'a ServerKey,
+    ) -> BoxFuture<'a, Result<Server, BackendError>> {
+        Box::pin(async move {
+            let (client, old, new) = (self.client.clone(), saved.0.clone(), now.0.clone());
+            let entry = on_runtime(&self.handle, async move {
+                client.trust_new_identity(&old, &new).await
+            })
+            .await?;
+            // The old key's sessions are gone with it.
+            self.sessions
+                .lock()
+                .expect("never poisoned")
+                .retain(|(server, _), _| server != saved);
+            self.servers_changed.send_replace(());
             Ok(server(entry))
         })
     }
@@ -434,6 +483,22 @@ impl Session for SdkSession {
     fn mark_unwatched<'a>(&'a self, id: &'a MediaId) -> BoxFuture<'a, Result<(), BackendError>> {
         let id = id.clone();
         Box::pin(self.call(move |s| async move { s.mark_unwatched(&id).await }))
+    }
+
+    fn hide_from_continue<'a>(
+        &'a self,
+        id: &'a MediaId,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        let id = id.clone();
+        Box::pin(self.call(move |s| async move { s.hide_from_continue(&id).await }))
+    }
+
+    fn unhide_from_continue<'a>(
+        &'a self,
+        id: &'a MediaId,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        let id = id.clone();
+        Box::pin(self.call(move |s| async move { s.unhide_from_continue(&id).await }))
     }
     fn track_preferences(&self) -> BoxFuture<'_, Result<TrackPreferences, BackendError>> {
         Box::pin(self.call(|s| async move { s.track_preferences().await }))

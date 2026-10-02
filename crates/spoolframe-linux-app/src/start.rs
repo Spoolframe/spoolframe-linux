@@ -10,7 +10,12 @@ pub type Choose<T> = Rc<dyn Fn(T)>;
 
 /// "Choose a server": servers on this network, then saved ones, and a way
 /// to add one the network does not show.
-pub fn servers(servers: &[Server], choose: &Choose<Server>, add: &Rc<dyn Fn()>) -> gtk::Widget {
+pub fn servers(
+    servers: &[Server],
+    choose: &Choose<Server>,
+    verify: &Choose<Server>,
+    add: &Rc<dyn Fn()>,
+) -> gtk::Widget {
     let (clamp, column) = column();
     column.append(&title("Choose a server"));
     column.append(&dim("Servers on this network appear here on their own."));
@@ -21,10 +26,10 @@ pub fn servers(servers: &[Server], choose: &Choose<Server>, add: &Rc<dyn Fn()>) 
     let saved = adw::PreferencesGroup::builder().title("Saved").build();
     for server in servers {
         if server.on_network {
-            nearby.add(&server_row(server, choose, true));
+            nearby.add(&server_row(server, choose, verify, true));
         }
         if server.pinned {
-            saved.add(&server_row(server, choose, false));
+            saved.add(&server_row(server, choose, verify, false));
         }
     }
     if servers.iter().any(|s| s.on_network) {
@@ -42,13 +47,18 @@ pub fn servers(servers: &[Server], choose: &Choose<Server>, add: &Rc<dyn Fn()>) 
     add_button.connect_clicked(move |_| add());
     column.append(&add_button);
     column.append(&dim(
-        "Connecting proves the server holds its key. A server with the same \
-         name and a different key shows as a new server.",
+        "Before a server is saved you check its code against the server's own, \
+         so a stranger on the network cannot pass for it.",
     ));
     page(&adw::HeaderBar::new(), &clamp)
 }
 
-fn server_row(server: &Server, choose: &Choose<Server>, nearby: bool) -> adw::ActionRow {
+fn server_row(
+    server: &Server,
+    choose: &Choose<Server>,
+    verify: &Choose<Server>,
+    nearby: bool,
+) -> adw::ActionRow {
     let subtitle = if nearby {
         let address = server
             .addresses
@@ -56,7 +66,7 @@ fn server_row(server: &Server, choose: &Choose<Server>, nearby: bool) -> adw::Ac
             .map_or("no address", String::as_str);
         format!("{address} · key {}", server.key.short())
     } else {
-        format!("Key {} pinned", server.key.short())
+        server.fingerprint.clone()
     };
     let row = adw::ActionRow::builder()
         .title(&server.name)
@@ -79,17 +89,275 @@ fn server_row(server: &Server, choose: &Choose<Server>, nearby: bool) -> adw::Ac
         row.add_suffix(&connect);
         row.set_activatable_widget(Some(&connect));
     } else {
-        row.add_suffix(
-            &gtk::Label::builder()
-                .label("Pinned")
+        if server.verified {
+            row.add_suffix(&badge("Verified", "pinned-badge"));
+        } else {
+            // Skipped at the check: say so, and offer it again.
+            row.add_suffix(&badge("Not verified", "unverified-badge"));
+            let check = gtk::Button::builder()
+                .label("Verify now")
                 .valign(gtk::Align::Center)
-                .css_classes(["pinned-badge", "caption-heading"])
-                .build(),
-        );
+                .css_classes(["flat"])
+                .build();
+            let (server, verify) = (server.clone(), verify.clone());
+            check.connect_clicked(move |_| verify(server.clone()));
+            row.add_suffix(&check);
+        }
         let (server, choose) = (server.clone(), choose.clone());
         row.connect_activated(move |_| choose(server.clone()));
     }
     row
+}
+
+fn badge(text: &str, class: &str) -> gtk::Label {
+    gtk::Label::builder()
+        .label(text)
+        .valign(gtk::Align::Center)
+        .css_classes([class, "caption-heading"])
+        .build()
+}
+
+/// What the user decides at the fingerprint check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Check {
+    /// "It matches": save the server, verified.
+    Matches,
+    /// "Skip": save it, not verified. When verifying a saved server,
+    /// "Not now": leave it as it is.
+    Skip,
+}
+
+/// "Is this your server?" (P1-21): the server's name and address, its
+/// fingerprint large, and how to compare it with the server's own. Closing
+/// it (Cancel) decides nothing and saves nothing. `verifying` is for a
+/// server saved before as not verified.
+pub fn fingerprint_check(
+    server: &Server,
+    verifying: bool,
+    decide: Rc<dyn Fn(Check)>,
+) -> adw::Dialog {
+    let icon = gtk::Image::builder()
+        .icon_name(crate::icons::VERIFIED)
+        .pixel_size(30)
+        .width_request(56)
+        .height_request(56)
+        .halign(gtk::Align::Center)
+        .css_classes(["check-icon"])
+        .build();
+    let heading = gtk::Label::builder()
+        .label("Is this your server?")
+        .css_classes(["title-2"])
+        .build();
+    let address = server.addresses.first().map(String::as_str);
+    let who = gtk::Label::builder()
+        .use_markup(true)
+        .label(match address {
+            Some(address) => format!(
+                "<b>{}</b> · {}",
+                glib_escape(&server.name),
+                glib_escape(address)
+            ),
+            None => format!("<b>{}</b>", glib_escape(&server.name)),
+        })
+        .css_classes(["dim-label"])
+        .build();
+    let code = gtk::Label::builder()
+        .label(&server.fingerprint)
+        .selectable(true)
+        .css_classes(["fingerprint", "monospace"])
+        .build();
+    let code_box = adw::Bin::builder()
+        .child(&code)
+        .halign(gtk::Align::Center)
+        .css_classes(["fingerprint-box"])
+        .build();
+    let how = gtk::Label::builder()
+        .use_markup(true)
+        .label(
+            "Check that your server shows the same code, in its log or with \
+             <tt>spoolframe-server fingerprint</tt>.",
+        )
+        .wrap(true)
+        .justify(gtk::Justification::Center)
+        .css_classes(["dim-label"])
+        .build();
+    let full = full_keys(&[("", &server.key.0)]);
+    let matches = gtk::Button::builder()
+        .child(
+            &adw::ButtonContent::builder()
+                .icon_name(crate::icons::CHECK)
+                .label("It matches")
+                .build(),
+        )
+        .hexpand(true)
+        .css_classes(["action", "suggested-action"])
+        .build();
+    let skip = gtk::Button::builder()
+        .label(if verifying { "Not now" } else { "Skip" })
+        .hexpand(true)
+        .css_classes(["action"])
+        .build();
+    let buttons = gtk::Box::builder().spacing(10).homogeneous(true).build();
+    buttons.append(&skip);
+    buttons.append(&matches);
+    let body = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(14)
+        .margin_top(24)
+        .margin_bottom(22)
+        .margin_start(28)
+        .margin_end(28)
+        .build();
+    for widget in [
+        icon.upcast_ref::<gtk::Widget>(),
+        heading.upcast_ref(),
+        who.upcast_ref(),
+        code_box.upcast_ref(),
+        how.upcast_ref(),
+        full.upcast_ref(),
+        buttons.upcast_ref(),
+    ] {
+        body.append(widget);
+    }
+    if !verifying {
+        body.append(&dim(
+            "Skip saves the server as Not verified. You can verify it later.",
+        ));
+    }
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&adw::HeaderBar::new());
+    toolbar.set_content(Some(&body));
+    let dialog = adw::Dialog::builder()
+        .title(if verifying {
+            "Verify server"
+        } else {
+            "Add server"
+        })
+        .content_width(440)
+        .child(&toolbar)
+        .build();
+    for (button, choice) in [(&matches, Check::Matches), (&skip, Check::Skip)] {
+        let (decide, dialog) = (decide.clone(), dialog.downgrade());
+        button.connect_clicked(move |_| {
+            if let Some(dialog) = dialog.upgrade() {
+                dialog.close();
+            }
+            decide(choice);
+        });
+    }
+    dialog
+}
+
+/// "Server identity changed" (P1-13): a saved server answered with another
+/// key. Both codes, the full keys on request, and the choice: Cancel
+/// (nothing changes) or Trust New Identity (everyone signs in again).
+pub fn identity_changed(
+    name: &str,
+    saved: &str,
+    now: &str,
+    trust: Rc<dyn Fn()>,
+) -> adw::AlertDialog {
+    let code =
+        |key: &str| spoolframe_protocol::fingerprint::of_hex(key).unwrap_or_else(|| key.to_owned());
+    let row = |label: &str, key: &str, class: &str| {
+        let column = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(4)
+            .css_classes(["identity-row"])
+            .build();
+        column.append(
+            &gtk::Label::builder()
+                .label(label)
+                .xalign(0.0)
+                .css_classes(["caption-heading", "dim-label"])
+                .build(),
+        );
+        column.append(
+            &gtk::Label::builder()
+                .label(code(key))
+                .xalign(0.0)
+                .selectable(true)
+                .css_classes(["monospace", class])
+                .build(),
+        );
+        column
+    };
+    let extra = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(10)
+        .build();
+    extra.append(&row("Previously", saved, "dim-label"));
+    extra.append(&row("Now", now, "identity-new"));
+    extra.append(&full_keys(&[("Previously ", saved), ("Now ", now)]));
+    extra.append(
+        &gtk::Label::builder()
+            .use_markup(true)
+            .label(
+                "Check the new code against the server's log or \
+                 <tt>spoolframe-server fingerprint</tt>. If you trust it, you sign \
+                 in to this server again.",
+            )
+            .wrap(true)
+            .xalign(0.0)
+            .css_classes(["dim-label", "caption"])
+            .build(),
+    );
+    let dialog = adw::AlertDialog::builder()
+        .heading("Server identity changed")
+        .body_use_markup(true)
+        .body(format!(
+            "<b>{}</b> has a different key than the one saved on this computer. \
+             This may mean the server was reinstalled, or that you're connecting \
+             to a different server.",
+            glib_escape(name)
+        ))
+        .extra_child(&extra)
+        .default_response("cancel")
+        .close_response("cancel")
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("trust", "Trust New Identity");
+    dialog.set_response_appearance("trust", adw::ResponseAppearance::Destructive);
+    dialog.connect_response(None, move |_, response| {
+        if response == "trust" {
+            trust();
+        }
+    });
+    dialog
+}
+
+/// "Show full key(s)": the hex keys behind the codes, for whoever wants to
+/// compare all of them.
+fn full_keys(keys: &[(&str, &str)]) -> gtk::Expander {
+    let column = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(4)
+        .build();
+    for (label, key) in keys {
+        column.append(
+            &gtk::Label::builder()
+                .label(format!("{label}{key}"))
+                .wrap(true)
+                .wrap_mode(gtk::pango::WrapMode::Char)
+                .selectable(true)
+                .xalign(0.0)
+                .css_classes(["monospace", "caption", "dim-label"])
+                .build(),
+        );
+    }
+    gtk::Expander::builder()
+        .label(if keys.len() > 1 {
+            "Show full keys"
+        } else {
+            "Show full key"
+        })
+        .child(&column)
+        .halign(gtk::Align::Center)
+        .build()
+}
+
+fn glib_escape(text: &str) -> String {
+    gtk::glib::markup_escape_text(text).to_string()
 }
 
 /// "Who's watching?": the users signed in on this device, and a way to sign

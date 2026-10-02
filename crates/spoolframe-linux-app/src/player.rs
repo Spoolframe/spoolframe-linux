@@ -228,7 +228,7 @@ impl View {
                 self.error.set_visible(true);
             }
             Change::Volume(_) | Change::Muted(_) => self.controls.volume.show(change),
-            Change::Modes { .. } | Change::Queue => {}
+            Change::Modes { .. } | Change::Queue | Change::Skipped(_) => {}
         }
     }
 

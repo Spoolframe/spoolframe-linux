@@ -55,6 +55,38 @@ impl Art {
             fetch(session, server, cache, id, size).await
         });
     }
+
+    /// The first of `kinds` the item has, as image bytes with the
+    /// artwork's id; `None` when it has none or the fetch fails. For uses
+    /// other than a tile, such as the cover MPRIS points to.
+    pub async fn bytes(
+        &self,
+        artwork: &[Artwork],
+        kinds: &[ArtworkKind],
+        size: ArtworkSize,
+    ) -> Option<(ArtworkId, Vec<u8>)> {
+        let id = first_of(artwork, kinds)?;
+        let (session, server, cache) = (
+            self.session.clone(),
+            self.server.clone(),
+            self.cache.clone(),
+        );
+        let fetch = {
+            let id = id.clone();
+            relm4::spawn(async move { fetch(session, server, cache, id, size).await })
+        };
+        match fetch.await {
+            Ok(Ok(bytes)) => Some((id, bytes)),
+            Ok(Err(e)) => {
+                tracing::debug!(error = %e, "no artwork");
+                None
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "artwork fetch panicked");
+                None
+            }
+        }
+    }
 }
 
 /// The first artwork of `kinds`, in the order of `kinds`.

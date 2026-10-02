@@ -52,6 +52,11 @@ gst-base = { package = "gstreamer-base", version = "0.25" }
 # the sink a GL context. Without them every frame is copied out of the
 # decoder and converted on the CPU, which 4K cannot keep up with.
 gst-plugin-gtk4 = { version = "0.15", features = ["gtk_v4_14", "dmabuf", "wayland", "x11egl"] }
+# MPRIS on the session bus (P1-24): the desktop's Now Playing and media keys.
+mpris-server = "0.10"
+# The play queue saved per profile (P1-23), as JSON beside the SDK's data.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 # Compiles the app's icons into its binary (a GResource).
 glib-build-tools = "0.22"
 

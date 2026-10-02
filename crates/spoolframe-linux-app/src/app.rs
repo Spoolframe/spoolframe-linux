@@ -22,10 +22,13 @@ use spoolframe_types::{
 
 use crate::artwork::Art;
 use crate::minibar::MiniBar;
-use crate::playback::{Playback, Playlist};
+use crate::mpris::Mpris;
+use crate::playback::{Change, Playback, Playlist};
+use crate::queue::Queued;
+use crate::saved_queue::SavedQueue;
 use crate::settings::Settings;
 use crate::theme::ThemeApplier;
-use crate::views::Cards;
+use crate::views::{Cards, Enqueue};
 use crate::{library, nowplaying, pages, player, preferences, start, views};
 use spoolframe_linux_core::artcache::ArtworkCache;
 
@@ -86,6 +89,11 @@ pub struct App {
     connection_watch: Option<glib::JoinHandle<()>>,
     /// What plays, shown full or in the bar; dropping it stops it.
     playback: Option<Rc<Playback>>,
+    /// The play queue (P1-23) while no playback holds it: kept from the
+    /// one stopped last, for the next one.
+    queued: Vec<Queued>,
+    /// Where the profile's queue is saved, once a profile is chosen.
+    saved_queue: Option<Rc<SavedQueue>>,
     /// The session's libraries as far as fetched, kept between visits.
     library_cache: Option<Rc<library::Cache>>,
     /// Whether the server used last has been opened already. It may be
@@ -120,6 +128,8 @@ pub struct AppWidgets {
     library_page: adw::NavigationPage,
     /// What plays while the player is minimized, under the library.
     mini_bar: Rc<MiniBar>,
+    /// The desktop's Now Playing and media keys (P1-24).
+    mpris: Rc<Mpris>,
     root_page: adw::NavigationPage,
     /// The root page's scrolled area: `content`, or a library's grid,
     /// which must be the scrolled child itself to load row by row.
@@ -145,6 +155,10 @@ pub enum Msg {
     Search(String),
     Open(Box<Item>),
     Play(Box<PlayRequest>),
+    /// A track, an album or an artist's albums to the play queue (P1-23).
+    Enqueue(Box<Item>, Enqueue),
+    /// Tracks of a known album to the play queue.
+    EnqueueTracks(Vec<Item>, Option<Album>, Enqueue),
     SetWatched(MediaId, bool),
     /// Remember these tracks for the item (an episode: its series).
     RememberTracks(MediaId, Selection),
@@ -158,6 +172,17 @@ pub enum Msg {
     SetTheme(Theme),
     /// Leave the full player and keep playing in the bar.
     MinimizePlayer,
+    /// Take an item out of Continue watching (`true`), or put it back
+    /// (`false`, from the toast's Undo).
+    HideFromContinue(Box<Item>, bool),
+    /// Connect to `server` and show its fingerprint; `true` when it is a
+    /// saved server being verified.
+    CheckServer(Server, bool),
+    /// Save `server`: verified (It matches) or not (Skip); then, unless it
+    /// was being verified, go on to "Who's watching".
+    PinServer(Server, bool, bool),
+    /// Replace a saved server's pin with the key that answered for it.
+    TrustIdentity(ServerKey, ServerKey),
     /// Back to the full player from the bar.
     ExpandPlayer,
     StopPlayback,
@@ -178,6 +203,17 @@ type SeasonEpisodes = (Season, Vec<Item>);
 pub enum Loaded {
     Servers(Result<Vec<Server>, BackendError>),
     ServerAdded(Result<Server, BackendError>),
+    /// A server connected for its fingerprint check (P1-21); the flag says
+    /// whether it is a saved server being verified.
+    Checked(Server, bool, Result<Server, BackendError>),
+    /// The user decided at the check; the flag as for `Checked`.
+    Pinned(bool, Result<Server, BackendError>),
+    /// An item was taken out of Continue watching (`true`) or put back.
+    Hidden(Box<Item>, bool, Result<(), BackendError>),
+    /// What an enqueued item stands for: tracks, grouped by album.
+    Enqueued(Enqueue, Result<Vec<AlbumTracks>, BackendError>),
+    /// The user trusted a server's new identity (P1-13).
+    Trusted(Result<Server, BackendError>),
     Profiles(Server, Result<Vec<Profile>, BackendError>),
     SignedIn(Result<Profile, BackendError>),
     Libraries(Result<Vec<Library>, BackendError>),
@@ -217,6 +253,8 @@ impl Loaded {
             | Loaded::Artist(_, Err(e))
             | Loaded::Album(_, Err(e))
             | Loaded::WatchChanged(Err(e))
+            | Loaded::Hidden(_, _, Err(e))
+            | Loaded::Enqueued(_, Err(e))
             | Loaded::Saved(Err(e))
             | Loaded::TracksForgotten(_, Err(e))
             | Loaded::Preferences(Err(e)) => gone(e),
@@ -433,6 +471,23 @@ impl Component for App {
                 Rc::new(move || sender.input(Msg::StopPlayback))
             },
         );
+        let mpris = Mpris::start(
+            {
+                let (sender, window) = (sender.clone(), root.clone());
+                Rc::new(move || {
+                    window.present();
+                    sender.input(Msg::ExpandPlayer);
+                })
+            },
+            {
+                let sender = sender.clone();
+                Rc::new(move || sender.input(Msg::StopPlayback))
+            },
+            {
+                let window = root.clone();
+                Rc::new(move || window.close())
+            },
+        );
         let library = gtk::Box::new(gtk::Orientation::Vertical, 0);
         split.set_vexpand(true);
         library.append(&split);
@@ -484,9 +539,13 @@ impl Component for App {
                 open: open_with(&sender),
                 art: None,
                 set_watched: None,
+                hide: None,
+                enqueue: None,
             }),
             connection_watch: None,
             playback: None,
+            queued: Vec::new(),
+            saved_queue: None,
             library_cache: None,
             opened_last_server: false,
             search_query: String::new(),
@@ -521,6 +580,7 @@ impl Component for App {
                 window_stack,
                 library_page,
                 mini_bar,
+                mpris,
                 scroller,
                 content,
                 search_entry,
@@ -548,7 +608,41 @@ impl Component for App {
                     self.load_servers(&sender);
                 }
             }
-            Msg::ChooseServer(server) => self.load_profiles(server, &sender),
+            // A server not saved yet has its fingerprint checked first.
+            Msg::ChooseServer(server) if server.pinned => self.load_profiles(server, &sender),
+            Msg::ChooseServer(server) => sender.input(Msg::CheckServer(server, false)),
+            Msg::HideFromContinue(item, hide) => {
+                let Some(session) = self.session.clone() else {
+                    return;
+                };
+                sender.oneshot_command(async move {
+                    let done = if hide {
+                        session.hide_from_continue(item.id()).await
+                    } else {
+                        session.unhide_from_continue(item.id()).await
+                    };
+                    Loaded::Hidden(item, hide, done)
+                });
+            }
+            Msg::CheckServer(server, verifying) => {
+                let client = self.client.clone();
+                sender.oneshot_command(async move {
+                    let checked = client.connect(&server.key).await;
+                    Loaded::Checked(server, verifying, checked)
+                });
+            }
+            Msg::PinServer(server, verified, verifying) => {
+                let client = self.client.clone();
+                sender.oneshot_command(async move {
+                    Loaded::Pinned(verifying, client.pin(&server.key, verified).await)
+                });
+            }
+            Msg::TrustIdentity(saved, now) => {
+                let client = self.client.clone();
+                sender.oneshot_command(async move {
+                    Loaded::Trusted(client.trust_new_identity(&saved, &now).await)
+                });
+            }
             Msg::OpenAddServer => {
                 let submit: Rc<dyn Fn(String, String)> = {
                     let sender = sender.clone();
@@ -677,18 +771,20 @@ impl Component for App {
                     tracks,
                     album,
                 } = *request;
+                // A new context keeps the queue, as Spotify does.
                 self.stop_playback(widgets);
                 match Playback::start(Playlist {
                     session,
                     items,
                     index,
+                    queued: std::mem::take(&mut self.queued),
                     from,
                     selection,
                     tracks,
                     album,
                 }) {
                     Ok(playback) => {
-                        widgets.mini_bar.attach(&playback, &self.cards);
+                        self.attach_playback(&playback, widgets);
                         widgets
                             .window_stack
                             .push(&player_page(&playback, &sender, &self.cards));
@@ -713,6 +809,17 @@ impl Component for App {
                 }
             }
             Msg::StopPlayback => self.stop_playback(widgets),
+            Msg::Enqueue(item, at) => {
+                let Some(session) = self.session.clone() else {
+                    return;
+                };
+                sender.oneshot_command(async move {
+                    Loaded::Enqueued(at, tracks_of(session.as_ref(), *item).await)
+                });
+            }
+            Msg::EnqueueTracks(items, album, at) => {
+                self.enqueue(vec![(items, album)], at, widgets, &sender)
+            }
             Msg::SetWatched(id, watched) => {
                 let Some(session) = self.session.clone() else {
                     return;
@@ -772,7 +879,7 @@ impl Component for App {
         widgets: &mut Self::Widgets,
         loaded: Self::CommandOutput,
         sender: ComponentSender<Self>,
-        _root: &Self::Root,
+        root: &Self::Root,
     ) {
         if loaded.sign_in_required() {
             return self.signed_out(widgets, &sender);
@@ -798,9 +905,13 @@ impl Component for App {
                     let sender = sender.clone();
                     Rc::new(move || sender.input(Msg::OpenAddServer))
                 };
+                let verify: start::Choose<Server> = {
+                    let sender = sender.clone();
+                    Rc::new(move |s| sender.input(Msg::CheckServer(s, true)))
+                };
                 widgets
                     .servers
-                    .set_child(Some(&start::servers(&servers, &choose, &add)));
+                    .set_child(Some(&start::servers(&servers, &choose, &verify, &add)));
                 if self.server.is_none() {
                     widgets.screens.set_visible_child_name("servers");
                 }
@@ -811,12 +922,65 @@ impl Component for App {
                     dialog.dialog.close();
                 }
                 self.load_servers(&sender);
-                self.load_profiles(server, &sender);
+                if server.pinned {
+                    self.load_profiles(server, &sender);
+                } else {
+                    // Connected and learned its fingerprint: check it.
+                    check_fingerprint(&server, false, &sender, root);
+                }
             }
             Loaded::ServerAdded(Err(e)) => match &widgets.add_server {
-                Some(dialog) => dialog.refuse(&e.to_string()),
-                None => toast(widgets, &e),
+                Some(dialog) if !matches!(e, BackendError::IdentityChanged { .. }) => {
+                    dialog.refuse(&e.to_string())
+                }
+                _ => {
+                    if let Some(dialog) = widgets.add_server.take() {
+                        dialog.dialog.close();
+                    }
+                    server_error(widgets, "This server", &e, &sender, root);
+                }
             },
+            Loaded::Checked(_, verifying, Ok(server)) => {
+                check_fingerprint(&server, verifying, &sender, root)
+            }
+            Loaded::Checked(server, _, Err(e)) => {
+                server_error(widgets, &server.name, &e, &sender, root)
+            }
+            Loaded::Pinned(verifying, Ok(server)) => {
+                self.load_servers(&sender);
+                if verifying {
+                    toast_text(widgets, &format!("{} is verified", server.name));
+                    if self.server.as_ref().is_some_and(|s| s.key == server.key) {
+                        self.server = Some(server);
+                    }
+                } else {
+                    self.load_profiles(server, &sender);
+                }
+            }
+            Loaded::Pinned(_, Err(e)) => server_error(widgets, "This server", &e, &sender, root),
+            Loaded::Hidden(item, hide, Ok(())) => {
+                self.load_home(&sender);
+                if hide {
+                    let title = views::Facts::of(&item).caption();
+                    let toast = adw::Toast::builder()
+                        .title(format!("{title} removed from Continue watching"))
+                        .button_label("Undo")
+                        .build();
+                    let sender = sender.clone();
+                    toast.connect_button_clicked(move |_| {
+                        sender.input(Msg::HideFromContinue(item.clone(), false))
+                    });
+                    widgets.toasts.add_toast(toast);
+                }
+            }
+            Loaded::Hidden(_, _, Err(e)) => toast(widgets, &e),
+            Loaded::Enqueued(at, Ok(groups)) => self.enqueue(groups, at, widgets, &sender),
+            Loaded::Enqueued(_, Err(e)) => toast(widgets, &e),
+            Loaded::Trusted(Ok(server)) => {
+                self.load_servers(&sender);
+                self.load_profiles(server, &sender);
+            }
+            Loaded::Trusted(Err(e)) => toast(widgets, &e),
             Loaded::Profiles(server, Ok(profiles)) => {
                 let choose: start::Choose<Profile> = {
                     let sender = sender.clone();
@@ -842,7 +1006,7 @@ impl Component for App {
             }
             Loaded::Profiles(server, Err(e)) => {
                 tracing::warn!(server = %server.name, error = %e, "cannot list profiles");
-                toast(widgets, &e);
+                server_error(widgets, &server.name, &e, &sender, root);
                 widgets.screens.set_visible_child_name("servers");
             }
             Loaded::SignedIn(Ok(profile)) => {
@@ -1002,10 +1166,16 @@ impl Component for App {
                         })))
                     })
                 };
+                let enqueue: pages::EnqueueTracks = {
+                    let (sender, album) = (sender.clone(), album.clone());
+                    Rc::new(move |items, at| {
+                        sender.input(Msg::EnqueueTracks(items, Some(album.clone()), at))
+                    })
+                };
                 push(
                     widgets,
                     &album.title,
-                    &pages::album(&album, &artist, &tracks, play, cards),
+                    &pages::album(&album, &artist, &tracks, play, enqueue, cards),
                 );
             }
             Loaded::Album(album, Err(e)) => push_error(widgets, &album.title, &e),
@@ -1034,8 +1204,7 @@ impl Component for App {
                 let tracks = result
                     .inspect_err(|e| tracing::warn!(error = %e, "no track preferences"))
                     .ok();
-                self.preferences_dialog(tracks, &sender)
-                    .present(Some(_root));
+                self.preferences_dialog(tracks, &sender).present(Some(root));
             }
         }
     }
@@ -1055,7 +1224,14 @@ impl App {
             let sender = sender.clone();
             Rc::new(move |p| sender.input(Msg::SetTrackPreferences(Box::new(p))))
         };
-        preferences::dialog(self.settings.theme(), tracks, set_theme, set_tracks)
+        let server = self.server.clone().map(|server| {
+            let sender = sender.clone();
+            let check = server.clone();
+            let verify: Rc<dyn Fn()> =
+                Rc::new(move || sender.input(Msg::CheckServer(check.clone(), true)));
+            (server, verify)
+        });
+        preferences::dialog(self.settings.theme(), tracks, server, set_theme, set_tracks)
     }
 
     fn load_servers(&self, sender: &ComponentSender<Self>) {
@@ -1094,6 +1270,14 @@ impl App {
                 let sender = sender.clone();
                 Rc::new(move |id, watched| sender.input(Msg::SetWatched(id, watched)))
             }),
+            hide: Some({
+                let sender = sender.clone();
+                Rc::new(move |item| sender.input(Msg::HideFromContinue(Box::new(item), true)))
+            }),
+            enqueue: Some({
+                let sender = sender.clone();
+                Rc::new(move |item, at| sender.input(Msg::Enqueue(Box::new(item), at)))
+            }),
         });
         self.library_cache = Some(library::Cache::new(session.clone()));
         self.session = Some(session);
@@ -1109,6 +1293,10 @@ impl App {
         widgets.search_entry.set_text("");
         clear(&widgets.search_results);
         self.stop_playback(widgets);
+        // The queue was the last profile's; this one's comes back paused.
+        self.queued.clear();
+        self.saved_queue = SavedQueue::for_profile(&profile).map(Rc::new);
+        self.restore_queue(widgets);
         widgets.stack.pop_to_page(&widgets.root_page);
         clear(&widgets.content);
         widgets.screens.set_visible_child_name("library");
@@ -1135,12 +1323,100 @@ impl App {
         }));
     }
 
+    /// Shows `playback` in the bar and to the desktop, and saves its queue
+    /// as it changes.
+    fn attach_playback(&self, playback: &Rc<Playback>, widgets: &AppWidgets) {
+        // A queued item that cannot play is passed over with a word, not
+        // a stop (P1-23).
+        let toasts = widgets.toasts.clone();
+        playback.subscribe(move |change| {
+            if let Change::Skipped(message) = change {
+                toasts.add_toast(adw::Toast::new(message));
+            }
+            true
+        });
+        if let Some(saved) = self.saved_queue.clone() {
+            save_queue_on_changes(playback, saved);
+        }
+        widgets.mini_bar.attach(playback, &self.cards);
+        widgets.mpris.attach(playback, self.cards.art.clone());
+    }
+
+    /// Brings back the profile's queue from the last run, paused in the
+    /// bar.
+    fn restore_queue(&mut self, widgets: &AppWidgets) {
+        let (Some(session), Some(saved)) = (self.session.clone(), self.saved_queue.clone()) else {
+            return;
+        };
+        let Some((queue, at)) = saved.load() else {
+            return;
+        };
+        if queue.current().is_none() {
+            return;
+        }
+        match Playback::restore(session, queue, at) {
+            Ok(playback) => {
+                self.attach_playback(&playback, widgets);
+                self.playback = Some(playback);
+            }
+            Err(e) => tracing::warn!(error = %e, "cannot restore the queue"),
+        }
+    }
+
+    /// Puts `groups` (tracks with their album) in the play queue. With
+    /// nothing playing they start playing: there is no queue to see
+    /// without a player.
+    fn enqueue(
+        &mut self,
+        groups: Vec<AlbumTracks>,
+        at: Enqueue,
+        widgets: &mut AppWidgets,
+        sender: &ComponentSender<Self>,
+    ) {
+        if groups.iter().all(|(items, _)| items.is_empty()) {
+            return;
+        }
+        let Some(playback) = &self.playback else {
+            let album = match groups.as_slice() {
+                [(_, album)] => album.clone(),
+                _ => None,
+            };
+            let items = groups.into_iter().flat_map(|(items, _)| items).collect();
+            sender.input(Msg::Play(Box::new(PlayRequest {
+                items,
+                index: 0,
+                from: None,
+                selection: None,
+                tracks: None,
+                album,
+            })));
+            return;
+        };
+        match at {
+            // Each group to the front, last first, so they play in order.
+            Enqueue::Next => {
+                for (items, album) in groups.into_iter().rev() {
+                    playback.play_next(items, album);
+                }
+                toast_text(widgets, "Playing next");
+            }
+            Enqueue::Last => {
+                for (items, album) in groups {
+                    playback.add_to_queue(items, album);
+                }
+                toast_text(widgets, "Added to queue");
+            }
+        }
+    }
+
     /// Stops what plays, closing the full player and the bar.
     fn stop_playback(&mut self, widgets: &mut AppWidgets) {
         if let Some(playback) = self.playback.take() {
+            self.queued = playback.carry();
             playback.stop();
         }
         widgets.mini_bar.detach();
+        widgets.mpris.detach();
         widgets.window_stack.pop_to_page(&widgets.library_page);
     }
 
@@ -1150,6 +1426,7 @@ impl App {
         self.session = None;
         // A player still open would keep playing behind "Who's watching".
         self.stop_playback(widgets);
+        self.queued.clear();
         toast(widgets, &BackendError::SignInRequired);
         if let Some(server) = self.server.clone() {
             self.load_profiles(server, sender);
@@ -1239,6 +1516,67 @@ impl App {
                 item, None, None, None,
             )))),
         }
+    }
+}
+
+/// How often the position is saved with the queue while playing; the queue
+/// itself is saved on every change.
+const SAVE_POSITION_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Saves the queue and position whenever what plays changes, on pause,
+/// and every few seconds while playing. Music only, for now (P1-23): a
+/// film started from the library leaves the music saved last alone.
+fn save_queue_on_changes(playback: &Rc<Playback>, saved: Rc<SavedQueue>) {
+    let weak = Rc::downgrade(playback);
+    let last = std::cell::Cell::new(std::time::Instant::now());
+    playback.subscribe(move |change| {
+        let Some(playback) = weak.upgrade() else {
+            return false;
+        };
+        let due = match change {
+            Change::Item(_) | Change::Queue | Change::Modes { .. } | Change::Playing(false) => true,
+            Change::Position { .. } => last.get().elapsed() >= SAVE_POSITION_EVERY,
+            _ => false,
+        };
+        if due && !playback.is_video() {
+            saved.save(&playback.snapshot(), playback.position());
+            last.set(std::time::Instant::now());
+        }
+        true
+    });
+}
+
+/// Tracks, with the album they are from (for the cover and name).
+type AlbumTracks = (Vec<Item>, Option<Album>);
+
+/// The tracks an item stands for in the play queue, grouped by album, in
+/// album order: a track (with its album, for the cover), an album, or each
+/// of an artist's albums.
+async fn tracks_of(session: &dyn Session, item: Item) -> Result<Vec<AlbumTracks>, BackendError> {
+    match item {
+        Item::Track(ref track) => {
+            // The album is for the cover and name only.
+            let album = match session.item(&track.album_id).await {
+                Ok((Item::Album(album), _)) => Some(album),
+                _ => None,
+            };
+            Ok(vec![(vec![item], album)])
+        }
+        Item::Album(album) => {
+            let tracks = session.item(&album.id).await?.1;
+            Ok(vec![(tracks, Some(album))])
+        }
+        Item::Artist(artist) => {
+            let mut groups = Vec::new();
+            for child in session.item(&artist.id).await?.1 {
+                if let Item::Album(album) = child {
+                    let tracks = session.item(&album.id).await?.1;
+                    groups.push((tracks, Some(album)));
+                }
+            }
+            Ok(groups)
+        }
+        _ => Ok(Vec::new()),
     }
 }
 
@@ -1388,4 +1726,47 @@ fn player_page(
     } else {
         nowplaying::page(playback, actions, cards)
     }
+}
+
+/// Shows "Is this your server?" for `server`; the user's answer pins it.
+fn check_fingerprint(
+    server: &Server,
+    verifying: bool,
+    sender: &ComponentSender<App>,
+    root: &adw::ApplicationWindow,
+) {
+    let decide: Rc<dyn Fn(start::Check)> = {
+        let (sender, server) = (sender.clone(), server.clone());
+        Rc::new(move |check| match check {
+            start::Check::Matches => sender.input(Msg::PinServer(server.clone(), true, verifying)),
+            // Skipping a check of a saved server leaves it as it is.
+            start::Check::Skip if verifying => {}
+            start::Check::Skip => sender.input(Msg::PinServer(server.clone(), false, false)),
+        })
+    };
+    start::fingerprint_check(server, verifying, decide).present(Some(root));
+}
+
+/// A server's error: the identity alert when it answered with another key,
+/// otherwise a toast.
+fn server_error(
+    widgets: &AppWidgets,
+    name: &str,
+    error: &BackendError,
+    sender: &ComponentSender<App>,
+    root: &adw::ApplicationWindow,
+) {
+    let BackendError::IdentityChanged { saved, now } = error else {
+        return toast(widgets, error);
+    };
+    let trust: Rc<dyn Fn()> = {
+        let (sender, saved, now) = (sender.clone(), saved.clone(), now.clone());
+        Rc::new(move || {
+            sender.input(Msg::TrustIdentity(
+                ServerKey(saved.clone()),
+                ServerKey(now.clone()),
+            ))
+        })
+    };
+    start::identity_changed(name, saved, now, trust).present(Some(root));
 }

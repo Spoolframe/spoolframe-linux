@@ -271,6 +271,9 @@ struct WatchState {
     /// Movies and episodes in the order their state last changed, newest
     /// last: Continue watching and Next up are ordered by it.
     touched: Vec<MediaId>,
+    /// Movies and shows taken out of Continue watching and Next up (P1-22),
+    /// until their progress next changes.
+    hidden: std::collections::HashSet<MediaId>,
 }
 
 impl WatchState {
@@ -399,6 +402,20 @@ impl FakeSession {
             .collect()
     }
 
+    /// What hiding `id` hides: an episode hides its whole show.
+    fn hide_key(&self, id: &MediaId) -> MediaId {
+        match self.catalog.items.get(id) {
+            Some(Item::Episode(e)) => e.show_id.clone(),
+            _ => id.clone(),
+        }
+    }
+
+    /// Progress or a mark on `id` brings it back, as on the server.
+    fn unhide(&self, id: &MediaId) {
+        let key = self.hide_key(id);
+        self.watch().hidden.remove(&key);
+    }
+
     fn home_now(&self) -> HomeScreen {
         let watch = self.watch();
         let continue_ids: Vec<MediaId> = watch
@@ -441,7 +458,11 @@ impl FakeSession {
                 next_up.push(next.clone());
             }
         }
+        let hidden = watch.hidden.clone();
         drop(watch);
+        let shown = |id: &MediaId| !hidden.contains(&self.hide_key(id));
+        let continue_ids: Vec<MediaId> = continue_ids.into_iter().filter(|id| shown(id)).collect();
+        let next_up: Vec<MediaId> = next_up.into_iter().filter(|id| shown(id)).collect();
         HomeScreen {
             continue_watching: self.items_with_state(&continue_ids),
             next_up: self.items_with_state(&next_up),
@@ -871,6 +892,7 @@ impl Session for FakeSession {
             // Music has no watch state in Phase 1 (P1-14).
             if matches!(item, Item::Movie(_) | Item::Episode(_)) {
                 self.watch().progress(id, length_of(item), position);
+                self.unhide(id);
             }
             Ok(())
         })
@@ -886,6 +908,30 @@ impl Session for FakeSession {
                     watched: true,
                 },
             );
+            self.unhide(id);
+            Ok(())
+        })
+    }
+
+    fn hide_from_continue<'a>(
+        &'a self,
+        id: &'a MediaId,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            self.catalog.get(id)?;
+            let key = self.hide_key(id);
+            self.watch().hidden.insert(key);
+            Ok(())
+        })
+    }
+
+    fn unhide_from_continue<'a>(
+        &'a self,
+        id: &'a MediaId,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            self.catalog.get(id)?;
+            self.unhide(id);
             Ok(())
         })
     }
@@ -894,6 +940,7 @@ impl Session for FakeSession {
         Box::pin(async move {
             self.catalog.get(id)?;
             self.watch().set(id, PlaybackState::default());
+            self.unhide(id);
             Ok(())
         })
     }
@@ -969,6 +1016,15 @@ pub struct FakeClient {
     gone: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// A fake key's fingerprint, made the real way from its bytes.
+fn fingerprint(key: &ServerKey) -> String {
+    let mut bytes = [0u8; 32];
+    for (slot, byte) in bytes.iter_mut().zip(key.0.bytes()) {
+        *slot = byte;
+    }
+    spoolframe_protocol::fingerprint::fingerprint(&bytes)
+}
+
 fn home_media() -> ServerKey {
     ServerKey("k5d2r8w1tqz7m3c0vnh4q7fa".into())
 }
@@ -997,6 +1053,8 @@ impl FakeClient {
                     name: "Home Media".into(),
                     addresses: vec!["192.168.1.20".into()],
                     pinned: true,
+                    fingerprint: fingerprint(&home_media()),
+                    verified: true,
                     on_network: true,
                 },
                 Server {
@@ -1004,6 +1062,8 @@ impl FakeClient {
                     name: "Basement".into(),
                     addresses: vec!["192.168.1.34".into()],
                     pinned: false,
+                    fingerprint: fingerprint(&basement()),
+                    verified: false,
                     on_network: true,
                 },
             ]),
@@ -1071,13 +1131,22 @@ impl FakeClient {
         Ok(server.clone())
     }
 
+    /// Like the SDK: a server must be pinned before signing in to it.
+    fn pinned(&self, key: &ServerKey) -> Result<Server, BackendError> {
+        let server = self.reach(key)?;
+        if !server.pinned {
+            return Err(BackendError::NotPinned(key.0.clone()));
+        }
+        Ok(server)
+    }
+
     fn sign_in_now(
         &self,
         server: &ServerKey,
         username: &str,
         password: &str,
     ) -> Result<Profile, BackendError> {
-        self.reach(server)?;
+        self.pinned(server)?;
         let mut failed = self
             .failed_sign_ins
             .lock()
@@ -1140,6 +1209,8 @@ impl Client for FakeClient {
                         name: format!("Server {}", server.short()),
                         addresses: Vec::new(),
                         pinned: false,
+                        fingerprint: fingerprint(server),
+                        verified: false,
                         on_network: false,
                     });
                     servers.last_mut().expect("just pushed")
@@ -1153,12 +1224,71 @@ impl Client for FakeClient {
         })
     }
 
+    fn connect<'a>(&'a self, server: &'a ServerKey) -> BoxFuture<'a, Result<Server, BackendError>> {
+        Box::pin(async move { self.reach(server) })
+    }
+
+    fn pin<'a>(
+        &'a self,
+        server: &'a ServerKey,
+        verified: bool,
+    ) -> BoxFuture<'a, Result<Server, BackendError>> {
+        Box::pin(async move {
+            self.reach(server)?;
+            let mut servers = self.servers.lock().expect("fake state is never poisoned");
+            let entry = servers
+                .iter_mut()
+                .find(|s| &s.key == server)
+                .ok_or_else(|| BackendError::NotFound(server.short()))?;
+            // A saved server is only ever verified, never unverified again.
+            entry.verified = verified || (entry.pinned && entry.verified);
+            entry.pinned = true;
+            let entry = entry.clone();
+            drop(servers);
+            self.servers_changed.send_replace(());
+            Ok(entry)
+        })
+    }
+
+    fn trust_new_identity<'a>(
+        &'a self,
+        saved: &'a ServerKey,
+        now: &'a ServerKey,
+    ) -> BoxFuture<'a, Result<Server, BackendError>> {
+        Box::pin(async move {
+            let mut servers = self.servers.lock().expect("fake state is never poisoned");
+            let name = servers
+                .iter()
+                .find(|s| &s.key == saved)
+                .map(|s| s.name.clone())
+                .ok_or_else(|| BackendError::NotFound(saved.short()))?;
+            servers.retain(|s| &s.key != saved && &s.key != now);
+            let entry = Server {
+                key: now.clone(),
+                name,
+                addresses: Vec::new(),
+                pinned: true,
+                fingerprint: fingerprint(now),
+                verified: true,
+                on_network: true,
+            };
+            servers.push(entry.clone());
+            drop(servers);
+            self.signed_in
+                .lock()
+                .expect("fake state is never poisoned")
+                .retain(|p| &p.server != saved);
+            self.servers_changed.send_replace(());
+            Ok(entry)
+        })
+    }
+
     fn profiles<'a>(
         &'a self,
         server: &'a ServerKey,
     ) -> BoxFuture<'a, Result<Vec<Profile>, BackendError>> {
         Box::pin(async move {
-            self.reach(server)?;
+            self.pinned(server)?;
             let signed_in = self.signed_in.lock().expect("fake state is never poisoned");
             Ok(signed_in
                 .iter()
@@ -1314,6 +1444,25 @@ mod tests {
         ready(session.update_progress(&heat, Duration::from_secs(30))).unwrap();
         let home = ready(session.home()).unwrap();
         assert!(!titles(&home.continue_watching).contains(&"Heat"));
+    }
+
+    #[test]
+    fn a_hidden_item_leaves_continue_watching_and_keeps_its_progress() {
+        let session = andrey();
+        let first = ready(session.home()).unwrap().continue_watching[0].clone();
+        ready(session.hide_from_continue(first.id())).unwrap();
+        let home = ready(session.home()).unwrap();
+        assert!(!home.continue_watching.iter().any(|i| i.id() == first.id()));
+    }
+
+    #[test]
+    fn progress_brings_a_hidden_item_back() {
+        let session = andrey();
+        let first = ready(session.home()).unwrap().continue_watching[0].clone();
+        ready(session.hide_from_continue(first.id())).unwrap();
+        ready(session.update_progress(first.id(), Duration::from_secs(120))).unwrap();
+        let home = ready(session.home()).unwrap();
+        assert!(home.continue_watching.iter().any(|i| i.id() == first.id()));
     }
 
     #[test]
@@ -1516,6 +1665,75 @@ mod tests {
         let key = ServerKey("abcdefghijklmnop".into());
         ready(client.add_address(&key, "10.0.0.5:4433")).unwrap();
         assert!(changes.has_changed().unwrap());
+    }
+
+    fn added_server(client: &FakeClient) -> ServerKey {
+        // Home Media's address under a key not saved yet: it answers, as an
+        // unsaved server would.
+        let key = home_media();
+        let mut servers = client.servers.lock().unwrap();
+        let home = servers.iter_mut().find(|s| s.key == key).unwrap();
+        home.pinned = false;
+        home.verified = false;
+        key
+    }
+
+    #[test]
+    fn an_unpinned_server_refuses_sign_in() {
+        let client = FakeClient::new(None);
+        let key = added_server(&client);
+        assert_eq!(
+            ready(client.sign_in(&key, "andrey", FAKE_PASSWORD)),
+            Err(BackendError::NotPinned(key.0.clone()))
+        );
+    }
+
+    #[test]
+    fn connecting_shows_the_fingerprint_without_saving() {
+        let client = FakeClient::new(None);
+        let key = added_server(&client);
+        let server = ready(client.connect(&key)).unwrap();
+        assert_eq!(
+            (server.fingerprint.len(), server.pinned),
+            ("K7QX-3MPA-9TRD-WF2H".len(), false)
+        );
+    }
+
+    #[test]
+    fn pinning_unverified_saves_and_lets_sign_in() {
+        let client = FakeClient::new(None);
+        let key = added_server(&client);
+        let server = ready(client.pin(&key, false)).unwrap();
+        assert_eq!((server.pinned, server.verified), (true, false));
+        assert!(ready(client.sign_in(&key, "andrey", FAKE_PASSWORD)).is_ok());
+    }
+
+    #[test]
+    fn verifying_later_marks_it_verified() {
+        let client = FakeClient::new(None);
+        let key = added_server(&client);
+        ready(client.pin(&key, false)).unwrap();
+        assert!(ready(client.pin(&key, true)).unwrap().verified);
+    }
+
+    #[test]
+    fn trusting_a_new_identity_replaces_the_saved_server() {
+        let client = FakeClient::new(None);
+        let now = ServerKey("z9z9z9z9z9z9z9z9z9z9z9z9".into());
+        let server = ready(client.trust_new_identity(&home_media(), &now)).unwrap();
+        let keys: Vec<_> = ready(client.servers())
+            .unwrap()
+            .into_iter()
+            .map(|s| s.key)
+            .collect();
+        assert_eq!(
+            (
+                server.name.as_str(),
+                keys.contains(&home_media()),
+                keys.contains(&now)
+            ),
+            ("Home Media", false, true)
+        );
     }
 
     #[test]
