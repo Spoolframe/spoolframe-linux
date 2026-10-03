@@ -18,6 +18,7 @@ ICONS=(
   chevron-right server circle-alert palette
   shield-check circle-x
   list-start list-plus ellipsis grip-vertical
+  lock delete
 )
 
 here="$(cd "$(dirname "$0")" && pwd)"

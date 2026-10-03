@@ -377,12 +377,12 @@ fn loop_status(repeat: Repeat) -> LoopStatus {
     }
 }
 
-/// Writes a cover under `$XDG_CACHE_HOME/spoolframe-linux/mpris/`, named
+/// Writes a cover under `mpris/` in the app's cache directory, named
 /// by its artwork id, and returns its file:// URL. Desktops read the file
 /// themselves; they cannot reach the server.
 fn write_cover(id: &str, bytes: &[u8]) -> std::io::Result<String> {
-    let dir = glib::user_cache_dir()
-        .join("spoolframe-linux")
+    let dir = spoolframe_linux_core::paths::cache_dir()
+        .ok_or_else(|| std::io::Error::other("no cache directory"))?
         .join("mpris");
     std::fs::create_dir_all(&dir)?;
     let name = glib::compute_checksum_for_string(glib::ChecksumType::Sha256, id)

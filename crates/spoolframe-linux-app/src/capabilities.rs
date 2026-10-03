@@ -6,7 +6,9 @@
 //! caps. Mapped to the shared codec vocabulary, which the server maps
 //! ffprobe's names to.
 
-use spoolframe_types::{AudioCodec, ClientCapabilities, Container, SubtitleFormat, VideoCodec};
+use spoolframe_types::{
+    AudioCodec, ClientCapabilities, Container, Delivery, SubtitleFormat, VideoCodec,
+};
 
 const VIDEO: &[(&str, VideoCodec)] = &[
     ("video/x-h264", VideoCodec::H264),
@@ -92,8 +94,12 @@ pub fn capabilities() -> ClientCapabilities {
         audio: supported(AUDIO, &decoders),
         containers: supported(CONTAINERS, &demuxers),
         subtitles: supported(SUBTITLES, &subtitle_handlers),
-        // Range reads only, the default, until the player can follow a
-        // growing stream; no limits on resolution, channels or bitrate.
+        // The file itself first; a progressive encode when it will not
+        // play (P2-06). Not HLS: GStreamer's HLS demuxer fetches with its
+        // own HTTP client, which cannot reach the server over Iroh.
+        delivery: vec![Delivery::Range, Delivery::Progressive],
+        // No limits on resolution or channels; the bitrate limit is the
+        // user's setting, added by the caller.
         ..ClientCapabilities::default()
     };
     // Raw PCM needs no decoder; every pipeline plays it.
@@ -144,10 +150,16 @@ fn supported<T: Ord + Copy>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spoolframe_linux_core::test_dir::TestDir;
 
     fn caps() -> ClientCapabilities {
         gst::init().unwrap();
         capabilities()
+    }
+
+    #[test]
+    fn direct_play_comes_first_then_a_progressive_encode() {
+        assert_eq!(caps().delivery, [Delivery::Range, Delivery::Progressive]);
     }
 
     #[test]
@@ -309,8 +321,7 @@ mod tests {
     fn a_pgs_subtitle_is_drawn() {
         use gst::prelude::*;
         gst::init().unwrap();
-        let dir = std::env::temp_dir().join(format!("spoolframe-pgs-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TestDir::new_blocking("spoolframe-pgs");
         let (video, sup, muxed) = (dir.join("v.mkv"), dir.join("s.sup"), dir.join("m.mkv"));
         // Three seconds of black.
         let pipeline = gst::parse::launch(&format!(

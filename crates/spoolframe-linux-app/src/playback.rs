@@ -18,9 +18,13 @@ use std::time::Duration;
 use gst::prelude::*;
 use gtk::glib;
 use gtk::glib::thread_guard::ThreadGuard;
-use spoolframe_linux_core::backend::{PlaybackHandle, PlaybackPlan, Selection, Session};
-use spoolframe_linux_core::reader::{self, MediaReader, Spawn};
-use spoolframe_protocol::{PlannedSubtitle, SubtitleDelivery};
+use spoolframe_linux_core::backend::{
+    BackendError, PlaybackHandle, PlaybackPlan, Selection, Session,
+};
+use spoolframe_linux_core::progressive::ProgressiveReader;
+use spoolframe_linux_core::reader::{self, ByteSource, MediaReader, Spawn};
+use spoolframe_protocol::{PlannedSubtitle, SubtitleAction, SubtitleDelivery};
+use spoolframe_types::Delivery;
 use spoolframe_types::{Album, Item, MediaTracks, SubtitleFormat};
 
 pub use crate::queue::Repeat;
@@ -125,6 +129,10 @@ pub fn shutdown() {
     }
 }
 
+/// How long to wait before asking again for a subtitle the server is
+/// still reading as text, in seconds.
+const SUBTITLE_RETRY: u32 = 5;
+
 /// How often progress goes to the server while playing (P1-14 throttles
 /// on its side too).
 const PROGRESS_EVERY: u32 = 10;
@@ -147,6 +155,19 @@ pub struct Playback {
     track_list: RefCell<Option<MediaTracks>>,
     /// The current item's reader, reachable by its spoolframe:// URI.
     published: RefCell<Option<Published>>,
+    /// How the server plays the current item, for the diagnostics.
+    plan: RefCell<Option<PlaybackPlan>>,
+    /// A converted playback's handle (P2-06): a seek restarts its encode,
+    /// and moving on ends it.
+    converted: RefCell<Option<PlaybackHandle>>,
+    /// Where a converted playback is asked to seek next; seeks while
+    /// scrubbing are gathered into one restart.
+    seek_to: Cell<Option<Duration>>,
+    /// Bumped on each restart, so a slow one does not replace a newer.
+    restarts: Cell<u64>,
+    /// The catalog's length of the current item: a converted output's own
+    /// is unknown while it is encoded.
+    catalog_length: Cell<Option<Duration>>,
     /// An external subtitle, written where GstPlay can open it.
     subtitle_file: RefCell<Option<std::path::PathBuf>>,
     /// Whether subtitles show; see [`tracks::menu`].
@@ -157,6 +178,10 @@ pub struct Playback {
     media_info: RefCell<Option<gst_play::PlayMediaInfo>>,
     failure: RefCell<Option<String>>,
     stopped: Cell<bool>,
+    /// When the current item was asked for, for the timings in the log.
+    asked: Cell<std::time::Instant>,
+    /// Whether the current item's first picture has been logged.
+    pictured: Rc<Cell<bool>>,
     /// Whether the current item plays once ready. False for a queue
     /// restored at start-up, which waits, paused, for Play.
     autoplay: Cell<bool>,
@@ -223,6 +248,11 @@ impl Playback {
             pending: Cell::new(None),
             track_list: RefCell::new(start.tracks),
             published: RefCell::new(None),
+            plan: RefCell::new(None),
+            converted: RefCell::new(None),
+            seek_to: Cell::new(None),
+            restarts: Cell::new(0),
+            catalog_length: Cell::new(None),
             subtitle_file: RefCell::new(None),
             subtitles_on: Rc::new(Cell::new(false)),
             playing: Cell::new(false),
@@ -231,10 +261,25 @@ impl Playback {
             media_info: RefCell::new(None),
             failure: RefCell::new(None),
             stopped: Cell::new(false),
+            asked: Cell::new(std::time::Instant::now()),
+            pictured: Rc::new(Cell::new(false)),
             autoplay: Cell::new(start.autoplay),
             listeners: RefCell::new(Vec::new()),
         });
         connect(&adapter, &playback);
+        {
+            let weak = Rc::downgrade(&playback);
+            gtk::prelude::PaintableExt::connect_invalidate_contents(
+                &playback.paintable,
+                move |_| {
+                    if let Some(playback) = weak.upgrade()
+                        && !playback.pictured.replace(true)
+                    {
+                        tracing::debug!(ms = playback.since_asked(), "first picture");
+                    }
+                },
+            );
+        }
         LIVE.with(|live| {
             let mut live = live.borrow_mut();
             live.retain(|p| p.strong_count() > 0);
@@ -440,13 +485,126 @@ impl Playback {
         }
     }
 
-    pub fn seek(&self, to: Duration) {
+    /// Seeks within the item. A converted playback cannot seek in its
+    /// output: the server restarts the encode there instead (see
+    /// [`Playback::restart_at`]).
+    pub fn seek(self: &Rc<Self>, to: Duration) {
+        if self.converted.borrow().is_some() {
+            return self.restart_at(to);
+        }
+        self.seek_direct(to);
+    }
+
+    /// A seek in the file itself: direct play.
+    fn seek_direct(&self, to: Duration) {
         self.play
             .seek(gst::ClockTime::from_nseconds(to.as_nanos() as u64));
     }
 
+    /// How the server plays the current item, once it has said.
+    pub fn plan(&self) -> Option<PlaybackPlan> {
+        self.plan.borrow().clone()
+    }
+
+    /// Asks the server to restart the converted encode at `to` and plays
+    /// the new encode from its start. matroskademux does not pass a time
+    /// seek up to a source it cannot seek in bytes (checked with a spike),
+    /// so the pipeline is restarted rather than sought. The output keeps
+    /// the film's own time (the server's -copyts), so positions need no
+    /// offset. Seeks while scrubbing gather into one restart.
+    fn restart_at(self: &Rc<Self>, to: Duration) {
+        // The seek bar shows the target straight away.
+        self.position.set(to);
+        self.emit(&Change::Position {
+            at: to,
+            length: self.length.get(),
+        });
+        if self.seek_to.replace(Some(to)).is_some() {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local_once(Duration::from_millis(250), move || {
+            if let Some(playback) = weak.upgrade()
+                && let Some(to) = playback.seek_to.take()
+            {
+                playback.restart_now(to);
+            }
+        });
+    }
+
+    fn restart_now(self: &Rc<Self>, to: Duration) {
+        let Some(handle) = self.converted.borrow().clone() else {
+            return;
+        };
+        let restart = self.restarts.get() + 1;
+        self.restarts.set(restart);
+        let session = self.session.clone();
+        let sought = {
+            let handle = handle.clone();
+            relm4::spawn(async move { session.seek_playback(&handle, to).await })
+        };
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let result = sought.await;
+            let Some(playback) = weak.upgrade() else {
+                return;
+            };
+            if playback.stopped.get()
+                || playback.restarts.get() != restart
+                || playback.converted.borrow().as_ref() != Some(&handle)
+            {
+                return;
+            }
+            let epoch = match result {
+                Ok(Ok(epoch)) => epoch,
+                Ok(Err(e)) => return playback.failed(&e.to_string()),
+                Err(e) => return playback.failed(&format!("seeking failed: {e}")),
+            };
+            let playing = playback.playing.get() || playback.autoplay.get();
+            let reader = ProgressiveReader::new(playback.session.clone(), handle, epoch, spawn());
+            playback.play.stop();
+            let published = Published::new(reader);
+            playback.play.set_uri(Some(&published.uri()));
+            playback.published.replace(Some(published));
+            playback.resubtitle();
+            playback.media_info.replace(None);
+            // The new encode has the same streams; they are picked again.
+            playback.pending.set(Some(Selection::default()));
+            if playing {
+                playback.play.play();
+            } else {
+                playback.play.pause();
+            }
+        });
+    }
+
+    /// Hands GstPlay the external subtitle again after a new URI. Only
+    /// when there is one: any subtitle change makes GstPlay restart and
+    /// seek, which a converted stream cannot do.
+    fn resubtitle(&self) {
+        if let Some(path) = self.subtitle_file.borrow().as_ref() {
+            self.play.set_subtitle_uri(Some(&gtk::prelude::FileExt::uri(
+                &gtk::gio::File::for_path(path),
+            )));
+            self.play.set_subtitle_track_enabled(true);
+        }
+    }
+
+    /// Ends the converted encode of the item that played, on the server:
+    /// it would otherwise run on until its handle idles out.
+    fn end_conversion(&self) {
+        if let Some(handle) = self.converted.take() {
+            let session = self.session.clone();
+            relm4::spawn(async move {
+                if let Err(e) = session.stop_playback(&handle).await {
+                    tracing::debug!(error = %e, "stopping the conversion");
+                }
+            });
+        }
+    }
+
     /// Seeks `seconds` from where playback is, within the item.
-    pub fn jump(&self, seconds: f64) {
+    pub fn jump(self: &Rc<Self>, seconds: f64) {
         let at = self.position.get().as_secs_f64() + seconds;
         let length = self.length.get().as_secs_f64();
         self.seek(Duration::from_secs_f64(at.clamp(0.0, length.max(0.0))));
@@ -508,6 +666,7 @@ impl Playback {
     pub fn stop(&self) {
         if !self.stopped.replace(true) {
             self.report_progress();
+            self.end_conversion();
             self.play.stop();
             // Down to NULL, not just stopped: the sink lets go of its GL
             // context, and the pipeline of its threads, now rather than
@@ -540,11 +699,18 @@ impl Playback {
             return false;
         }
         self.autoplay.set(true);
+        self.end_conversion();
         self.resume.set(None);
         self.requested.set(None);
         self.pending.set(None);
         self.track_list.replace(None);
         self.play.stop();
+        // The last item's external subtitle goes now, while its pipeline
+        // is stopped (see `start_current`).
+        if let Some(path) = self.subtitle_file.take() {
+            self.play.set_subtitle_uri(None);
+            let _ = std::fs::remove_file(path);
+        }
         self.start_current();
         self.emit(&Change::Queue);
         true
@@ -556,6 +722,9 @@ impl Playback {
         let Some(item) = self.current() else {
             return;
         };
+        self.asked.set(std::time::Instant::now());
+        self.pictured.set(false);
+        tracing::debug!(item = %item.id(), resume = ?self.resume.get(), "starting");
         self.subtitles_on.set(false);
         self.media_info.replace(None);
         self.failure.replace(None);
@@ -570,12 +739,17 @@ impl Playback {
         });
         self.emit(&Change::Starting);
         let length = crate::views::Facts::of(&item).length;
+        self.catalog_length.set(length);
+        self.plan.replace(None);
         let requested = self.requested.get();
+        // A converted playback's encode begins here; direct play ignores
+        // it and seeks itself.
+        let from = self.resume.get();
         let need_tracks = self.track_list.borrow().is_none();
         let session = self.session.clone();
         let id = item.id().clone();
         let started = relm4::spawn(async move {
-            let start = session.start_playback(&id, requested).await;
+            let start = session.start_playback(&id, requested, from).await;
             // The track list maps the chosen tracks onto the file's streams.
             let tracks = match need_tracks {
                 true => session.tracks(&id).await.ok(),
@@ -592,6 +766,7 @@ impl Playback {
             if playback.stopped.get() {
                 return;
             }
+            tracing::debug!(ms = playback.since_asked(), "the server answered");
             let (start, tracks) = match result {
                 Ok((Ok(start), tracks)) => (start, tracks),
                 Ok((Err(e), _)) => return playback.could_not_start(&item, &e.to_string()),
@@ -608,6 +783,7 @@ impl Playback {
                 .or(start.chosen.map(|c| c.selection))
                 .unwrap_or_default();
             playback.pending.set(Some(selection));
+            playback.plan.replace(Some(start.plan.clone()));
             let external = matches!(
                 start.plan,
                 PlaybackPlan::Direct {
@@ -616,31 +792,65 @@ impl Playback {
                         ..
                     }),
                     ..
+                } | PlaybackPlan::Converted {
+                    subtitle: Some(spoolframe_protocol::ConvertedSubtitle {
+                        action: SubtitleAction::Ocr { .. },
+                        ..
+                    }),
+                    ..
                 }
             );
             let handle = start.handle.clone();
             let size = start.size;
-            let reader = MediaReader::with_length(
-                playback.session.clone(),
-                item.id().clone(),
-                selection,
-                start,
-                spawn(),
-                length,
-            );
-            // Resuming: start reading ahead from about where the resume
-            // point is in the file while the demuxer reads the header, so
-            // the seek finds its data on the way or here.
-            if let (Some(at), Some(length)) = (playback.resume.get(), length) {
-                reader.expect(reader::guess_offset(size, length, at));
-            }
-            let published = Published::new(reader);
+            let reader: Box<dyn ByteSource> = match &start.plan {
+                PlaybackPlan::Converted {
+                    delivery: Delivery::Progressive,
+                    ..
+                } => {
+                    // The encode began at the resume point: nothing to
+                    // seek, and its output is already in the film's time.
+                    playback.resume.set(None);
+                    playback.converted.replace(Some(handle.clone()));
+                    Box::new(ProgressiveReader::new(
+                        playback.session.clone(),
+                        handle.clone(),
+                        start.epoch,
+                        spawn(),
+                    ))
+                }
+                PlaybackPlan::Converted { delivery, .. } => {
+                    return playback.failed(&format!(
+                        "the server planned {delivery:?} delivery, which this player does not take"
+                    ));
+                }
+                _ => {
+                    let reader = MediaReader::with_length(
+                        playback.session.clone(),
+                        item.id().clone(),
+                        selection,
+                        start,
+                        spawn(),
+                        length,
+                    );
+                    // Resuming: start reading ahead from about where the
+                    // resume point is in the file while the demuxer reads
+                    // the header, so the seek finds its data on the way
+                    // or here.
+                    if let (Some(at), Some(length)) = (playback.resume.get(), length) {
+                        reader.expect(reader::guess_offset(size, length, at));
+                    }
+                    Box::new(reader)
+                }
+            };
+            let published = Published::boxed(reader);
             playback.play.set_uri(Some(&published.uri()));
             playback.published.replace(Some(published));
+            // The last item's subtitle was let go in `step`. Not cleared
+            // here: GstPlay restarts the pipeline and seeks back on any
+            // subtitle change, and a converted stream cannot seek, so
+            // even clearing an unset one stalled it.
             if external {
                 playback.load_external_subtitle(handle);
-            } else {
-                playback.play.set_subtitle_uri(None);
             }
             // Resuming: preroll paused, seek there once the length is
             // known, then play. Playing at once read and decoded the start
@@ -660,7 +870,8 @@ impl Playback {
         if !self.length.get().is_zero()
             && let Some(at) = self.resume.take()
         {
-            self.seek(at);
+            tracing::debug!(?at, ms = self.since_asked(), "resume seek");
+            self.seek_direct(at);
             if self.autoplay.get() {
                 self.play.play();
             } else {
@@ -679,7 +890,10 @@ impl Playback {
     /// file: GstPlay takes subtitles only by URI.
     fn load_external_subtitle(self: &Rc<Self>, handle: PlaybackHandle) {
         let session = self.session.clone();
-        let fetched = relm4::spawn(async move { session.read_subtitle(&handle).await });
+        let fetched = {
+            let handle = handle.clone();
+            relm4::spawn(async move { session.read_subtitle(&handle).await })
+        };
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
             let Ok(result) = fetched.await else { return };
@@ -688,9 +902,23 @@ impl Playback {
             };
             let (format, bytes) = match result {
                 Ok(subtitle) => subtitle,
+                // Still being read as text (P2-07): play on, ask again.
+                Err(BackendError::SubtitleNotReady(done)) => {
+                    tracing::debug!(done, "the subtitle is still being read");
+                    let weak = Rc::downgrade(&playback);
+                    glib::timeout_add_seconds_local_once(SUBTITLE_RETRY, move || {
+                        if let Some(playback) = weak.upgrade()
+                            && !playback.stopped.get()
+                            && playback.converted.borrow().as_ref() == Some(&handle)
+                        {
+                            playback.load_external_subtitle(handle);
+                        }
+                    });
+                    return;
+                }
                 Err(e) => return tracing::warn!(error = %e, "no external subtitle"),
             };
-            let path = glib::user_runtime_dir().join(format!(
+            let path = spoolframe_linux_core::paths::runtime_dir().join(format!(
                 "spoolframe-subtitle-{}.{}",
                 std::process::id(),
                 match format {
@@ -739,7 +967,17 @@ impl Playback {
     }
 
     fn duration_changed(&self, duration: Option<gst::ClockTime>) {
-        let length = duration.map_or(Duration::ZERO, |d| Duration::from_nanos(d.nseconds()));
+        tracing::debug!(?duration, ms = self.since_asked(), "length known");
+        // A converted output being encoded has no duration of its own yet:
+        // the catalog's length stands in.
+        let length = duration
+            .map(|d| Duration::from_nanos(d.nseconds()))
+            .filter(|d| !d.is_zero())
+            .or(self
+                .catalog_length
+                .get()
+                .filter(|_| self.converted.borrow().is_some()))
+            .unwrap_or_default();
         self.length.set(length);
         self.resume_if_ready();
         self.emit(&Change::Position {
@@ -758,7 +996,13 @@ impl Playback {
         });
     }
 
+    /// Milliseconds since the current item was asked for.
+    fn since_asked(&self) -> u64 {
+        self.asked.get().elapsed().as_millis() as u64
+    }
+
     fn state_changed(&self, state: gst_play::PlayState) {
+        tracing::debug!(?state, ms = self.since_asked(), "player state");
         // Prerolled for a resume: seek and play, or, with no length to
         // seek in, play from the start rather than stay paused.
         if state == gst_play::PlayState::Paused && self.resume.get().is_some() {
@@ -779,9 +1023,37 @@ impl Playback {
         self.media_info.replace(Some(info.clone()));
         let has_streams = !info.audio_streams().is_empty() || !info.subtitle_streams().is_empty();
         if has_streams && let Some(selection) = self.pending.take() {
-            self.apply(selection, info);
+            if self.converted.borrow().is_some() {
+                self.apply_converted(info);
+            } else {
+                self.apply(selection, info);
+            }
         }
         self.emit(&Change::MediaInfo(info));
+    }
+
+    /// A converted output holds only the tracks picked: one audio, and the
+    /// subtitle when the server copied or converted it into the output.
+    /// One read as text (OCR) comes as a file; one burned in is in the
+    /// picture.
+    fn apply_converted(&self, info: &gst_play::PlayMediaInfo) {
+        if self.subtitle_file.borrow().is_some() {
+            return;
+        }
+        let in_output = matches!(
+            self.plan.borrow().as_ref(),
+            Some(PlaybackPlan::Converted {
+                subtitle: Some(spoolframe_protocol::ConvertedSubtitle {
+                    action: SubtitleAction::Copy { .. } | SubtitleAction::Convert { .. },
+                    ..
+                }),
+                ..
+            })
+        );
+        match tracks::select_subtitle(&self.play, info, in_output.then_some(0)) {
+            Ok(()) => self.subtitles_on.set(in_output),
+            Err(e) => tracing::warn!(error = %e, "cannot pick the converted subtitle"),
+        }
     }
 
     /// Picks the tracks that play. The selection counts positions in the
@@ -972,6 +1244,7 @@ impl VideoSink {
 
 #[cfg(test)]
 mod tests {
+    use spoolframe_linux_core::test_dir::TestDir;
     use std::path::Path;
 
     use spoolframe_linux_core::backend::{Client, Profile, ServerKey};
@@ -1023,19 +1296,93 @@ mod tests {
         pausing_saves_where_playback_got_to();
         resuming_plays_from_where_it_stopped();
         a_restored_queue_waits_paused_where_it_was();
+        a_converted_playback_restarts_its_encode_on_a_seek();
+    }
+
+    /// A converted playback (P2-06) plays, a seek restarts the encode and
+    /// playback goes on in it, with one encode open on the server, and
+    /// stopping ends it.
+    fn a_converted_playback_restarts_its_encode_on_a_seek() {
+        let dir = TestDir::new_blocking("spoolframe-convert");
+        let path = dir.join("clip.mkv");
+        clip(&path);
+        let client = FakeClient::new(Some(path)).converting(64 * 1024);
+        let profile = Profile {
+            server: ServerKey("k5d2r8w1tqz7m3c0vnh4q7fa".into()),
+            username: "andrey".into(),
+            display_name: "Andrey".into(),
+            locked: false,
+        };
+        let session = client.session(&profile).unwrap();
+        let item = first_movie(&session);
+        let playback = Playback::start(Playlist {
+            session,
+            items: vec![item],
+            index: 0,
+            queued: Vec::new(),
+            from: None,
+            selection: None,
+            tracks: None,
+            album: None,
+        })
+        .unwrap();
+        let played = Rc::new(Cell::new(Duration::ZERO));
+        {
+            let played = played.clone();
+            playback.subscribe(move |change| {
+                if let Change::Position { at, .. } = change {
+                    played.set(*at);
+                }
+                true
+            });
+        }
+        assert!(
+            run_until(Duration::from_secs(20), || played.get()
+                > Duration::from_secs(1)),
+            "the converted playback never got past a second"
+        );
+        assert!(matches!(
+            playback.plan(),
+            Some(PlaybackPlan::Converted { .. })
+        ));
+        let restarts = playback.restarts.get();
+        playback.seek(Duration::from_secs(3));
+        // The fake's encode starts again from the file's start (it has no
+        // -copyts), so the position drops back; playback must go on.
+        assert!(
+            run_until(Duration::from_secs(20), || playback.restarts.get()
+                > restarts
+                && playback.is_playing()
+                && played.get() < Duration::from_secs(3)
+                && played.get() > Duration::from_millis(500)),
+            "playback did not go on after the restart (playing {}, at {:?})",
+            playback.is_playing(),
+            played.get()
+        );
+        assert_eq!(client.open_playbacks(&profile), 1);
+        playback.stop();
+        run_until(Duration::from_secs(2), || {
+            client.open_playbacks(&profile) == 0
+        });
+        assert_eq!(
+            client.open_playbacks(&profile),
+            0,
+            "the encode was not ended"
+        );
     }
 
     /// A queue saved at the last run comes back prerolled at its position,
     /// paused, and plays on Play (P1-23).
     fn a_restored_queue_waits_paused_where_it_was() {
-        let path =
-            std::env::temp_dir().join(format!("spoolframe-restore-{}.mkv", std::process::id()));
+        let dir = TestDir::new_blocking("spoolframe-restore");
+        let path = dir.join("clip.mkv");
         clip(&path);
         let client = FakeClient::new(Some(path));
         let profile = Profile {
             server: ServerKey("k5d2r8w1tqz7m3c0vnh4q7fa".into()),
             username: "andrey".into(),
             display_name: "Andrey".into(),
+            locked: false,
         };
         let session = client.session(&profile).unwrap();
         let item = first_movie(&session);
@@ -1070,14 +1417,15 @@ mod tests {
 
     /// A resume prerolls paused, seeks, and plays from there by itself.
     fn resuming_plays_from_where_it_stopped() {
-        let path =
-            std::env::temp_dir().join(format!("spoolframe-resume-{}.mkv", std::process::id()));
+        let dir = TestDir::new_blocking("spoolframe-resume");
+        let path = dir.join("clip.mkv");
         clip(&path);
         let client = FakeClient::new(Some(path));
         let profile = Profile {
             server: ServerKey("k5d2r8w1tqz7m3c0vnh4q7fa".into()),
             username: "andrey".into(),
             display_name: "Andrey".into(),
+            locked: false,
         };
         let session = client.session(&profile).unwrap();
         let item = first_movie(&session);
@@ -1114,14 +1462,15 @@ mod tests {
 
     /// Pausing reports the position at once, not at the next 10 s tick.
     fn pausing_saves_where_playback_got_to() {
-        let path =
-            std::env::temp_dir().join(format!("spoolframe-pause-{}.mkv", std::process::id()));
+        let dir = TestDir::new_blocking("spoolframe-pause");
+        let path = dir.join("clip.mkv");
         clip(&path);
         let client = FakeClient::new(Some(path));
         let profile = Profile {
             server: ServerKey("k5d2r8w1tqz7m3c0vnh4q7fa".into()),
             username: "andrey".into(),
             display_name: "Andrey".into(),
+            locked: false,
         };
         let session = client.session(&profile).unwrap();
         let item = first_movie(&session);
@@ -1163,14 +1512,15 @@ mod tests {
     /// A movie of the fake catalog played from `clip`: it starts, plays,
     /// moves on, tells a view that attaches late where it is, and stops.
     fn a_playback_plays_and_tells_a_late_view_where_it_is() {
-        let path =
-            std::env::temp_dir().join(format!("spoolframe-playback-{}.mkv", std::process::id()));
+        let dir = TestDir::new_blocking("spoolframe-playback");
+        let path = dir.join("clip.mkv");
         clip(&path);
         let client = FakeClient::new(Some(path));
         let profile = Profile {
             server: ServerKey("k5d2r8w1tqz7m3c0vnh4q7fa".into()),
             username: "andrey".into(),
             display_name: "Andrey".into(),
+            locked: false,
         };
         let session = client.session(&profile).unwrap();
         let item = first_movie(&session);
@@ -1228,13 +1578,15 @@ mod tests {
     /// failed (the player shows the error) instead of waiting forever, and
     /// shutting down afterwards releases it.
     fn a_server_that_goes_away_fails_the_playback() {
-        let path = std::env::temp_dir().join(format!("spoolframe-gone-{}.mkv", std::process::id()));
+        let dir = TestDir::new_blocking("spoolframe-gone");
+        let path = dir.join("clip.mkv");
         clip(&path);
         let client = FakeClient::new(Some(path));
         let profile = Profile {
             server: ServerKey("k5d2r8w1tqz7m3c0vnh4q7fa".into()),
             username: "andrey".into(),
             display_name: "Andrey".into(),
+            locked: false,
         };
         let session = client.session(&profile).unwrap();
         let item = first_movie(&session);

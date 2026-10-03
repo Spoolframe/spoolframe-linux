@@ -1,5 +1,7 @@
-//! A client and sessions that answer from fixed data, so the UI can be
-//! built and tried without a server. The catalog is the content of the UI
+//! A client and sessions that answer from fixed data, for tests: the
+//! reader, the player and the screens' logic meet a server's cases without
+//! one. Built only for tests (core's own, or the app's through the
+//! `testing` feature); the app itself always talks to real servers. The catalog is the content of the UI
 //! mockups. Watch state, playback handles and sign-in limits behave like
 //! the server's (P1-08, P1-11, P1-14), so the UI meets the same cases.
 
@@ -10,20 +12,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use spoolframe_protocol::{PlannedAudio, PlannedSubtitle, SubtitleDelivery};
+use spoolframe_protocol::{
+    AudioAction, ConvertedAudio, ConvertedVideo, PlannedAudio, PlannedSubtitle, SubtitleDelivery,
+};
 use spoolframe_types::language::same_language;
 use spoolframe_types::{
-    Album, Artist, ArtworkId, AudioCodec, AudioRole, AudioTrack, Container, Episode, Item, Library,
-    LibraryId, LibraryKind, MediaId, MediaKind, MediaTracks, Movie, Namespace, PlaybackState,
-    SdhPreference, Season, Show, SubtitleFormat, SubtitleMode, SubtitleRole, SubtitleTrack, Track,
-    TrackPreferences, VideoCodec,
+    Album, Artist, ArtworkId, AudioCodec, AudioRole, AudioTrack, Container, Delivery, Episode,
+    Item, Library, LibraryId, LibraryKind, MediaId, MediaKind, MediaTracks, Movie, Namespace,
+    PlaybackState, SdhPreference, Season, Show, SubtitleFormat, SubtitleMode, SubtitleRole,
+    SubtitleTrack, Track, TrackPreferences, VideoCodec,
 };
 use tokio::sync::watch;
 
 use crate::backend::{
-    ArtworkSize, BackendError, BoxFuture, ChosenTracks, Client, ConnectionState, HomeScreen,
-    MAX_READ, PlaybackHandle, PlaybackPlan, PlaybackStart, Profile, Selection, Server, ServerKey,
-    Session, TrackReason,
+    ArtworkSize, BackendError, BoxFuture, ChosenTracks, Chunk, Client, ConnectionState, DeviceInfo,
+    DeviceSignInRequest, HomeScreen, MAX_READ, PlaybackHandle, PlaybackPlan, PlaybackStart,
+    Profile, Selection, Server, ServerKey, Session, TrackReason,
 };
 
 /// Every fake account's password.
@@ -309,6 +313,9 @@ struct Playback {
     item: MediaId,
     selection: Selection,
     last_used: Instant,
+    /// A converted playback's encode, and how much of it is written.
+    epoch: u32,
+    written: u64,
 }
 
 /// One user's view of the fake server.
@@ -319,6 +326,9 @@ pub struct FakeSession {
     media: Option<PathBuf>,
     /// The most one read returns, like a server that answers short.
     read_limit: u64,
+    /// Converts every playback (P2-04): the "encode" is the media file,
+    /// revealed this many bytes per chunk read. `None` plays directly.
+    converting: Option<u64>,
     /// Set by [`FakeClient::go_away`]: the server stopped answering.
     gone: Arc<std::sync::atomic::AtomicBool>,
     /// Every progress report, in order, for tests.
@@ -328,7 +338,68 @@ pub struct FakeSession {
     preferences: Mutex<TrackPreferences>,
     /// Tracks remembered per movie, or per show for its episodes.
     overrides: Mutex<HashMap<MediaId, Selection>>,
+    username: String,
+    pin: Mutex<PinState>,
+    /// Devices waiting to be signed in by code (P3-07), and wrong codes
+    /// tried.
+    sign_ins: Mutex<SignIns>,
+    /// Which profile used the device's connection last: switching to
+    /// another and back locks a profile again (P2-08).
+    active: Arc<Mutex<Option<String>>>,
 }
+
+/// Device sign-ins waiting for this user's approval (P3-07).
+struct SignIns {
+    pending: HashMap<String, DeviceSignInRequest>,
+    wrong: u32,
+}
+
+impl Default for SignIns {
+    fn default() -> Self {
+        let request = DeviceSignInRequest {
+            device_name: Some("Living Room Apple TV".into()),
+            client_name: "spoolframe-tvos".into(),
+            requested_at: unix_now() - 30,
+        };
+        Self {
+            pending: [(FAKE_SIGN_IN_CODE.to_owned(), request)].into(),
+            wrong: 0,
+        }
+    }
+}
+
+/// The code a TV shows in the fixtures, waiting for approval.
+pub const FAKE_SIGN_IN_CODE: &str = "BCDFGHJK";
+/// The code this device itself would show: approving it is refused.
+pub const FAKE_OWN_SIGN_IN_CODE: &str = "ZZZZZZZZ";
+/// Wrong codes in a row before lookups are refused for a while.
+const WRONG_CODES: u32 = 5;
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// One user's PIN, as the fake server keeps it (P2-08).
+#[derive(Default)]
+struct PinState {
+    pin: Option<String>,
+    /// The fake's devices, by endpoint id, where the PIN is asked for.
+    required: std::collections::HashSet<String>,
+    locked: bool,
+    wrong: u32,
+    /// Ten wrong PINs in a row ended the session here.
+    revoked: bool,
+}
+
+/// The fake's two devices: this one, and a TV to set from here.
+const THIS_DEVICE: &str = "this-device";
+const LIVING_ROOM_TV: &str = "living-room-tv";
+/// Alice's PIN in the fixtures; asked for on this device.
+pub const FAKE_PIN: &str = "1234";
+/// Wrong PINs in a row before the session here ends.
+const WRONG_PINS: u32 = 10;
 
 impl FakeSession {
     fn new(
@@ -336,19 +407,36 @@ impl FakeSession {
         username: &str,
         media_file: Option<PathBuf>,
         read_limit: u64,
+        converting: Option<u64>,
         gone: Arc<std::sync::atomic::AtomicBool>,
+        active: Arc<Mutex<Option<String>>>,
     ) -> Self {
+        // Alice has a PIN, asked for here, so the fake opens her locked.
+        let pin = match username {
+            "alice" => PinState {
+                pin: Some(FAKE_PIN.into()),
+                required: [THIS_DEVICE.to_owned()].into(),
+                locked: true,
+                ..PinState::default()
+            },
+            _ => PinState::default(),
+        };
         let session = FakeSession {
             catalog,
             watch: Mutex::new(WatchState::default()),
             media: media_file,
             read_limit,
+            converting,
             gone,
             reports: Mutex::new(Vec::new()),
             playbacks: Mutex::new(HashMap::new()),
             next_handle: AtomicU64::new(1),
             preferences: Mutex::new(TrackPreferences::default()),
             overrides: Mutex::new(HashMap::new()),
+            username: username.to_owned(),
+            pin: Mutex::new(pin),
+            sign_ins: Mutex::new(SignIns::default()),
+            active,
         };
         {
             let mut watch = session.watch();
@@ -640,6 +728,61 @@ impl FakeSession {
         }
     }
 
+    fn pin_state(&self) -> std::sync::MutexGuard<'_, PinState> {
+        self.pin.lock().expect("fake state is never poisoned")
+    }
+
+    /// Whether choosing this profile now asks for its PIN: it is locked,
+    /// or another profile used the connection since it was unlocked.
+    fn would_lock(&self) -> bool {
+        let pin = self.pin_state();
+        let active = self.active.lock().expect("fake state is never poisoned");
+        pin.required.contains(THIS_DEVICE)
+            && (pin.locked || active.as_deref() != Some(&self.username))
+    }
+
+    /// What every call but unlocking goes through, as on the server: a
+    /// locked profile answers nothing else.
+    fn guard(&self) -> Result<(), BackendError> {
+        let mut pin = self.pin_state();
+        if pin.revoked {
+            return Err(BackendError::SignInRequired);
+        }
+        let mut active = self.active.lock().expect("fake state is never poisoned");
+        if pin.required.contains(THIS_DEVICE) && active.as_deref() != Some(&self.username) {
+            pin.locked = true;
+        }
+        if pin.locked {
+            return Err(BackendError::ProfileLocked);
+        }
+        *active = Some(self.username.clone());
+        Ok(())
+    }
+
+    /// What the fake converts to: HEVC it "cannot play" encoded to H.264,
+    /// the audio copied.
+    fn converted_plan(item: &Item, selection: Selection) -> PlaybackPlan {
+        let video = !matches!(item, Item::Track(_));
+        PlaybackPlan::Converted {
+            delivery: Delivery::Progressive,
+            container: Container::Matroska,
+            video: video.then_some(ConvertedVideo::Encode {
+                codec: VideoCodec::H264,
+                height: 1080,
+                max_bitrate: Some(8_000_000),
+                tone_map: false,
+            }),
+            audio: Some(ConvertedAudio {
+                index: selection.audio.unwrap_or(0),
+                action: AudioAction::Copy {
+                    codec: AudioCodec::Aac,
+                },
+            }),
+            subtitle: None,
+            reasons: vec!["video 0: hevc is not supported; encoded to h264".into()],
+        }
+    }
+
     fn plan_for(item: &Item, tracks: &MediaTracks, selection: Selection) -> PlaybackPlan {
         let subtitle = selection.subtitle.and_then(|i| {
             let track = tracks.subtitles.get(i as usize)?;
@@ -670,6 +813,14 @@ impl FakeSession {
 
     /// The playback behind `handle`, touched; expired when idle too long.
     fn playback(&self, handle: &PlaybackHandle) -> Result<(MediaId, Selection), BackendError> {
+        self.with_playback(handle, |p| (p.item.clone(), p.selection))
+    }
+
+    fn with_playback<T>(
+        &self,
+        handle: &PlaybackHandle,
+        run: impl FnOnce(&mut Playback) -> T,
+    ) -> Result<T, BackendError> {
         let mut playbacks = self.playbacks.lock().expect("fake state is never poisoned");
         let playback = playbacks
             .get_mut(handle)
@@ -679,17 +830,46 @@ impl FakeSession {
             return Err(BackendError::PlaybackExpired);
         }
         playback.last_used = Instant::now();
-        Ok((playback.item.clone(), playback.selection))
+        Ok(run(playback))
+    }
+
+    fn media_size(&self) -> Result<(PathBuf, u64), BackendError> {
+        let Some(path) = &self.media else {
+            return Err(BackendError::Unavailable(
+                "the fake server has no media; start the app with --fake-media FILE".into(),
+            ));
+        };
+        let size = std::fs::metadata(path)
+            .map_err(|e| BackendError::Unavailable(format!("{}: {e}", path.display())))?
+            .len();
+        Ok((path.clone(), size))
+    }
+
+    /// Up to `length` bytes of the media file from `offset`.
+    fn file_bytes(&self, offset: u64, length: u64) -> Result<Vec<u8>, BackendError> {
+        let (path, _) = self.media_size()?;
+        let io = |e: std::io::Error| BackendError::Unavailable(format!("{}: {e}", path.display()));
+        let mut file = std::fs::File::open(&path).map_err(io)?;
+        file.seek(SeekFrom::Start(offset)).map_err(io)?;
+        let mut bytes = Vec::new();
+        file.take(length.min(MAX_READ).min(self.read_limit))
+            .read_to_end(&mut bytes)
+            .map_err(io)?;
+        Ok(bytes)
     }
 }
 
 impl Session for FakeSession {
     fn home(&self) -> BoxFuture<'_, Result<HomeScreen, BackendError>> {
-        Box::pin(async move { Ok(self.home_now()) })
+        Box::pin(async move {
+            self.guard()?;
+            Ok(self.home_now())
+        })
     }
 
     fn libraries(&self) -> BoxFuture<'_, Result<Vec<Library>, BackendError>> {
         Box::pin(async move {
+            self.guard()?;
             Ok(self
                 .catalog
                 .libraries
@@ -706,6 +886,7 @@ impl Session for FakeSession {
         limit: u32,
     ) -> BoxFuture<'a, Result<(Vec<Item>, u32), BackendError>> {
         Box::pin(async move {
+            self.guard()?;
             let (_, ids) = self
                 .catalog
                 .libraries
@@ -727,6 +908,7 @@ impl Session for FakeSession {
         id: &'a MediaId,
     ) -> BoxFuture<'a, Result<(Item, Vec<Item>), BackendError>> {
         Box::pin(async move {
+            self.guard()?;
             let item = self.catalog.get(id)?;
             let item = self.with_state(item, &self.watch());
             let children = self.catalog.children.get(id).cloned().unwrap_or_default();
@@ -788,18 +970,13 @@ impl Session for FakeSession {
         &'a self,
         id: &'a MediaId,
         selection: Option<Selection>,
+        _start: Option<Duration>,
     ) -> BoxFuture<'a, Result<PlaybackStart, BackendError>> {
         Box::pin(async move {
+            self.guard()?;
             let item = self.catalog.get(id)?;
             let tracks = self.tracks_of(item);
-            let Some(path) = &self.media else {
-                return Err(BackendError::Unavailable(
-                    "the fake server has no media; start the app with --fake-media FILE".into(),
-                ));
-            };
-            let size = std::fs::metadata(path)
-                .map_err(|e| BackendError::Unavailable(format!("{}: {e}", path.display())))?
-                .len();
+            let (_, size) = self.media_size()?;
             let chosen = selection.is_none().then(|| self.choose(item, &tracks));
             let effective = selection
                 .or(chosen.map(|c| c.selection))
@@ -817,14 +994,86 @@ impl Session for FakeSession {
                         item: id.clone(),
                         selection: effective,
                         last_used: Instant::now(),
+                        epoch: 0,
+                        written: 0,
                     },
                 );
+            let (plan, size) = match self.converting {
+                Some(_) => (Self::converted_plan(item, effective), 0),
+                None => (Self::plan_for(item, &tracks, effective), size),
+            };
             Ok(PlaybackStart {
                 handle,
-                plan: Self::plan_for(item, &tracks, effective),
+                plan,
                 size,
                 chosen,
+                epoch: 0,
             })
+        })
+    }
+
+    fn read_chunk<'a>(
+        &'a self,
+        handle: &'a PlaybackHandle,
+        epoch: u32,
+        offset: u64,
+        length: u64,
+    ) -> BoxFuture<'a, Result<Chunk, BackendError>> {
+        Box::pin(async move {
+            if self.gone.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(BackendError::Unreachable("Home Media".into()));
+            }
+            let (_, size) = self.media_size()?;
+            let grow = self.converting.unwrap_or(size);
+            // Each read lets the "encode" write a little more.
+            let (current, written) = self.with_playback(handle, |p| {
+                p.written = (p.written + grow).min(size);
+                (p.epoch, p.written)
+            })?;
+            if epoch != current {
+                return Err(BackendError::PlaybackRestarted { epoch: current });
+            }
+            let available = written.saturating_sub(offset).min(length);
+            let bytes = if available == 0 {
+                Vec::new()
+            } else {
+                self.file_bytes(offset, available)?
+            };
+            Ok(Chunk {
+                bytes,
+                size: written,
+                complete: written == size,
+                epoch: current,
+            })
+        })
+    }
+
+    fn seek_playback<'a>(
+        &'a self,
+        handle: &'a PlaybackHandle,
+        _position: Duration,
+    ) -> BoxFuture<'a, Result<u32, BackendError>> {
+        // The fake's "encode" is the file itself, from its start: the
+        // restart is in the epoch and the bytes written, not the time.
+        Box::pin(async move {
+            self.with_playback(handle, |p| {
+                p.epoch += 1;
+                p.written = 0;
+                p.epoch
+            })
+        })
+    }
+
+    fn stop_playback<'a>(
+        &'a self,
+        handle: &'a PlaybackHandle,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            self.playbacks
+                .lock()
+                .expect("fake state is never poisoned")
+                .remove(handle);
+            Ok(())
         })
     }
 
@@ -839,16 +1088,7 @@ impl Session for FakeSession {
                 return Err(BackendError::Unreachable("Home Media".into()));
             }
             self.playback(handle)?;
-            let path = self.media.as_ref().ok_or(BackendError::PlaybackExpired)?;
-            let io =
-                |e: std::io::Error| BackendError::Unavailable(format!("{}: {e}", path.display()));
-            let mut file = std::fs::File::open(path).map_err(io)?;
-            file.seek(SeekFrom::Start(offset)).map_err(io)?;
-            let mut bytes = Vec::new();
-            file.take(length.min(MAX_READ).min(self.read_limit))
-                .read_to_end(&mut bytes)
-                .map_err(io)?;
-            Ok(bytes)
+            self.file_bytes(offset, length)
         })
     }
 
@@ -989,6 +1229,150 @@ impl Session for FakeSession {
             Ok(())
         })
     }
+
+    fn unlock<'a>(&'a self, given: &'a str) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            let mut pin = self.pin_state();
+            if pin.revoked {
+                return Err(BackendError::SignInRequired);
+            }
+            if pin.pin.as_deref() != Some(given) {
+                pin.wrong += 1;
+                if pin.wrong >= WRONG_PINS {
+                    pin.revoked = true;
+                    return Err(BackendError::SignInRequired);
+                }
+                return Err(BackendError::WrongCredentials);
+            }
+            pin.wrong = 0;
+            pin.locked = false;
+            *self.active.lock().expect("fake state is never poisoned") =
+                Some(self.username.clone());
+            Ok(())
+        })
+    }
+
+    // The unlocked session is the proof: it came from a sign-in with the
+    // password, and a PIN only ever locks such a session.
+    fn set_pin<'a>(&'a self, new: &'a str) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            let mut pin = self.pin_state();
+            if !(4..=8).contains(&new.len()) || !new.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(BackendError::InvalidInput("a PIN is 4 to 8 digits".into()));
+            }
+            pin.pin = Some(new.to_owned());
+            Ok(())
+        })
+    }
+
+    fn clear_pin(&self) -> BoxFuture<'_, Result<(), BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            let mut pin = self.pin_state();
+            pin.pin = None;
+            pin.required.clear();
+            Ok(())
+        })
+    }
+
+    fn devices(&self) -> BoxFuture<'_, Result<Vec<DeviceInfo>, BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            let pin = self.pin_state();
+            let device = |id: &str, name: &str, ago: i64| DeviceInfo {
+                endpoint_id: id.to_owned(),
+                name: Some(name.to_owned()),
+                last_seen_at: 1_790_000_000 - ago,
+                pin_required: pin.required.contains(id),
+                this_device: id == THIS_DEVICE,
+            };
+            Ok(vec![
+                device(THIS_DEVICE, "This computer", 0),
+                device(LIVING_ROOM_TV, "Living room TV", 3 * 86_400),
+            ])
+        })
+    }
+
+    fn set_pin_required<'a>(
+        &'a self,
+        device: Option<&'a str>,
+        required: bool,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            let mut pin = self.pin_state();
+            if pin.pin.is_none() {
+                return Err(BackendError::InvalidInput("set a PIN first".into()));
+            }
+            let device = device.unwrap_or(THIS_DEVICE).to_owned();
+            if required {
+                pin.required.insert(device);
+            } else {
+                pin.required.remove(&device);
+            }
+            Ok(())
+        })
+    }
+
+    fn lookup_device_sign_in<'a>(
+        &'a self,
+        code: &'a str,
+    ) -> BoxFuture<'a, Result<DeviceSignInRequest, BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            let mut sign_ins = self.sign_ins.lock().expect("fake state is never poisoned");
+            if sign_ins.wrong >= WRONG_CODES {
+                return Err(BackendError::RateLimited(Duration::from_secs(15 * 60)));
+            }
+            if code == FAKE_OWN_SIGN_IN_CODE {
+                return Ok(DeviceSignInRequest {
+                    device_name: Some("This computer".into()),
+                    client_name: "spoolframe-linux".into(),
+                    requested_at: unix_now(),
+                });
+            }
+            match sign_ins.pending.get(code) {
+                Some(request) => Ok(request.clone()),
+                None => {
+                    sign_ins.wrong += 1;
+                    Err(BackendError::NotFound(format!("sign-in code {code}")))
+                }
+            }
+        })
+    }
+
+    fn approve_device_sign_in<'a>(
+        &'a self,
+        code: &'a str,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            if code == FAKE_OWN_SIGN_IN_CODE {
+                return Err(BackendError::InvalidInput(
+                    "this device cannot approve its own sign-in".into(),
+                ));
+            }
+            let mut sign_ins = self.sign_ins.lock().expect("fake state is never poisoned");
+            sign_ins
+                .pending
+                .remove(code)
+                .map(|_| ())
+                .ok_or_else(|| BackendError::NotFound(format!("sign-in code {code}")))
+        })
+    }
+
+    fn deny_device_sign_in<'a>(&'a self, code: &'a str) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            let mut sign_ins = self.sign_ins.lock().expect("fake state is never poisoned");
+            sign_ins
+                .pending
+                .remove(code)
+                .map(|_| ())
+                .ok_or_else(|| BackendError::NotFound(format!("sign-in code {code}")))
+        })
+    }
 }
 
 impl FakeSession {
@@ -1002,6 +1386,7 @@ pub struct FakeClient {
     catalog: Arc<Catalog>,
     media: Option<PathBuf>,
     read_limit: u64,
+    converting: Option<u64>,
     servers: Mutex<Vec<Server>>,
     /// Accounts each server has: (server, username, display name).
     accounts: Vec<(ServerKey, &'static str, &'static str)>,
@@ -1014,6 +1399,8 @@ pub struct FakeClient {
     /// The fake has no LAN: its list changes only when an address is added.
     servers_changed: watch::Sender<()>,
     gone: Arc<std::sync::atomic::AtomicBool>,
+    /// The profile that used the connection last (P2-08).
+    active: Arc<Mutex<Option<String>>>,
 }
 
 /// A fake key's fingerprint, made the real way from its bytes.
@@ -1041,12 +1428,15 @@ impl FakeClient {
             server: home_media(),
             username: username.into(),
             display_name: display_name.into(),
+            locked: false,
         };
         FakeClient {
             catalog: Arc::new(Catalog::new()),
             media,
             read_limit: MAX_READ,
+            converting: None,
             gone: Arc::default(),
+            active: Arc::default(),
             servers: Mutex::new(vec![
                 Server {
                     key: home_media(),
@@ -1111,9 +1501,52 @@ impl FakeClient {
         }
     }
 
+    /// The session behind `profile`, made on first use and kept, so watch
+    /// state and the PIN's lock survive switching.
+    fn fake_session(&self, profile: &Profile) -> Arc<FakeSession> {
+        let mut sessions = self.sessions.lock().expect("fake state is never poisoned");
+        sessions
+            .entry((profile.server.clone(), profile.username.clone()))
+            .or_insert_with(|| {
+                Arc::new(FakeSession::new(
+                    self.catalog.clone(),
+                    &profile.username,
+                    self.media.clone(),
+                    self.read_limit,
+                    self.converting,
+                    self.gone.clone(),
+                    self.active.clone(),
+                ))
+            })
+            .clone()
+    }
+
     pub fn with_read_limit(mut self, limit: u64) -> Self {
         self.read_limit = limit;
         self
+    }
+
+    /// Every playback is converted (P2-04): a `Converted` progressive plan
+    /// whose output, the media file, grows by `bytes` with each chunk
+    /// read, as an encode would.
+    pub fn converting(mut self, bytes: u64) -> Self {
+        self.converting = Some(bytes);
+        self
+    }
+
+    /// How many playbacks `profile`'s session holds open: a converted one
+    /// is an encode running on the server.
+    pub fn open_playbacks(&self, profile: &Profile) -> usize {
+        self.sessions
+            .lock()
+            .expect("fake state is never poisoned")
+            .get(&(profile.server.clone(), profile.username.clone()))
+            .map_or(0, |s| {
+                s.playbacks
+                    .lock()
+                    .expect("fake state is never poisoned")
+                    .len()
+            })
     }
 
     /// Basement shows on the network but does not answer: the fixture for
@@ -1174,11 +1607,22 @@ impl FakeClient {
             server: server.clone(),
             username: (*username).into(),
             display_name: (*display_name).into(),
+            locked: false,
         };
         let mut signed_in = self.signed_in.lock().expect("fake state is never poisoned");
         if !signed_in.contains(&profile) {
             signed_in.push(profile.clone());
         }
+        drop(signed_in);
+        // A sign-in with the password is a new session, unlocked: the
+        // password proves more than the PIN would.
+        let session = self.fake_session(&profile);
+        let mut pin = session.pin_state();
+        pin.revoked = false;
+        pin.wrong = 0;
+        pin.locked = false;
+        drop(pin);
+        *self.active.lock().expect("fake state is never poisoned") = Some(profile.username.clone());
         Ok(profile)
     }
 }
@@ -1289,11 +1733,19 @@ impl Client for FakeClient {
     ) -> BoxFuture<'a, Result<Vec<Profile>, BackendError>> {
         Box::pin(async move {
             self.pinned(server)?;
-            let signed_in = self.signed_in.lock().expect("fake state is never poisoned");
+            let signed_in = self
+                .signed_in
+                .lock()
+                .expect("fake state is never poisoned")
+                .clone();
             Ok(signed_in
-                .iter()
+                .into_iter()
                 .filter(|p| &p.server == server)
-                .cloned()
+                .filter(|p| !self.fake_session(p).pin_state().revoked)
+                .map(|p| Profile {
+                    locked: self.fake_session(&p).would_lock(),
+                    ..p
+                })
                 .collect())
         })
     }
@@ -1309,19 +1761,7 @@ impl Client for FakeClient {
 
     fn session(&self, profile: &Profile) -> Result<Arc<dyn Session>, BackendError> {
         self.reach(&profile.server)?;
-        let mut sessions = self.sessions.lock().expect("fake state is never poisoned");
-        let session = sessions
-            .entry((profile.server.clone(), profile.username.clone()))
-            .or_insert_with(|| {
-                Arc::new(FakeSession::new(
-                    self.catalog.clone(),
-                    &profile.username,
-                    self.media.clone(),
-                    self.read_limit,
-                    self.gone.clone(),
-                ))
-            });
-        Ok(session.clone())
+        Ok(self.fake_session(profile))
     }
 
     fn connection(&self, server: &ServerKey) -> watch::Receiver<ConnectionState> {
@@ -1381,6 +1821,7 @@ mod tests {
             server: home_media(),
             username: username.into(),
             display_name: username.into(),
+            locked: false,
         };
         client.session(&profile).unwrap()
     }
@@ -1425,6 +1866,8 @@ mod tests {
     fn next_up_skips_an_episode_already_in_continue_watching() {
         let client = FakeClient::new(None);
         let alice = session_for(&client, "alice");
+        // Her PIN is asked for here (P2-08).
+        ready(alice.unlock(FAKE_PIN)).unwrap();
         let home = ready(alice.home()).unwrap();
         assert!(home.next_up.is_empty(), "{:?}", titles(&home.next_up));
     }
@@ -1433,7 +1876,10 @@ mod tests {
     fn each_user_has_their_own_continue_watching() {
         let client = FakeClient::new(None);
         let andrey = ready(session_for(&client, "andrey").home()).unwrap();
-        let alice = ready(session_for(&client, "alice").home()).unwrap();
+        let alice = session_for(&client, "alice");
+        // Her PIN is asked for here (P2-08).
+        ready(alice.unlock(FAKE_PIN)).unwrap();
+        let alice = ready(alice.home()).unwrap();
         assert_ne!(andrey.continue_watching, alice.continue_watching);
     }
 
@@ -1547,30 +1993,28 @@ mod tests {
     #[test]
     fn playback_without_media_says_how_to_get_some() {
         let alien = media(MediaKind::Movie, "1");
-        let error = ready(andrey().start_playback(&alien, None)).unwrap_err();
+        let error = ready(andrey().start_playback(&alien, None, None)).unwrap_err();
         assert!(matches!(error, BackendError::Unavailable(m) if m.contains("--fake-media")));
     }
 
-    fn media_file(bytes: &[u8]) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "spoolframe-fake-{}-{}",
-            std::process::id(),
-            bytes.len()
-        ));
+    fn media_file(bytes: &[u8]) -> (crate::test_dir::TestDir, PathBuf) {
+        let dir = crate::test_dir::TestDir::new_blocking("spoolframe-fake");
+        let path = dir.join("media");
         std::fs::File::create(&path)
             .unwrap()
             .write_all(bytes)
             .unwrap();
-        path
+        (dir, path)
     }
 
     #[test]
     fn reads_return_the_requested_range_of_the_file() {
         let bytes: Vec<u8> = (0..=255).collect();
-        let client = FakeClient::new(Some(media_file(&bytes)));
+        let (_dir, path) = media_file(&bytes);
+        let client = FakeClient::new(Some(path));
         let session = session_for(&client, "andrey");
         let alien = media(MediaKind::Movie, "1");
-        let start = ready(session.start_playback(&alien, None)).unwrap();
+        let start = ready(session.start_playback(&alien, None, None)).unwrap();
         assert_eq!(start.size, 256);
         let read = ready(session.read(&start.handle, 250, 100)).unwrap();
         assert_eq!(read, (250..=255).collect::<Vec<u8>>());
@@ -1588,14 +2032,15 @@ mod tests {
 
     #[test]
     fn the_external_subtitle_comes_with_its_playback() {
-        let client = FakeClient::new(Some(media_file(&[0; 17])));
+        let (_dir, path) = media_file(&[0; 17]);
+        let client = FakeClient::new(Some(path));
         let session = session_for(&client, "andrey");
         let alien = media(MediaKind::Movie, "1");
         let selection = Selection {
             audio: None,
             subtitle: Some(0),
         };
-        let start = ready(session.start_playback(&alien, Some(selection))).unwrap();
+        let start = ready(session.start_playback(&alien, Some(selection), None)).unwrap();
         let (format, bytes) = ready(session.read_subtitle(&start.handle)).unwrap();
         assert_eq!(format, SubtitleFormat::Srt);
         assert!(String::from_utf8(bytes).unwrap().contains("read_subtitle"));
@@ -1827,5 +2272,178 @@ mod tests {
         };
         let (_, chosen) = ready(session.playback_plan(&episode, Some(asked))).unwrap();
         assert_eq!(chosen, None);
+    }
+
+    #[test]
+    fn stopping_a_converted_playback_ends_its_encode() {
+        let (_dir, path) = media_file(b"output");
+        let client = FakeClient::new(Some(path)).converting(2);
+        let profile = Profile {
+            server: home_media(),
+            username: "andrey".into(),
+            display_name: "Andrey".into(),
+            locked: false,
+        };
+        let session = client.session(&profile).unwrap();
+        let start =
+            ready(session.start_playback(&media(MediaKind::Movie, "1"), None, None)).unwrap();
+        ready(session.stop_playback(&start.handle)).unwrap();
+        assert_eq!(client.open_playbacks(&profile), 0);
+    }
+
+    fn profile_of(client: &FakeClient, username: &str) -> Profile {
+        let profiles = ready(client.profiles(&home_media())).unwrap();
+        profiles
+            .into_iter()
+            .find(|p| p.username == username)
+            .unwrap()
+    }
+
+    #[test]
+    fn a_profile_with_a_pin_required_here_is_listed_locked() {
+        let client = FakeClient::new(None);
+        assert!(profile_of(&client, "alice").locked);
+        assert!(!profile_of(&client, "andrey").locked);
+    }
+
+    #[test]
+    fn a_locked_profile_answers_nothing_until_unlocked() {
+        let client = FakeClient::new(None);
+        let alice = session_for(&client, "alice");
+        assert_eq!(
+            ready(alice.libraries()).unwrap_err(),
+            BackendError::ProfileLocked
+        );
+        ready(alice.unlock(FAKE_PIN)).unwrap();
+        assert!(ready(alice.libraries()).is_ok());
+    }
+
+    #[test]
+    fn a_wrong_pin_is_wrong_credentials() {
+        let alice = session_for(&FakeClient::new(None), "alice");
+        assert_eq!(
+            ready(alice.unlock("0000")).unwrap_err(),
+            BackendError::WrongCredentials
+        );
+    }
+
+    #[test]
+    fn ten_wrong_pins_end_the_session_here() {
+        let client = FakeClient::new(None);
+        let alice = session_for(&client, "alice");
+        for _ in 0..9 {
+            let _ = ready(alice.unlock("0000"));
+        }
+        assert_eq!(
+            ready(alice.unlock("0000")).unwrap_err(),
+            BackendError::SignInRequired
+        );
+        assert!(!usernames(&ready(client.profiles(&home_media())).unwrap()).contains(&"alice"));
+    }
+
+    #[test]
+    fn switching_to_another_profile_and_back_locks_it_again() {
+        let client = FakeClient::new(None);
+        let alice = session_for(&client, "alice");
+        ready(alice.unlock(FAKE_PIN)).unwrap();
+        ready(session_for(&client, "andrey").libraries()).unwrap();
+        assert!(profile_of(&client, "alice").locked);
+    }
+
+    #[test]
+    fn an_unlocked_session_turns_the_requirement_off() {
+        let client = FakeClient::new(None);
+        let alice = session_for(&client, "alice");
+        ready(alice.unlock(FAKE_PIN)).unwrap();
+        ready(alice.set_pin_required(None, false)).unwrap();
+        assert!(!profile_of(&client, "alice").locked);
+    }
+
+    #[test]
+    fn a_locked_session_cannot_remove_its_pin() {
+        let alice = session_for(&FakeClient::new(None), "alice");
+        assert_eq!(
+            ready(alice.clear_pin()).unwrap_err(),
+            BackendError::ProfileLocked
+        );
+    }
+
+    #[test]
+    fn a_pin_must_be_four_to_eight_digits() {
+        let andrey = andrey();
+        assert!(matches!(
+            ready(andrey.set_pin("12a4")),
+            Err(BackendError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn the_tv_can_be_set_from_here() {
+        let client = FakeClient::new(None);
+        let alice = session_for(&client, "alice");
+        ready(alice.unlock(FAKE_PIN)).unwrap();
+        ready(alice.set_pin_required(Some(LIVING_ROOM_TV), true)).unwrap();
+        let devices = ready(alice.devices()).unwrap();
+        let tv = devices
+            .iter()
+            .find(|d| d.endpoint_id == LIVING_ROOM_TV)
+            .unwrap();
+        assert!(tv.pin_required && !tv.this_device);
+    }
+
+    #[test]
+    fn clearing_the_pin_stops_asking_everywhere() {
+        let client = FakeClient::new(None);
+        let alice = session_for(&client, "alice");
+        ready(alice.unlock(FAKE_PIN)).unwrap();
+        ready(alice.set_pin_required(Some(LIVING_ROOM_TV), true)).unwrap();
+        ready(alice.clear_pin()).unwrap();
+        let devices = ready(alice.devices()).unwrap();
+        assert!(devices.iter().all(|d| !d.pin_required));
+    }
+
+    #[test]
+    fn a_pending_device_sign_in_is_looked_up_by_its_code() {
+        let request = ready(andrey().lookup_device_sign_in(FAKE_SIGN_IN_CODE)).unwrap();
+        assert_eq!(request.device_name.as_deref(), Some("Living Room Apple TV"));
+    }
+
+    #[test]
+    fn an_approved_code_is_used_up() {
+        let andrey = andrey();
+        ready(andrey.approve_device_sign_in(FAKE_SIGN_IN_CODE)).unwrap();
+        assert!(matches!(
+            ready(andrey.lookup_device_sign_in(FAKE_SIGN_IN_CODE)),
+            Err(BackendError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn approving_this_devices_own_code_is_refused() {
+        assert!(matches!(
+            ready(andrey().approve_device_sign_in(FAKE_OWN_SIGN_IN_CODE)),
+            Err(BackendError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn five_wrong_codes_are_rate_limited() {
+        let andrey = andrey();
+        for _ in 0..5 {
+            let _ = ready(andrey.lookup_device_sign_in("BBBBBBBB"));
+        }
+        assert!(matches!(
+            ready(andrey.lookup_device_sign_in(FAKE_SIGN_IN_CODE)),
+            Err(BackendError::RateLimited(_))
+        ));
+    }
+
+    #[test]
+    fn a_locked_profile_cannot_approve() {
+        let alice = session_for(&FakeClient::new(None), "alice");
+        assert_eq!(
+            ready(alice.approve_device_sign_in(FAKE_SIGN_IN_CODE)).unwrap_err(),
+            BackendError::ProfileLocked
+        );
     }
 }

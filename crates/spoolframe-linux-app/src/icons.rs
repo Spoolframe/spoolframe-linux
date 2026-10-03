@@ -61,6 +61,9 @@ pub const PLAY_NEXT: &str = "lucide-list-start-symbolic";
 pub const ADD_TO_QUEUE: &str = "lucide-list-plus-symbolic";
 pub const MORE: &str = "lucide-ellipsis-symbolic";
 pub const DRAG: &str = "lucide-grip-vertical-symbolic";
+// The profile PIN (P2-08).
+pub const LOCK: &str = "lucide-lock-symbolic";
+pub const DELETE: &str = "lucide-delete-symbolic";
 
 /// Every name above, for the tests.
 #[cfg(test)]
@@ -103,6 +106,8 @@ const ALL: &[&str] = &[
     ADD_TO_QUEUE,
     MORE,
     DRAG,
+    LOCK,
+    DELETE,
 ];
 
 #[cfg(test)]

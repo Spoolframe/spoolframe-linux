@@ -8,7 +8,7 @@
 //! Secret Service through oo7, which gnome-keyring, KWallet and KeePassXC
 //! provide. Without one, [`Storage::open`] fails: secrets are never written
 //! to a plain file instead. Everything else (saved servers, their pins and
-//! addresses) is one file per key under `$XDG_DATA_HOME/spoolframe-linux/`.
+//! addresses) is one file per key in the app's data directory ([`crate::paths`]).
 
 use std::path::{Path, PathBuf};
 
@@ -43,14 +43,9 @@ impl DataStore {
         Self { dir: dir.into() }
     }
 
-    /// The default: `$XDG_DATA_HOME/spoolframe-linux`, or
-    /// `~/.local/share/spoolframe-linux`.
+    /// The default: the app's data directory ([`crate::paths::data_dir`]).
     pub fn default_dir() -> Option<PathBuf> {
-        let base = std::env::var_os("XDG_DATA_HOME")
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".local/share")))?;
-        Some(base.join("spoolframe-linux"))
+        crate::paths::data_dir()
     }
 
     fn path(&self, key: &str) -> Result<PathBuf, StorageError> {
@@ -181,28 +176,32 @@ impl Storage {
 mod tests {
     use super::*;
 
-    fn temp_store(name: &str) -> DataStore {
-        let dir =
-            std::env::temp_dir().join(format!("spoolframe-storage-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        DataStore::new(dir)
+    use crate::test_dir::TestDir;
+
+    /// A store in a directory of the test's own, which is not made until a
+    /// value is written.
+    fn temp_store(name: &str) -> (TestDir, DataStore) {
+        let dir = TestDir::new_blocking(&format!("spoolframe-storage-{name}"));
+        let store = DataStore::new(dir.join("data"));
+        (dir, store)
     }
 
     #[test]
     fn a_missing_key_is_none() {
-        assert_eq!(temp_store("missing").get("servers").unwrap(), None);
+        let (_dir, store) = temp_store("missing");
+        assert_eq!(store.get("servers").unwrap(), None);
     }
 
     #[test]
     fn a_stored_value_reads_back() {
-        let store = temp_store("roundtrip");
+        let (_dir, store) = temp_store("roundtrip");
         store.set("servers", Some(b"[]")).unwrap();
         assert_eq!(store.get("servers").unwrap(), Some(b"[]".to_vec()));
     }
 
     #[test]
     fn a_new_value_replaces_the_old_one() {
-        let store = temp_store("replace");
+        let (_dir, store) = temp_store("replace");
         store.set("servers", Some(b"one")).unwrap();
         store.set("servers", Some(b"two")).unwrap();
         assert_eq!(store.get("servers").unwrap(), Some(b"two".to_vec()));
@@ -210,7 +209,7 @@ mod tests {
 
     #[test]
     fn setting_none_removes_the_value() {
-        let store = temp_store("remove");
+        let (_dir, store) = temp_store("remove");
         store.set("servers", Some(b"x")).unwrap();
         store.set("servers", None).unwrap();
         assert_eq!(store.get("servers").unwrap(), None);
@@ -218,12 +217,13 @@ mod tests {
 
     #[test]
     fn removing_a_missing_value_is_fine() {
-        temp_store("remove-missing").set("servers", None).unwrap();
+        let (_dir, store) = temp_store("remove-missing");
+        store.set("servers", None).unwrap();
     }
 
     #[test]
     fn a_key_cannot_leave_the_directory() {
-        let store = temp_store("escape");
+        let (_dir, store) = temp_store("escape");
         assert!(matches!(
             store.set("../etc", Some(b"x")),
             Err(StorageError::BadKey(_))
@@ -232,7 +232,7 @@ mod tests {
 
     #[test]
     fn a_key_with_a_directory_round_trips() {
-        let store = temp_store("nested");
+        let (_dir, store) = temp_store("nested");
         store.set("sessions/9e80325910d054d2", Some(b"x")).unwrap();
         assert_eq!(
             store.get("sessions/9e80325910d054d2").unwrap(),
@@ -269,7 +269,10 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a running Secret Service"]
     async fn a_secret_round_trips_through_the_keyring() {
-        let storage = Storage::open(temp_store("keyring")).await.unwrap();
+        let dir = spoolframe_test_dir::TestDir::new("spoolframe-storage-keyring").await;
+        let storage = Storage::open(DataStore::new(dir.as_ref().join("data")))
+            .await
+            .unwrap();
         // Shaped like the SDK's session keys, which have a `/`.
         let key = "sessions/test-roundtrip";
         storage

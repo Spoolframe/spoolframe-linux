@@ -1,6 +1,6 @@
 //! The play queue and context saved per profile (P1-23), so they come back
 //! on the next start, paused where they were. A JSON file beside the SDK's
-//! data, `$XDG_DATA_HOME/spoolframe-linux/queues/<hash>.json`, named by a
+//! data, `queues/<hash>.json` in the app's data directory, named by a
 //! hash of the server and the username: usernames need not fit a file
 //! name.
 
@@ -86,6 +86,7 @@ impl SavedQueue {
 #[cfg(test)]
 mod tests {
     use spoolframe_linux_core::backend::ServerKey;
+    use spoolframe_linux_core::test_dir::TestDir;
     use spoolframe_types::{Item, MediaId, MediaKind, Namespace, PlaybackState, Track};
 
     use super::*;
@@ -109,16 +110,12 @@ mod tests {
             server: ServerKey("k5d2r8w1tqz7m3c0vnh4q7fa".into()),
             username: username.into(),
             display_name: username.into(),
+            locked: false,
         }
     }
 
-    fn dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "spoolframe-saved-queue-{name}-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
+    fn dir(name: &str) -> TestDir {
+        TestDir::new_blocking(&format!("spoolframe-saved-queue-{name}"))
     }
 
     fn titles(queue: &Queue) -> Vec<String> {
@@ -136,7 +133,8 @@ mod tests {
 
     #[test]
     fn a_saved_queue_and_position_come_back() {
-        let saved = SavedQueue::in_store(DataStore::new(dir("back")), &profile("Andrey"));
+        let store = dir("back");
+        let saved = SavedQueue::in_store(DataStore::new(store.path()), &profile("Andrey"));
         let mut queue = Queue::new(vec![song("a"), song("b")], 1, None, Vec::new());
         queue.add(vec![song("x")], None);
         saved.save(&queue, Duration::from_millis(61_500));
@@ -150,8 +148,8 @@ mod tests {
     #[test]
     fn each_profile_has_its_own_queue() {
         let store = dir("profiles");
-        let andrey = SavedQueue::in_store(DataStore::new(&store), &profile("andrey"));
-        let alice = SavedQueue::in_store(DataStore::new(&store), &profile("alice"));
+        let andrey = SavedQueue::in_store(DataStore::new(store.path()), &profile("andrey"));
+        let alice = SavedQueue::in_store(DataStore::new(store.path()), &profile("alice"));
         andrey.save(
             &Queue::new(vec![song("a")], 0, None, Vec::new()),
             Duration::ZERO,
@@ -162,8 +160,8 @@ mod tests {
     #[test]
     fn an_unreadable_file_is_no_queue() {
         let store = dir("unreadable");
-        let saved = SavedQueue::in_store(DataStore::new(&store), &profile("andrey"));
-        DataStore::new(&store)
+        let saved = SavedQueue::in_store(DataStore::new(store.path()), &profile("andrey"));
+        DataStore::new(store.path())
             .set(&saved.key, Some(b"not json"))
             .unwrap();
         assert!(saved.load().is_none());

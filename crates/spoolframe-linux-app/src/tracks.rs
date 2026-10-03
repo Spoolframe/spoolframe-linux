@@ -329,6 +329,7 @@ pub fn channel_layout(channels: i32) -> String {
 
 #[cfg(test)]
 mod tests {
+    use spoolframe_linux_core::test_dir::TestDir;
     use std::path::Path;
     use std::time::Duration;
 
@@ -394,17 +395,17 @@ mod tests {
         panic!("GstPlay never listed two audio streams and a subtitle");
     }
 
-    fn clip_path(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "spoolframe-tracks-{}-{name}.mkv",
-            std::process::id()
-        ))
+    /// Where a clip goes, in a directory of the test's own.
+    fn clip_path(name: &str) -> (TestDir, std::path::PathBuf) {
+        let dir = TestDir::new_blocking(&format!("spoolframe-tracks-{name}"));
+        let path = dir.join("clip.mkv");
+        (dir, path)
     }
 
     #[test]
     fn the_second_audio_stream_can_be_chosen() {
         gst::init().unwrap();
-        let path = clip_path("audio");
+        let (_dir, path) = clip_path("audio");
         clip(&path);
         let (play, info) = play(&path);
         select_audio(&play, &info, 1).unwrap();
@@ -421,7 +422,7 @@ mod tests {
     #[test]
     fn choosing_the_audio_already_playing_succeeds() {
         gst::init().unwrap();
-        let path = clip_path("same-audio");
+        let (_dir, path) = clip_path("same-audio");
         clip(&path);
         let (play, info) = play(&path);
         let chosen = select_audio(&play, &info, 0);
@@ -433,7 +434,7 @@ mod tests {
     #[test]
     fn a_subtitle_stream_can_be_chosen() {
         gst::init().unwrap();
-        let path = clip_path("subtitle");
+        let (_dir, path) = clip_path("subtitle");
         clip(&path);
         let (play, info) = play(&path);
         select_subtitle(&play, &info, Some(0)).unwrap();

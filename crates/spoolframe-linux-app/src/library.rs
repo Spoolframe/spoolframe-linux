@@ -251,6 +251,7 @@ mod tests {
             server: ServerKey("k5d2r8w1tqz7m3c0vnh4q7fa".into()),
             username: "andrey".into(),
             display_name: "Andrey".into(),
+            locked: false,
         };
         let session = client.session(&profile).unwrap();
         // A context of its own: tests run on parallel threads.

@@ -29,14 +29,12 @@ use crate::saved_queue::SavedQueue;
 use crate::settings::Settings;
 use crate::theme::ThemeApplier;
 use crate::views::{Cards, Enqueue};
-use crate::{library, nowplaying, pages, player, preferences, start, views};
+use crate::{library, nowplaying, pages, pin, player, preferences, start, views};
 use spoolframe_linux_core::artcache::ArtworkCache;
 
 /// What the app starts with.
 pub struct Init {
     pub client: Arc<dyn Client>,
-    /// A line for the sign-in dialog: the fake's accounts, when on it.
-    pub sign_in_hint: Option<String>,
     /// The device's artwork cache, if it could be opened.
     pub artwork_cache: Option<Arc<ArtworkCache>>,
 }
@@ -74,12 +72,15 @@ impl PlayRequest {
 
 pub struct App {
     client: Arc<dyn Client>,
-    sign_in_hint: Option<String>,
     artwork_cache: Option<Arc<ArtworkCache>>,
     /// The signed-in user's session, once a profile is chosen.
     session: Option<Arc<dyn Session>>,
     /// The server being used, once one is chosen.
     server: Option<Server>,
+    /// The profile in use, once one is entered.
+    profile: Option<Profile>,
+    /// The locked profile whose PIN the pad asks for (P2-08).
+    unlocking: Option<Profile>,
     libraries: Vec<Library>,
     settings: Settings,
     theme: ThemeApplier,
@@ -110,6 +111,8 @@ pub struct App {
 pub struct AppWidgets {
     /// "servers", "profiles" or "library".
     screens: gtk::Stack,
+    /// The PIN pad on the profiles screen, while it shows (P2-08).
+    pin_pad: Option<Rc<pin::Pad>>,
     servers: adw::Bin,
     profiles: adw::Bin,
     toasts: adw::ToastOverlay,
@@ -146,6 +149,11 @@ pub enum Msg {
     OpenAddServer,
     AddServer(String, String),
     ChooseProfile(Profile),
+    /// The PIN typed for the locked profile being chosen (P2-08).
+    Unlock(String),
+    /// From the PIN pad: back to "Who's watching", or to the password.
+    BackToProfiles,
+    ForgotPin,
     OpenSignIn,
     SubmitSignIn(String, String),
     /// Back to "Who's watching" from the library.
@@ -170,6 +178,8 @@ pub enum Msg {
     ServersChanged,
     OpenPreferences,
     SetTheme(Theme),
+    /// The streaming bitrate limit (P2-06), for the next start.
+    SetMaxBitrate(Option<u64>),
     /// Leave the full player and keep playing in the bar.
     MinimizePlayer,
     /// Take an item out of Continue watching (`true`), or put it back
@@ -237,13 +247,26 @@ pub enum Loaded {
     Saved(Result<(), BackendError>),
     TracksForgotten(Box<Item>, Result<(), BackendError>),
     Preferences(Result<TrackPreferences, BackendError>),
+    /// What the server said to the PIN typed for a locked profile.
+    Unlocked(Box<Profile>, Result<(), BackendError>),
 }
 
 impl Loaded {
     /// Whether the session behind this answer is gone. Any session call
     /// can find out; the app then asks the user to sign in again.
     fn sign_in_required(&self) -> bool {
-        let gone = |e: &BackendError| *e == BackendError::SignInRequired;
+        self.session_error() == Some(&BackendError::SignInRequired)
+    }
+
+    /// Whether the profile turned out locked mid-session (P2-08): another
+    /// profile used the connection, or the requirement was just turned on
+    /// from elsewhere. The app asks for the PIN again.
+    fn profile_locked(&self) -> bool {
+        self.session_error() == Some(&BackendError::ProfileLocked)
+    }
+
+    /// The error of an answer that comes from the profile's session.
+    fn session_error(&self) -> Option<&BackendError> {
         match self {
             Loaded::Libraries(Err(e))
             | Loaded::Home(Err(e))
@@ -257,8 +280,8 @@ impl Loaded {
             | Loaded::Enqueued(_, Err(e))
             | Loaded::Saved(Err(e))
             | Loaded::TracksForgotten(_, Err(e))
-            | Loaded::Preferences(Err(e)) => gone(e),
-            _ => false,
+            | Loaded::Preferences(Err(e)) => Some(e),
+            _ => None,
         }
     }
 }
@@ -282,7 +305,6 @@ impl Component for App {
     fn init(
         Init {
             client,
-            sign_in_hint,
             artwork_cache,
         }: Self::Init,
         root: Self::Root,
@@ -528,10 +550,11 @@ impl Component for App {
 
         let model = App {
             client,
-            sign_in_hint,
             artwork_cache,
             session: None,
             server: None,
+            profile: None,
+            unlocking: None,
             libraries: Vec::new(),
             settings,
             theme,
@@ -573,6 +596,7 @@ impl Component for App {
                 profile_server,
                 banner,
                 sign_in: None,
+                pin_pad: None,
                 add_server: None,
                 sidebar,
                 stack,
@@ -664,14 +688,39 @@ impl Component for App {
                     Loaded::ServerAdded(client.add_address(&ServerKey(key), &address).await)
                 });
             }
+            Msg::ChooseProfile(profile) if profile.locked => {
+                self.ask_pin(profile, widgets, &sender)
+            }
             Msg::ChooseProfile(profile) => self.enter(profile, widgets, &sender),
+            Msg::Unlock(pin) => {
+                let Some(profile) = self.unlocking.clone() else {
+                    return;
+                };
+                let session = match self.client.session(&profile) {
+                    Ok(session) => session,
+                    Err(e) => return toast(widgets, &e),
+                };
+                sender.oneshot_command(async move {
+                    let unlocked = session.unlock(&pin).await;
+                    Loaded::Unlocked(Box::new(profile), unlocked)
+                });
+            }
+            Msg::BackToProfiles => {
+                self.unlocking = None;
+                widgets.pin_pad = None;
+                match self.server.clone() {
+                    Some(server) => self.load_profiles(server, &sender),
+                    None => sender.input(Msg::ShowServers),
+                }
+            }
+            Msg::ForgotPin => sender.input(Msg::OpenSignIn),
             Msg::OpenSignIn => {
                 let Some(server) = &self.server else { return };
                 let submit: Rc<dyn Fn(String, String)> = {
                     let sender = sender.clone();
                     Rc::new(move |u, p| sender.input(Msg::SubmitSignIn(u, p)))
                 };
-                let dialog = start::SignIn::new(server, self.sign_in_hint.as_deref(), submit);
+                let dialog = start::SignIn::new(server, submit);
                 dialog.dialog.present(Some(root));
                 widgets.sign_in = Some(dialog);
             }
@@ -871,6 +920,18 @@ impl Component for App {
                 self.theme.apply(theme);
                 self.settings.set_theme(theme);
             }
+            Msg::SetMaxBitrate(limit) => {
+                // The server learns it with the device's capabilities, at
+                // the next start.
+                self.settings.set_max_bitrate(limit);
+                toast_text(
+                    widgets,
+                    &format!(
+                        "Bitrate limit: {} · applies when Spoolframe next starts",
+                        preferences::bitrate_name(limit)
+                    ),
+                );
+            }
         }
     }
 
@@ -883,6 +944,9 @@ impl Component for App {
     ) {
         if loaded.sign_in_required() {
             return self.signed_out(widgets, &sender);
+        }
+        if loaded.profile_locked() {
+            return self.locked_mid_session(widgets, &sender);
         }
         let cards = self.cards.clone();
         let cards = cards.as_ref();
@@ -974,6 +1038,16 @@ impl Component for App {
                 }
             }
             Loaded::Hidden(_, _, Err(e)) => toast(widgets, &e),
+            Loaded::Unlocked(profile, Ok(())) => {
+                self.unlocking = None;
+                widgets.pin_pad = None;
+                let profile = Profile {
+                    locked: false,
+                    ..*profile
+                };
+                self.enter(profile, widgets, &sender);
+            }
+            Loaded::Unlocked(_, Err(e)) => self.pin_refused(&e, widgets, &sender),
             Loaded::Enqueued(at, Ok(groups)) => self.enqueue(groups, at, widgets, &sender),
             Loaded::Enqueued(_, Err(e)) => toast(widgets, &e),
             Loaded::Trusted(Ok(server)) => {
@@ -1231,7 +1305,19 @@ impl App {
                 Rc::new(move || sender.input(Msg::CheckServer(check.clone(), true)));
             (server, verify)
         });
-        preferences::dialog(self.settings.theme(), tracks, server, set_theme, set_tracks)
+        let set_bitrate: preferences::SetBitrate = {
+            let sender = sender.clone();
+            Rc::new(move |limit| sender.input(Msg::SetMaxBitrate(limit)))
+        };
+        preferences::dialog(
+            self.settings.theme(),
+            tracks,
+            server,
+            set_theme,
+            set_tracks,
+            (self.settings.max_bitrate(), set_bitrate),
+            self.signed(),
+        )
     }
 
     fn load_servers(&self, sender: &ComponentSender<Self>) {
@@ -1281,6 +1367,7 @@ impl App {
         });
         self.library_cache = Some(library::Cache::new(session.clone()));
         self.session = Some(session);
+        self.profile = Some(profile.clone());
         self.settings.set_server(&profile.server.0);
         widgets.profile_avatar.set_text(Some(&profile.display_name));
         widgets.profile_name.set_label(&profile.display_name);
@@ -1418,6 +1505,95 @@ impl App {
         widgets.mini_bar.detach();
         widgets.mpris.detach();
         widgets.window_stack.pop_to_page(&widgets.library_page);
+    }
+
+    /// The profile in use, for Preferences → Profile.
+    fn signed(&self) -> Option<crate::profile_page::Signed> {
+        let (session, server, profile) = (
+            self.session.clone()?,
+            self.server.as_ref()?,
+            self.profile.as_ref()?,
+        );
+        Some(crate::profile_page::Signed {
+            session,
+            server_key: server.key.0.clone(),
+            server_name: server.name.clone(),
+            display_name: profile.display_name.clone(),
+        })
+    }
+
+    /// Asks for `profile`'s PIN on the profiles screen, before anything of
+    /// it shows (P2-08).
+    fn ask_pin(
+        &mut self,
+        profile: Profile,
+        widgets: &mut AppWidgets,
+        sender: &ComponentSender<Self>,
+    ) {
+        let server_name = self.server.as_ref().map_or("", |s| s.name.as_str());
+        let unlock: Rc<dyn Fn(String)> = {
+            let sender = sender.clone();
+            Rc::new(move |pin| sender.input(Msg::Unlock(pin)))
+        };
+        let back: Rc<dyn Fn()> = {
+            let sender = sender.clone();
+            Rc::new(move || sender.input(Msg::BackToProfiles))
+        };
+        let forgot: Rc<dyn Fn()> = {
+            let sender = sender.clone();
+            Rc::new(move || sender.input(Msg::ForgotPin))
+        };
+        let pad = pin::pad(&profile, server_name, unlock, forgot, back);
+        widgets.profiles.set_child(Some(&pad.widget));
+        widgets.screens.set_visible_child_name("profiles");
+        widgets.pin_pad = Some(pad);
+        self.unlocking = Some(profile);
+    }
+
+    /// What the server said no to a PIN with, on the pad.
+    fn pin_refused(
+        &mut self,
+        error: &BackendError,
+        widgets: &mut AppWidgets,
+        sender: &ComponentSender<Self>,
+    ) {
+        let Some(pad) = widgets.pin_pad.clone() else {
+            return;
+        };
+        match error {
+            BackendError::WrongCredentials => pad.wrong(),
+            BackendError::RateLimited(wait) => pad.reject(&format!(
+                "Too many tries. Try again in {} s.",
+                wait.as_secs().max(1)
+            )),
+            // The tenth wrong PIN in a row ended the session here: the
+            // password, from "Who's watching".
+            BackendError::SignInRequired => {
+                toast_text(
+                    widgets,
+                    "Too many wrong PINs. Sign in again with your password.",
+                );
+                sender.input(Msg::BackToProfiles);
+            }
+            other => pad.reject(&other.to_string()),
+        }
+    }
+
+    /// The profile in use turned out locked: what plays stops, and the
+    /// PIN is asked for before the library comes back.
+    fn locked_mid_session(&mut self, widgets: &mut AppWidgets, sender: &ComponentSender<Self>) {
+        self.stop_playback(widgets);
+        match self.profile.clone() {
+            Some(profile) => self.ask_pin(
+                Profile {
+                    locked: true,
+                    ..profile
+                },
+                widgets,
+                sender,
+            ),
+            None => self.signed_out(widgets, sender),
+        }
     }
 
     /// The session is gone: back to "Who's watching", where the profile

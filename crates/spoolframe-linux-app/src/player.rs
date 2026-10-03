@@ -17,8 +17,10 @@ use adw::prelude::*;
 use gst::prelude::*;
 use gst_play::prelude::*;
 use gtk::glib;
+use spoolframe_linux_core::backend::PlaybackPlan;
 use spoolframe_linux_core::format;
 use spoolframe_linux_core::reader;
+use spoolframe_protocol::{AudioAction, ConvertedAudio, ConvertedVideo, SubtitleAction};
 use spoolframe_types::Item;
 
 use crate::playback::{Change, Playback, VideoSink};
@@ -247,6 +249,7 @@ impl View {
     }
 
     fn media_info(&self, playback: &Playback, info: &gst_play::PlayMediaInfo) {
+        self.diagnostics.show_plan(playback.plan().as_ref());
         self.diagnostics.show_media(info);
         // GstPlay updates the media info as streams turn up; the menu is
         // built again whenever the stream lists change.
@@ -644,7 +647,7 @@ impl Controls {
 /// shared by the buttons and the keys.
 fn transport_actions(playback: &Rc<Playback>) -> gtk::gio::SimpleActionGroup {
     let group = gtk::gio::SimpleActionGroup::new();
-    let add = |name: &str, run: Box<dyn Fn(&Playback)>| {
+    let add = |name: &str, run: fn(&Rc<Playback>)| {
         let action = gtk::gio::SimpleAction::new(name, None);
         let weak = Rc::downgrade(playback);
         action.connect_activate(move |_, _| {
@@ -654,9 +657,9 @@ fn transport_actions(playback: &Rc<Playback>) -> gtk::gio::SimpleActionGroup {
         });
         group.add_action(&action);
     };
-    add("toggle", Box::new(|p| p.toggle()));
-    add("back", Box::new(|p| p.jump(-10.0)));
-    add("forward", Box::new(|p| p.jump(30.0)));
+    add("toggle", |p| p.toggle());
+    add("back", |p| p.jump(-10.0));
+    add("forward", |p| p.jump(30.0));
     group
 }
 
@@ -705,8 +708,10 @@ struct Diagnostics {
 }
 
 impl Diagnostics {
-    const ROWS: [&'static str; 9] = [
+    const ROWS: [&'static str; 11] = [
         "path",
+        "conversion",
+        "why",
         "video",
         "decoder",
         "audio",
@@ -780,14 +785,7 @@ impl Diagnostics {
             _ => format!("{} MiB", status.ready_bytes / (1024 * 1024)),
         };
         self.set("buffer", &ahead);
-        self.set(
-            "reads",
-            &format!(
-                "{} × {} MiB in flight",
-                status.in_flight,
-                reader::BLOCK / (1024 * 1024)
-            ),
-        );
+        self.set("reads", &format!("{} in flight", status.in_flight));
         let throughput = status.throughput.map_or("—".to_owned(), |rate| {
             format!("{:.0} Mbit/s", rate * 8.0 / 1_000_000.0)
         });
@@ -825,9 +823,25 @@ impl Diagnostics {
         );
     }
 
+    /// How the server plays the item (P2-06): directly, or what it copies
+    /// and encodes, and why.
+    fn show_plan(&self, plan: Option<&PlaybackPlan>) {
+        let shown = plan.map(PlanSummary::of).unwrap_or_default();
+        self.badge.set_label(shown.badge);
+        for class in ["success", "warning"] {
+            self.badge.remove_css_class(class);
+        }
+        self.badge.add_css_class(if shown.badge == "Direct" {
+            "success"
+        } else {
+            "warning"
+        });
+        self.set("path", &shown.path);
+        self.set("conversion", &shown.conversion);
+        self.set("why", &shown.why);
+    }
+
     fn show_media(&self, info: &gst_play::PlayMediaInfo) {
-        self.set("path", "direct · range reads");
-        self.badge.set_label("Direct");
         if let Some(video) = info.video_streams().first() {
             let codec = video.codec().map(|c| c.to_string()).unwrap_or_default();
             self.set(
@@ -881,10 +895,217 @@ impl Diagnostics {
     }
 }
 
+/// A plan in the diagnostics' words.
+#[derive(Debug, PartialEq)]
+struct PlanSummary {
+    badge: &'static str,
+    path: String,
+    conversion: String,
+    why: String,
+}
+
+impl Default for PlanSummary {
+    fn default() -> Self {
+        Self {
+            badge: "Direct",
+            path: "—".into(),
+            conversion: "—".into(),
+            why: "—".into(),
+        }
+    }
+}
+
+impl PlanSummary {
+    fn of(plan: &PlaybackPlan) -> Self {
+        match plan {
+            PlaybackPlan::Direct { .. } => Self {
+                path: "direct · range reads".into(),
+                ..Self::default()
+            },
+            PlaybackPlan::Converted {
+                delivery,
+                container,
+                video,
+                audio,
+                subtitle,
+                reasons,
+            } => {
+                let encodes = matches!(video, Some(ConvertedVideo::Encode { .. }))
+                    || matches!(
+                        audio,
+                        Some(ConvertedAudio {
+                            action: AudioAction::Encode { .. },
+                            ..
+                        })
+                    );
+                let mut parts = Vec::new();
+                match video {
+                    Some(ConvertedVideo::Copy { codec }) => {
+                        parts.push(format!("video copied ({codec})"))
+                    }
+                    Some(ConvertedVideo::Encode {
+                        codec,
+                        height,
+                        max_bitrate,
+                        tone_map,
+                    }) => {
+                        let mut part = format!("video → {codec} {height}p");
+                        if let Some(rate) = max_bitrate {
+                            part.push_str(&format!(" ≤{} Mbit/s", rate / 1_000_000));
+                        }
+                        if *tone_map {
+                            part.push_str(", tone-mapped");
+                        }
+                        parts.push(part);
+                    }
+                    Some(ConvertedVideo::Unknown) => parts.push("video: ?".into()),
+                    None => {}
+                }
+                match audio.map(|a| a.action) {
+                    Some(AudioAction::Copy { codec }) => {
+                        parts.push(format!("audio copied ({codec})"))
+                    }
+                    Some(AudioAction::Encode {
+                        codec,
+                        channels,
+                        bitrate,
+                    }) => parts.push(format!(
+                        "audio → {codec} {channels} ch {} kbit/s",
+                        bitrate / 1000
+                    )),
+                    Some(AudioAction::Unknown) => parts.push("audio: ?".into()),
+                    None => {}
+                }
+                match subtitle.map(|s| s.action) {
+                    Some(SubtitleAction::Copy { format }) => {
+                        parts.push(format!("subtitle copied ({format})"))
+                    }
+                    Some(SubtitleAction::Convert { from, to }) => {
+                        parts.push(format!("subtitle {from} → {to}"))
+                    }
+                    Some(SubtitleAction::BurnIn { format }) => {
+                        parts.push(format!("subtitle ({format}) burned in"))
+                    }
+                    Some(SubtitleAction::Ocr { from, .. }) => {
+                        parts.push(format!("subtitle ({from}) read as text"))
+                    }
+                    Some(SubtitleAction::Unknown) => parts.push("subtitle: ?".into()),
+                    None => {}
+                }
+                Self {
+                    badge: if encodes { "Transcode" } else { "Remux" },
+                    path: format!(
+                        "converted · {} {container}",
+                        format!("{delivery:?}").to_lowercase()
+                    ),
+                    conversion: parts.join(" · "),
+                    why: if reasons.is_empty() {
+                        "—".into()
+                    } else {
+                        reasons.join("; ")
+                    },
+                }
+            }
+            PlaybackPlan::Unsupported { reasons } => Self {
+                badge: "Unsupported",
+                why: reasons.join("; "),
+                ..Self::default()
+            },
+            PlaybackPlan::Unknown => Self::default(),
+        }
+    }
+}
+
 pub fn mono(text: &str) -> gtk::Label {
     gtk::Label::builder()
         .label(text)
         .xalign(0.0)
         .css_classes(["monospace", "numeric"])
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use spoolframe_protocol::{ConvertedSubtitle, PlannedAudio};
+    use spoolframe_types::{AudioCodec, Container, Delivery, SubtitleFormat, VideoCodec};
+
+    use super::*;
+
+    fn transcode() -> PlaybackPlan {
+        PlaybackPlan::Converted {
+            delivery: Delivery::Progressive,
+            container: Container::Matroska,
+            video: Some(ConvertedVideo::Encode {
+                codec: VideoCodec::H264,
+                height: 1080,
+                max_bitrate: Some(8_000_000),
+                tone_map: true,
+            }),
+            audio: Some(ConvertedAudio {
+                index: 0,
+                action: AudioAction::Copy {
+                    codec: AudioCodec::Aac,
+                },
+            }),
+            subtitle: Some(ConvertedSubtitle {
+                index: 2,
+                action: SubtitleAction::BurnIn {
+                    format: SubtitleFormat::Pgs,
+                },
+            }),
+            reasons: vec!["video 0: hevc is not supported".into()],
+        }
+    }
+
+    #[test]
+    fn a_transcode_says_what_is_encoded_and_why() {
+        let summary = PlanSummary::of(&transcode());
+        assert_eq!(
+            (summary.badge, summary.why.as_str()),
+            ("Transcode", "video 0: hevc is not supported")
+        );
+    }
+
+    #[test]
+    fn a_transcode_lists_each_stream() {
+        let summary = PlanSummary::of(&transcode());
+        assert_eq!(
+            summary.conversion,
+            format!(
+                "video → {} 1080p ≤8 Mbit/s, tone-mapped · audio copied ({}) · subtitle ({}) burned in",
+                VideoCodec::H264,
+                AudioCodec::Aac,
+                SubtitleFormat::Pgs
+            )
+        );
+    }
+
+    #[test]
+    fn a_plan_that_copies_every_stream_is_a_remux() {
+        let remux = PlaybackPlan::Converted {
+            delivery: Delivery::Progressive,
+            container: Container::Matroska,
+            video: Some(ConvertedVideo::Copy {
+                codec: VideoCodec::Hevc,
+            }),
+            audio: None,
+            subtitle: None,
+            reasons: Vec::new(),
+        };
+        assert_eq!(PlanSummary::of(&remux).badge, "Remux");
+    }
+
+    #[test]
+    fn direct_play_is_direct() {
+        let direct = PlaybackPlan::Direct {
+            container: Container::Matroska,
+            video: Some(VideoCodec::H264),
+            audio: Some(PlannedAudio {
+                index: 0,
+                codec: AudioCodec::Aac,
+            }),
+            subtitle: None,
+        };
+        assert_eq!(PlanSummary::of(&direct).badge, "Direct");
+    }
 }

@@ -31,5 +31,8 @@ mpris-server = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+[dev-dependencies]
+spoolframe-linux-core = { workspace = true, features = ["testing"] }
+
 [build-dependencies]
 glib-build-tools = { workspace = true }

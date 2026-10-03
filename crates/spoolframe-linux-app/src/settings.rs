@@ -1,19 +1,24 @@
-//! The user's preferences, in `$XDG_CONFIG_HOME/spoolframe-linux/settings.ini`.
+//! The user's preferences, in `settings.ini` in the app's config
+//! directory (`paths::config_dir`: `~/.config/spoolframe-relm4` on Linux).
 //! A GLib key file rather than GSettings: GSettings needs a schema
 //! installed system-wide, which a `cargo run` does not have.
 
 use std::path::PathBuf;
 
 use gtk::glib;
+use spoolframe_linux_core::paths;
 use spoolframe_linux_core::theme::Theme;
 
 const APPEARANCE: &str = "appearance";
 const THEME: &str = "theme";
 const CONNECTION: &str = "connection";
 const SERVER: &str = "server";
+const STREAMING: &str = "streaming";
+const MAX_BITRATE: &str = "max-bitrate";
 
 pub struct Settings {
-    path: PathBuf,
+    /// `None` without a home directory: settings then last for this run.
+    path: Option<PathBuf>,
     file: glib::KeyFile,
 }
 
@@ -21,14 +26,17 @@ impl Settings {
     /// Reads the settings file. A missing file means every setting is at
     /// its default.
     pub fn load() -> Self {
-        let path = glib::user_config_dir()
-            .join("spoolframe-linux")
-            .join("settings.ini");
+        let path = paths::config_dir().map(|dir| dir.join("settings.ini"));
         let file = glib::KeyFile::new();
-        if let Err(e) = file.load_from_file(&path, glib::KeyFileFlags::KEEP_COMMENTS)
-            && !e.matches(glib::FileError::Noent)
-        {
-            tracing::warn!(path = %path.display(), error = %e, "settings file unreadable; using defaults");
+        match &path {
+            Some(path) => {
+                if let Err(e) = file.load_from_file(path, glib::KeyFileFlags::KEEP_COMMENTS)
+                    && !e.matches(glib::FileError::Noent)
+                {
+                    tracing::warn!(path = %path.display(), error = %e, "settings file unreadable; using defaults");
+                }
+            }
+            None => tracing::warn!("no home directory; settings last for this run only"),
         }
         Self { path, file }
     }
@@ -38,7 +46,7 @@ impl Settings {
             return Theme::default();
         };
         Theme::from_key(&key).unwrap_or_else(|| {
-            tracing::warn!(path = %self.path.display(), theme = %key, "unknown theme in settings; following the system");
+            tracing::warn!(path = ?self.path, theme = %key, "unknown theme in settings; following the system");
             Theme::default()
         })
     }
@@ -48,7 +56,7 @@ impl Settings {
     pub fn set_theme(&mut self, theme: Theme) {
         self.file.set_string(APPEARANCE, THEME, theme.key());
         if let Err(e) = self.save() {
-            tracing::warn!(path = %self.path.display(), error = %e, "could not save settings");
+            tracing::warn!(path = ?self.path, error = %e, "could not save settings");
         }
     }
 
@@ -63,15 +71,40 @@ impl Settings {
     pub fn set_server(&mut self, key: &str) {
         self.file.set_string(CONNECTION, SERVER, key);
         if let Err(e) = self.save() {
-            tracing::warn!(path = %self.path.display(), error = %e, "could not save settings");
+            tracing::warn!(path = ?self.path, error = %e, "could not save settings");
+        }
+    }
+
+    /// The most the server may send, in bits per second (P2-06); `None`,
+    /// the default, for no limit, as on a LAN. Read once at start-up: it is
+    /// part of what this device tells the server it can take.
+    pub fn max_bitrate(&self) -> Option<u64> {
+        self.file
+            .uint64(STREAMING, MAX_BITRATE)
+            .ok()
+            .filter(|b| *b > 0)
+    }
+
+    pub fn set_max_bitrate(&mut self, bitrate: Option<u64>) {
+        match bitrate {
+            Some(bitrate) => self.file.set_uint64(STREAMING, MAX_BITRATE, bitrate),
+            None => {
+                let _ = self.file.remove_key(STREAMING, MAX_BITRATE);
+            }
+        }
+        if let Err(e) = self.save() {
+            tracing::warn!(path = ?self.path, error = %e, "could not save settings");
         }
     }
 
     fn save(&self) -> anyhow::Result<()> {
-        if let Some(dir) = self.path.parent() {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        self.file.save_to_file(&self.path)?;
+        self.file.save_to_file(path)?;
         Ok(())
     }
 }

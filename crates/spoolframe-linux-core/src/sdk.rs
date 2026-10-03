@@ -23,8 +23,9 @@ use tokio::runtime::Handle;
 use tokio::sync::watch;
 
 use crate::backend::{
-    ArtworkSize, BackendError, BoxFuture, ChosenTracks, Client, ConnectionState, HomeScreen,
-    PlaybackHandle, PlaybackPlan, PlaybackStart, Profile, Selection, Server, ServerKey, Session,
+    ArtworkSize, BackendError, BoxFuture, ChosenTracks, Chunk, Client, ConnectionState, DeviceInfo,
+    DeviceSignInRequest, HomeScreen, PlaybackHandle, PlaybackPlan, PlaybackStart, Profile,
+    Selection, Server, ServerKey, Session,
 };
 use crate::storage::Storage;
 
@@ -41,6 +42,12 @@ pub fn backend_error(error: sdk::SdkError) -> BackendError {
         E::NotFound(what) => BackendError::NotFound(what),
         E::NotPinned(id) => BackendError::NotPinned(id),
         E::IdentityChanged { saved, now } => BackendError::IdentityChanged { saved, now },
+        E::Busy => BackendError::Busy,
+        E::ProfileLocked => BackendError::ProfileLocked,
+        E::InvalidInput(why) => BackendError::InvalidInput(why),
+        E::PlaybackRestarted { epoch } => BackendError::PlaybackRestarted { epoch },
+        E::SubtitleNotReady { done_percent } => BackendError::SubtitleNotReady(done_percent),
+        E::PlaybackFailed(why) => BackendError::Other(format!("the conversion failed: {why}")),
         // The server's own "unavailable" (Plex or a media mount down)
         // arrives as a server error with its message.
         E::Server(message) => match message.strip_prefix("unavailable: ") {
@@ -79,6 +86,7 @@ fn profile(session: &sdk::Session) -> Profile {
         server: ServerKey(session.server()),
         username: user.username.clone(),
         display_name: user.display_name.clone(),
+        locked: user.locked,
     }
 }
 
@@ -423,17 +431,59 @@ impl Session for SdkSession {
         &'a self,
         id: &'a MediaId,
         selection: Option<Selection>,
+        start: Option<Duration>,
     ) -> BoxFuture<'a, Result<PlaybackStart, BackendError>> {
         let id = id.clone();
         Box::pin(self.call(move |s| async move {
-            let playback = s.start_playback(&id, selection).await?;
+            let options = sdk::PlaybackOptions {
+                start,
+                ..Default::default()
+            };
+            let playback = s.start_playback_with(&id, selection, options).await?;
             Ok(PlaybackStart {
                 handle: playback.handle,
                 plan: playback.plan,
                 size: playback.size,
                 chosen: playback.chosen,
+                epoch: playback.epoch,
             })
         }))
+    }
+
+    fn read_chunk<'a>(
+        &'a self,
+        handle: &'a PlaybackHandle,
+        epoch: u32,
+        offset: u64,
+        length: u64,
+    ) -> BoxFuture<'a, Result<Chunk, BackendError>> {
+        let handle = handle.clone();
+        Box::pin(self.call(move |s| async move {
+            let chunk = s.read_chunk(&handle, epoch, offset, length).await?;
+            Ok(Chunk {
+                bytes: chunk.bytes,
+                size: chunk.size,
+                complete: chunk.complete,
+                epoch: chunk.epoch,
+            })
+        }))
+    }
+
+    fn seek_playback<'a>(
+        &'a self,
+        handle: &'a PlaybackHandle,
+        position: Duration,
+    ) -> BoxFuture<'a, Result<u32, BackendError>> {
+        let handle = handle.clone();
+        Box::pin(self.call(move |s| async move { s.seek_playback(&handle, position).await }))
+    }
+
+    fn stop_playback<'a>(
+        &'a self,
+        handle: &'a PlaybackHandle,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        let handle = handle.clone();
+        Box::pin(self.call(move |s| async move { s.stop_playback(&handle).await }))
     }
 
     fn read<'a>(
@@ -527,6 +577,57 @@ impl Session for SdkSession {
     ) -> BoxFuture<'a, Result<(), BackendError>> {
         let id = id.clone();
         Box::pin(self.call(move |s| async move { s.clear_track_override(&id).await }))
+    }
+
+    fn unlock<'a>(&'a self, pin: &'a str) -> BoxFuture<'a, Result<(), BackendError>> {
+        let pin = pin.to_owned();
+        Box::pin(self.call(move |s| async move { s.unlock(&pin).await }))
+    }
+
+    fn set_pin<'a>(&'a self, pin: &'a str) -> BoxFuture<'a, Result<(), BackendError>> {
+        let pin = pin.to_owned();
+        Box::pin(self.call(move |s| async move { s.set_pin(&pin).await }))
+    }
+
+    fn clear_pin(&self) -> BoxFuture<'_, Result<(), BackendError>> {
+        Box::pin(self.call(|s| async move { s.clear_pin().await }))
+    }
+
+    fn devices(&self) -> BoxFuture<'_, Result<Vec<DeviceInfo>, BackendError>> {
+        Box::pin(self.call(|s| async move { s.devices().await }))
+    }
+
+    fn set_pin_required<'a>(
+        &'a self,
+        device: Option<&'a str>,
+        required: bool,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        let device = device.map(str::to_owned);
+        Box::pin(
+            self.call(
+                move |s| async move { s.set_pin_required(device.as_deref(), required).await },
+            ),
+        )
+    }
+    fn lookup_device_sign_in<'a>(
+        &'a self,
+        code: &'a str,
+    ) -> BoxFuture<'a, Result<DeviceSignInRequest, BackendError>> {
+        let code = code.to_owned();
+        Box::pin(self.call(move |s| async move { s.lookup_device_sign_in(&code).await }))
+    }
+
+    fn approve_device_sign_in<'a>(
+        &'a self,
+        code: &'a str,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        let code = code.to_owned();
+        Box::pin(self.call(move |s| async move { s.approve_device_sign_in(&code).await }))
+    }
+
+    fn deny_device_sign_in<'a>(&'a self, code: &'a str) -> BoxFuture<'a, Result<(), BackendError>> {
+        let code = code.to_owned();
+        Box::pin(self.call(move |s| async move { s.deny_device_sign_in(&code).await }))
     }
 }
 

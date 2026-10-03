@@ -54,6 +54,9 @@ gst-base = { package = "gstreamer-base", version = "0.25" }
 gst-plugin-gtk4 = { version = "0.15", features = ["gtk_v4_14", "dmabuf", "wayland", "x11egl"] }
 # MPRIS on the session bus (P1-24): the desktop's Now Playing and media keys.
 mpris-server = "0.10"
+# A test's own directory under a random name, removed with it, so tests
+# running at once never share one (core's `testing` feature).
+spoolframe-test-dir = { path = "../spoolframe/crates/spoolframe-test-dir" }
 # The play queue saved per profile (P1-23), as JSON beside the SDK's data.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -63,6 +66,9 @@ glib-build-tools = "0.22"
 # The backend's connection state is a tokio watch channel, as in the SDK.
 # Relm4 runs its commands on tokio already.
 tokio = { version = "1", features = ["sync", "rt-multi-thread"] }
+
+# Where config, data and cache live, by each platform's rules.
+directories = "6"
 
 # Secrets (the device key, session tokens) in the desktop's Secret
 # Service, never a plain file.

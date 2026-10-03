@@ -2,10 +2,12 @@
 //! plays a server's file like any other URI (P1-16). Registered in-process;
 //! not a system plugin.
 //!
-//! The player publishes a [`MediaReader`] and gets a URI for it; playbin
-//! makes this element for the URI, and the element reads through the
-//! reader. It is a byte-oriented, seekable BaseSrc that knows the file's
-//! size, so demuxers seek in it as in a local file.
+//! The player publishes a reader and gets a URI for it; playbin makes this
+//! element for the URI, and the element reads through the reader. It is a
+//! byte-oriented BaseSrc. For direct play it knows the file's size and is
+//! seekable, so demuxers seek in it as in a local file. For a converted
+//! playback (P2-06) the size is unknown and it reads in order only, as a
+//! stream: a seek there is a new encode and a new URI.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,12 +18,12 @@ use gst::prelude::*;
 use gst::subclass::prelude::*;
 use gst_base::prelude::*;
 use gst_base::subclass::prelude::*;
-use spoolframe_linux_core::reader::{MediaReader, ReadError};
+use spoolframe_linux_core::reader::{ByteSource, ReadError};
 
 const SCHEME: &str = "spoolframe";
 
 /// Published readers, by the number in their URI.
-static READERS: LazyLock<Mutex<HashMap<u64, Arc<MediaReader>>>> =
+static READERS: LazyLock<Mutex<HashMap<u64, Arc<dyn ByteSource>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
@@ -29,20 +31,27 @@ static NEXT: AtomicU64 = AtomicU64::new(1);
 /// dropped; an element already reading keeps its own reference.
 pub struct Published {
     id: u64,
-    reader: Arc<MediaReader>,
+    reader: Arc<dyn ByteSource>,
 }
 
 impl Published {
-    pub fn new(reader: MediaReader) -> Self {
+    pub fn new(reader: impl ByteSource + 'static) -> Self {
+        Self::publish(Arc::new(reader))
+    }
+
+    pub fn boxed(reader: Box<dyn ByteSource>) -> Self {
+        Self::publish(Arc::from(reader))
+    }
+
+    fn publish(reader: Arc<dyn ByteSource>) -> Self {
         let id = NEXT.fetch_add(1, Ordering::Relaxed);
-        let reader = Arc::new(reader);
         readers().insert(id, reader.clone());
         Self { id, reader }
     }
 
     /// The reader, for its read-ahead status.
-    pub fn reader(&self) -> &MediaReader {
-        &self.reader
+    pub fn reader(&self) -> &dyn ByteSource {
+        &*self.reader
     }
 
     pub fn uri(&self) -> String {
@@ -56,7 +65,7 @@ impl Drop for Published {
     }
 }
 
-fn readers() -> std::sync::MutexGuard<'static, HashMap<u64, Arc<MediaReader>>> {
+fn readers() -> std::sync::MutexGuard<'static, HashMap<u64, Arc<dyn ByteSource>>> {
     READERS.lock().expect("the reader table is never poisoned")
 }
 
@@ -82,11 +91,11 @@ mod imp {
     #[derive(Default)]
     pub struct SpoolframeSrc {
         uri: Mutex<Option<String>>,
-        reader: Mutex<Option<Arc<MediaReader>>>,
+        reader: Mutex<Option<Arc<dyn ByteSource>>>,
     }
 
     impl SpoolframeSrc {
-        fn reader(&self) -> Option<Arc<MediaReader>> {
+        fn reader(&self) -> Option<Arc<dyn ByteSource>> {
             self.reader.lock().expect("never poisoned").clone()
         }
     }
@@ -151,12 +160,14 @@ mod imp {
             }
         }
 
+        /// Seekable in bytes only with a fixed size: a converted output
+        /// grows, and is read in order.
         fn is_seekable(&self) -> bool {
-            true
+            self.reader().is_some_and(|r| r.size().is_some())
         }
 
         fn size(&self) -> Option<u64> {
-            self.reader().map(|r| r.size())
+            self.reader().and_then(|r| r.size())
         }
 
         fn unlock(&self) -> Result<(), gst::ErrorMessage> {
@@ -245,6 +256,7 @@ mod imp {
 
 #[cfg(test)]
 mod tests {
+    use spoolframe_linux_core::test_dir::TestDir;
     use std::future::Future;
     use std::path::{Path, PathBuf};
     use std::pin::pin;
@@ -253,7 +265,7 @@ mod tests {
 
     use spoolframe_linux_core::backend::{Client, Profile, Selection, ServerKey};
     use spoolframe_linux_core::fake::FakeClient;
-    use spoolframe_linux_core::reader::Spawn;
+    use spoolframe_linux_core::reader::{MediaReader, Spawn};
     use spoolframe_types::{MediaId, MediaKind, Namespace};
 
     use super::*;
@@ -315,10 +327,11 @@ mod tests {
             server: ServerKey("k5d2r8w1tqz7m3c0vnh4q7fa".into()),
             username: "andrey".into(),
             display_name: "Andrey".into(),
+            locked: false,
         };
         let session = client.session(&profile).unwrap();
         let item = MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap();
-        let start = ready(session.start_playback(&item, None)).unwrap();
+        let start = ready(session.start_playback(&item, None, None)).unwrap();
         Published::new(MediaReader::new(
             session,
             item,
@@ -332,7 +345,8 @@ mod tests {
     fn playbin_plays_a_spoolframe_uri_to_the_end() {
         gst::init().unwrap();
         register().unwrap();
-        let path = std::env::temp_dir().join(format!("spoolframe-src-{}.mkv", std::process::id()));
+        let dir = TestDir::new_blocking("spoolframe-src");
+        let path = dir.join("clip.mkv");
         clip(&path);
         let published = published(path);
         let playbin = gst::ElementFactory::make("playbin3")
@@ -354,7 +368,8 @@ mod tests {
     fn a_seek_into_the_middle_continues_to_the_end() {
         gst::init().unwrap();
         register().unwrap();
-        let path = std::env::temp_dir().join(format!("spoolframe-seek-{}.mkv", std::process::id()));
+        let dir = TestDir::new_blocking("spoolframe-seek");
+        let path = dir.join("clip.mkv");
         clip(&path);
         let published = published(path);
         let playbin = gst::ElementFactory::make("playbin3")
@@ -380,6 +395,52 @@ mod tests {
                 gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
                 gst::ClockTime::from_seconds(1),
             )
+            .unwrap();
+        run_to_eos(&playbin, Duration::from_secs(30));
+    }
+
+    /// A converted playback (P2-06): the output grows as it is read, its
+    /// size is unknown and the source cannot seek in it, and playbin still
+    /// plays it to the end.
+    #[test]
+    fn playbin_plays_a_growing_converted_output_to_the_end() {
+        use spoolframe_linux_core::progressive::ProgressiveReader;
+
+        gst::init().unwrap();
+        register().unwrap();
+        let dir = TestDir::new_blocking("spoolframe-grow");
+        let path = dir.join("clip.mkv");
+        clip(&path);
+        let client = FakeClient::new(Some(path)).converting(16 * 1024);
+        let profile = Profile {
+            server: ServerKey("k5d2r8w1tqz7m3c0vnh4q7fa".into()),
+            username: "andrey".into(),
+            display_name: "Andrey".into(),
+            locked: false,
+        };
+        let session = client.session(&profile).unwrap();
+        let item = MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap();
+        let start = ready(session.start_playback(&item, None, None)).unwrap();
+        let published = Published::new(ProgressiveReader::new(
+            session,
+            start.handle,
+            start.epoch,
+            thread_spawn(),
+        ));
+        let playbin = gst::ElementFactory::make("playbin3")
+            .property("uri", published.uri())
+            .property(
+                "video-sink",
+                gst::ElementFactory::make("fakesink")
+                    .property("sync", true)
+                    .build()
+                    .unwrap(),
+            )
+            .property(
+                "audio-sink",
+                gst::ElementFactory::make("fakesink").build().unwrap(),
+            )
+            .build()
             .unwrap();
         run_to_eos(&playbin, Duration::from_secs(30));
     }
@@ -431,7 +492,7 @@ mod tests {
         let (items, _) = runtime.block_on(session.items(&movies.id, 0, 1)).unwrap();
         let item = items.into_iter().next().expect("a movie");
         let start = runtime
-            .block_on(session.start_playback(item.id(), None))
+            .block_on(session.start_playback(item.id(), None, None))
             .unwrap();
         eprintln!(
             "playing {} ({} bytes, {:?})",

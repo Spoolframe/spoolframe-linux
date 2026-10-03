@@ -8,9 +8,11 @@ mod minibar;
 mod mpris;
 mod nowplaying;
 mod pages;
+mod pin;
 mod playback;
 mod player;
 mod preferences;
+mod profile_page;
 mod queue;
 mod saved_queue;
 mod settings;
@@ -29,7 +31,6 @@ use relm4::RelmApp;
 use spoolframe_client_sdk as sdk;
 use spoolframe_linux_core::artcache::{ArtworkCache, Limits};
 use spoolframe_linux_core::backend::Client;
-use spoolframe_linux_core::fake::{FAKE_PASSWORD, FakeClient};
 use spoolframe_linux_core::sdk::{SdkClient, SdkStorage};
 use spoolframe_linux_core::storage::{DataStore, Storage};
 use tracing_subscriber::EnvFilter;
@@ -46,16 +47,6 @@ struct Cli {
     /// Increase log verbosity (-v = debug, -vv = trace).
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
-
-    /// Use a built-in fake server instead of real ones: the mockups'
-    /// content, for working on the UI without a server.
-    #[arg(long)]
-    fake: bool,
-
-    /// The file the fake server plays for every movie, episode and track.
-    /// Without it, playback says the fake has no media.
-    #[arg(long, value_name = "FILE", requires = "fake")]
-    fake_media: Option<std::path::PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -80,28 +71,11 @@ fn main() -> Result<()> {
     // The SDK's runtime: its tasks (discovery, reconnecting) run here for
     // as long as the app does. Kept in scope until the app returns.
     let runtime = tokio::runtime::Runtime::new().context("cannot start the async runtime")?;
-    let (client, sign_in_hint): (Arc<dyn Client>, _) = if cli.fake {
-        let fake_media = match cli.fake_media {
-            Some(path) => Some(
-                path.canonicalize()
-                    .with_context(|| format!("--fake-media {}", path.display()))?,
-            ),
-            None => None,
-        };
-        (
-            Arc::new(FakeClient::new(fake_media)),
-            Some(format!(
-                "Fake accounts: andrey, alice, steve · password {FAKE_PASSWORD}"
-            )),
-        )
-    } else {
-        (Arc::new(open_sdk(&runtime)?), None)
-    };
+    let client: Arc<dyn Client> = Arc::new(open_sdk(&runtime)?);
 
     let artwork_cache = open_artwork_cache(&runtime);
     app.run::<app::App>(app::Init {
         client,
-        sign_in_hint,
         artwork_cache: artwork_cache.clone(),
     });
     playback::shutdown();
@@ -116,7 +90,7 @@ fn main() -> Result<()> {
 /// fetched each time, which is slower but works.
 fn open_artwork_cache(runtime: &tokio::runtime::Runtime) -> Option<Arc<ArtworkCache>> {
     let Some(dir) = ArtworkCache::default_dir() else {
-        tracing::warn!("neither XDG_CACHE_HOME nor HOME is set; artwork is not cached");
+        tracing::warn!("no cache directory (no home directory?); artwork is not cached");
         return None;
     };
     match runtime.block_on(ArtworkCache::open(&dir, Limits::default())) {
@@ -133,9 +107,10 @@ fn open_artwork_cache(runtime: &tokio::runtime::Runtime) -> Option<Arc<ArtworkCa
 /// the user sees, never a fallback to a plain file.
 fn open_sdk(runtime: &tokio::runtime::Runtime) -> Result<SdkClient> {
     let data = DataStore::default_dir()
-        .context("neither XDG_DATA_HOME nor HOME is set, so there is nowhere to keep data")?;
+        .context("no data directory (no home directory?), so there is nowhere to keep data")?;
     let storage = runtime.block_on(Storage::open(DataStore::new(data)))?;
-    let capabilities = capabilities::capabilities();
+    let mut capabilities = capabilities::capabilities();
+    capabilities.max_bitrate = settings::Settings::load().max_bitrate();
     tracing::debug!(?capabilities, "decoders found");
     let device = sdk::Device {
         name: gtk::glib::host_name().to_string(),

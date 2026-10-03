@@ -1,7 +1,8 @@
-//! What the UI talks to. Today the fakes in [`crate::fake`] implement it;
-//! `spoolframe-client-sdk` will, through a thin adapter, once it lands
-//! (P1-15). The shapes follow the SDK's API and use the protocol's own
-//! types, so that adapter only passes calls through.
+//! What the UI talks to. `spoolframe-client-sdk` implements it, through
+//! the thin adapter in [`crate::sdk`]; tests use a fake server answering
+//! from fixed data (`fake`, behind the `testing` feature). The shapes
+//! follow the SDK's API and use the protocol's own types, so the adapter
+//! only passes calls through.
 //!
 //! The split follows ARCHITECTURE §13–16: a [`Client`] is this device, with
 //! its one endpoint and the servers it knows; a [`Session`] is one user
@@ -14,7 +15,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use spoolframe_protocol::{
-    ArtworkSize, ChosenTracks, HomeScreen, PlaybackHandle, PlaybackPlan, Selection, TrackReason,
+    ArtworkSize, ChosenTracks, DeviceInfo, DeviceSignInRequest, HomeScreen, PlaybackHandle,
+    PlaybackPlan, Selection, TrackReason,
 };
 use spoolframe_types::{
     ArtworkId, Item, Library, LibraryId, MediaId, MediaTracks, SubtitleFormat, TrackPreferences,
@@ -46,6 +48,25 @@ pub enum BackendError {
     /// A playback handle idled out. Start playback again and carry on.
     #[error("the playback has expired")]
     PlaybackExpired,
+    /// This profile needs its PIN on this device before anything else
+    /// (P2-08).
+    #[error("this profile is locked; enter its PIN")]
+    ProfileLocked,
+    /// The server refused what was sent, saying why (a PIN that is not 4
+    /// to 8 digits).
+    #[error("{0}")]
+    InvalidInput(String),
+    /// The server is converting as many files as it may (P2-03).
+    #[error("the server is busy converting other files; try again shortly")]
+    Busy,
+    /// A seek restarted a converted playback's encode (P2-04): read
+    /// `epoch` from offset 0.
+    #[error("the playback restarted (epoch {epoch})")]
+    PlaybackRestarted { epoch: u32 },
+    /// The subtitle is still being read as text (P2-07): ask again in a
+    /// few seconds.
+    #[error("the subtitle is still being read ({0}% done)")]
+    SubtitleNotReady(u8),
     /// Something the server depends on is down (Plex, a media mount).
     #[error("unavailable: {0}")]
     Unavailable(String),
@@ -105,6 +126,9 @@ pub struct Profile {
     pub server: ServerKey,
     pub username: String,
     pub display_name: String,
+    /// Its PIN is asked for on this device before anything of it shows
+    /// (P2-08). As the server said when the profiles were listed.
+    pub locked: bool,
 }
 
 /// How the device's connection to a server is doing.
@@ -121,10 +145,25 @@ pub enum ConnectionState {
 pub struct PlaybackStart {
     pub handle: PlaybackHandle,
     pub plan: PlaybackPlan,
-    /// The size of the file the handle reads, in bytes.
+    /// The size of the file the handle reads, in bytes; 0 for a converted
+    /// playback, whose output grows as it is encoded (see [`Chunk`]).
     pub size: u64,
     /// The tracks the server chose and why, when none were asked for.
     pub chosen: Option<ChosenTracks>,
+    /// A converted playback's encode: 0 at the start, one more after each
+    /// [`Session::seek_playback`].
+    pub epoch: u32,
+}
+
+/// Part of a converted playback's output (P2-04).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chunk {
+    pub bytes: Vec<u8>,
+    /// Bytes encoded so far: the whole output once `complete`.
+    pub size: u64,
+    /// The encode has finished: no more bytes will come.
+    pub complete: bool,
+    pub epoch: u32,
 }
 
 /// The longest read the server serves at once (P1-08).
@@ -232,12 +271,43 @@ pub trait Session: Send + Sync {
     ) -> BoxFuture<'a, Result<(PlaybackPlan, Option<ChosenTracks>), BackendError>>;
 
     /// Starts playback with these tracks, or with the server's choice from
-    /// the user's preferences and series override (`None`).
+    /// the user's preferences and series override (`None`). A converted
+    /// playback's encode begins at `start` (P2-03); direct play reads from
+    /// wherever the player likes, and the server ignores it.
     fn start_playback<'a>(
         &'a self,
         id: &'a MediaId,
         selection: Option<Selection>,
+        start: Option<Duration>,
     ) -> BoxFuture<'a, Result<PlaybackStart, BackendError>>;
+
+    /// Up to `length` bytes of a converted playback's output from
+    /// `offset`, for its `epoch` (P2-04). A read past what is encoded
+    /// waits a while on the server and may come back empty and not
+    /// `complete`: ask again. [`BackendError::PlaybackRestarted`] means a
+    /// seek replaced `epoch`.
+    fn read_chunk<'a>(
+        &'a self,
+        handle: &'a PlaybackHandle,
+        epoch: u32,
+        offset: u64,
+        length: u64,
+    ) -> BoxFuture<'a, Result<Chunk, BackendError>>;
+
+    /// Restarts a converted playback's encode at `position`; reads go on
+    /// with the returned epoch, from offset 0.
+    fn seek_playback<'a>(
+        &'a self,
+        handle: &'a PlaybackHandle,
+        position: Duration,
+    ) -> BoxFuture<'a, Result<u32, BackendError>>;
+
+    /// Ends a playback now, and its encode. Otherwise it ends when it has
+    /// not been read for a while.
+    fn stop_playback<'a>(
+        &'a self,
+        handle: &'a PlaybackHandle,
+    ) -> BoxFuture<'a, Result<(), BackendError>>;
 
     /// Up to [`MAX_READ`] bytes of a playback's file from `offset`; fewer
     /// only at the end of the file.
@@ -304,6 +374,50 @@ pub trait Session: Send + Sync {
         &'a self,
         id: &'a MediaId,
     ) -> BoxFuture<'a, Result<(), BackendError>>;
+
+    /// Unlocks this profile on this device with its PIN (P2-08). A wrong
+    /// PIN is [`BackendError::WrongCredentials`], too many in a while
+    /// [`BackendError::RateLimited`]; the tenth wrong in a row ends the
+    /// session here ([`BackendError::SignInRequired`]).
+    fn unlock<'a>(&'a self, pin: &'a str) -> BoxFuture<'a, Result<(), BackendError>>;
+
+    /// Sets or changes the user's PIN, 4 to 8 digits. The signed-in,
+    /// unlocked session is all it takes.
+    fn set_pin<'a>(&'a self, pin: &'a str) -> BoxFuture<'a, Result<(), BackendError>>;
+
+    /// Removes the user's PIN, and with it every device's requirement.
+    fn clear_pin(&self) -> BoxFuture<'_, Result<(), BackendError>>;
+
+    /// The devices the user has signed in from, and where the PIN is
+    /// asked for.
+    fn devices(&self) -> BoxFuture<'_, Result<Vec<DeviceInfo>, BackendError>>;
+
+    /// Asks for the PIN on `device` (an endpoint id from
+    /// [`Session::devices`]; this device for `None`), or stops asking.
+    fn set_pin_required<'a>(
+        &'a self,
+        device: Option<&'a str>,
+        required: bool,
+    ) -> BoxFuture<'a, Result<(), BackendError>>;
+
+    /// The device asking to be signed in with `code` (P3-07), normalized:
+    /// what it calls itself and when it asked. A code that is not pending
+    /// is [`BackendError::NotFound`]; too many wrong codes,
+    /// [`BackendError::RateLimited`].
+    fn lookup_device_sign_in<'a>(
+        &'a self,
+        code: &'a str,
+    ) -> BoxFuture<'a, Result<DeviceSignInRequest, BackendError>>;
+
+    /// Signs that device in as this user. Approving the device that shows
+    /// the code is [`BackendError::InvalidInput`].
+    fn approve_device_sign_in<'a>(
+        &'a self,
+        code: &'a str,
+    ) -> BoxFuture<'a, Result<(), BackendError>>;
+
+    /// Refuses it: the device is told so.
+    fn deny_device_sign_in<'a>(&'a self, code: &'a str) -> BoxFuture<'a, Result<(), BackendError>>;
 }
 
 #[cfg(test)]

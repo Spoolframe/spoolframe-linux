@@ -393,7 +393,19 @@ pub fn profiles(
         .build();
     for profile in profiles {
         let avatar = adw::Avatar::new(128, Some(&profile.display_name), true);
-        let tile = profile_tile(&avatar, &profile.display_name, "Signed in");
+        // A locked profile asks for its PIN when chosen (P2-08).
+        let detail = gtk::Box::builder()
+            .spacing(6)
+            .halign(gtk::Align::Center)
+            .css_classes(["dim-label", "caption"])
+            .build();
+        if profile.locked {
+            detail.append(&gtk::Image::from_icon_name(crate::icons::LOCK));
+            detail.append(&gtk::Label::new(Some("PIN")));
+        } else {
+            detail.append(&gtk::Label::new(Some("Signed in")));
+        }
+        let tile = profile_tile(&avatar, &profile.display_name, &detail);
         let (profile, choose) = (profile.clone(), choose.clone());
         tile.connect_clicked(move |_| choose(profile.clone()));
         tiles.append(&tile);
@@ -408,7 +420,14 @@ pub fn profiles(
         .halign(gtk::Align::Center)
         .css_classes(["add-profile"])
         .build();
-    let add_tile = profile_tile(&add, "Sign in", "Another account");
+    let add_tile = profile_tile(
+        &add,
+        "Sign in",
+        &gtk::Label::builder()
+            .label("Another account")
+            .css_classes(["dim-label", "caption"])
+            .build(),
+    );
     let sign_in = sign_in.clone();
     add_tile.connect_clicked(move |_| sign_in());
     tiles.append(&add_tile);
@@ -432,7 +451,11 @@ pub fn profiles(
     page(&header, &column)
 }
 
-fn profile_tile(avatar: &impl IsA<gtk::Widget>, name: &str, detail: &str) -> gtk::Button {
+fn profile_tile(
+    avatar: &impl IsA<gtk::Widget>,
+    name: &str,
+    detail: &impl IsA<gtk::Widget>,
+) -> gtk::Button {
     let body = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(8)
@@ -445,12 +468,7 @@ fn profile_tile(avatar: &impl IsA<gtk::Widget>, name: &str, detail: &str) -> gtk
             .margin_top(8)
             .build(),
     );
-    body.append(
-        &gtk::Label::builder()
-            .label(detail)
-            .css_classes(["dim-label", "caption"])
-            .build(),
-    );
+    body.append(detail);
     gtk::Button::builder()
         .child(&body)
         .css_classes(["flat", "profile-tile"])
@@ -466,7 +484,7 @@ pub struct SignIn {
 }
 
 impl SignIn {
-    pub fn new(server: &Server, hint: Option<&str>, submit: Rc<dyn Fn(String, String)>) -> Self {
+    pub fn new(server: &Server, submit: Rc<dyn Fn(String, String)>) -> Self {
         let username = adw::EntryRow::builder().title("Username").build();
         let password = adw::PasswordEntryRow::builder().title("Password").build();
         let fields = adw::PreferencesGroup::new();
@@ -502,12 +520,6 @@ impl SignIn {
         body.append(&fields);
         body.append(&error);
         body.append(&button);
-        if let Some(hint) = hint {
-            let hint = dim(hint);
-            hint.set_halign(gtk::Align::Center);
-            hint.add_css_class("caption");
-            body.append(&hint);
-        }
 
         let toolbar = adw::ToolbarView::new();
         toolbar.add_top_bar(&adw::HeaderBar::new());

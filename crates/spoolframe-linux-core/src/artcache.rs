@@ -49,13 +49,9 @@ pub struct ArtworkCache {
 }
 
 impl ArtworkCache {
-    /// `$XDG_CACHE_HOME/spoolframe-linux/artwork`, or under `~/.cache`.
+    /// `artwork` in the app's cache directory ([`crate::paths::cache_dir`]).
     pub fn default_dir() -> Option<PathBuf> {
-        let base = std::env::var_os("XDG_CACHE_HOME")
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".cache")))?;
-        Some(base.join("spoolframe-linux").join("artwork"))
+        crate::paths::cache_dir().map(|dir| dir.join("artwork"))
     }
 
     /// Opens the cache in `dir`, with what an earlier run left there. Runs
@@ -134,11 +130,12 @@ mod tests {
 
     use super::*;
 
-    fn temp_dir(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("spoolframe-artcache-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
+    /// A directory of the test's own (removed when dropped), and the
+    /// cache's place in it, not made yet.
+    async fn temp_dir(name: &str) -> (spoolframe_test_dir::TestDir, PathBuf) {
+        let tmp = spoolframe_test_dir::TestDir::new(&format!("spoolframe-artcache-{name}")).await;
+        let path = tmp.as_ref().join("cache");
+        (tmp, path)
     }
 
     fn small() -> Limits {
@@ -169,9 +166,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_second_get_does_not_fetch_again() {
-        let cache = ArtworkCache::open(&temp_dir("again"), small())
-            .await
-            .unwrap();
+        let (_tmp, dir) = temp_dir("again").await;
+        let cache = ArtworkCache::open(&dir, small()).await.unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         for _ in 0..2 {
             let bytes = cache
@@ -185,9 +181,8 @@ mod tests {
 
     #[tokio::test]
     async fn another_size_is_another_entry() {
-        let cache = ArtworkCache::open(&temp_dir("sizes"), small())
-            .await
-            .unwrap();
+        let (_tmp, dir) = temp_dir("sizes").await;
+        let cache = ArtworkCache::open(&dir, small()).await.unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         for size in [ArtworkSize::Small, ArtworkSize::Large] {
             cache
@@ -200,9 +195,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_fetch_is_an_error_and_is_not_kept() {
-        let cache = ArtworkCache::open(&temp_dir("failed"), small())
-            .await
-            .unwrap();
+        let (_tmp, dir) = temp_dir("failed").await;
+        let cache = ArtworkCache::open(&dir, small()).await.unwrap();
         let failed = cache
             .get_or_fetch(&server(), &poster(), ArtworkSize::Small, async {
                 Err(BackendError::NotFound("poster".into()))
@@ -219,7 +213,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_cache_outlives_the_app() {
-        let dir = temp_dir("restart");
+        let (_tmp, dir) = temp_dir("restart").await;
         let calls = Arc::new(AtomicUsize::new(0));
         {
             let cache = ArtworkCache::open(&dir, small()).await.unwrap();

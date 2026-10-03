@@ -17,6 +17,13 @@ tracing = { workspace = true }
 oo7 = { workspace = true }
 foyer = { workspace = true }
 anyhow = { workspace = true }
+directories = { workspace = true }
+spoolframe-test-dir = { workspace = true, optional = true }
+
+[features]
+# TestDir and the fake server, for the app's tests too.
+testing = ["dep:spoolframe-test-dir"]
 
 [dev-dependencies]
+spoolframe-test-dir = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }

@@ -1,7 +1,8 @@
 //! The Preferences dialog: Appearance (the app's theme, kept on this
 //! device), Server (the fingerprint of the server in use, P1-21) and, when
 //! signed in, Playback (the user's audio and subtitle preferences, kept on
-//! the server for every device, P1-20).
+//! the server for every device, P1-20) and Profile (the PIN and where it
+//! is asked for, P2-08).
 
 use std::rc::Rc;
 
@@ -40,14 +41,20 @@ pub fn dialog(
     server: Option<(Server, Rc<dyn Fn()>)>,
     set_theme: Rc<dyn Fn(Theme)>,
     set_tracks: Rc<dyn Fn(TrackPreferences)>,
+    bitrate: (Option<u64>, SetBitrate),
+    signed: Option<crate::profile_page::Signed>,
 ) -> adw::PreferencesDialog {
     let dialog = adw::PreferencesDialog::new();
     dialog.add(&appearance(theme, set_theme));
+    dialog.add(&streaming(bitrate.0, bitrate.1));
     if let Some((server, verify)) = server {
         dialog.add(&server_page(&server, verify));
     }
     if let Some(tracks) = tracks {
         dialog.add(&playback(tracks, set_tracks));
+    }
+    if let Some(signed) = signed {
+        dialog.add(&crate::profile_page::page(signed, &dialog));
     }
     dialog
 }
@@ -124,6 +131,68 @@ fn appearance(current: Theme, set_theme: Rc<dyn Fn(Theme)>) -> adw::PreferencesP
     let page = adw::PreferencesPage::builder()
         .title("Appearance")
         .icon_name(crate::icons::APPEARANCE)
+        .build();
+    page.add(&group);
+    page
+}
+
+/// Saves a new bitrate limit.
+pub type SetBitrate = Rc<dyn Fn(Option<u64>)>;
+
+/// The bitrate limits offered, in bits per second; `None` is no limit.
+pub const BITRATE_LIMITS: [Option<u64>; 7] = [
+    None,
+    Some(40_000_000),
+    Some(20_000_000),
+    Some(12_000_000),
+    Some(8_000_000),
+    Some(4_000_000),
+    Some(2_000_000),
+];
+
+/// "No limit", or "8 Mbit/s".
+pub fn bitrate_name(limit: Option<u64>) -> String {
+    match limit {
+        None => "No limit".to_owned(),
+        Some(bits) => format!("{} Mbit/s", bits / 1_000_000),
+    }
+}
+
+/// The offered limit nearest `current` (a hand-edited setting may be
+/// none of them).
+fn nearest_limit(current: Option<u64>) -> usize {
+    match current {
+        None => 0,
+        Some(bits) => BITRATE_LIMITS
+            .iter()
+            .enumerate()
+            .skip(1)
+            .min_by_key(|(_, limit)| limit.unwrap_or(0).abs_diff(bits))
+            .map_or(0, |(i, _)| i),
+    }
+}
+
+/// The most the server may send (P2-06): over it, it encodes down. Off by
+/// default, as on a LAN.
+fn streaming(current: Option<u64>, set: SetBitrate) -> adw::PreferencesPage {
+    let names: Vec<String> = BITRATE_LIMITS.iter().map(|l| bitrate_name(*l)).collect();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let row = adw::ComboRow::builder()
+        .title("Bitrate limit")
+        .subtitle("Over it, the server converts to fit. Applies when Spoolframe next starts.")
+        .model(&gtk::StringList::new(&names))
+        .selected(nearest_limit(current) as u32)
+        .build();
+    row.connect_selected_notify(move |row| {
+        if let Some(limit) = BITRATE_LIMITS.get(row.selected() as usize) {
+            set(*limit);
+        }
+    });
+    let group = adw::PreferencesGroup::builder().title("Streaming").build();
+    group.add(&row);
+    let page = adw::PreferencesPage::builder()
+        .title("Streaming")
+        .icon_name(crate::icons::DIAGNOSTICS)
         .build();
     page.add(&group);
     page
@@ -267,4 +336,27 @@ fn playback(
     page.add(&audio);
     page.add(&subtitles);
     page
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_setting_is_no_limit() {
+        assert_eq!(BITRATE_LIMITS[nearest_limit(None)], None);
+    }
+
+    #[test]
+    fn a_hand_edited_limit_shows_as_the_nearest_offered() {
+        assert_eq!(
+            BITRATE_LIMITS[nearest_limit(Some(9_000_000))],
+            Some(8_000_000)
+        );
+    }
+
+    #[test]
+    fn a_limit_is_named_in_megabits() {
+        assert_eq!(bitrate_name(Some(12_000_000)), "12 Mbit/s");
+    }
 }

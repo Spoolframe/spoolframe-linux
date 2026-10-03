@@ -410,6 +410,28 @@ button.action.outlined:hover {
   border-radius: 16px;
 }
 
+/* The PIN pad (P2-08): round keys on the surface, and a dot per digit,
+   filled once typed. */
+.pin-key {
+  min-width: 64px;
+  min-height: 64px;
+  font-size: 22px;
+  font-weight: 600;
+}
+
+.pin-key:not(.flat) {
+  background-color: alpha(currentColor, 0.1);
+}
+
+.pin-dot {
+  border-radius: 9999px;
+  border: 2px solid var(--accent-color);
+}
+
+.pin-dot.filled {
+  background-color: var(--accent-color);
+}
+
 /* The Sign in tile: a neutral circle with a plus. */
 .add-profile {
   border-radius: 9999px;
