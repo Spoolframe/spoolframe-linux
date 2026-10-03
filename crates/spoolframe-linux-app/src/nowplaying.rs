@@ -6,11 +6,9 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::time::Duration;
 
 use adw::prelude::*;
 use gst_play::prelude::*;
-use gtk::glib;
 use spoolframe_linux_core::backend::ArtworkSize;
 use spoolframe_linux_core::format;
 use spoolframe_types::{ArtworkKind, Item};
@@ -79,21 +77,14 @@ pub fn page(playback: &Rc<Playback>, actions: Actions, cards: &Cards) -> adw::Na
     titles.append(&artist);
     titles.append(&detail);
 
-    let scale = gtk::Scale::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .adjustment(&gtk::Adjustment::new(0.0, 0.0, 0.0, 1.0, 10.0, 0.0))
-        .hexpand(true)
-        .css_classes(["seek"])
-        .build();
-    {
+    let scale = {
         let weak = Rc::downgrade(playback);
-        scale.connect_change_value(move |_, _, value| {
+        crate::transport::seek_scale(move |to| {
             if let Some(playback) = weak.upgrade() {
-                playback.seek(Duration::from_secs_f64(value.max(0.0)));
+                playback.seek(to);
             }
-            glib::Propagation::Proceed
-        });
-    }
+        })
+    };
     let position = mono("0:00");
     let left = mono("");
     for label in [&position, &left] {
@@ -244,11 +235,14 @@ impl View {
                 self.transport.show_item(playback);
                 self.queue.show(playback);
             }
-            Change::Queue => self.queue.show(playback),
+            // What comes next changed: Next may have something now.
+            Change::Queue => {
+                self.queue.show(playback);
+                self.transport.show_item(playback);
+            }
             Change::Playing(playing) => self.transport.show_playing(*playing),
             Change::Position { at, length } => {
-                self.scale.adjustment().set_upper(length.as_secs_f64());
-                self.scale.set_value(at.as_secs_f64());
+                crate::transport::show_position(&self.scale, *at, *length);
                 self.position.set_label(&format::timestamp(*at));
                 self.left.set_label(&format!(
                     "−{}",
@@ -268,8 +262,17 @@ impl View {
                 }
             }
             Change::Volume(_) | Change::Muted(_) => self.volume.show(change),
-            Change::Modes { shuffle, repeat } => self.transport.show_modes(*shuffle, *repeat),
-            Change::Starting | Change::Buffering(_) | Change::Failed(_) | Change::Skipped(_) => {}
+            Change::Modes { shuffle, repeat } => {
+                self.transport.show_modes(*shuffle, *repeat);
+                // Repeat all gives the last track a next.
+                self.transport.show_item(playback);
+            }
+            Change::Starting
+            | Change::Buffering(_)
+            | Change::Failed(_)
+            | Change::Skipped(_)
+            | Change::Offer(_)
+            | Change::IntroSkipped => {}
         }
     }
 }
@@ -406,13 +409,7 @@ impl Transport {
     }
 
     pub fn show_playing(&self, playing: bool) {
-        self.toggle.set_icon_name(if playing {
-            crate::icons::PAUSE
-        } else {
-            crate::icons::PLAY
-        });
-        self.toggle
-            .set_tooltip_text(Some(if playing { "Pause" } else { "Play" }));
+        crate::transport::show_playing(&self.toggle, playing);
     }
 
     pub fn show_modes(&self, shuffle: bool, repeat: Repeat) {

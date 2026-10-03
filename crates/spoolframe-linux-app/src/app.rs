@@ -32,6 +32,16 @@ use crate::views::{Cards, Enqueue};
 use crate::{library, nowplaying, pages, pin, player, preferences, start, views};
 use spoolframe_linux_core::artcache::ArtworkCache;
 
+/// A password or PIN in a message. Msg derives Debug, and Relm4 records
+/// each message in a tracing span: this keeps them out of logs.
+pub struct Secret(String);
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(…)")
+    }
+}
+
 /// What the app starts with.
 pub struct Init {
     pub client: Arc<dyn Client>,
@@ -50,6 +60,8 @@ pub struct PlayRequest {
     pub tracks: Option<MediaTracks>,
     /// The album the tracks are from, for its cover and name.
     pub album: Option<Album>,
+    /// Shuffle on from the start (an album's Shuffle button).
+    pub shuffle: bool,
 }
 
 impl PlayRequest {
@@ -66,6 +78,7 @@ impl PlayRequest {
             selection,
             tracks,
             album: None,
+            shuffle: false,
         }
     }
 }
@@ -81,6 +94,14 @@ pub struct App {
     profile: Option<Profile>,
     /// The locked profile whose PIN the pad asks for (P2-08).
     unlocking: Option<Profile>,
+    /// A PIN or a sign-in is with the server: another is not sent.
+    unlock_in_flight: bool,
+    sign_in_in_flight: bool,
+    /// What the root page shows (or is about to).
+    root: Root,
+    /// The root page's load in flight: aborted by the next sidebar choice
+    /// or search, so a late answer never replaces a newer page.
+    root_load: Option<glib::JoinHandle<()>>,
     libraries: Vec<Library>,
     settings: Settings,
     theme: ThemeApplier,
@@ -101,11 +122,14 @@ pub struct App {
     /// heard only on a later listing; it is opened once, not on every
     /// change after.
     opened_last_server: bool,
-    /// What the search page last asked for; older answers are dropped.
-    search_query: String,
-    /// Bumped on each sidebar choice, so a library that loads late does
-    /// not replace a newer page.
-    root_generation: Rc<std::cell::Cell<u64>>,
+}
+
+/// The sidebar's choice.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Root {
+    Home,
+    Search,
+    Library,
 }
 
 pub struct AppWidgets {
@@ -150,12 +174,12 @@ pub enum Msg {
     AddServer(String, String),
     ChooseProfile(Profile),
     /// The PIN typed for the locked profile being chosen (P2-08).
-    Unlock(String),
+    Unlock(Secret),
     /// From the PIN pad: back to "Who's watching", or to the password.
     BackToProfiles,
     ForgotPin,
     OpenSignIn,
-    SubmitSignIn(String, String),
+    SubmitSignIn(String, Secret),
     /// Back to "Who's watching" from the library.
     SwitchProfile,
     /// A sidebar row was activated: see the `ROW_*` constants.
@@ -180,6 +204,8 @@ pub enum Msg {
     SetTheme(Theme),
     /// The streaming bitrate limit (P2-06), for the next start.
     SetMaxBitrate(Option<u64>),
+    /// Skip intros without asking (P2-10).
+    SetSkipIntros(bool),
     /// Leave the full player and keep playing in the bar.
     MinimizePlayer,
     /// Take an item out of Continue watching (`true`), or put it back
@@ -532,7 +558,11 @@ impl Component for App {
                     .and_then(|w| w.root())
                     .and_then(|root| root.focus())
                     .is_some_and(|focus| focus.is::<gtk::Text>() || focus.is::<gtk::TextView>());
-                if key == gtk::gdk::Key::space && modifiers.is_empty() && !typing && bar.toggle() {
+                if key == gtk::gdk::Key::space
+                    && crate::player::plain(modifiers)
+                    && !typing
+                    && bar.toggle()
+                {
                     glib::Propagation::Stop
                 } else {
                     glib::Propagation::Proceed
@@ -555,6 +585,10 @@ impl Component for App {
             server: None,
             profile: None,
             unlocking: None,
+            unlock_in_flight: false,
+            sign_in_in_flight: false,
+            root: Root::Home,
+            root_load: None,
             libraries: Vec::new(),
             settings,
             theme,
@@ -571,8 +605,6 @@ impl Component for App {
             saved_queue: None,
             library_cache: None,
             opened_last_server: false,
-            search_query: String::new(),
-            root_generation: Rc::new(std::cell::Cell::new(0)),
         };
         model.load_servers(&sender);
         // Discovery hears servers a moment after the client opens, so the
@@ -692,7 +724,12 @@ impl Component for App {
                 self.ask_pin(profile, widgets, &sender)
             }
             Msg::ChooseProfile(profile) => self.enter(profile, widgets, &sender),
-            Msg::Unlock(pin) => {
+            Msg::Unlock(Secret(pin)) => {
+                // One try at a time: a held Enter repeats, and each wrong
+                // try counts towards the ten that end the session.
+                if self.unlock_in_flight {
+                    return;
+                }
                 let Some(profile) = self.unlocking.clone() else {
                     return;
                 };
@@ -700,6 +737,7 @@ impl Component for App {
                     Ok(session) => session,
                     Err(e) => return toast(widgets, &e),
                 };
+                self.unlock_in_flight = true;
                 sender.oneshot_command(async move {
                     let unlocked = session.unlock(&pin).await;
                     Loaded::Unlocked(Box::new(profile), unlocked)
@@ -718,16 +756,21 @@ impl Component for App {
                 let Some(server) = &self.server else { return };
                 let submit: Rc<dyn Fn(String, String)> = {
                     let sender = sender.clone();
-                    Rc::new(move |u, p| sender.input(Msg::SubmitSignIn(u, p)))
+                    Rc::new(move |u, p| sender.input(Msg::SubmitSignIn(u, Secret(p))))
                 };
                 let dialog = start::SignIn::new(server, submit);
                 dialog.dialog.present(Some(root));
                 widgets.sign_in = Some(dialog);
             }
-            Msg::SubmitSignIn(username, password) => {
+            Msg::SubmitSignIn(username, Secret(password)) => {
+                // Enter in the password field still sends while one is out.
+                if self.sign_in_in_flight {
+                    return;
+                }
                 let Some(server) = self.server.clone() else {
                     return;
                 };
+                self.sign_in_in_flight = true;
                 if let Some(dialog) = &widgets.sign_in {
                     dialog.set_busy(true);
                 }
@@ -742,12 +785,12 @@ impl Component for App {
                 }
             }
             Msg::Select(ROW_HOME) => {
-                self.root_generation.set(self.root_generation.get() + 1);
+                self.select_root(Root::Home);
                 widgets.stack.pop_to_page(&widgets.root_page);
                 self.load_home(&sender);
             }
             Msg::Select(ROW_SEARCH) => {
-                self.root_generation.set(self.root_generation.get() + 1);
+                self.select_root(Root::Search);
                 widgets.stack.pop_to_page(&widgets.root_page);
                 widgets.root_page.set_title("Search");
                 show_content(widgets);
@@ -763,6 +806,7 @@ impl Component for App {
                 let Some(cache) = self.library_cache.clone() else {
                     return;
                 };
+                self.select_root(Root::Library);
                 widgets.stack.pop_to_page(&widgets.root_page);
                 widgets.root_page.set_title(&library.title);
                 show_content(widgets);
@@ -773,28 +817,23 @@ impl Component for App {
                     views::grid(&library.title, (0..18).map(|_| views::placeholder_card()));
                 skeleton.add_css_class("loading");
                 widgets.content.append(&skeleton);
-                // A newer choice in the sidebar makes this one stale.
-                let generation = self.root_generation.get() + 1;
-                self.root_generation.set(generation);
-                let current = self.root_generation.clone();
+                // A newer choice in the sidebar aborts this one.
                 let (scroller, content) = (widgets.scroller.clone(), widgets.content.clone());
                 let cards = self.cards.clone();
-                glib::spawn_future_local(async move {
-                    let grid = cache.grid(library, cards).await;
-                    if current.get() != generation {
-                        return;
-                    }
-                    match grid {
+                self.root_load = Some(glib::spawn_future_local(async move {
+                    match cache.grid(library, cards).await {
                         Ok(grid) => scroller.set_child(Some(&grid)),
                         Err(e) => {
                             clear(&content);
                             content.append(&error_status(&e));
                         }
                     }
-                });
+                }));
             }
             Msg::Search(query) => {
-                self.search_query = query.clone();
+                // An older query's answer, overtaken while typing, is
+                // aborted.
+                self.select_root(Root::Search);
                 if query.is_empty() {
                     clear(&widgets.search_results);
                     return;
@@ -802,7 +841,7 @@ impl Component for App {
                 let Some(session) = self.session.clone() else {
                     return;
                 };
-                sender.oneshot_command(async move {
+                self.load_root(&sender, async move {
                     let items = session.search(&query, SEARCH_LIMIT).await;
                     Loaded::Search(query, items)
                 });
@@ -819,6 +858,7 @@ impl Component for App {
                     selection,
                     tracks,
                     album,
+                    shuffle,
                 } = *request;
                 // A new context keeps the queue, as Spotify does.
                 self.stop_playback(widgets);
@@ -833,6 +873,9 @@ impl Component for App {
                     album,
                 }) {
                     Ok(playback) => {
+                        if shuffle {
+                            playback.toggle_shuffle();
+                        }
                         self.attach_playback(&playback, widgets);
                         widgets
                             .window_stack
@@ -847,6 +890,7 @@ impl Component for App {
             }
             Msg::MinimizePlayer => {
                 widgets.window_stack.pop_to_page(&widgets.library_page);
+                self.refresh_home(&sender);
             }
             Msg::ExpandPlayer => {
                 if let Some(playback) = &self.playback
@@ -857,7 +901,10 @@ impl Component for App {
                         .push(&player_page(playback, &sender, &self.cards));
                 }
             }
-            Msg::StopPlayback => self.stop_playback(widgets),
+            Msg::StopPlayback => {
+                self.stop_playback(widgets);
+                self.refresh_home(&sender);
+            }
             Msg::Enqueue(item, at) => {
                 let Some(session) = self.session.clone() else {
                     return;
@@ -920,6 +967,12 @@ impl Component for App {
                 self.theme.apply(theme);
                 self.settings.set_theme(theme);
             }
+            Msg::SetSkipIntros(on) => {
+                self.settings.set_skip_intros(on);
+                if let Some(playback) = &self.playback {
+                    playback.set_skip_intros(on);
+                }
+            }
             Msg::SetMaxBitrate(limit) => {
                 // The server learns it with the device's capabilities, at
                 // the next start.
@@ -942,6 +995,12 @@ impl Component for App {
         sender: ComponentSender<Self>,
         root: &Self::Root,
     ) {
+        // The answer is in: the next try may go.
+        match &loaded {
+            Loaded::SignedIn(_) => self.sign_in_in_flight = false,
+            Loaded::Unlocked(..) => self.unlock_in_flight = false,
+            _ => {}
+        }
         if loaded.sign_in_required() {
             return self.signed_out(widgets, &sender);
         }
@@ -1137,10 +1196,6 @@ impl Component for App {
             }
             Loaded::Home(Err(e)) => show_error(widgets, "Home", &e),
             Loaded::Search(query, result) => {
-                // An answer to an older query, overtaken while typing.
-                if query != self.search_query {
-                    return;
-                }
                 clear(&widgets.search_results);
                 match result {
                     Ok(items) if items.is_empty() => widgets.search_results.append(
@@ -1229,7 +1284,7 @@ impl Component for App {
             Loaded::Album(album, Ok((artist, tracks))) => {
                 let play: pages::PlayTracks = {
                     let (sender, album) = (sender.clone(), album.clone());
-                    Rc::new(move |items, index| {
+                    Rc::new(move |items, index, shuffle| {
                         sender.input(Msg::Play(Box::new(PlayRequest {
                             items,
                             index,
@@ -1237,6 +1292,7 @@ impl Component for App {
                             selection: None,
                             tracks: None,
                             album: Some(album.clone()),
+                            shuffle,
                         })))
                     })
                 };
@@ -1256,7 +1312,7 @@ impl Component for App {
             // Home shows watch state (Continue watching, Next up): show it
             // again, if it is what is on screen.
             Loaded::WatchChanged(Ok(())) => {
-                let on_home = widgets.root_page.title() == "Home"
+                let on_home = self.root == Root::Home
                     && widgets.stack.visible_page().as_ref() == Some(&widgets.root_page);
                 if on_home {
                     self.load_home(&sender);
@@ -1294,7 +1350,7 @@ impl App {
             let sender = sender.clone();
             Rc::new(move |theme| sender.input(Msg::SetTheme(theme)))
         };
-        let set_tracks: Rc<dyn Fn(TrackPreferences)> = {
+        let set_tracks: preferences::SetTracks = {
             let sender = sender.clone();
             Rc::new(move |p| sender.input(Msg::SetTrackPreferences(Box::new(p))))
         };
@@ -1309,13 +1365,22 @@ impl App {
             let sender = sender.clone();
             Rc::new(move |limit| sender.input(Msg::SetMaxBitrate(limit)))
         };
+        let set_skip_intros: preferences::SetSkipIntros = {
+            let sender = sender.clone();
+            Rc::new(move |on| sender.input(Msg::SetSkipIntros(on)))
+        };
         preferences::dialog(
             self.settings.theme(),
             tracks,
             server,
             set_theme,
             set_tracks,
-            (self.settings.max_bitrate(), set_bitrate),
+            preferences::Device {
+                bitrate: self.settings.max_bitrate(),
+                set_bitrate,
+                skip_intros: self.settings.skip_intros(),
+                set_skip_intros,
+            },
             self.signed(),
         )
     }
@@ -1376,7 +1441,7 @@ impl App {
             widgets.sidebar.remove(&row);
         }
         self.libraries.clear();
-        self.search_query.clear();
+        self.select_root(Root::Home);
         widgets.search_entry.set_text("");
         clear(&widgets.search_results);
         self.stop_playback(widgets);
@@ -1413,12 +1478,20 @@ impl App {
     /// Shows `playback` in the bar and to the desktop, and saves its queue
     /// as it changes.
     fn attach_playback(&self, playback: &Rc<Playback>, widgets: &AppWidgets) {
+        playback.set_skip_intros(self.settings.skip_intros());
         // A queued item that cannot play is passed over with a word, not
         // a stop (P1-23).
+        // Music has no page that shows an error (the video player does):
+        // a track that cannot play says so in a toast.
         let toasts = widgets.toasts.clone();
+        let weak = Rc::downgrade(playback);
         playback.subscribe(move |change| {
-            if let Change::Skipped(message) = change {
-                toasts.add_toast(adw::Toast::new(message));
+            match change {
+                Change::Skipped(message) => toasts.add_toast(adw::Toast::new(message)),
+                Change::Failed(error) if weak.upgrade().is_some_and(|p| !p.is_video()) => {
+                    toasts.add_toast(adw::Toast::new(&format!("Cannot play: {error}")));
+                }
+                _ => {}
             }
             true
         });
@@ -1476,6 +1549,7 @@ impl App {
                 selection: None,
                 tracks: None,
                 album,
+                shuffle: false,
             })));
             return;
         };
@@ -1507,6 +1581,11 @@ impl App {
         widgets.window_stack.pop_to_page(&widgets.library_page);
     }
 
+    /// Home again, if it shows: Continue watching moved with what played.
+    fn refresh_home(&mut self, sender: &ComponentSender<Self>) {
+        self.load_home(sender);
+    }
+
     /// The profile in use, for Preferences → Profile.
     fn signed(&self) -> Option<crate::profile_page::Signed> {
         let (session, server, profile) = (
@@ -1533,7 +1612,7 @@ impl App {
         let server_name = self.server.as_ref().map_or("", |s| s.name.as_str());
         let unlock: Rc<dyn Fn(String)> = {
             let sender = sender.clone();
-            Rc::new(move |pin| sender.input(Msg::Unlock(pin)))
+            Rc::new(move |pin| sender.input(Msg::Unlock(Secret(pin))))
         };
         let back: Rc<dyn Fn()> = {
             let sender = sender.clone();
@@ -1618,11 +1697,43 @@ impl App {
         sender.oneshot_command(async move { Loaded::Libraries(session.libraries().await) });
     }
 
-    fn load_home(&self, sender: &ComponentSender<Self>) {
+    /// Home, if it is the sidebar's choice: asked for by Undo from
+    /// another page, it would replace that page.
+    fn load_home(&mut self, sender: &ComponentSender<Self>) {
+        if self.root != Root::Home {
+            return;
+        }
         let Some(session) = self.session.clone() else {
             return;
         };
-        sender.oneshot_command(async move { Loaded::Home(session.home().await) });
+        self.load_root(sender, async move { Loaded::Home(session.home().await) });
+    }
+
+    /// A new sidebar choice: the last one's load, if still going, is
+    /// aborted.
+    fn select_root(&mut self, root: Root) {
+        self.root = root;
+        if let Some(load) = self.root_load.take() {
+            load.abort();
+        }
+    }
+
+    /// Loads the root page's content on the runtime and hands the answer
+    /// to `update_cmd`, unless the next sidebar choice aborts it first.
+    fn load_root(
+        &mut self,
+        sender: &ComponentSender<Self>,
+        load: impl std::future::Future<Output = Loaded> + Send + 'static,
+    ) {
+        if let Some(old) = self.root_load.take() {
+            old.abort();
+        }
+        let (task, sender) = (relm4::spawn(load), sender.clone());
+        self.root_load = Some(glib::spawn_future_local(async move {
+            if let Ok(loaded) = task.await {
+                sender.command_sender().emit(loaded);
+            }
+        }));
     }
 
     /// Loads what the item's page needs, then pushes the page.
@@ -1634,22 +1745,31 @@ impl App {
             Item::Movie(ref m) => {
                 let id = m.id.clone();
                 sender.oneshot_command(async move {
-                    let tracks = backend.tracks(&id).await;
-                    let chosen = server_choice(backend.as_ref(), &id).await;
+                    // The card's copy may be from before the last
+                    // playback: Resume would start from where it was then.
+                    let (item, tracks, chosen) = tokio::join!(
+                        fresh(backend.as_ref(), item),
+                        backend.tracks(&id),
+                        server_choice(backend.as_ref(), &id),
+                    );
                     Loaded::Playable(item, None, tracks, chosen)
                 });
             }
             Item::Episode(ref e) => {
                 let (id, show) = (e.id.clone(), e.show_id.clone());
                 sender.oneshot_command(async move {
+                    let (item, show, tracks, chosen) = tokio::join!(
+                        fresh(backend.as_ref(), item),
+                        backend.item(&show),
+                        backend.tracks(&id),
+                        server_choice(backend.as_ref(), &id),
+                    );
                     // The show's title is context, not essential: the page
                     // opens without it if the show cannot be loaded.
-                    let context = match backend.item(&show).await {
+                    let context = match show {
                         Ok((Item::Show(s), _)) => Some(s.title),
                         _ => None,
                     };
-                    let tracks = backend.tracks(&id).await;
-                    let chosen = server_choice(backend.as_ref(), &id).await;
                     Loaded::Playable(item, context, tracks, chosen)
                 });
             }
@@ -1753,6 +1873,15 @@ async fn tracks_of(session: &dyn Session, item: Item) -> Result<Vec<AlbumTracks>
             Ok(groups)
         }
         _ => Ok(Vec::new()),
+    }
+}
+
+/// `item` as the server has it now, with its watch state; the copy given
+/// when the server cannot say.
+async fn fresh(session: &dyn Session, item: Item) -> Item {
+    match session.item(item.id()).await {
+        Ok((now, _)) => now,
+        Err(_) => item,
     }
 }
 
@@ -1945,4 +2074,15 @@ fn server_error(
         })
     };
     start::identity_changed(name, saved, now, trust).present(Some(root));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_secret_never_prints() {
+        let shown = format!("{:?}", Msg::Unlock(Secret("1234".into())));
+        assert!(!shown.contains("1234"), "{shown}");
+    }
 }

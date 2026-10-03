@@ -5,7 +5,7 @@
 //! ```sh
 //! SPOOLFRAME_TEST_KEY=<endpoint id> SPOOLFRAME_TEST_ADDR=<ip:port> \
 //! SPOOLFRAME_TEST_USER=<user> SPOOLFRAME_TEST_PASSWORD=<password> \
-//!   cargo test -p spoolframe-linux-core --test live_server -- --ignored --nocapture
+//!   cargo test -p spoolframe-linux-core --test it live_server -- --ignored --nocapture
 //! ```
 //!
 //! It keeps the device's key in memory, so it leaves nothing in the
@@ -139,13 +139,11 @@ fn the_app_backend_works_against_a_live_server() {
         client.add_address(&key, &env("SPOOLFRAME_TEST_ADDR")),
     )
     .unwrap();
-    eprintln!(
-        "server: {} ({}), pinned {}",
-        server.name,
-        key.short(),
-        server.pinned
-    );
-    assert!(server.pinned, "connecting pins the server");
+    eprintln!("server: {} ({})", server.name, key.short());
+    // Adding remembers an address only: the key is pinned on the user's
+    // word, after the fingerprint check (P1-21).
+    let server = run(&runtime, client.pin(&key, false)).unwrap();
+    assert!(server.pinned, "pinning pins the server");
 
     let profile = run(
         &runtime,
@@ -230,7 +228,14 @@ fn the_app_backend_works_against_a_live_server() {
     let spawn: Spawn = Arc::new(move |future| {
         handle.spawn(future);
     });
-    let reader = MediaReader::new(session.clone(), item.id().clone(), selection, start, spawn);
+    let reader = MediaReader::new(
+        session.clone(),
+        item.id().clone(),
+        selection,
+        start,
+        spawn,
+        None,
+    );
     let head = reader.read(0, 64 * 1024).unwrap();
     assert_eq!(head.len(), 64 * 1024);
     let middle = reader.read(reader.size() / 2, 4096).unwrap();

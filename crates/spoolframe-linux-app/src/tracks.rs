@@ -14,6 +14,7 @@ use std::rc::Rc;
 use gst::glib;
 use gst_play::prelude::*;
 use gtk::prelude::*;
+use spoolframe_linux_core::format;
 
 /// Plays the `position`th audio stream of `info`.
 pub fn select_audio(
@@ -71,6 +72,8 @@ pub const SEARCH_FROM: usize = 3;
 /// check mark on what plays. `subtitles_on` is shared with the player,
 /// which also turns subtitles on and off (the item page's choice, an
 /// external subtitle); GstPlay has no call that says whether they are on.
+/// It holds GstPlay weakly: a menu outliving its playback must not hold
+/// the last reference (see [`crate::pipeline`]).
 pub fn menu(
     play: &gst_play::Play,
     info: &gst_play::PlayMediaInfo,
@@ -93,7 +96,9 @@ pub fn menu(
             stream_label(
                 s.language().as_deref(),
                 s.codec().as_deref(),
-                Some(s.channels()).filter(|c| *c > 0).map(channel_layout),
+                Some(s.channels())
+                    .filter(|c| *c > 0)
+                    .map(|c| format::channels(c as u32)),
             )
         })
         .collect();
@@ -155,9 +160,11 @@ pub fn menu(
         .build();
     column.append(&scroller);
 
+    let weak = play.downgrade();
     {
-        let (play, info, marks) = (play.clone(), info.clone(), audio.clone());
+        let (play, info, marks) = (weak.clone(), info.clone(), audio.clone());
         audio.list.connect_row_activated(move |_, row| {
+            let Some(play) = play.upgrade() else { return };
             let position = row.index() as usize;
             match select_audio(&play, &info, position) {
                 Ok(()) => marks.mark(Some(position)),
@@ -167,12 +174,13 @@ pub fn menu(
     }
     {
         let (play, info, marks, on) = (
-            play.clone(),
+            weak.clone(),
             info.clone(),
             subtitles.clone(),
             subtitles_on.clone(),
         );
         subtitles.list.connect_row_activated(move |_, row| {
+            let Some(play) = play.upgrade() else { return };
             // Row 0 is "Off"; the streams follow.
             let position = (row.index() as usize).checked_sub(1);
             match select_subtitle(&play, &info, position) {
@@ -188,8 +196,9 @@ pub fn menu(
     let popover = gtk::Popover::builder().child(&column).build();
     // What plays can change without the menu (the item page's choice, an
     // external subtitle arriving), so the marks are read on each opening.
-    let (play, info, on) = (play.clone(), info.clone(), subtitles_on.clone());
+    let (play, info, on) = (weak, info.clone(), subtitles_on.clone());
     popover.connect_show(move |_| {
+        let Some(play) = play.upgrade() else { return };
         audio.mark(current_audio(&play, &info));
         let subtitle = match on.get() {
             false => Some(0),
@@ -317,19 +326,9 @@ pub fn stream_label(language: Option<&str>, codec: Option<&str>, extra: Option<S
     }
 }
 
-pub fn channel_layout(channels: i32) -> String {
-    match channels {
-        1 => "mono".to_owned(),
-        2 => "stereo".to_owned(),
-        6 => "5.1".to_owned(),
-        8 => "7.1".to_owned(),
-        n => format!("{n} ch"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use spoolframe_linux_core::test_dir::TestDir;
+    use spoolframe_linux_core::testing::TestDir;
     use std::path::Path;
     use std::time::Duration;
 

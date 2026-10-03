@@ -240,19 +240,14 @@ fn grid(pages: &Rc<Pages>, cards: Rc<Cards>) -> gtk::GridView {
 
 #[cfg(test)]
 mod tests {
-    use spoolframe_linux_core::backend::{Client, Profile, ServerKey};
+    use spoolframe_linux_core::backend::Client;
     use spoolframe_linux_core::fake::FakeClient;
 
     use super::*;
 
     fn pages() -> Pages {
         let client = FakeClient::new(None);
-        let profile = Profile {
-            server: ServerKey("k5d2r8w1tqz7m3c0vnh4q7fa".into()),
-            username: "andrey".into(),
-            display_name: "Andrey".into(),
-            locked: false,
-        };
+        let profile = FakeClient::profile("andrey");
         let session = client.session(&profile).unwrap();
         // A context of its own: tests run on parallel threads.
         let library = glib::MainContext::new()

@@ -76,7 +76,7 @@ impl State {
 
     fn volume(&self) -> Volume {
         self.playback()
-            .map_or(1.0, |p| if p.is_muted() { 0.0 } else { p.play().volume() })
+            .map_or(1.0, |p| if p.is_muted() { 0.0 } else { p.volume() })
     }
 
     /// The metadata of what plays now, kept until the next change.
@@ -245,7 +245,9 @@ impl Mpris {
             | Change::MediaInfo(_)
             | Change::Buffering(_)
             | Change::Failed(_)
-            | Change::Skipped(_) => {}
+            | Change::Skipped(_)
+            | Change::Offer(_)
+            | Change::IntroSkipped => {}
         }
     }
 

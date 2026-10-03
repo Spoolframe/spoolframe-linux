@@ -176,7 +176,7 @@ impl Storage {
 mod tests {
     use super::*;
 
-    use crate::test_dir::TestDir;
+    use crate::testing::TestDir;
 
     /// A store in a directory of the test's own, which is not made until a
     /// value is written.

@@ -30,6 +30,7 @@ gst-plugin-gtk4 = { workspace = true }
 mpris-server = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+snmalloc-rs = { workspace = true }
 
 [dev-dependencies]
 spoolframe-linux-core = { workspace = true, features = ["testing"] }

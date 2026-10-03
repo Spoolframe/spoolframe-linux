@@ -21,8 +21,9 @@ const POSTER_OVER_BACKDROP: i32 = 150;
 /// the tracks picked on the page, or with the server's choice (`None`).
 pub type Play = Rc<dyn Fn(Option<Duration>, Option<Selection>)>;
 
-/// Plays a list of tracks from one of them, as the context.
-pub type PlayTracks = Rc<dyn Fn(Vec<Item>, usize)>;
+/// Plays a list of tracks from one of them, as the context; shuffled
+/// (the queue's own shuffle, so the toggle shows it) when the flag says.
+pub type PlayTracks = Rc<dyn Fn(Vec<Item>, usize, bool)>;
 
 /// Puts tracks of the page's album in the play queue (P1-23).
 pub type EnqueueTracks = Rc<dyn Fn(Vec<Item>, Enqueue)>;
@@ -568,7 +569,7 @@ pub fn album(
         .build();
     {
         let (play, tracks) = (play.clone(), tracks.to_vec());
-        play_all.connect_clicked(move |_| play(tracks.clone(), 0));
+        play_all.connect_clicked(move |_| play(tracks.clone(), 0, false));
     }
     let shuffle = gtk::Button::builder()
         .label("Shuffle")
@@ -576,7 +577,11 @@ pub fn album(
         .build();
     {
         let (play, tracks) = (play.clone(), tracks.to_vec());
-        shuffle.connect_clicked(move |_| play(shuffled(&tracks), 0));
+        // From a random track, the rest shuffled by the queue.
+        shuffle.connect_clicked(move |_| {
+            let start = gtk::glib::random_int_range(0, tracks.len().max(1) as i32) as usize;
+            play(tracks.clone(), start, true)
+        });
     }
     buttons.append(&play_all);
     buttons.append(&shuffle);
@@ -624,22 +629,11 @@ pub fn album(
         };
         row.add_suffix(&views::menu_button(&menu, "More"));
         let (play, tracks) = (play.clone(), tracks.to_vec());
-        row.connect_activated(move |_| play(tracks.clone(), index));
+        row.connect_activated(move |_| play(tracks.clone(), index, false));
         list.append(&row);
     }
     body.append(&list);
     body.upcast()
-}
-
-/// The tracks in a random order.
-fn shuffled(tracks: &[Item]) -> Vec<Item> {
-    let mut tracks = tracks.to_vec();
-    // Fisher–Yates with GLib's random numbers; no new dependency for this.
-    for i in (1..tracks.len()).rev() {
-        let j = gtk::glib::random_int_range(0, i as i32 + 1) as usize;
-        tracks.swap(i, j);
-    }
-    tracks
 }
 
 fn content() -> gtk::Box {

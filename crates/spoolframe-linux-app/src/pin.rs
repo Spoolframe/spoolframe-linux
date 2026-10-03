@@ -217,7 +217,9 @@ pub fn pad(
         let (digits, keys, unlock_button) = (digits.clone(), keys.clone(), unlock_button.clone());
         Rc::new(move || {
             let pin = digits.borrow().clone();
-            if pin.ready() {
+            // Resting keys mean a try is with the server: Enter (held,
+            // it repeats) sends no second.
+            if pin.ready() && keys.is_sensitive() {
                 // Resting until the server answers; see `Pad::reject`.
                 keys.set_sensitive(false);
                 unlock_button.set_sensitive(false);

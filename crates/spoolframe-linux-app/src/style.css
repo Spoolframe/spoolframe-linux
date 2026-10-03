@@ -1,6 +1,6 @@
 /* The app's own styling. Colours come only from libadwaita's variables,
    never a literal, so that "Follow system", the user's gtk.css and every
-   Catppuccin theme restyle these widgets too. tests/stylesheet.rs checks
+   Catppuccin theme restyle these widgets too. tests/it/stylesheet.rs checks
    this.
 
    This sheet loads one step above the user's gtk.css (see theme.rs). A
@@ -157,6 +157,7 @@ windowcontrols > button:hover > image {
    white, so the play button and the seek bar lost the theme's colour. */
 .player-top,
 .player-bottom,
+.player-skipped,
 .diagnostics {
   color: var(--window-fg-color);
 }
@@ -540,4 +541,22 @@ button.watched-toggle.watched {
   background-color: var(--accent-bg-color);
   color: var(--accent-fg-color);
   box-shadow: none;
+}
+
+/* Skip Intro, Skip Credits, Next Episode (P2-10), and the undo of an
+   automatic skip: over the video, above the controls. */
+button.player-offer {
+  padding: 10px 22px;
+  font-weight: 600;
+}
+
+.player-skipped {
+  padding: 4px 4px 4px 18px;
+  border-radius: 9999px;
+  background-color: alpha(var(--window-bg-color), 0.87);
+}
+
+.player-skipped button.player-undo {
+  color: var(--accent-color);
+  font-weight: 600;
 }

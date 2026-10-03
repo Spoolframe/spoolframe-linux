@@ -8,10 +8,8 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::time::Duration;
 
 use adw::prelude::*;
-use gtk::glib;
 use spoolframe_linux_core::backend::ArtworkSize;
 use spoolframe_linux_core::format;
 use spoolframe_types::{ArtworkKind, Item};
@@ -129,22 +127,14 @@ impl MiniBar {
         }
         let music_slot = adw::Bin::builder().halign(gtk::Align::Center).build();
 
-        let scale = gtk::Scale::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .adjustment(&gtk::Adjustment::new(0.0, 0.0, 0.0, 1.0, 10.0, 0.0))
-            .hexpand(true)
-            .css_classes(["seek"])
-            .build();
-        {
-            // change-value fires only for the user's moves.
+        let scale = {
             let current = current.clone();
-            scale.connect_change_value(move |_, _, value| {
+            crate::transport::seek_scale(move |to| {
                 if let Some(playback) = current.borrow().as_ref() {
-                    playback.seek(Duration::from_secs_f64(value.max(0.0)));
+                    playback.seek(to);
                 }
-                glib::Propagation::Proceed
-            });
-        }
+            })
+        };
         let position = mono("0:00");
         let length = mono("0:00");
         for label in [&position, &length] {
@@ -349,13 +339,7 @@ impl MiniBar {
                 }
             }
             Change::Playing(playing) => {
-                self.toggle.set_icon_name(if *playing {
-                    crate::icons::PAUSE
-                } else {
-                    crate::icons::PLAY
-                });
-                self.toggle
-                    .set_tooltip_text(Some(if *playing { "Pause" } else { "Play" }));
+                crate::transport::show_playing(&self.toggle, *playing);
                 if let Some(music) = self.music.borrow().as_ref() {
                     music.show_playing(*playing);
                 }
@@ -363,11 +347,18 @@ impl MiniBar {
             Change::Modes { shuffle, repeat } => {
                 if let Some(music) = self.music.borrow().as_ref() {
                     music.show_modes(*shuffle, *repeat);
+                    // Repeat all gives the last track a next.
+                    music.show_item(playback);
+                }
+            }
+            // What comes next changed: Next may have something now.
+            Change::Queue => {
+                if let Some(music) = self.music.borrow().as_ref() {
+                    music.show_item(playback);
                 }
             }
             Change::Position { at, length } => {
-                self.scale.adjustment().set_upper(length.as_secs_f64());
-                self.scale.set_value(at.as_secs_f64());
+                crate::transport::show_position(&self.scale, *at, *length);
                 self.position.set_label(&format::timestamp(*at));
                 self.length.set_label(&format::timestamp(*length));
             }
@@ -375,19 +366,16 @@ impl MiniBar {
             Change::MediaInfo(info) if playback.is_video() => {
                 let counts = (info.audio_streams().len(), info.subtitle_streams().len());
                 if counts != (0, 0) && self.tracks_built.replace(Some(counts)) != Some(counts) {
-                    self.tracks.set_popover(Some(&crate::tracks::menu(
-                        playback.play(),
-                        info,
-                        playback.subtitles_on(),
-                    )));
+                    self.tracks.set_popover(Some(&playback.track_menu(info)));
                 }
             }
             Change::Starting
             | Change::MediaInfo(_)
             | Change::Buffering(_)
             | Change::Failed(_)
-            | Change::Queue
-            | Change::Skipped(_) => {}
+            | Change::Skipped(_)
+            | Change::Offer(_)
+            | Change::IntroSkipped => {}
         }
     }
 }

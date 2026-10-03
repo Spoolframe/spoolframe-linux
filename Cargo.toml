@@ -16,6 +16,13 @@ license = "GPL-3.0-or-later"
 repository = "https://git.coldsteel.casa/Coldsteel/foundry"
 
 [workspace.dependencies]
+# The app's global allocator, the one mainframe and the server use. Built
+# with the `cc` crate rather than its default cmake: the devshell carries
+# no cmake, and `cc` needs only its C++ compiler. `check`: snmalloc's
+# hardening checks. GTK and GStreamer allocate through glib's own malloc,
+# so this covers the Rust side only.
+snmalloc-rs = { version = "0.7.5", default-features = false, features = ["build_cc", "check"] }
+
 # Internal crates
 spoolframe-linux-core = { path = "crates/spoolframe-linux-core" }
 
@@ -64,8 +71,9 @@ serde_json = "1"
 glib-build-tools = "0.22"
 
 # The backend's connection state is a tokio watch channel, as in the SDK.
-# Relm4 runs its commands on tokio already.
-tokio = { version = "1", features = ["sync", "rt-multi-thread"] }
+# Relm4 runs its commands on tokio already. `macros`: join! for calls
+# that do not wait on each other.
+tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros"] }
 
 # Where config, data and cache live, by each platform's rules.
 directories = "6"

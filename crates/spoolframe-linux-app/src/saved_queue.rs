@@ -86,7 +86,7 @@ impl SavedQueue {
 #[cfg(test)]
 mod tests {
     use spoolframe_linux_core::backend::ServerKey;
-    use spoolframe_linux_core::test_dir::TestDir;
+    use spoolframe_linux_core::testing::TestDir;
     use spoolframe_types::{Item, MediaId, MediaKind, Namespace, PlaybackState, Track};
 
     use super::*;

@@ -4,7 +4,7 @@
 
 use spoolframe_linux_core::theme::VARIABLES;
 
-const STYLESHEET: &str = include_str!("../src/style.css");
+const STYLESHEET: &str = include_str!("../../src/style.css");
 
 /// Colour literals: `#rgb`-style hex, and the CSS colour functions.
 fn colour_literals(css: &str) -> Vec<String> {

@@ -24,8 +24,12 @@ pub const CHUNK: u64 = 4 * 1024 * 1024;
 /// The most fetched ahead of the demuxer.
 pub const MAX_BUFFERED: u64 = 128 * 1024 * 1024;
 /// After the demuxer caught up with the encode, how much must be ready
-/// before playback goes on.
+/// before playback goes on, when the output's bitrate is not known.
 pub const RESUME_BYTES: u64 = 4 * 1024 * 1024;
+/// With a known bitrate, the margin is this much playback...
+const RESUME_SECONDS: u64 = 4;
+/// ...but never less than this.
+const MIN_RESUME_BYTES: u64 = 256 * 1024;
 // A read waiting for its margin needs the fetch to get there: the cap
 // must leave room for it.
 const _: () = assert!(RESUME_BYTES < MAX_BUFFERED);
@@ -44,6 +48,9 @@ struct Shared {
     epoch: u32,
     /// The most fetched ahead of the last read.
     cap: u64,
+    /// The margin to have ready after running dry (see [`resume_bytes`]).
+    /// The first this many bytes of an encode are its start, not a stall.
+    resume: u64,
     spawn: Spawn,
     state: Mutex<State>,
     changed: Condvar,
@@ -70,14 +77,18 @@ struct State {
 
 impl ProgressiveReader {
     /// A reader for encode `epoch` of converted playback `handle`, from
-    /// its start. Fetching starts at once.
+    /// its start, for an output of `bitrate` bits per second (the plan's
+    /// cap): a stall waits for seconds of it, not a fixed byte count, which
+    /// at 2 Mbit/s was 16 s of video. Fetching starts at once.
     pub fn new(
         session: Arc<dyn Session>,
         handle: PlaybackHandle,
         epoch: u32,
         spawn: Spawn,
+        bitrate: Option<u64>,
     ) -> Self {
-        Self::with_cap(session, handle, epoch, spawn, MAX_BUFFERED)
+        let resume = resume_bytes(bitrate);
+        Self::with_cap(session, handle, epoch, spawn, MAX_BUFFERED, resume)
     }
 
     fn with_cap(
@@ -86,12 +97,14 @@ impl ProgressiveReader {
         epoch: u32,
         spawn: Spawn,
         cap: u64,
+        resume: u64,
     ) -> Self {
         let shared = Arc::new(Shared {
             session,
             handle,
             epoch,
             cap,
+            resume,
             spawn,
             state: Mutex::new(State::default()),
             changed: Condvar::new(),
@@ -99,11 +112,15 @@ impl ProgressiveReader {
         shared.top_up(&shared.clone(), &mut shared.lock());
         Self { shared }
     }
+}
 
-    /// The encode this reader reads.
-    pub fn epoch(&self) -> u32 {
-        self.shared.epoch
-    }
+/// The margin to wait for after running dry: RESUME_SECONDS of an output
+/// of `bitrate` bits per second, within MIN_RESUME_BYTES and
+/// RESUME_BYTES; RESUME_BYTES when the bitrate is unknown.
+pub fn resume_bytes(bitrate: Option<u64>) -> u64 {
+    bitrate.map_or(RESUME_BYTES, |bits| {
+        (bits / 8 * RESUME_SECONDS).clamp(MIN_RESUME_BYTES, RESUME_BYTES)
+    })
 }
 
 impl Drop for ProgressiveReader {
@@ -137,7 +154,7 @@ impl ByteSource for ProgressiveReader {
                 return Err(ReadError::Flushing);
             }
             let ready = state.end.saturating_sub(offset);
-            let enough = !reported || ready >= RESUME_BYTES || state.complete;
+            let enough = !reported || ready >= shared.resume || state.complete;
             if ready > 0 && enough {
                 let bytes = state.copy(offset, length.min(ready));
                 let Some(bytes) = bytes else {
@@ -165,8 +182,11 @@ impl ByteSource for ProgressiveReader {
             }
             state.playhead = offset;
             shared.top_up(&shared.clone(), &mut state);
-            if offset > 0 {
-                let percent = (ready * 100 / RESUME_BYTES).min(99) as u8;
+            // Waiting within the encode's first bytes is its start, not a
+            // stall: only past them does it report buffering and wait for
+            // the margin (every new encode's second read used to).
+            if offset > shared.resume {
+                let percent = (ready * 100 / shared.resume).min(99) as u8;
                 // Reported without the lock: GStreamer handles a posted
                 // message on this thread, and the fetch must not wait on it.
                 drop(state);
@@ -309,66 +329,22 @@ impl Shared {
 
 #[cfg(test)]
 mod tests {
-    use std::future::Future;
-    use std::io::Write;
+
     use std::path::PathBuf;
-    use std::pin::pin;
-    use std::task::{Context, Poll, Waker};
 
     use spoolframe_types::{MediaId, MediaKind, Namespace};
 
     use super::*;
-    use crate::backend::{Client, PlaybackPlan, Profile, ServerKey};
+    use crate::backend::{Client, PlaybackPlan};
     use crate::fake::FakeClient;
-    use crate::test_dir::TestDir;
 
-    fn thread_spawn() -> Spawn {
-        Arc::new(|future| {
-            std::thread::spawn(move || {
-                let mut future = future;
-                while pin!(&mut future)
-                    .poll(&mut Context::from_waker(Waker::noop()))
-                    .is_pending()
-                {
-                    std::thread::yield_now();
-                }
-            });
-        })
-    }
-
-    fn ready<T>(future: impl Future<Output = T>) -> T {
-        match pin!(future).poll(&mut Context::from_waker(Waker::noop())) {
-            Poll::Ready(value) => value,
-            Poll::Pending => panic!("the fake backend never waits"),
-        }
-    }
-
-    /// A file where each byte is its offset modulo 251.
-    fn media_file(name: &str, len: usize) -> (TestDir, PathBuf, Vec<u8>) {
-        let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
-        let dir = TestDir::new_blocking(&format!("spoolframe-progressive-{name}"));
-        let path = dir.join("media");
-        std::fs::File::create(&path)
-            .unwrap()
-            .write_all(&bytes)
-            .unwrap();
-        (dir, path, bytes)
-    }
-
-    fn profile() -> Profile {
-        Profile {
-            server: ServerKey("k5d2r8w1tqz7m3c0vnh4q7fa".into()),
-            username: "andrey".into(),
-            display_name: "Andrey".into(),
-            locked: false,
-        }
-    }
+    use crate::testing::{media_file, ready, thread_spawn};
 
     /// A converted playback on the fake, whose output grows by `grow`
     /// bytes per chunk read.
     fn converted(path: PathBuf, grow: u64) -> (Arc<dyn Session>, PlaybackHandle, PlaybackPlan) {
         let client = FakeClient::new(Some(path)).converting(grow);
-        let session = client.session(&profile()).unwrap();
+        let session = client.session(&FakeClient::profile("andrey")).unwrap();
         let item = MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap();
         let start = ready(session.start_playback(&item, None, None)).unwrap();
         (session, start.handle, start.plan)
@@ -390,7 +366,7 @@ mod tests {
 
     #[test]
     fn the_fake_plans_a_progressive_conversion() {
-        let (_dir, path, _) = media_file("plan", 10);
+        let (_dir, path, _) = media_file("progressive-plan", 10);
         let (_, _, plan) = converted(path, 10);
         assert!(matches!(
             plan,
@@ -403,18 +379,18 @@ mod tests {
 
     #[test]
     fn the_whole_output_is_read_in_order_as_it_grows() {
-        let (_dir, path, bytes) = media_file("whole", 3 * CHUNK as usize + 1_234);
+        let (_dir, path, bytes) = media_file("progressive-whole", 3 * CHUNK as usize + 1_234);
         let (session, handle, _) = converted(path, 1_000_000);
-        let reader = ProgressiveReader::new(session, handle, 0, thread_spawn());
+        let reader = ProgressiveReader::new(session, handle, 0, thread_spawn(), None);
         assert!(read_all(&reader, 65_536) == bytes, "the bytes differ");
     }
 
     #[test]
     fn a_read_past_what_is_encoded_waits_until_it_is() {
         // 100 bytes appear per chunk read: the read at 5 000 needs fifty.
-        let (_dir, path, bytes) = media_file("wait", 10_000);
+        let (_dir, path, bytes) = media_file("progressive-wait", 10_000);
         let (session, handle, _) = converted(path, 100);
-        let reader = ProgressiveReader::new(session, handle, 0, thread_spawn());
+        let reader = ProgressiveReader::new(session, handle, 0, thread_spawn(), None);
         read_all_to(&reader, 5_000);
         assert_eq!(
             reader.read_reporting(5_000, 10, &mut |_| {}).unwrap(),
@@ -435,9 +411,9 @@ mod tests {
 
     #[test]
     fn the_end_of_the_encode_is_the_end_of_the_stream() {
-        let (_dir, path, _) = media_file("end", 1_000);
+        let (_dir, path, _) = media_file("progressive-end", 1_000);
         let (session, handle, _) = converted(path, 1_000);
-        let reader = ProgressiveReader::new(session, handle, 0, thread_spawn());
+        let reader = ProgressiveReader::new(session, handle, 0, thread_spawn(), None);
         read_all_to(&reader, 1_000);
         assert_eq!(
             reader.read_reporting(1_000, 10, &mut |_| {}).unwrap(),
@@ -447,9 +423,9 @@ mod tests {
 
     #[test]
     fn a_flushing_reader_stops_waiting() {
-        let (_dir, path, _) = media_file("flushing", 1_000);
+        let (_dir, path, _) = media_file("progressive-flushing", 1_000);
         let (session, handle, _) = converted(path, 1_000);
-        let reader = ProgressiveReader::new(session, handle, 0, thread_spawn());
+        let reader = ProgressiveReader::new(session, handle, 0, thread_spawn(), None);
         reader.set_flushing(true);
         assert_eq!(
             reader.read_reporting(0, 10, &mut |_| {}),
@@ -459,10 +435,10 @@ mod tests {
 
     #[test]
     fn a_reader_of_a_replaced_encode_fails_with_the_new_epoch() {
-        let (_dir, path, _) = media_file("restarted", 1_000);
+        let (_dir, path, _) = media_file("progressive-restarted", 1_000);
         let (session, handle, _) = converted(path, 10);
         ready(session.seek_playback(&handle, Duration::from_secs(60))).unwrap();
-        let reader = ProgressiveReader::new(session, handle, 0, thread_spawn());
+        let reader = ProgressiveReader::new(session, handle, 0, thread_spawn(), None);
         assert_eq!(
             reader.read_reporting(0, 10, &mut |_| {}),
             Err(ReadError::Backend(BackendError::PlaybackRestarted {
@@ -473,10 +449,10 @@ mod tests {
 
     #[test]
     fn the_new_epoch_reads_from_the_start() {
-        let (_dir, path, bytes) = media_file("new-epoch", 2_000);
+        let (_dir, path, bytes) = media_file("progressive-new-epoch", 2_000);
         let (session, handle, _) = converted(path, 500);
         let epoch = ready(session.seek_playback(&handle, Duration::from_secs(60))).unwrap();
-        let reader = ProgressiveReader::new(session, handle, epoch, thread_spawn());
+        let reader = ProgressiveReader::new(session, handle, epoch, thread_spawn(), None);
         assert_eq!(read_all(&reader, 300), bytes);
     }
 
@@ -485,9 +461,10 @@ mod tests {
         // The cap holds fetching at 5 MiB, so a read at 10 MiB finds
         // nothing there: it reports, waits for RESUME_BYTES, then says 100.
         let mib = 1024 * 1024;
-        let (_dir, path, _) = media_file("buffering", 16 * mib as usize);
+        let (_dir, path, _) = media_file("progressive-buffering", 16 * mib as usize);
         let (session, handle, _) = converted(path, 256 * 1024);
-        let reader = ProgressiveReader::with_cap(session, handle, 0, thread_spawn(), 5 * mib);
+        let reader =
+            ProgressiveReader::with_cap(session, handle, 0, thread_spawn(), 5 * mib, RESUME_BYTES);
         let mut reports = Vec::new();
         reader
             .read_reporting(10 * mib, 10, &mut |p| reports.push(p))
@@ -501,9 +478,16 @@ mod tests {
 
     #[test]
     fn fetching_stops_at_the_cap_ahead_of_the_reader() {
-        let (_dir, path, _) = media_file("cap", 10 * CHUNK as usize);
+        let (_dir, path, _) = media_file("progressive-cap", 10 * CHUNK as usize);
         let (session, handle, _) = converted(path, 10 * CHUNK);
-        let reader = ProgressiveReader::with_cap(session, handle, 0, thread_spawn(), 2 * CHUNK);
+        let reader = ProgressiveReader::with_cap(
+            session,
+            handle,
+            0,
+            thread_spawn(),
+            2 * CHUNK,
+            RESUME_BYTES,
+        );
         let deadline = Instant::now() + Duration::from_secs(10);
         while reader.shared.lock().fetching && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
@@ -513,9 +497,42 @@ mod tests {
 
     #[test]
     fn its_size_is_unknown() {
-        let (_dir, path, _) = media_file("size", 10);
+        let (_dir, path, _) = media_file("progressive-size", 10);
         let (session, handle, _) = converted(path, 10);
-        let reader = ProgressiveReader::new(session, handle, 0, thread_spawn());
+        let reader = ProgressiveReader::new(session, handle, 0, thread_spawn(), None);
         assert_eq!(reader.size(), None);
+    }
+
+    #[test]
+    fn the_start_of_an_encode_is_not_a_stall() {
+        // 100 bytes appear per chunk read: the read at 100 waits, but it
+        // is the encode's start, so it reports no buffering.
+        let (_dir, path, _) = media_file("progressive-start", 10_000);
+        let (session, handle, _) = converted(path, 100);
+        let reader = ProgressiveReader::new(session, handle, 0, thread_spawn(), None);
+        let _ = reader.read_reporting(0, 100, &mut |_| {}).unwrap();
+        let mut reports = Vec::new();
+        reader
+            .read_reporting(100, 100, &mut |p| reports.push(p))
+            .unwrap();
+        assert_eq!(reports, Vec::<u8>::new());
+    }
+
+    #[test]
+    fn a_low_bitrate_waits_for_seconds_of_it() {
+        // 2 Mbit/s: four seconds is 1 MB, not 4 MiB.
+        assert_eq!(resume_bytes(Some(2_000_000)), 1_000_000);
+    }
+
+    #[test]
+    fn the_margin_stays_within_its_bounds() {
+        assert_eq!(
+            (
+                resume_bytes(Some(64_000)),
+                resume_bytes(Some(100_000_000)),
+                resume_bytes(None)
+            ),
+            (MIN_RESUME_BYTES, RESUME_BYTES, RESUME_BYTES)
+        );
     }
 }

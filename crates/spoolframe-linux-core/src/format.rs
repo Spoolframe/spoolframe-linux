@@ -63,7 +63,8 @@ pub fn language(code: &str) -> String {
     name.to_owned()
 }
 
-fn channels(n: u32) -> String {
+/// An audio layout: "stereo", "5.1", "3 channels".
+pub fn channels(n: u32) -> String {
     match n {
         1 => "mono".to_owned(),
         2 => "stereo".to_owned(),
@@ -71,6 +72,11 @@ fn channels(n: u32) -> String {
         8 => "7.1".to_owned(),
         n => format!("{n} channels"),
     }
+}
+
+/// A bitrate in bits per second, in whole megabits: "12 Mbit/s".
+pub fn bitrate(bits: u64) -> String {
+    format!("{:.0} Mbit/s", bits as f64 / 1_000_000.0)
 }
 
 /// An audio track as a picker shows it: "English · Commentary · stereo".

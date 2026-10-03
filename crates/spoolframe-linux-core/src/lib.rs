@@ -10,11 +10,13 @@ pub mod backend;
 #[cfg(any(test, feature = "testing"))]
 pub mod fake;
 pub mod format;
+pub mod markers;
+pub mod next_episode;
 pub mod paths;
 pub mod progressive;
 pub mod reader;
 pub mod sdk;
 pub mod storage;
 #[cfg(any(test, feature = "testing"))]
-pub mod test_dir;
+pub mod testing;
 pub mod theme;

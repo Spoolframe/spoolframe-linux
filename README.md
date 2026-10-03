@@ -6,6 +6,6 @@ Spoolframe Linux client: Relm4, libadwaita, GStreamer.
 
 ```bash
 devenv shell
-cargo run -p spoolframe-linux-cli -- --version
+cargo run -p spoolframe-linux-app -- --version
 devenv --no-tui tasks run --profile ci ci:static ci:style ci:test
 ```

@@ -150,7 +150,7 @@ fn supported<T: Ord + Copy>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spoolframe_linux_core::test_dir::TestDir;
+    use spoolframe_linux_core::testing::TestDir;
 
     fn caps() -> ClientCapabilities {
         gst::init().unwrap();

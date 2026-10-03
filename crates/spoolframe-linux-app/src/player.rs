@@ -23,8 +23,9 @@ use spoolframe_linux_core::reader;
 use spoolframe_protocol::{AudioAction, ConvertedAudio, ConvertedVideo, SubtitleAction};
 use spoolframe_types::Item;
 
-use crate::playback::{Change, Playback, VideoSink};
-use crate::tracks;
+use crate::playback::{Change, Offer, Playback, UNDO_WINDOW, VideoSink};
+
+use crate::transport;
 use crate::volume::Volume;
 
 /// What the page asks of the app.
@@ -79,7 +80,24 @@ pub fn page(playback: &Rc<Playback>, actions: Actions) -> adw::NavigationPage {
 
     let controls = Controls::new(playback);
     let bottom_revealer = fade(&controls.bar, gtk::Align::End);
-    video.add_overlay(&bottom_revealer);
+    // The offer and the undo of a skip sit just above the controls, at
+    // the right.
+    let offer = offer_button(playback);
+    let undo = UndoSkip::new(playback);
+    let offers = gtk::Box::builder()
+        .halign(gtk::Align::End)
+        .margin_end(24)
+        .build();
+    offers.append(&offer);
+    offers.append(&undo.revealer);
+    let bottom = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .valign(gtk::Align::End)
+        .spacing(16)
+        .build();
+    bottom.append(&offers);
+    bottom.append(&bottom_revealer);
+    video.add_overlay(&bottom);
 
     let diagnostics = Diagnostics::new();
     video.add_overlay(&diagnostics.panel);
@@ -88,6 +106,16 @@ pub fn page(playback: &Rc<Playback>, actions: Actions) -> adw::NavigationPage {
         .bind_property("active", &diagnostics.panel, "visible")
         .sync_create()
         .build();
+    {
+        let (panel, weak) = (diagnostics.clone(), Rc::downgrade(playback));
+        controls.diagnostics.connect_toggled(move |button| {
+            if let Some(playback) = weak.upgrade()
+                && button.is_active()
+            {
+                panel.show_decoders(&playback.pipeline());
+            }
+        });
+    }
 
     let page = adw::NavigationPage::builder()
         .title("Player")
@@ -115,6 +143,8 @@ pub fn page(playback: &Rc<Playback>, actions: Actions) -> adw::NavigationPage {
         starting,
         buffering,
         error,
+        offer,
+        undo,
         tracks_built: Cell::new(None),
     });
     {
@@ -198,6 +228,9 @@ struct View {
     starting: gtk::Spinner,
     buffering: gtk::Label,
     error: adw::StatusPage,
+    /// Skip Intro, Skip Credits or Next Episode (P2-10).
+    offer: gtk::Button,
+    undo: UndoSkip,
     /// The audio and subtitle stream counts the menu was built for.
     tracks_built: Cell<Option<(usize, usize)>>,
 }
@@ -205,14 +238,19 @@ struct View {
 impl View {
     fn update(&self, playback: &Playback, change: &Change) {
         match change {
-            Change::Item(item) => self.item(item),
+            Change::Item(item) => {
+                self.undo.hide();
+                self.item(item);
+            }
             Change::Starting => {
                 self.starting.set_visible(true);
                 self.error.set_visible(false);
             }
             Change::Playing(playing) => {
                 self.controls.show_playing(*playing);
-                if *playing {
+                // A walk of the whole pipeline: only for an open panel
+                // (opening it walks it too).
+                if *playing && self.diagnostics.panel.is_visible() {
                     self.diagnostics.show_decoders(&playback.pipeline());
                 }
             }
@@ -230,8 +268,21 @@ impl View {
                 self.error.set_visible(true);
             }
             Change::Volume(_) | Change::Muted(_) => self.controls.volume.show(change),
+            Change::Offer(offer) => self.show_offer(*offer),
+            Change::IntroSkipped => self.undo.show(),
             Change::Modes { .. } | Change::Queue | Change::Skipped(_) => {}
         }
+    }
+
+    fn show_offer(&self, offer: Option<Offer>) {
+        let label = match offer {
+            Some(Offer::SkipIntro { .. }) => "Skip Intro",
+            Some(Offer::SkipCredits { .. }) => "Skip Credits",
+            Some(Offer::NextItem) => "Next Episode",
+            None => return self.offer.set_visible(false),
+        };
+        self.offer.set_label(label);
+        self.offer.set_visible(true);
     }
 
     fn item(&self, item: &Item) {
@@ -257,11 +308,90 @@ impl View {
         if counts == (0, 0) || self.tracks_built.replace(Some(counts)) == Some(counts) {
             return;
         }
-        self.controls.tracks.set_popover(Some(&tracks::menu(
-            playback.play(),
-            info,
-            playback.subtitles_on(),
-        )));
+        self.controls
+            .tracks
+            .set_popover(Some(&playback.track_menu(info)));
+    }
+}
+
+/// The button over the video for what the markers offer where playback
+/// is (P2-10). It stays while the controls fade: it is what the viewer
+/// reaches for in the intro.
+fn offer_button(playback: &Rc<Playback>) -> gtk::Button {
+    let button = gtk::Button::builder()
+        .visible(false)
+        .css_classes(["pill", "suggested-action", "player-offer"])
+        .build();
+    let weak = Rc::downgrade(playback);
+    button.connect_clicked(move |_| {
+        if let Some(playback) = weak.upgrade() {
+            playback.take_offer();
+        }
+    });
+    button
+}
+
+/// "Intro skipped · Undo" for a few seconds after an automatic skip.
+struct UndoSkip {
+    revealer: gtk::Revealer,
+    /// Bumped on each showing, so an older one's timer does not hide it.
+    shown: Rc<Cell<u32>>,
+}
+
+impl UndoSkip {
+    fn new(playback: &Rc<Playback>) -> Self {
+        let label = gtk::Label::new(Some("Intro skipped"));
+        let undo = gtk::Button::builder()
+            .label("Undo")
+            .css_classes(["flat", "player-undo"])
+            .build();
+        let row = gtk::Box::builder()
+            .spacing(12)
+            .css_classes(["player-skipped"])
+            .build();
+        row.append(&label);
+        row.append(&undo);
+        let revealer = gtk::Revealer::builder()
+            .child(&row)
+            // Sliding, not crossfading: a hidden crossfade keeps its
+            // width, and pushed the offer off the right edge.
+            .transition_type(gtk::RevealerTransitionType::SlideLeft)
+            .reveal_child(false)
+            .build();
+        let weak = Rc::downgrade(playback);
+        undo.connect_clicked(glib::clone!(
+            #[weak]
+            revealer,
+            move |_| {
+                revealer.set_reveal_child(false);
+                if let Some(playback) = weak.upgrade() {
+                    playback.undo_intro_skip();
+                }
+            }
+        ));
+        Self {
+            revealer,
+            shown: Rc::new(Cell::new(0)),
+        }
+    }
+
+    fn hide(&self) {
+        self.shown.set(self.shown.get() + 1);
+        self.revealer.set_reveal_child(false);
+    }
+
+    fn show(&self) {
+        let shown = self.shown.get() + 1;
+        self.shown.set(shown);
+        self.revealer.set_reveal_child(true);
+        let (revealer, count) = (self.revealer.downgrade(), self.shown.clone());
+        glib::timeout_add_local_once(UNDO_WINDOW, move || {
+            if let Some(revealer) = revealer.upgrade()
+                && count.get() == shown
+            {
+                revealer.set_reveal_child(false);
+            }
+        });
     }
 }
 
@@ -481,7 +611,7 @@ fn follow_fullscreen(
             .root()
             .and_downcast::<gtk::Window>()
             .is_some_and(|w| w.is_fullscreen());
-        if !modifiers.is_empty() {
+        if !plain(modifiers) {
             return glib::Propagation::Proceed;
         }
         let action = |name: &str| {
@@ -615,13 +745,7 @@ impl Controls {
     }
 
     fn show_playing(&self, playing: bool) {
-        self.toggle.set_icon_name(if playing {
-            crate::icons::PAUSE
-        } else {
-            crate::icons::PLAY
-        });
-        self.toggle
-            .set_tooltip_text(Some(if playing { "Pause" } else { "Play" }));
+        transport::show_playing(&self.toggle, playing);
     }
 
     /// Shades what is buffered ahead of the playhead, when the read-ahead
@@ -633,8 +757,7 @@ impl Controls {
     }
 
     fn show_position(&self, at: Duration, length: Duration) {
-        self.scale.adjustment().set_upper(length.as_secs_f64());
-        self.scale.set_value(at.as_secs_f64());
+        transport::show_position(&self.scale, at, length);
         self.position.set_label(&format::timestamp(at));
         self.left.set_label(&format!(
             "−{}",
@@ -664,24 +787,17 @@ fn transport_actions(playback: &Rc<Playback>) -> gtk::gio::SimpleActionGroup {
 }
 
 /// A seek bar for `playback`; moving it seeks, playback moves it.
+/// The shared seek bar, shading what is buffered ahead.
 fn seek_scale(playback: &Rc<Playback>) -> gtk::Scale {
-    let scale = gtk::Scale::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .adjustment(&gtk::Adjustment::new(0.0, 0.0, 0.0, 1.0, 10.0, 0.0))
-        .hexpand(true)
-        .css_classes(["seek"])
-        .show_fill_level(true)
-        .restrict_to_fill_level(false)
-        .fill_level(0.0)
-        .build();
-    // change-value fires only for the user's moves, never for set_value.
     let weak = Rc::downgrade(playback);
-    scale.connect_change_value(move |_, _, value| {
+    let scale = transport::seek_scale(move |to| {
         if let Some(playback) = weak.upgrade() {
-            playback.seek(Duration::from_secs_f64(value.max(0.0)));
+            playback.seek(to);
         }
-        glib::Propagation::Proceed
     });
+    scale.set_show_fill_level(true);
+    scale.set_restrict_to_fill_level(false);
+    scale.set_fill_level(0.0);
     scale
 }
 
@@ -787,7 +903,7 @@ impl Diagnostics {
         self.set("buffer", &ahead);
         self.set("reads", &format!("{} in flight", status.in_flight));
         let throughput = status.throughput.map_or("—".to_owned(), |rate| {
-            format!("{:.0} Mbit/s", rate * 8.0 / 1_000_000.0)
+            format::bitrate((rate * 8.0) as u64)
         });
         self.set("throughput", &throughput);
     }
@@ -853,7 +969,10 @@ impl Diagnostics {
             let codec = audio.codec().map(|c| c.to_string()).unwrap_or_default();
             self.set(
                 "audio",
-                &format!("{codec} · {}", tracks::channel_layout(audio.channels())),
+                &format!(
+                    "{codec} · {}",
+                    format::channels(audio.channels().max(0) as u32)
+                ),
             );
         }
     }
@@ -951,7 +1070,7 @@ impl PlanSummary {
                     }) => {
                         let mut part = format!("video → {codec} {height}p");
                         if let Some(rate) = max_bitrate {
-                            part.push_str(&format!(" ≤{} Mbit/s", rate / 1_000_000));
+                            part.push_str(&format!(" ≤{}", format::bitrate(*rate)));
                         }
                         if *tone_map {
                             part.push_str(", tone-mapped");
@@ -1014,6 +1133,15 @@ impl PlanSummary {
             PlaybackPlan::Unknown => Self::default(),
         }
     }
+}
+
+/// No modifier that changes a key's meaning is held. Caps Lock and Num
+/// Lock do not count: with `is_empty`, Caps Lock on turned off Space,
+/// the arrows, f and Esc.
+pub fn plain(modifiers: gtk::gdk::ModifierType) -> bool {
+    use gtk::gdk::ModifierType as M;
+    !modifiers
+        .intersects(M::SHIFT_MASK | M::CONTROL_MASK | M::ALT_MASK | M::SUPER_MASK | M::META_MASK)
 }
 
 pub fn mono(text: &str) -> gtk::Label {
@@ -1107,5 +1235,11 @@ mod tests {
             subtitle: None,
         };
         assert_eq!(PlanSummary::of(&direct).badge, "Direct");
+    }
+
+    #[test]
+    fn caps_lock_leaves_a_key_plain() {
+        use gtk::gdk::ModifierType as M;
+        assert!(plain(M::LOCK_MASK) && !plain(M::CONTROL_MASK));
     }
 }

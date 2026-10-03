@@ -1,8 +1,8 @@
 //! The Preferences dialog: Appearance (the app's theme, kept on this
-//! device), Server (the fingerprint of the server in use, P1-21) and, when
-//! signed in, Playback (the user's audio and subtitle preferences, kept on
-//! the server for every device, P1-20) and Profile (the PIN and where it
-//! is asked for, P2-08).
+//! device), Server (the fingerprint of the server in use, P1-21),
+//! Playback (skipping intros, on this device, P2-10, and, when signed in,
+//! the user's audio and subtitle preferences, kept on the server for every
+//! device, P1-20) and Profile (the PIN and where it is asked for, P2-08).
 
 use std::rc::Rc;
 
@@ -40,19 +40,21 @@ pub fn dialog(
     tracks: Option<TrackPreferences>,
     server: Option<(Server, Rc<dyn Fn()>)>,
     set_theme: Rc<dyn Fn(Theme)>,
-    set_tracks: Rc<dyn Fn(TrackPreferences)>,
-    bitrate: (Option<u64>, SetBitrate),
+    set_tracks: SetTracks,
+    device: Device,
     signed: Option<crate::profile_page::Signed>,
 ) -> adw::PreferencesDialog {
     let dialog = adw::PreferencesDialog::new();
     dialog.add(&appearance(theme, set_theme));
-    dialog.add(&streaming(bitrate.0, bitrate.1));
+    dialog.add(&streaming(device.bitrate, device.set_bitrate));
     if let Some((server, verify)) = server {
         dialog.add(&server_page(&server, verify));
     }
-    if let Some(tracks) = tracks {
-        dialog.add(&playback(tracks, set_tracks));
-    }
+    dialog.add(&playback(
+        tracks.map(|tracks| (tracks, set_tracks)),
+        device.skip_intros,
+        device.set_skip_intros,
+    ));
     if let Some(signed) = signed {
         dialog.add(&crate::profile_page::page(signed, &dialog));
     }
@@ -139,6 +141,12 @@ fn appearance(current: Theme, set_theme: Rc<dyn Fn(Theme)>) -> adw::PreferencesP
 /// Saves a new bitrate limit.
 pub type SetBitrate = Rc<dyn Fn(Option<u64>)>;
 
+/// Saves the user's track preferences on the server.
+pub type SetTracks = Rc<dyn Fn(TrackPreferences)>;
+
+/// Turns skipping intros on or off.
+pub type SetSkipIntros = Rc<dyn Fn(bool)>;
+
 /// The bitrate limits offered, in bits per second; `None` is no limit.
 pub const BITRATE_LIMITS: [Option<u64>; 7] = [
     None,
@@ -154,7 +162,7 @@ pub const BITRATE_LIMITS: [Option<u64>; 7] = [
 pub fn bitrate_name(limit: Option<u64>) -> String {
     match limit {
         None => "No limit".to_owned(),
-        Some(bits) => format!("{} Mbit/s", bits / 1_000_000),
+        Some(bits) => format::bitrate(bits),
     }
 }
 
@@ -237,10 +245,51 @@ impl PlaybackRows {
     }
 }
 
+/// Settings kept on this device, as they are now and how to change them.
+pub struct Device {
+    pub bitrate: Option<u64>,
+    pub set_bitrate: SetBitrate,
+    pub skip_intros: bool,
+    pub set_skip_intros: SetSkipIntros,
+}
+
+/// Skipping intros, on this device, and the user's track preferences when
+/// the server gave them.
 fn playback(
-    preferences: TrackPreferences,
-    set_tracks: Rc<dyn Fn(TrackPreferences)>,
+    tracks: Option<(TrackPreferences, SetTracks)>,
+    skip_intros: bool,
+    set_skip_intros: SetSkipIntros,
 ) -> adw::PreferencesPage {
+    let skip = adw::SwitchRow::builder()
+        .title("Skip intros automatically")
+        .subtitle("Once per episode, with a moment to undo it")
+        .active(skip_intros)
+        .build();
+    skip.connect_active_notify(move |row| set_skip_intros(row.is_active()));
+    let markers = adw::PreferencesGroup::builder()
+        .title("Intros")
+        .description("On this device.")
+        .build();
+    markers.add(&skip);
+
+    let page = adw::PreferencesPage::builder()
+        .title("Playback")
+        .icon_name(crate::icons::PLAY)
+        .build();
+    page.add(&markers);
+    if let Some((preferences, set_tracks)) = tracks {
+        let (audio, subtitles) = track_groups(preferences, set_tracks);
+        page.add(&audio);
+        page.add(&subtitles);
+    }
+    page
+}
+
+/// Audio and Subtitles, kept on the server for all the user's devices.
+fn track_groups(
+    preferences: TrackPreferences,
+    set_tracks: SetTracks,
+) -> (adw::PreferencesGroup, adw::PreferencesGroup) {
     let audio_languages = adw::EntryRow::builder()
         .title("Preferred languages")
         .text(format::language_list(&preferences.audio.languages))
@@ -263,7 +312,7 @@ fn playback(
     let audio = adw::PreferencesGroup::builder()
         .title("Audio")
         .description(
-            "Language codes in order, such as “original, eng”. Empty plays the file's default.",
+            "Kept on the server, for all your devices. Language codes in order, such as “original, eng”. Empty plays the file's default.",
         )
         .build();
     audio.add(&audio_languages);
@@ -327,15 +376,7 @@ fn playback(
         let save = save.clone();
         combo.connect_selected_notify(move |_| save());
     }
-
-    let page = adw::PreferencesPage::builder()
-        .title("Playback")
-        .icon_name(crate::icons::PLAY)
-        .description("Kept on the server, for all your devices.")
-        .build();
-    page.add(&audio);
-    page.add(&subtitles);
-    page
+    (audio, subtitles)
 }
 
 #[cfg(test)]

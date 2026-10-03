@@ -191,36 +191,23 @@ struct State {
     expected: Option<u64>,
     /// An average of recent fetch throughput, bytes per second.
     throughput: Option<f64>,
+    /// The reader was dropped: fetches still running start no more.
+    stopped: bool,
+}
+
+impl Drop for MediaReader {
+    fn drop(&mut self) {
+        self.shared.lock().stopped = true;
+        self.shared.changed.notify_all();
+    }
 }
 
 impl MediaReader {
     /// A reader for a started playback of `item`. `selection` is what
     /// plays (the server's choice, when it chose); a restart asks for those
-    /// same tracks, so they do not change mid-play. Without a length, the
-    /// read-ahead is a fixed few blocks; see [`MediaReader::with_length`].
+    /// same tracks, so they do not change mid-play. With the item's
+    /// `length` the read-ahead is a time; without, a fixed few blocks.
     pub fn new(
-        session: Arc<dyn Session>,
-        item: MediaId,
-        selection: Selection,
-        start: PlaybackStart,
-        spawn: Spawn,
-    ) -> Self {
-        Self::build(session, item, selection, start, spawn, None)
-    }
-
-    /// The same, with the item's length, so the read-ahead is a time.
-    pub fn with_length(
-        session: Arc<dyn Session>,
-        item: MediaId,
-        selection: Selection,
-        start: PlaybackStart,
-        spawn: Spawn,
-        length: Option<Duration>,
-    ) -> Self {
-        Self::build(session, item, selection, start, spawn, length)
-    }
-
-    fn build(
         session: Arc<dyn Session>,
         item: MediaId,
         selection: Selection,
@@ -236,7 +223,11 @@ impl MediaReader {
                 item,
                 selection,
                 size,
-                bitrate: length.map(|l| size as f64 / l.as_secs_f64()),
+                // None for a size of 0 too: a rate of 0 made status()'s
+                // seconds NaN, and Duration panics on NaN.
+                bitrate: length
+                    .map(|l| size as f64 / l.as_secs_f64())
+                    .filter(|rate| *rate > 0.0),
                 ahead: ahead_blocks(size, length, TARGET_AHEAD),
                 spawn,
                 state: Mutex::new(State {
@@ -250,6 +241,7 @@ impl MediaReader {
                     last_block: None,
                     expected: None,
                     throughput: None,
+                    stopped: false,
                 }),
                 changed: Condvar::new(),
             }),
@@ -389,6 +381,10 @@ impl MediaReader {
                 }
             }
             if underrun {
+                // A read-ahead block that failed is fetched again here:
+                // the underrun waits for a run of blocks, and nothing else
+                // would restart one (a flaky link stalled at N% for good).
+                shared.top_up(&shared.clone(), &mut state, index);
                 let ready = shared.ready_from(&state, index * BLOCK);
                 let percent = (ready * 100 / resume_bytes).min(99) as u8;
                 // Reported without the lock: GStreamer handles a posted
@@ -406,8 +402,6 @@ impl MediaReader {
         }
     }
 
-    /// Starts fetches up to the in-flight limit, nearest first; for tests
-    /// and for the player to warm up before playing.
     /// Starts reading ahead from `offset` before anything asks for it, and
     /// keeps what arrives until a read gets there. For a resume: the
     /// demuxer reads the header and index first, then seeks, and by then
@@ -420,6 +414,8 @@ impl MediaReader {
             .top_up_to(&self.shared.clone(), &mut state, index, EXPECT_IN_FLIGHT);
     }
 
+    /// Starts fetches up to the in-flight limit, nearest first; for tests
+    /// and for the player to warm up before playing.
     pub fn prefetch(&self, offset: u64) {
         let mut state = self.shared.lock();
         self.shared
@@ -451,11 +447,18 @@ impl Shared {
     /// Drops blocks too far from `from`, the block being read, to be read
     /// soon. Only a read evicts: a fetch arriving for a block a read
     /// jumped to must stay until that read takes it.
+    /// The first and last blocks stay: demuxers read the header and the
+    /// index at the end of the file again and again while they open it,
+    /// and a resume's log showed each fetched six or seven times.
     fn evict(&self, state: &mut State, from: u64) {
         let near = |at: u64| at.saturating_sub(BEHIND)..=at + self.ahead;
         let (keep, expected) = (near(from), state.expected.map(near));
+        let last = self.last_index();
         state.blocks.retain(|index, _| {
-            keep.contains(index) || expected.as_ref().is_some_and(|e| e.contains(index))
+            *index == 0
+                || *index == last
+                || keep.contains(index)
+                || expected.as_ref().is_some_and(|e| e.contains(index))
         });
     }
 
@@ -495,6 +498,9 @@ impl Shared {
     }
 
     fn start(&self, this: &Arc<Self>, state: &mut State, index: u64) {
+        if state.stopped {
+            return;
+        }
         state.pending.insert(index);
         state.failed.remove(&index);
         let shared = this.clone();
@@ -547,7 +553,7 @@ impl Shared {
     async fn read_block(&self, index: u64) -> Result<Vec<u8>, BackendError> {
         let start = index * BLOCK;
         let want = BLOCK.min(self.size.saturating_sub(start));
-        let mut bytes = Vec::with_capacity(want as usize);
+        let mut bytes = Vec::new();
         let mut restarted = false;
         while (bytes.len() as u64) < want {
             let (handle, generation) = {
@@ -557,7 +563,12 @@ impl Shared {
             let got = bytes.len() as u64;
             match self.session.read(&handle, start + got, want - got).await {
                 Ok(more) if more.is_empty() => break,
-                Ok(more) => bytes.extend_from_slice(&more),
+                // The whole block in one answer, as usual: kept as it came.
+                Ok(more) if bytes.is_empty() && more.len() as u64 == want => return Ok(more),
+                Ok(more) => {
+                    bytes.reserve_exact(want as usize - bytes.len());
+                    bytes.extend_from_slice(&more);
+                }
                 Err(BackendError::PlaybackExpired) if !restarted => {
                     restarted = true;
                     self.restart(generation).await?;
@@ -588,65 +599,20 @@ impl Shared {
 
 #[cfg(test)]
 mod tests {
-    use std::future::Future;
-    use std::io::Write;
+
     use std::path::PathBuf;
-    use std::pin::pin;
-    use std::task::{Context, Poll, Waker};
 
     use spoolframe_types::{MediaKind, Namespace};
 
     use super::*;
-    use crate::backend::{Client, PlaybackPlan, Profile, ServerKey};
+    use crate::backend::{Client, PlaybackPlan};
     use crate::fake::FakeClient;
-    use crate::test_dir::TestDir;
 
-    /// The fake's futures finish without waiting, so a fetch completes on
-    /// a plain thread polling it.
-    fn thread_spawn() -> Spawn {
-        Arc::new(|future| {
-            std::thread::spawn(move || {
-                let mut future = future;
-                loop {
-                    if let Poll::Ready(()) =
-                        pin!(&mut future).poll(&mut Context::from_waker(Waker::noop()))
-                    {
-                        break;
-                    }
-                    std::thread::yield_now();
-                }
-            });
-        })
-    }
-
-    fn ready<T>(future: impl Future<Output = T>) -> T {
-        match pin!(future).poll(&mut Context::from_waker(Waker::noop())) {
-            Poll::Ready(value) => value,
-            Poll::Pending => panic!("the fake backend never waits"),
-        }
-    }
-
-    /// A file of `len` bytes where each byte is its offset modulo 251, so a
-    /// misplaced range shows.
-    fn media_file(name: &str, len: usize) -> (TestDir, PathBuf, Vec<u8>) {
-        let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
-        let dir = TestDir::new_blocking(&format!("spoolframe-reader-{name}"));
-        let path = dir.join("media");
-        std::fs::File::create(&path)
-            .unwrap()
-            .write_all(&bytes)
-            .unwrap();
-        (dir, path, bytes)
-    }
+    use crate::testing::{media_file, ready, thread_spawn};
 
     fn reader_for(path: PathBuf) -> (MediaReader, Arc<dyn Session>) {
         let client = FakeClient::new(Some(path));
-        let profile = Profile {
-            server: ServerKey("k5d2r8w1tqz7m3c0vnh4q7fa".into()),
-            username: "andrey".into(),
-            display_name: "Andrey".into(),
-            locked: false,
-        };
+        let profile = FakeClient::profile("andrey");
         let session = client.session(&profile).unwrap();
         let item = MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap();
         let start = ready(session.start_playback(&item, None, None)).unwrap();
@@ -656,13 +622,14 @@ mod tests {
             Selection::default(),
             start,
             thread_spawn(),
+            None,
         );
         (reader, session)
     }
 
     #[test]
     fn a_small_read_returns_exactly_its_range() {
-        let (_dir, path, bytes) = media_file("small", 10_000);
+        let (_dir, path, bytes) = media_file("reader-small", 10_000);
         let (reader, _) = reader_for(path);
         assert_eq!(reader.read(4_000, 100).unwrap(), bytes[4_000..4_100]);
     }
@@ -670,7 +637,7 @@ mod tests {
     #[test]
     fn a_read_across_a_block_boundary_joins_both_blocks() {
         let len = (BLOCK + 1_000) as usize;
-        let (_dir, path, bytes) = media_file("boundary", len);
+        let (_dir, path, bytes) = media_file("reader-boundary", len);
         let (reader, _) = reader_for(path);
         let from = BLOCK as usize - 500;
         assert_eq!(
@@ -681,28 +648,23 @@ mod tests {
 
     #[test]
     fn a_read_at_the_end_returns_what_is_left() {
-        let (_dir, path, bytes) = media_file("end", 5_000);
+        let (_dir, path, bytes) = media_file("reader-end", 5_000);
         let (reader, _) = reader_for(path);
         assert_eq!(reader.read(4_990, 100).unwrap(), bytes[4_990..]);
     }
 
     #[test]
     fn a_read_past_the_end_is_empty() {
-        let (_dir, path, _) = media_file("past", 5_000);
+        let (_dir, path, _) = media_file("reader-past", 5_000);
         let (reader, _) = reader_for(path);
         assert_eq!(reader.read(6_000, 100).unwrap(), Vec::<u8>::new());
     }
 
     #[test]
     fn an_expired_handle_is_started_again_and_the_read_succeeds() {
-        let (_dir, path, bytes) = media_file("expired", 3_000);
+        let (_dir, path, bytes) = media_file("reader-expired", 3_000);
         let client = FakeClient::new(Some(path));
-        let profile = Profile {
-            server: ServerKey("k5d2r8w1tqz7m3c0vnh4q7fa".into()),
-            username: "andrey".into(),
-            display_name: "Andrey".into(),
-            locked: false,
-        };
+        let profile = FakeClient::profile("andrey");
         let session = client.session(&profile).unwrap();
         let item = MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap();
         // A handle the fake never issued reads as expired.
@@ -712,31 +674,41 @@ mod tests {
             size: 3_000,
             chosen: None,
             epoch: 0,
+            markers: Vec::new(),
         };
-        let reader = MediaReader::new(session, item, Selection::default(), stale, thread_spawn());
+        let reader = MediaReader::new(
+            session,
+            item,
+            Selection::default(),
+            stale,
+            thread_spawn(),
+            None,
+        );
         assert_eq!(reader.read(0, 10).unwrap(), bytes[..10]);
     }
 
     #[test]
     fn short_reads_are_asked_again_until_the_block_is_whole() {
-        let (_dir, path, bytes) = media_file("short", 50_000);
+        let (_dir, path, bytes) = media_file("reader-short", 50_000);
         let client = FakeClient::new(Some(path)).with_read_limit(4_096);
-        let profile = Profile {
-            server: ServerKey("k5d2r8w1tqz7m3c0vnh4q7fa".into()),
-            username: "andrey".into(),
-            display_name: "Andrey".into(),
-            locked: false,
-        };
+        let profile = FakeClient::profile("andrey");
         let session = client.session(&profile).unwrap();
         let item = MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap();
         let start = ready(session.start_playback(&item, None, None)).unwrap();
-        let reader = MediaReader::new(session, item, Selection::default(), start, thread_spawn());
+        let reader = MediaReader::new(
+            session,
+            item,
+            Selection::default(),
+            start,
+            thread_spawn(),
+            None,
+        );
         assert_eq!(reader.read(40_000, 9_000).unwrap(), bytes[40_000..49_000]);
     }
 
     #[test]
     fn a_flushing_reader_stops_waiting() {
-        let (_dir, path, _) = media_file("flushing", 1_000);
+        let (_dir, path, _) = media_file("reader-flushing", 1_000);
         let (reader, _) = reader_for(path);
         reader.set_flushing(true);
         assert_eq!(reader.read(0, 10), Err(ReadError::Flushing));
@@ -803,21 +775,16 @@ mod tests {
 
     #[test]
     fn no_more_than_the_limit_are_fetched_at_once() {
-        let (_dir, path, _) = media_file("in-flight", 10);
+        let (_dir, path, _) = media_file("reader-in-flight", 10);
         let client = FakeClient::new(Some(path));
-        let profile = Profile {
-            server: ServerKey("k5d2r8w1tqz7m3c0vnh4q7fa".into()),
-            username: "andrey".into(),
-            display_name: "Andrey".into(),
-            locked: false,
-        };
+        let profile = FakeClient::profile("andrey");
         let session = client.session(&profile).unwrap();
         let item = MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap();
         let mut start = ready(session.start_playback(&item, None, None)).unwrap();
         // Pretend the file is large and fast, so the read-ahead is long.
         start.size = 100 * BLOCK;
         let (spawn, spawned) = held_spawn();
-        let reader = MediaReader::with_length(
+        let reader = MediaReader::new(
             session,
             item,
             Selection::default(),
@@ -832,7 +799,7 @@ mod tests {
 
     #[test]
     fn after_a_read_the_status_counts_the_bytes_ready_ahead() {
-        let (_dir, path, _) = media_file("status", 10_000);
+        let (_dir, path, _) = media_file("reader-status", 10_000);
         let (reader, _) = reader_for(path);
         reader.read(0, 1_000).unwrap();
         assert_eq!(reader.status().ready_bytes, 9_000);
@@ -845,18 +812,13 @@ mod tests {
         // reads there; the read-ahead's own fetches finishing must not
         // evict the block before the probe takes it.
         let len = 3 * BLOCK as usize + 1_000;
-        let (_dir, path, bytes) = media_file("jump", len);
+        let (_dir, path, bytes) = media_file("reader-jump", len);
         let client = FakeClient::new(Some(path));
-        let profile = Profile {
-            server: ServerKey("k5d2r8w1tqz7m3c0vnh4q7fa".into()),
-            username: "andrey".into(),
-            display_name: "Andrey".into(),
-            locked: false,
-        };
+        let profile = FakeClient::profile("andrey");
         let session = client.session(&profile).unwrap();
         let item = MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap();
         let start = ready(session.start_playback(&item, None, None)).unwrap();
-        let reader = MediaReader::with_length(
+        let reader = MediaReader::new(
             session,
             item,
             Selection::default(),
@@ -876,14 +838,9 @@ mod tests {
     #[test]
     fn a_flush_during_an_underrun_ends_the_buffering() {
         let len = BLOCK as usize + 1_000;
-        let (_dir, path, _) = media_file("flush-underrun", len);
+        let (_dir, path, _) = media_file("reader-flush-underrun", len);
         let client = FakeClient::new(Some(path));
-        let profile = Profile {
-            server: ServerKey("k5d2r8w1tqz7m3c0vnh4q7fa".into()),
-            username: "andrey".into(),
-            display_name: "Andrey".into(),
-            locked: false,
-        };
+        let profile = FakeClient::profile("andrey");
         let session = client.session(&profile).unwrap();
         let item = MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap();
         let start = ready(session.start_playback(&item, None, None)).unwrap();
@@ -903,6 +860,7 @@ mod tests {
             Selection::default(),
             start,
             spawn,
+            None,
         ));
         reader.read(BLOCK - 100, 100).unwrap();
         {
@@ -942,14 +900,9 @@ mod tests {
     #[test]
     fn what_was_fetched_for_a_resume_survives_reading_the_header() {
         let len = 5 * BLOCK as usize;
-        let (_dir, path, bytes) = media_file("expect", len);
+        let (_dir, path, bytes) = media_file("reader-expect", len);
         let client = FakeClient::new(Some(path));
-        let profile = Profile {
-            server: ServerKey("k5d2r8w1tqz7m3c0vnh4q7fa".into()),
-            username: "andrey".into(),
-            display_name: "Andrey".into(),
-            locked: false,
-        };
+        let profile = FakeClient::profile("andrey");
         let session = client.session(&profile).unwrap();
         let item = MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap();
         let start = ready(session.start_playback(&item, None, None)).unwrap();
@@ -963,7 +916,7 @@ mod tests {
         };
         // Ten hours: the read-ahead is two blocks, so block 4 is far from
         // block 0.
-        let reader = MediaReader::with_length(
+        let reader = MediaReader::new(
             session,
             item,
             Selection::default(),
@@ -998,21 +951,14 @@ mod tests {
     /// flight. Before, it queued behind them (seconds of black screen).
     #[test]
     fn a_read_is_fetched_at_once_whatever_the_read_ahead_has_in_flight() {
-        let (_dir, path, _) = media_file("demand", 10);
+        let (_dir, path, _) = media_file("reader-demand", 10);
         let client = FakeClient::new(Some(path));
-        let session = client
-            .session(&Profile {
-                server: ServerKey("k5d2r8w1tqz7m3c0vnh4q7fa".into()),
-                username: "andrey".into(),
-                display_name: "Andrey".into(),
-                locked: false,
-            })
-            .unwrap();
+        let session = client.session(&FakeClient::profile("andrey")).unwrap();
         let item = MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap();
         let mut start = ready(session.start_playback(&item, None, None)).unwrap();
         start.size = 100 * BLOCK;
         let (spawn, spawned) = held_spawn();
-        let reader = Arc::new(MediaReader::with_length(
+        let reader = Arc::new(MediaReader::new(
             session,
             item,
             Selection::default(),
@@ -1043,21 +989,14 @@ mod tests {
 
     #[test]
     fn a_resume_takes_at_most_two_fetch_slots() {
-        let (_dir, path, _) = media_file("expect-slots", 10);
+        let (_dir, path, _) = media_file("reader-expect-slots", 10);
         let client = FakeClient::new(Some(path));
-        let session = client
-            .session(&Profile {
-                server: ServerKey("k5d2r8w1tqz7m3c0vnh4q7fa".into()),
-                username: "andrey".into(),
-                display_name: "Andrey".into(),
-                locked: false,
-            })
-            .unwrap();
+        let session = client.session(&FakeClient::profile("andrey")).unwrap();
         let item = MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap();
         let mut start = ready(session.start_playback(&item, None, None)).unwrap();
         start.size = 100 * BLOCK;
         let (spawn, spawned) = held_spawn();
-        let reader = MediaReader::with_length(
+        let reader = MediaReader::new(
             session,
             item,
             Selection::default(),
@@ -1067,5 +1006,52 @@ mod tests {
         );
         reader.expect(50 * BLOCK);
         assert_eq!(*spawned.lock().unwrap(), EXPECT_IN_FLIGHT);
+    }
+
+    #[test]
+    fn the_header_and_index_blocks_survive_a_jump() {
+        let len = 40 * BLOCK as usize + 100;
+        let (_dir, path, _) = media_file("reader-pinned", len);
+        let (reader, _) = reader_for(path);
+        reader.read(0, 10).unwrap();
+        reader.read(len as u64 - 10, 10).unwrap();
+        // A read far from both.
+        reader.read(20 * BLOCK, 10).unwrap();
+        let state = reader.shared.lock();
+        assert!(state.blocks.contains_key(&0) && state.blocks.contains_key(&40));
+    }
+
+    #[test]
+    fn a_dropped_reader_starts_no_more_fetches() {
+        let (_dir, path, _) = media_file("reader-stopped", 10);
+        let client = FakeClient::new(Some(path));
+        let session = client.session(&FakeClient::profile("andrey")).unwrap();
+        let item = MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap();
+        let mut start = ready(session.start_playback(&item, None, None)).unwrap();
+        start.size = 100 * BLOCK;
+        let (spawn, spawned) = held_spawn();
+        let reader = MediaReader::new(session, item, Selection::default(), start, spawn, None);
+        let shared = reader.shared.clone();
+        drop(reader);
+        shared.top_up(&shared.clone(), &mut shared.lock(), 0);
+        assert_eq!(*spawned.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn an_empty_file_with_a_length_has_a_status() {
+        let (_dir, path, _) = media_file("reader-empty", 0);
+        let client = FakeClient::new(Some(path));
+        let session = client.session(&FakeClient::profile("andrey")).unwrap();
+        let item = MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap();
+        let start = ready(session.start_playback(&item, None, None)).unwrap();
+        let reader = MediaReader::new(
+            session,
+            item,
+            Selection::default(),
+            start,
+            thread_spawn(),
+            Some(Duration::from_secs(60)),
+        );
+        assert_eq!(reader.status().ready, None);
     }
 }

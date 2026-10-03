@@ -9,6 +9,7 @@ mod mpris;
 mod nowplaying;
 mod pages;
 mod pin;
+mod pipeline;
 mod playback;
 mod player;
 mod preferences;
@@ -20,6 +21,7 @@ mod source;
 mod start;
 mod theme;
 mod tracks;
+mod transport;
 mod views;
 mod volume;
 
@@ -34,6 +36,9 @@ use spoolframe_linux_core::backend::Client;
 use spoolframe_linux_core::sdk::{SdkClient, SdkStorage};
 use spoolframe_linux_core::storage::{DataStore, Storage};
 use tracing_subscriber::EnvFilter;
+
+#[global_allocator]
+static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
 
 /// The application ID: GNOME uses it for the desktop file, the settings
 /// and the single-instance check.

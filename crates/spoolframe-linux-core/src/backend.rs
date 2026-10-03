@@ -21,6 +21,7 @@ pub use spoolframe_protocol::{
 use spoolframe_types::{
     ArtworkId, Item, Library, LibraryId, MediaId, MediaTracks, SubtitleFormat, TrackPreferences,
 };
+pub use spoolframe_types::{Marker, MarkerKind};
 use tokio::sync::watch;
 
 /// A boxed future, so that the UI can hold a backend as `dyn Client` or
@@ -153,6 +154,9 @@ pub struct PlaybackStart {
     /// A converted playback's encode: 0 at the start, one more after each
     /// [`Session::seek_playback`].
     pub epoch: u32,
+    /// The item's intro and credits (P2-10), sorted by start; empty when
+    /// the server knows none.
+    pub markers: Vec<Marker>,
 }
 
 /// Part of a converted playback's output (P2-04).

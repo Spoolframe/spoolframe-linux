@@ -106,6 +106,15 @@ impl Queue {
         }
     }
 
+    /// Adds `items` to the end of the context: what follows it, such as
+    /// a show's next episode when the episode was started on its own.
+    pub fn extend_context(&mut self, items: Vec<Item>) {
+        for item in items {
+            self.order.push(self.context.len());
+            self.context.push(item);
+        }
+    }
+
     pub fn current(&self) -> Option<&Item> {
         match self.now.as_ref()? {
             Now::Context => self.context.get(*self.order.get(self.at?)?),
@@ -564,6 +573,13 @@ mod tests {
         let mut queue = Queue::new(Vec::new(), 0, None, Vec::new());
         queue.add(songs("x y"), None);
         assert_eq!(played(&mut queue), "x y");
+    }
+
+    #[test]
+    fn an_extended_context_goes_on_into_what_was_added() {
+        let mut queue = context("a");
+        queue.extend_context(songs("b"));
+        assert_eq!(played(&mut queue), "a b");
     }
 
     #[test]

@@ -8,12 +8,13 @@
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use spoolframe_protocol::{
-    AudioAction, ConvertedAudio, ConvertedVideo, PlannedAudio, PlannedSubtitle, SubtitleDelivery,
+    AudioAction, ConvertedAudio, ConvertedSubtitle, ConvertedVideo, PlannedAudio, PlannedSubtitle,
+    SubtitleAction, SubtitleDelivery,
 };
 use spoolframe_types::language::same_language;
 use spoolframe_types::{
@@ -26,7 +27,7 @@ use tokio::sync::watch;
 
 use crate::backend::{
     ArtworkSize, BackendError, BoxFuture, ChosenTracks, Chunk, Client, ConnectionState, DeviceInfo,
-    DeviceSignInRequest, HomeScreen, MAX_READ, PlaybackHandle, PlaybackPlan, PlaybackStart,
+    DeviceSignInRequest, HomeScreen, MAX_READ, Marker, PlaybackHandle, PlaybackPlan, PlaybackStart,
     Profile, Selection, Server, ServerKey, Session, TrackReason,
 };
 
@@ -136,6 +137,14 @@ impl Catalog {
             1,
             &["Kassa", "That Would Be Me", "Reckoning", "Aldhani"],
         );
+        // A second season, for what follows a season's last episode.
+        catalog.season(
+            &andor,
+            "Andor",
+            "70",
+            2,
+            &["One Year Later", "Sagrona Teema", "Harvest"],
+        );
 
         let artist = media(MediaKind::Artist, "30");
         let album = media(MediaKind::Album, "31");
@@ -212,7 +221,6 @@ impl Catalog {
     ) -> MediaId {
         let base: u32 = key.parse().expect("fixture show keys are numbers");
         let show = media(MediaKind::Show, key);
-        let season_id = media(MediaKind::Season, &(base + 1).to_string());
         self.add(Item::Show(Show {
             id: show.clone(),
             title: title.into(),
@@ -220,19 +228,37 @@ impl Catalog {
             summary: None,
             artwork: Vec::new(),
         }));
+        self.season(&show, title, &(base + 1).to_string(), season, episodes);
+        show
+    }
+
+    /// Adds a season of 50-minute episodes to `show`, after its others.
+    /// Keys: the season's, then +1… for the episodes.
+    fn season(
+        &mut self,
+        show: &MediaId,
+        show_title: &str,
+        key: &str,
+        season: u32,
+        episodes: &[&str],
+    ) {
+        let base: u32 = key.parse().expect("fixture season keys are numbers");
+        let season_id = media(MediaKind::Season, key);
         self.add(Item::Season(Season {
             id: season_id.clone(),
             show_id: show.clone(),
-            show_title: Some(title.into()),
+            show_title: Some(show_title.into()),
             season,
             title: format!("Season {season}"),
             artwork: Vec::new(),
         }));
-        self.children.insert(show.clone(), vec![season_id.clone()]);
+        self.children
+            .entry(show.clone())
+            .or_default()
+            .push(season_id.clone());
         let mut ids = Vec::new();
-        let show_title = title;
         for (i, title) in episodes.iter().enumerate() {
-            let id = media(MediaKind::Episode, &(base + 2 + i as u32).to_string());
+            let id = media(MediaKind::Episode, &(base + 1 + i as u32).to_string());
             ids.push(id.clone());
             self.add(Item::Episode(Episode {
                 id,
@@ -249,7 +275,6 @@ impl Catalog {
             }));
         }
         self.children.insert(season_id, ids);
-        show
     }
 
     fn get(&self, id: &MediaId) -> Result<&Item, BackendError> {
@@ -322,13 +347,9 @@ struct Playback {
 pub struct FakeSession {
     catalog: Arc<Catalog>,
     watch: Mutex<WatchState>,
-    /// The file every playback reads; `None` when the fake has no media.
-    media: Option<PathBuf>,
-    /// The most one read returns, like a server that answers short.
-    read_limit: u64,
-    /// Converts every playback (P2-04): the "encode" is the media file,
-    /// revealed this many bytes per chunk read. `None` plays directly.
-    converting: Option<u64>,
+    serving: Serving,
+    /// How often the subtitle being read as text was asked for.
+    subtitle_asks: AtomicU32,
     /// Set by [`FakeClient::go_away`]: the server stopped answering.
     gone: Arc<std::sync::atomic::AtomicBool>,
     /// Every progress report, in order, for tests.
@@ -401,13 +422,28 @@ pub const FAKE_PIN: &str = "1234";
 /// Wrong PINs in a row before the session here ends.
 const WRONG_PINS: u32 = 10;
 
+/// How sessions serve media: the client's settings, handed to each.
+#[derive(Clone)]
+struct Serving {
+    /// The file every playback reads; `None` when the fake has no media.
+    file: Option<PathBuf>,
+    /// The most one read returns, like a server that answers short.
+    read_limit: u64,
+    /// Converts every playback (P2-04): the "encode" is the media file,
+    /// revealed this many bytes per chunk read. `None` plays directly.
+    converting: Option<u64>,
+    /// The markers every playback starts with (P2-10).
+    markers: Vec<Marker>,
+    /// A converted playback's subtitle is read as text by the server
+    /// (P2-07): not ready this many times, then there.
+    reading_subtitle: Option<u32>,
+}
+
 impl FakeSession {
     fn new(
         catalog: Arc<Catalog>,
         username: &str,
-        media_file: Option<PathBuf>,
-        read_limit: u64,
-        converting: Option<u64>,
+        serving: Serving,
         gone: Arc<std::sync::atomic::AtomicBool>,
         active: Arc<Mutex<Option<String>>>,
     ) -> Self {
@@ -424,9 +460,8 @@ impl FakeSession {
         let session = FakeSession {
             catalog,
             watch: Mutex::new(WatchState::default()),
-            media: media_file,
-            read_limit,
-            converting,
+            serving,
+            subtitle_asks: AtomicU32::new(0),
             gone,
             reports: Mutex::new(Vec::new()),
             playbacks: Mutex::new(HashMap::new()),
@@ -761,7 +796,7 @@ impl FakeSession {
 
     /// What the fake converts to: HEVC it "cannot play" encoded to H.264,
     /// the audio copied.
-    fn converted_plan(item: &Item, selection: Selection) -> PlaybackPlan {
+    fn converted_plan(item: &Item, selection: Selection, ocr: bool) -> PlaybackPlan {
         let video = !matches!(item, Item::Track(_));
         PlaybackPlan::Converted {
             delivery: Delivery::Progressive,
@@ -778,7 +813,13 @@ impl FakeSession {
                     codec: AudioCodec::Aac,
                 },
             }),
-            subtitle: None,
+            subtitle: ocr.then_some(ConvertedSubtitle {
+                index: 0,
+                action: SubtitleAction::Ocr {
+                    from: SubtitleFormat::Pgs,
+                    to: SubtitleFormat::Srt,
+                },
+            }),
             reasons: vec!["video 0: hevc is not supported; encoded to h264".into()],
         }
     }
@@ -834,7 +875,7 @@ impl FakeSession {
     }
 
     fn media_size(&self) -> Result<(PathBuf, u64), BackendError> {
-        let Some(path) = &self.media else {
+        let Some(path) = &self.serving.file else {
             return Err(BackendError::Unavailable(
                 "the fake server has no media; start the app with --fake-media FILE".into(),
             ));
@@ -852,7 +893,7 @@ impl FakeSession {
         let mut file = std::fs::File::open(&path).map_err(io)?;
         file.seek(SeekFrom::Start(offset)).map_err(io)?;
         let mut bytes = Vec::new();
-        file.take(length.min(MAX_READ).min(self.read_limit))
+        file.take(length.min(MAX_READ).min(self.serving.read_limit))
             .read_to_end(&mut bytes)
             .map_err(io)?;
         Ok(bytes)
@@ -998,8 +1039,11 @@ impl Session for FakeSession {
                         written: 0,
                     },
                 );
-            let (plan, size) = match self.converting {
-                Some(_) => (Self::converted_plan(item, effective), 0),
+            let (plan, size) = match self.serving.converting {
+                Some(_) => (
+                    Self::converted_plan(item, effective, self.serving.reading_subtitle.is_some()),
+                    0,
+                ),
                 None => (Self::plan_for(item, &tracks, effective), size),
             };
             Ok(PlaybackStart {
@@ -1008,6 +1052,7 @@ impl Session for FakeSession {
                 size,
                 chosen,
                 epoch: 0,
+                markers: self.serving.markers.clone(),
             })
         })
     }
@@ -1024,7 +1069,7 @@ impl Session for FakeSession {
                 return Err(BackendError::Unreachable("Home Media".into()));
             }
             let (_, size) = self.media_size()?;
-            let grow = self.converting.unwrap_or(size);
+            let grow = self.serving.converting.unwrap_or(size);
             // Each read lets the "encode" write a little more.
             let (current, written) = self.with_playback(handle, |p| {
                 p.written = (p.written + grow).min(size);
@@ -1098,7 +1143,11 @@ impl Session for FakeSession {
     ) -> BoxFuture<'a, Result<(SubtitleFormat, Vec<u8>), BackendError>> {
         Box::pin(async move {
             let (_, selection) = self.playback(handle)?;
-            if selection.subtitle != Some(0) {
+            if let Some(waits) = self.serving.reading_subtitle {
+                if self.subtitle_asks.fetch_add(1, Ordering::SeqCst) < waits {
+                    return Err(BackendError::SubtitleNotReady(50));
+                }
+            } else if selection.subtitle != Some(0) {
                 return Err(BackendError::NotFound(
                     "an external subtitle in this playback".into(),
                 ));
@@ -1384,9 +1433,7 @@ impl FakeSession {
 /// The servers and users the mockups show.
 pub struct FakeClient {
     catalog: Arc<Catalog>,
-    media: Option<PathBuf>,
-    read_limit: u64,
-    converting: Option<u64>,
+    serving: Serving,
     servers: Mutex<Vec<Server>>,
     /// Accounts each server has: (server, username, display name).
     accounts: Vec<(ServerKey, &'static str, &'static str)>,
@@ -1421,6 +1468,16 @@ fn basement() -> ServerKey {
 }
 
 impl FakeClient {
+    /// `username`'s profile on the fake's connected server, Home Media.
+    pub fn profile(username: &str) -> Profile {
+        Profile {
+            server: home_media(),
+            username: username.into(),
+            display_name: username.into(),
+            locked: false,
+        }
+    }
+
     /// `media` is the file every playback reads; without one, starting
     /// playback fails with a message saying so.
     pub fn new(media: Option<PathBuf>) -> Self {
@@ -1432,9 +1489,13 @@ impl FakeClient {
         };
         FakeClient {
             catalog: Arc::new(Catalog::new()),
-            media,
-            read_limit: MAX_READ,
-            converting: None,
+            serving: Serving {
+                file: media,
+                read_limit: MAX_READ,
+                converting: None,
+                markers: Vec::new(),
+                reading_subtitle: None,
+            },
             gone: Arc::default(),
             active: Arc::default(),
             servers: Mutex::new(vec![
@@ -1470,8 +1531,6 @@ impl FakeClient {
         }
     }
 
-    /// Reads answer at most `limit` bytes, like a server that sends less
-    /// than asked: clients must ask again from where a read stopped.
     /// The progress reports `profile`'s session has had, in order.
     pub fn progress_reports(&self, profile: &Profile) -> Vec<(MediaId, Duration)> {
         self.sessions
@@ -1511,9 +1570,7 @@ impl FakeClient {
                 Arc::new(FakeSession::new(
                     self.catalog.clone(),
                     &profile.username,
-                    self.media.clone(),
-                    self.read_limit,
-                    self.converting,
+                    self.serving.clone(),
                     self.gone.clone(),
                     self.active.clone(),
                 ))
@@ -1521,8 +1578,10 @@ impl FakeClient {
             .clone()
     }
 
+    /// Reads answer at most `limit` bytes, like a server that sends less
+    /// than asked: clients must ask again from where a read stopped.
     pub fn with_read_limit(mut self, limit: u64) -> Self {
-        self.read_limit = limit;
+        self.serving.read_limit = limit;
         self
     }
 
@@ -1530,7 +1589,21 @@ impl FakeClient {
     /// whose output, the media file, grows by `bytes` with each chunk
     /// read, as an encode would.
     pub fn converting(mut self, bytes: u64) -> Self {
-        self.converting = Some(bytes);
+        self.serving.converting = Some(bytes);
+        self
+    }
+
+    /// Every converted playback's subtitle is read as text by the server
+    /// (P2-07), and not ready the first `waits` times it is asked for.
+    pub fn reading_subtitle(mut self, waits: u32) -> Self {
+        self.serving.reading_subtitle = Some(waits);
+        self
+    }
+
+    /// Every playback starts with `markers` (P2-10), so tests can see the
+    /// player offer Skip Intro and the rest.
+    pub fn with_markers(mut self, markers: Vec<Marker>) -> Self {
+        self.serving.markers = markers;
         self
     }
 
@@ -1785,20 +1858,9 @@ impl Client for FakeClient {
 
 #[cfg(test)]
 mod tests {
-    use std::future::Future;
-    use std::io::Write;
-    use std::pin::pin;
-    use std::task::{Context, Poll, Waker};
 
     use super::*;
-
-    /// The fake never waits, so its futures finish on the first poll.
-    fn ready<T>(future: impl Future<Output = T>) -> T {
-        match pin!(future).poll(&mut Context::from_waker(Waker::noop())) {
-            Poll::Ready(value) => value,
-            Poll::Pending => panic!("the fake backend never waits"),
-        }
-    }
+    use crate::testing::{file_with, ready};
 
     fn title(item: &Item) -> &str {
         match item {
@@ -1817,13 +1879,7 @@ mod tests {
     }
 
     fn session_for(client: &FakeClient, username: &str) -> Arc<dyn Session> {
-        let profile = Profile {
-            server: home_media(),
-            username: username.into(),
-            display_name: username.into(),
-            locked: false,
-        };
-        client.session(&profile).unwrap()
+        client.session(&FakeClient::profile(username)).unwrap()
     }
 
     fn andrey() -> Arc<dyn Session> {
@@ -1997,20 +2053,10 @@ mod tests {
         assert!(matches!(error, BackendError::Unavailable(m) if m.contains("--fake-media")));
     }
 
-    fn media_file(bytes: &[u8]) -> (crate::test_dir::TestDir, PathBuf) {
-        let dir = crate::test_dir::TestDir::new_blocking("spoolframe-fake");
-        let path = dir.join("media");
-        std::fs::File::create(&path)
-            .unwrap()
-            .write_all(bytes)
-            .unwrap();
-        (dir, path)
-    }
-
     #[test]
     fn reads_return_the_requested_range_of_the_file() {
         let bytes: Vec<u8> = (0..=255).collect();
-        let (_dir, path) = media_file(&bytes);
+        let (_dir, path) = file_with("fake", &bytes);
         let client = FakeClient::new(Some(path));
         let session = session_for(&client, "andrey");
         let alien = media(MediaKind::Movie, "1");
@@ -2032,7 +2078,7 @@ mod tests {
 
     #[test]
     fn the_external_subtitle_comes_with_its_playback() {
-        let (_dir, path) = media_file(&[0; 17]);
+        let (_dir, path) = file_with("fake", &[0; 17]);
         let client = FakeClient::new(Some(path));
         let session = session_for(&client, "andrey");
         let alien = media(MediaKind::Movie, "1");
@@ -2276,7 +2322,7 @@ mod tests {
 
     #[test]
     fn stopping_a_converted_playback_ends_its_encode() {
-        let (_dir, path) = media_file(b"output");
+        let (_dir, path) = file_with("fake", b"output");
         let client = FakeClient::new(Some(path)).converting(2);
         let profile = Profile {
             server: home_media(),

@@ -446,6 +446,7 @@ impl Session for SdkSession {
                 size: playback.size,
                 chosen: playback.chosen,
                 epoch: playback.epoch,
+                markers: playback.markers,
             })
         }))
     }

@@ -35,6 +35,7 @@ pub struct Published {
 }
 
 impl Published {
+    #[cfg(test)]
     pub fn new(reader: impl ByteSource + 'static) -> Self {
         Self::publish(Arc::new(reader))
     }
@@ -256,41 +257,17 @@ mod imp {
 
 #[cfg(test)]
 mod tests {
-    use spoolframe_linux_core::test_dir::TestDir;
-    use std::future::Future;
     use std::path::{Path, PathBuf};
-    use std::pin::pin;
-    use std::task::{Context, Poll, Waker};
     use std::time::Duration;
 
-    use spoolframe_linux_core::backend::{Client, Profile, Selection, ServerKey};
+    use spoolframe_linux_core::testing::{TestDir, ready, thread_spawn};
+
+    use spoolframe_linux_core::backend::{Client, Selection, ServerKey};
     use spoolframe_linux_core::fake::FakeClient;
     use spoolframe_linux_core::reader::{MediaReader, Spawn};
     use spoolframe_types::{MediaId, MediaKind, Namespace};
 
     use super::*;
-
-    /// The fake's futures finish without waiting.
-    fn ready<T>(future: impl Future<Output = T>) -> T {
-        match pin!(future).poll(&mut Context::from_waker(Waker::noop())) {
-            Poll::Ready(value) => value,
-            Poll::Pending => panic!("the fake backend never waits"),
-        }
-    }
-
-    fn thread_spawn() -> Spawn {
-        Arc::new(|future| {
-            std::thread::spawn(move || {
-                let mut future = future;
-                while pin!(&mut future)
-                    .poll(&mut Context::from_waker(Waker::noop()))
-                    .is_pending()
-                {
-                    std::thread::yield_now();
-                }
-            });
-        })
-    }
 
     /// Runs `pipeline` until end of stream; panics on an error or after
     /// `limit`.
@@ -323,12 +300,7 @@ mod tests {
 
     fn published(path: PathBuf) -> Published {
         let client = FakeClient::new(Some(path));
-        let profile = Profile {
-            server: ServerKey("k5d2r8w1tqz7m3c0vnh4q7fa".into()),
-            username: "andrey".into(),
-            display_name: "Andrey".into(),
-            locked: false,
-        };
+        let profile = FakeClient::profile("andrey");
         let session = client.session(&profile).unwrap();
         let item = MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap();
         let start = ready(session.start_playback(&item, None, None)).unwrap();
@@ -338,6 +310,7 @@ mod tests {
             Selection::default(),
             start,
             thread_spawn(),
+            None,
         ))
     }
 
@@ -412,12 +385,7 @@ mod tests {
         let path = dir.join("clip.mkv");
         clip(&path);
         let client = FakeClient::new(Some(path)).converting(16 * 1024);
-        let profile = Profile {
-            server: ServerKey("k5d2r8w1tqz7m3c0vnh4q7fa".into()),
-            username: "andrey".into(),
-            display_name: "Andrey".into(),
-            locked: false,
-        };
+        let profile = FakeClient::profile("andrey");
         let session = client.session(&profile).unwrap();
         let item = MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap();
         let start = ready(session.start_playback(&item, None, None)).unwrap();
@@ -426,6 +394,7 @@ mod tests {
             start.handle,
             start.epoch,
             thread_spawn(),
+            None,
         ));
         let playbin = gst::ElementFactory::make("playbin3")
             .property("uri", published.uri())
@@ -476,6 +445,8 @@ mod tests {
         runtime
             .block_on(client.add_address(&key, &env("SPOOLFRAME_TEST_ADDR")))
             .unwrap();
+        // Signing in needs the key pinned first (P1-21).
+        runtime.block_on(client.pin(&key, false)).unwrap();
         let profile = runtime
             .block_on(client.sign_in(
                 &key,
@@ -511,6 +482,7 @@ mod tests {
             selection,
             start,
             spawn,
+            None,
         ));
         let playbin = gst::ElementFactory::make("playbin3")
             .property("uri", published.uri())

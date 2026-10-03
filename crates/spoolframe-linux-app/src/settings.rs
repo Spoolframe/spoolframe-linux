@@ -15,6 +15,8 @@ const CONNECTION: &str = "connection";
 const SERVER: &str = "server";
 const STREAMING: &str = "streaming";
 const MAX_BITRATE: &str = "max-bitrate";
+const PLAYBACK: &str = "playback";
+const SKIP_INTROS: &str = "skip-intros";
 
 pub struct Settings {
     /// `None` without a home directory: settings then last for this run.
@@ -51,13 +53,9 @@ impl Settings {
         })
     }
 
-    /// Saves the theme. A failure is logged, not fatal: the theme still
-    /// applies for this run.
     pub fn set_theme(&mut self, theme: Theme) {
         self.file.set_string(APPEARANCE, THEME, theme.key());
-        if let Err(e) = self.save() {
-            tracing::warn!(path = ?self.path, error = %e, "could not save settings");
-        }
+        self.save();
     }
 
     /// The key of the server used last, which the app opens to.
@@ -70,9 +68,7 @@ impl Settings {
 
     pub fn set_server(&mut self, key: &str) {
         self.file.set_string(CONNECTION, SERVER, key);
-        if let Err(e) = self.save() {
-            tracing::warn!(path = ?self.path, error = %e, "could not save settings");
-        }
+        self.save();
     }
 
     /// The most the server may send, in bits per second (P2-06); `None`,
@@ -92,12 +88,28 @@ impl Settings {
                 let _ = self.file.remove_key(STREAMING, MAX_BITRATE);
             }
         }
-        if let Err(e) = self.save() {
+        self.save();
+    }
+
+    /// Whether intros are skipped without asking (P2-10); off by default.
+    pub fn skip_intros(&self) -> bool {
+        self.file.boolean(PLAYBACK, SKIP_INTROS).unwrap_or(false)
+    }
+
+    pub fn set_skip_intros(&mut self, on: bool) {
+        self.file.set_boolean(PLAYBACK, SKIP_INTROS, on);
+        self.save();
+    }
+
+    /// Writes the file. A failure is logged, not fatal: the setting
+    /// still applies for this run.
+    fn save(&self) {
+        if let Err(e) = self.write() {
             tracing::warn!(path = ?self.path, error = %e, "could not save settings");
         }
     }
 
-    fn save(&self) -> anyhow::Result<()> {
+    fn write(&self) -> anyhow::Result<()> {
         let Some(path) = &self.path else {
             return Ok(());
         };
