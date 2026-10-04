@@ -6,6 +6,8 @@ use std::rc::Rc;
 use adw::prelude::*;
 use spoolframe_linux_core::backend::{Profile, Server};
 
+use crate::remote_sign_in::Via;
+
 pub type Choose<T> = Rc<dyn Fn(T)>;
 
 /// "Choose a server": servers on this network, then saved ones, and a way
@@ -17,6 +19,7 @@ pub fn servers(
     add: &Rc<dyn Fn()>,
 ) -> gtk::Widget {
     let (clamp, column) = column();
+    column.append(&crate::logo::mark(72));
     column.append(&title("Choose a server"));
     column.append(&dim("Servers on this network appear here on their own."));
 
@@ -475,8 +478,9 @@ fn profile_tile(
         .build()
 }
 
-/// The sign-in dialog: a username and password for one server (§22). The
-/// app keeps it to show a refusal without closing it.
+/// The sign-in dialog: a username and password for one server (§22), or
+/// the web sign-in, on a phone (P3-05) or in the browser (P3-06). The app keeps it to show a refusal
+/// without closing it.
 pub struct SignIn {
     pub dialog: adw::Dialog,
     error: gtk::Label,
@@ -484,7 +488,11 @@ pub struct SignIn {
 }
 
 impl SignIn {
-    pub fn new(server: &Server, submit: Rc<dyn Fn(String, String)>) -> Self {
+    pub fn new(
+        server: &Server,
+        submit: Rc<dyn Fn(String, String)>,
+        elsewhere: Rc<dyn Fn(Via)>,
+    ) -> Self {
         let username = adw::EntryRow::builder().title("Username").build();
         let password = adw::PasswordEntryRow::builder().title("Password").build();
         let fields = adw::PreferencesGroup::new();
@@ -520,6 +528,26 @@ impl SignIn {
         body.append(&fields);
         body.append(&error);
         body.append(&button);
+        // A passkey or a sign-in provider cannot sign in an app; the web
+        // sign-in can, for it, in the browser or on a phone.
+        let others = gtk::Box::builder()
+            .spacing(12)
+            .halign(gtk::Align::Center)
+            .build();
+        for (label, via) in [
+            ("Sign in with browser", Via::Browser),
+            ("Sign in with your phone", Via::Phone),
+        ] {
+            let button = gtk::Button::builder()
+                .label(label)
+                .css_classes(["pill"])
+                .build();
+            let elsewhere = elsewhere.clone();
+            button.connect_clicked(move |_| elsewhere(via));
+            others.append(&button);
+        }
+        body.append(&dim("or, with a passkey"));
+        body.append(&others);
 
         let toolbar = adw::ToolbarView::new();
         toolbar.add_top_bar(&adw::HeaderBar::new());
@@ -679,4 +707,120 @@ fn dim(text: &str) -> gtk::Label {
         .justify(gtk::Justification::Center)
         .css_classes(["dim-label"])
         .build()
+}
+
+/// "<server> isn't set up yet" (P3-10), where the library would be: the
+/// server runs and signs people in, but its admin has not finished setup,
+/// so it has no catalog. Laid out as the design's LinuxNotSetUp board.
+pub struct NotSetUp {
+    pub page: gtk::Widget,
+    title: gtk::Label,
+    status: adw::StatusPage,
+    hint: gtk::Label,
+}
+
+/// The admin listener's port when the server's config leaves it alone.
+const ADMIN_PORT: u16 = 7421;
+
+impl NotSetUp {
+    pub fn new(try_again: Rc<dyn Fn()>, choose_server: Rc<dyn Fn()>) -> Self {
+        let title = gtk::Label::builder().css_classes(["heading"]).build();
+        let header = adw::HeaderBar::builder().title_widget(&title).build();
+        let hint = gtk::Label::builder()
+            .wrap(true)
+            .justify(gtk::Justification::Center)
+            .selectable(true)
+            .css_classes(["dim-label", "caption"])
+            .build();
+        let other = gtk::Button::builder()
+            .label("Choose another server")
+            .css_classes(["pill"])
+            .build();
+        other.connect_clicked(move |_| choose_server());
+        let again = gtk::Button::builder()
+            .label("Try again")
+            .css_classes(["pill", "suggested-action"])
+            .build();
+        again.connect_clicked(move |_| try_again());
+        let buttons = gtk::Box::builder()
+            .spacing(10)
+            .halign(gtk::Align::Center)
+            .build();
+        buttons.append(&other);
+        buttons.append(&again);
+        let child = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(18)
+            .build();
+        child.append(&hint);
+        child.append(&buttons);
+        let status = adw::StatusPage::builder()
+            .icon_name(crate::icons::SERVER)
+            .description(
+                "The server is running, but its admin hasn't finished setup in the web UI. \
+                 Once they do, you can sign in here.",
+            )
+            .child(&child)
+            .build();
+        Self {
+            page: page(&header, &status),
+            title,
+            status,
+            hint,
+        }
+    }
+
+    /// Names `server`, and where its setup is likely to be.
+    pub fn show(&self, server: &Server) {
+        self.title.set_label(&server.name);
+        self.status
+            .set_title(&format!("{} isn't set up yet", server.name));
+        let hint = "If that's you: open the address in the server's log";
+        self.hint
+            .set_label(&match admin_example(&server.addresses) {
+                Some(address) => format!("{hint}, for example {address}"),
+                None => format!("{hint}."),
+            });
+    }
+}
+
+/// Where the server's web UI likely is, as an example: the host it was
+/// seen at, on the admin listener's default port.
+fn admin_example(addresses: &[String]) -> Option<String> {
+    let address = addresses.first()?;
+    let host = match address.strip_prefix('[') {
+        // [v6]:port or [v6]
+        Some(rest) => format!("[{}]", rest.split(']').next()?),
+        None if address.matches(':').count() == 1 => address.split(':').next()?.to_owned(),
+        // A bare IPv6 address.
+        None if address.contains(':') => format!("[{address}]"),
+        None => address.clone(),
+    };
+    Some(format!("http://{host}:{ADMIN_PORT}"))
+}
+
+#[cfg(test)]
+mod not_set_up_tests {
+    use super::*;
+
+    #[test]
+    fn the_example_is_the_host_on_the_admin_port() {
+        assert_eq!(
+            admin_example(&["192.168.1.20:4433".into()]).as_deref(),
+            Some("http://192.168.1.20:7421")
+        );
+    }
+
+    #[test]
+    fn an_ipv6_host_is_bracketed() {
+        assert_eq!(
+            admin_example(&["[fd00::14]:4433".into()]).as_deref(),
+            Some("http://[fd00::14]:7421")
+        );
+    }
+
+    #[test]
+    fn with_no_address_there_is_no_example() {
+        assert_eq!(admin_example(&[]), None);
+    }
 }

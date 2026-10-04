@@ -14,8 +14,12 @@ mod playback;
 mod player;
 mod preferences;
 mod profile_page;
+mod qr;
 mod queue;
+mod remote_sign_in;
 mod saved_queue;
+mod scrub;
+mod search;
 mod settings;
 mod source;
 mod start;
@@ -72,6 +76,9 @@ fn main() -> Result<()> {
     let app = RelmApp::new(APP_ID).with_args(Vec::new());
     playback::init()?;
     icons::register();
+    // The app's icon, from the resource when not installed.
+    gtk::Window::set_default_icon_name(APP_ID);
+    logo::register_font();
 
     // The SDK's runtime: its tasks (discovery, reconnecting) run here for
     // as long as the app does. Kept in scope until the app returns.

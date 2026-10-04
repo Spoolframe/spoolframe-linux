@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The Spoolframe symbolic icon: the small three-hole reel, one colour,
+     the holes cut out. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <path fill="#2e3436" fill-rule="evenodd" d="M16.000 8.000 A8.000 8.000 0 1 0 0.000 8.000 A8.000 8.000 0 1 0 16.000 8.000 Z M10.211 3.789 A2.211 2.211 0 1 0 5.789 3.789 A2.211 2.211 0 1 0 10.211 3.789 Z M13.857 10.105 A2.211 2.211 0 1 0 9.436 10.105 A2.211 2.211 0 1 0 13.857 10.105 Z M6.564 10.105 A2.211 2.211 0 1 0 2.143 10.105 A2.211 2.211 0 1 0 6.564 10.105 Z"/>
+</svg>

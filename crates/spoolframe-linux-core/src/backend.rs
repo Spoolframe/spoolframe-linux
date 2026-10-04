@@ -18,10 +18,15 @@ pub use spoolframe_protocol::{
     ArtworkSize, ChosenTracks, DeviceInfo, DeviceSignInRequest, HomeScreen, PlaybackHandle,
     PlaybackPlan, Selection, TrackReason,
 };
+pub use spoolframe_protocol::{
+    PreviewTile, Previews, SearchCounts, SearchGroup, SearchRequest, SearchResults,
+};
 use spoolframe_types::{
     ArtworkId, Item, Library, LibraryId, MediaId, MediaTracks, SubtitleFormat, TrackPreferences,
 };
-pub use spoolframe_types::{Marker, MarkerKind};
+pub use spoolframe_types::{
+    Marker, MarkerKind, Person, PersonId, PersonRole, SearchKind, SearchScope,
+};
 use tokio::sync::watch;
 
 /// A boxed future, so that the UI can hold a backend as `dyn Client` or
@@ -68,8 +73,9 @@ pub enum BackendError {
     /// few seconds.
     #[error("the subtitle is still being read ({0}% done)")]
     SubtitleNotReady(u8),
-    /// Something the server depends on is down (Plex, a media mount).
-    #[error("unavailable: {0}")]
+    /// Something the server depends on is down (one of its Plex servers,
+    /// a media mount), in the server's words.
+    #[error("{0}")]
     Unavailable(String),
     /// The server is not saved on this device yet: its fingerprint has to
     /// be checked and the server pinned first (P1-21).
@@ -79,6 +85,26 @@ pub enum BackendError {
     /// another server. Both are keys, hex; the user may trust the new one.
     #[error("the server answered with another key")]
     IdentityChanged { saved: String, now: String },
+    /// The server runs, but its admin has not finished setup (P3-10): it
+    /// has no catalog yet. Signing in still works.
+    #[error("this server is not set up yet")]
+    NotSetUp,
+    /// The item's preview frames (P3-13) are still being made: ask again
+    /// in a few seconds.
+    #[error("the previews are still being made ({0}% done)")]
+    PreviewsNotReady(u8),
+    /// The item has no preview frames (music, a file that cannot be read,
+    /// or previews turned off): do not ask again.
+    #[error("there are no previews for this item")]
+    NoPreviews,
+    /// The sign-in this device asked another to approve was refused
+    /// (P3-07).
+    #[error("the sign-in was refused")]
+    SignInDenied,
+    /// Nobody approved the sign-in in time (P3-07): begin again for a new
+    /// code.
+    #[error("the sign-in code expired")]
+    SignInExpired,
     #[error("{0}")]
     Other(String),
 }
@@ -130,6 +156,35 @@ pub struct Profile {
     /// Its PIN is asked for on this device before anything of it shows
     /// (P2-08). As the server said when the profiles were listed.
     pub locked: bool,
+}
+
+/// A sign-in this device began and another approves (P3-05, P3-07): a
+/// phone opens `web_url` and signs in there, or a signed-in Spoolframe
+/// app takes the code. [`Client::await_device_sign_in`] waits for it.
+#[derive(Clone)]
+pub struct DeviceSignIn {
+    pub server: ServerKey,
+    /// The code as shown, large: `BCDF-GHJK`.
+    pub display_code: String,
+    /// The server's web page that approves this code, for a QR code any
+    /// phone's camera opens; `None` when the server has no public web
+    /// address, and only a Spoolframe app can approve.
+    pub web_url: Option<String>,
+    /// How long it can be approved, from when it began.
+    pub expires_in: Duration,
+    /// The backend's own record of the request.
+    pub(crate) request: Arc<dyn std::any::Any + Send + Sync>,
+}
+
+impl std::fmt::Debug for DeviceSignIn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceSignIn")
+            .field("server", &self.server)
+            .field("display_code", &self.display_code)
+            .field("web_url", &self.web_url)
+            .field("expires_in", &self.expires_in)
+            .finish_non_exhaustive()
+    }
 }
 
 /// How the device's connection to a server is doing.
@@ -220,6 +275,23 @@ pub trait Client: Send + Sync {
         password: &'a str,
     ) -> BoxFuture<'a, Result<Profile, BackendError>>;
 
+    /// Begins a sign-in another device approves (P3-05, P3-07): what to
+    /// show while it waits. A server holds at most three per device, so
+    /// begin one per screen, not per redraw.
+    fn begin_device_sign_in<'a>(
+        &'a self,
+        server: &'a ServerKey,
+    ) -> BoxFuture<'a, Result<DeviceSignIn, BackendError>>;
+
+    /// Waits until `sign_in` is approved, adding its profile as a password
+    /// sign-in does; [`BackendError::SignInDenied`] or
+    /// [`BackendError::SignInExpired`] otherwise. Drop the future to stop
+    /// waiting.
+    fn await_device_sign_in<'a>(
+        &'a self,
+        sign_in: &'a DeviceSignIn,
+    ) -> BoxFuture<'a, Result<Profile, BackendError>>;
+
     /// The session behind a profile.
     fn session(&self, profile: &Profile) -> Result<Arc<dyn Session>, BackendError>;
 
@@ -236,6 +308,14 @@ pub trait Client: Send + Sync {
 /// One signed-in user's view of a server: the catalog, their watch state
 /// and playback.
 pub trait Session: Send + Sync {
+    /// Where a browser reaches the server's web UI, if it has a public
+    /// address: for "open in the browser" links (P3-12's Plex account).
+    fn web_url(&self) -> Option<String>;
+
+    /// The item's preview frames for scrubbing (P3-13). Asking also puts
+    /// the item first in the server's queue to make them.
+    fn previews<'a>(&'a self, id: &'a MediaId) -> BoxFuture<'a, Result<Previews, BackendError>>;
+
     /// Continue watching, next up and recently added, with the user's state.
     fn home(&self) -> BoxFuture<'_, Result<HomeScreen, BackendError>>;
 
@@ -257,11 +337,22 @@ pub trait Session: Send + Sync {
         id: &'a MediaId,
     ) -> BoxFuture<'a, Result<(Item, Vec<Item>), BackendError>>;
 
+    /// A search (P3-09): in a scope, or one group for "See all"; the top
+    /// match, then groups of shows, movies, people, artists, albums,
+    /// tracks and episodes, with counts per scope.
     fn search<'a>(
         &'a self,
-        query: &'a str,
+        request: &'a SearchRequest,
+    ) -> BoxFuture<'a, Result<SearchResults, BackendError>>;
+
+    /// A page of the items a person a search found is in, and how many
+    /// there are in all.
+    fn person_items<'a>(
+        &'a self,
+        person: &'a PersonId,
+        offset: u32,
         limit: u32,
-    ) -> BoxFuture<'a, Result<Vec<Item>, BackendError>>;
+    ) -> BoxFuture<'a, Result<(Vec<Item>, u32), BackendError>>;
 
     /// The item's audio and subtitle tracks, for the pickers.
     fn tracks<'a>(&'a self, id: &'a MediaId) -> BoxFuture<'a, Result<MediaTracks, BackendError>>;

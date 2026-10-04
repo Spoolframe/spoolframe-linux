@@ -130,6 +130,24 @@ mod tests {
         assert!(missing.is_empty(), "not in the resource: {missing:?}");
     }
 
+    /// The app's own icon and its symbolic form, so a window shows it
+    /// without an install.
+    #[test]
+    fn the_app_icon_is_compiled_in() {
+        gio::resources_register_include!("icons.gresource").unwrap();
+        let missing: Vec<_> = [
+            "casa.coldsteel.Spoolframe.svg",
+            "casa.coldsteel.Spoolframe-symbolic.svg",
+        ]
+        .into_iter()
+        .filter(|name| {
+            let path = format!("{RESOURCE_PATH}/scalable/apps/{name}");
+            gio::resources_lookup_data(&path, gio::ResourceLookupFlags::NONE).is_err()
+        })
+        .collect();
+        assert!(missing.is_empty(), "not in the resource: {missing:?}");
+    }
+
     /// GTK recolours a symbolic icon through its fills; a stroke left in
     /// would stay black. `icons/convert.sh` outlines every stroke.
     #[test]

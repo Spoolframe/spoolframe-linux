@@ -360,9 +360,17 @@ scale.seek slider {
   opacity: 0.55;
 }
 
-.brand {
-  font-weight: 600;
-  font-size: 1.25em;
+/* The wordmark beside the mark: lowercase, Bricolage Grotesque 700,
+   tight, "frame" in the theme's accent. */
+.wordmark label {
+  font-family: "Bricolage Grotesque", sans-serif;
+  font-weight: 700;
+  font-size: 18px;
+  letter-spacing: -0.03em;
+}
+
+.wordmark label.wordmark-accent {
+  color: var(--accent-color);
 }
 
 /* Item pages, as designed: a large title, square-cornered actions, and
@@ -559,4 +567,58 @@ button.player-offer {
 .player-skipped button.player-undo {
   color: var(--accent-color);
   font-weight: 600;
+}
+
+/* Sign in with your phone (P3-05): the QR code keeps its own white,
+   whatever the theme, and the code reads large and spaced. */
+.qr-code {
+  border-radius: 8px;
+}
+
+.sign-in-code {
+  font-family: monospace;
+  font-size: 34px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  color: var(--accent-color);
+}
+
+.sign-in-code.expired {
+  font-size: 26px;
+  color: alpha(var(--window-fg-color), 0.55);
+  text-decoration: line-through;
+}
+
+/* Search (P3-09): scope chips with their counts, the year token, the top
+   result, people as initials in a circle, and round artists. */
+.search-chip-count {
+  font-size: 0.85em;
+  opacity: 0.7;
+}
+
+.circle,
+.circle .tile {
+  border-radius: 9999px;
+}
+
+.search-person {
+  border-radius: 9999px;
+  background-color: alpha(var(--accent-bg-color), 0.25);
+  font-size: 2em;
+  font-weight: 700;
+}
+
+.search-year-note {
+  padding: 10px 14px;
+  border-radius: 10px;
+  background-color: alpha(currentColor, 0.06);
+}
+
+/* The frame over the seek bar while scrubbing (P3-13). */
+popover.scrub-preview > contents {
+  padding: 6px;
+}
+
+.scrub-frame {
+  border-radius: 6px;
 }

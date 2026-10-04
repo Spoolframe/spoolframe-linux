@@ -286,6 +286,7 @@ impl View {
     }
 
     fn item(&self, item: &Item) {
+        self.controls.preview.frames().for_item(item.id());
         let facts = crate::views::Facts::of(item);
         if let Some(page) = self.page.upgrade() {
             page.set_title(&facts.title);
@@ -653,11 +654,25 @@ struct Controls {
     diagnostics: gtk::ToggleButton,
     fullscreen: gtk::ToggleButton,
     volume: Volume,
+    /// The frame over the seek bar while scrubbing (P3-13).
+    preview: Rc<crate::scrub::Preview>,
 }
 
 impl Controls {
     fn new(playback: &Rc<Playback>) -> Self {
         let scale = seek_scale(playback);
+        let preview =
+            crate::scrub::Preview::new(&scale, crate::scrub::Frames::new(playback.session()));
+        {
+            // Dragging the bar (or its keys) shows the frame there.
+            let preview = Rc::downgrade(&preview);
+            scale.connect_change_value(move |_, _, value| {
+                if let Some(preview) = preview.upgrade() {
+                    preview.flash(Duration::from_secs_f64(value.max(0.0)));
+                }
+                glib::Propagation::Proceed
+            });
+        }
         let position = mono("0:00");
         let left = mono("");
         left.add_css_class("dim-label");
@@ -729,7 +744,7 @@ impl Controls {
             .build();
         bar.append(&seek_row);
         bar.append(&button_row);
-        bar.insert_action_group("player", Some(&transport_actions(playback)));
+        bar.insert_action_group("player", Some(&transport_actions(playback, &preview)));
 
         Self {
             bar,
@@ -741,6 +756,7 @@ impl Controls {
             diagnostics,
             fullscreen,
             volume,
+            preview,
         }
     }
 
@@ -768,21 +784,28 @@ impl Controls {
 
 /// `player.toggle`, `player.back` (10 s) and `player.forward` (30 s),
 /// shared by the buttons and the keys.
-fn transport_actions(playback: &Rc<Playback>) -> gtk::gio::SimpleActionGroup {
+fn transport_actions(
+    playback: &Rc<Playback>,
+    preview: &Rc<crate::scrub::Preview>,
+) -> gtk::gio::SimpleActionGroup {
     let group = gtk::gio::SimpleActionGroup::new();
-    let add = |name: &str, run: fn(&Rc<Playback>)| {
+    // A jump shows the frame it lands on, for a moment.
+    let add = |name: &str, run: fn(&Rc<Playback>), flash: bool| {
         let action = gtk::gio::SimpleAction::new(name, None);
-        let weak = Rc::downgrade(playback);
+        let (weak, preview) = (Rc::downgrade(playback), Rc::downgrade(preview));
         action.connect_activate(move |_, _| {
             if let Some(playback) = weak.upgrade() {
                 run(&playback);
+                if flash && let Some(preview) = preview.upgrade() {
+                    preview.flash(playback.position());
+                }
             }
         });
         group.add_action(&action);
     };
-    add("toggle", |p| p.toggle());
-    add("back", |p| p.jump(-10.0));
-    add("forward", |p| p.jump(30.0));
+    add("toggle", |p| p.toggle(), false);
+    add("back", |p| p.jump(-10.0), true);
+    add("forward", |p| p.jump(30.0), true);
     group
 }
 

@@ -327,7 +327,7 @@ pub fn placeholder_card() -> gtk::Widget {
 }
 
 /// A clickable card: a tile over a caption.
-fn card(
+pub(crate) fn card(
     item: &Item,
     tile: &gtk::Overlay,
     caption: &gtk::Box,

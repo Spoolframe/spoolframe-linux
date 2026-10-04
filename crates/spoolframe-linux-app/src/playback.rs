@@ -639,6 +639,12 @@ impl Playback {
         !matches!(self.queue.borrow().current(), Some(Item::Track(_)))
     }
 
+    /// The session the playback plays from, for what views fetch beside
+    /// it (preview frames).
+    pub fn session(&self) -> Arc<dyn Session> {
+        self.session.clone()
+    }
+
     /// The video frames, for any number of pictures.
     pub fn paintable(&self) -> &gtk::gdk::Paintable {
         self.pipeline.paintable()

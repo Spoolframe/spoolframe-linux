@@ -15,7 +15,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use spoolframe_client_sdk as sdk;
-use spoolframe_linux_core::backend::{Client, ConnectionState, ServerKey};
+use spoolframe_linux_core::backend::{
+    Client, ConnectionState, SearchRequest, SearchScope, ServerKey,
+};
 use spoolframe_linux_core::reader::{MediaReader, Spawn};
 use spoolframe_linux_core::sdk::SdkClient;
 use spoolframe_types::{
@@ -204,12 +206,19 @@ fn the_app_backend_works_against_a_live_server() {
     let item = playable.expect("a movie or an episode to play");
     eprintln!("playing: {}", title(&item));
 
-    let hits = run(
-        &runtime,
-        session.search(&title(&item).chars().take(4).collect::<String>(), 10),
-    )
-    .unwrap();
-    eprintln!("search: {} hits", hits.len());
+    let request = SearchRequest {
+        query: title(&item).chars().take(4).collect(),
+        limit: 10,
+        scope: SearchScope::All,
+        kind: None,
+        library: None,
+    };
+    let found = run(&runtime, session.search(&request)).unwrap();
+    eprintln!(
+        "search: top {:?}, {} groups",
+        found.top.as_ref().map(title),
+        found.groups.len()
+    );
 
     let tracks = run(&runtime, session.tracks(item.id())).unwrap();
     eprintln!(

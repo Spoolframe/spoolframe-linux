@@ -27,8 +27,10 @@ use tokio::sync::watch;
 
 use crate::backend::{
     ArtworkSize, BackendError, BoxFuture, ChosenTracks, Chunk, Client, ConnectionState, DeviceInfo,
-    DeviceSignInRequest, HomeScreen, MAX_READ, Marker, PlaybackHandle, PlaybackPlan, PlaybackStart,
-    Profile, Selection, Server, ServerKey, Session, TrackReason,
+    DeviceSignIn, DeviceSignInRequest, HomeScreen, MAX_READ, Marker, Person, PersonId, PersonRole,
+    PlaybackHandle, PlaybackPlan, PlaybackStart, Previews, Profile, SearchCounts, SearchGroup,
+    SearchKind, SearchRequest, SearchResults, SearchScope, Selection, Server, ServerKey, Session,
+    TrackReason,
 };
 
 /// Every fake account's password.
@@ -81,6 +83,8 @@ struct Catalog {
     /// Every item in fixture order, for search.
     order: Vec<MediaId>,
     recently_added: Vec<MediaId>,
+    /// The people a search finds (P3-09), with the items they are in.
+    people: Vec<(Person, Vec<MediaId>)>,
 }
 
 impl Catalog {
@@ -91,6 +95,7 @@ impl Catalog {
             children: HashMap::new(),
             order: Vec::new(),
             recently_added: Vec::new(),
+            people: Vec::new(),
         };
 
         let mut alien = movie("1", "Alien", 1979, 117);
@@ -112,6 +117,15 @@ impl Catalog {
             alien,
         ];
         catalog.recently_added = movies[..6].iter().map(|m| m.id().clone()).collect();
+        catalog.people = vec![(
+            Person {
+                id: PersonId::new(Namespace::Plex, "director-villeneuve").expect("not empty"),
+                name: "Denis Villeneuve".into(),
+                role: PersonRole::Director,
+                count: Some(2),
+            },
+            vec![media(MediaKind::Movie, "2"), media(MediaKind::Movie, "8")],
+        )];
         let movie_ids = movies.iter().map(|m| m.id().clone()).collect();
         for m in movies {
             catalog.add(m);
@@ -350,6 +364,8 @@ pub struct FakeSession {
     serving: Serving,
     /// How often the subtitle being read as text was asked for.
     subtitle_asks: AtomicU32,
+    /// How often previews were asked for.
+    preview_asks: AtomicU32,
     /// Set by [`FakeClient::go_away`]: the server stopped answering.
     gone: Arc<std::sync::atomic::AtomicBool>,
     /// Every progress report, in order, for tests.
@@ -437,7 +453,28 @@ struct Serving {
     /// A converted playback's subtitle is read as text by the server
     /// (P2-07): not ready this many times, then there.
     reading_subtitle: Option<u32>,
+    /// The server's admin has not finished setup (P3-10): its catalog
+    /// answers nothing yet.
+    not_set_up: bool,
+    /// Whether the server has a public web address (P3-07, P3-12).
+    web: bool,
+    /// How the server answers for preview frames (P3-13).
+    previews: PreviewsAnswer,
 }
+
+/// How the fake answers for an item's preview frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewsAnswer {
+    /// None: music, previews off.
+    None,
+    /// Still being made this many times, then ready.
+    NotReadyFor(u32),
+    Ready,
+}
+
+/// The fake's preview sheet: two by two tiles of 64 × 36 px, red, green,
+/// blue and yellow, a second apart.
+pub const FAKE_PREVIEW_SHEET: &[u8] = include_bytes!("fake-preview-sheet.png");
 
 impl FakeSession {
     fn new(
@@ -462,6 +499,7 @@ impl FakeSession {
             watch: Mutex::new(WatchState::default()),
             serving,
             subtitle_asks: AtomicU32::new(0),
+            preview_asks: AtomicU32::new(0),
             gone,
             reports: Mutex::new(Vec::new()),
             playbacks: Mutex::new(HashMap::new()),
@@ -778,6 +816,16 @@ impl FakeSession {
 
     /// What every call but unlocking goes through, as on the server: a
     /// locked profile answers nothing else.
+    /// [`FakeSession::guard`], for the catalog's calls, which a server not
+    /// set up yet refuses (P3-10).
+    fn catalog(&self) -> Result<(), BackendError> {
+        self.guard()?;
+        if self.serving.not_set_up {
+            return Err(BackendError::NotSetUp);
+        }
+        Ok(())
+    }
+
     fn guard(&self) -> Result<(), BackendError> {
         let mut pin = self.pin_state();
         if pin.revoked {
@@ -903,14 +951,14 @@ impl FakeSession {
 impl Session for FakeSession {
     fn home(&self) -> BoxFuture<'_, Result<HomeScreen, BackendError>> {
         Box::pin(async move {
-            self.guard()?;
+            self.catalog()?;
             Ok(self.home_now())
         })
     }
 
     fn libraries(&self) -> BoxFuture<'_, Result<Vec<Library>, BackendError>> {
         Box::pin(async move {
-            self.guard()?;
+            self.catalog()?;
             Ok(self
                 .catalog
                 .libraries
@@ -927,7 +975,7 @@ impl Session for FakeSession {
         limit: u32,
     ) -> BoxFuture<'a, Result<(Vec<Item>, u32), BackendError>> {
         Box::pin(async move {
-            self.guard()?;
+            self.catalog()?;
             let (_, ids) = self
                 .catalog
                 .libraries
@@ -949,7 +997,7 @@ impl Session for FakeSession {
         id: &'a MediaId,
     ) -> BoxFuture<'a, Result<(Item, Vec<Item>), BackendError>> {
         Box::pin(async move {
-            self.guard()?;
+            self.catalog()?;
             let item = self.catalog.get(id)?;
             let item = self.with_state(item, &self.watch());
             let children = self.catalog.children.get(id).cloned().unwrap_or_default();
@@ -959,31 +1007,45 @@ impl Session for FakeSession {
 
     fn search<'a>(
         &'a self,
-        query: &'a str,
-        limit: u32,
-    ) -> BoxFuture<'a, Result<Vec<Item>, BackendError>> {
+        request: &'a SearchRequest,
+    ) -> BoxFuture<'a, Result<SearchResults, BackendError>> {
         Box::pin(async move {
-            let query = query.to_lowercase();
-            let hits: Vec<MediaId> = self
+            self.catalog()?;
+            let mut results = search::run(&self.catalog, request);
+            // As the server answers: with this user's watch state.
+            let stated = |items: &[Item]| {
+                self.items_with_state(&items.iter().map(|i| i.id().clone()).collect::<Vec<_>>())
+            };
+            results.top = results.top.and_then(|top| stated(&[top]).pop());
+            for group in &mut results.groups {
+                group.items = stated(&group.items);
+            }
+            results.without_year = stated(&results.without_year);
+            Ok(results)
+        })
+    }
+
+    fn person_items<'a>(
+        &'a self,
+        person: &'a PersonId,
+        offset: u32,
+        limit: u32,
+    ) -> BoxFuture<'a, Result<(Vec<Item>, u32), BackendError>> {
+        Box::pin(async move {
+            self.catalog()?;
+            let (_, items) = self
                 .catalog
-                .order
+                .people
                 .iter()
-                .filter(|id| {
-                    let name = match &self.catalog.items[*id] {
-                        Item::Movie(m) => &m.title,
-                        Item::Show(s) => &s.title,
-                        Item::Season(_) => return false,
-                        Item::Episode(e) => &e.title,
-                        Item::Artist(a) => &a.name,
-                        Item::Album(a) => &a.title,
-                        Item::Track(t) => &t.title,
-                    };
-                    name.to_lowercase().contains(&query)
-                })
+                .find(|(p, _)| &p.id == person)
+                .ok_or_else(|| BackendError::NotFound(person.to_string()))?;
+            let page: Vec<MediaId> = items
+                .iter()
+                .skip(offset as usize)
                 .take(limit as usize)
                 .cloned()
                 .collect();
-            Ok(self.items_with_state(&hits))
+            Ok((self.items_with_state(&page), items.len() as u32))
         })
     }
 
@@ -1014,7 +1076,7 @@ impl Session for FakeSession {
         _start: Option<Duration>,
     ) -> BoxFuture<'a, Result<PlaybackStart, BackendError>> {
         Box::pin(async move {
-            self.guard()?;
+            self.catalog()?;
             let item = self.catalog.get(id)?;
             let tracks = self.tracks_of(item);
             let (_, size) = self.media_size()?;
@@ -1163,8 +1225,47 @@ impl Session for FakeSession {
         id: &'a ArtworkId,
         _size: ArtworkSize,
     ) -> BoxFuture<'a, Result<Vec<u8>, BackendError>> {
-        // The fixture items carry no artwork; nothing asks for any.
-        Box::pin(async move { Err(BackendError::NotFound(id.to_string())) })
+        // The fixture items carry no artwork; a preview sheet is the one
+        // picture the fake has.
+        Box::pin(async move {
+            self.catalog()?;
+            if id.namespace() == Namespace::Preview {
+                return Ok(FAKE_PREVIEW_SHEET.to_vec());
+            }
+            Err(BackendError::NotFound(id.to_string()))
+        })
+    }
+
+    fn web_url(&self) -> Option<String> {
+        self.serving
+            .web
+            .then(|| "https://media.example.org".to_owned())
+    }
+
+    fn previews<'a>(&'a self, id: &'a MediaId) -> BoxFuture<'a, Result<Previews, BackendError>> {
+        Box::pin(async move {
+            self.catalog()?;
+            let item = self.catalog.get(id)?;
+            match self.serving.previews {
+                PreviewsAnswer::None => return Err(BackendError::NoPreviews),
+                _ if matches!(item, Item::Track(_)) => return Err(BackendError::NoPreviews),
+                PreviewsAnswer::NotReadyFor(times)
+                    if self.preview_asks.fetch_add(1, Ordering::SeqCst) < times =>
+                {
+                    return Err(BackendError::PreviewsNotReady(30));
+                }
+                _ => {}
+            }
+            Ok(Previews {
+                interval_ms: 1000,
+                tile_width: 64,
+                tile_height: 36,
+                columns: 2,
+                rows: 2,
+                count: 4,
+                sheets: vec![ArtworkId::new(Namespace::Preview, "fake/0").expect("not empty")],
+            })
+        })
     }
 
     fn update_progress<'a>(
@@ -1448,7 +1549,31 @@ pub struct FakeClient {
     gone: Arc<std::sync::atomic::AtomicBool>,
     /// The profile that used the connection last (P2-08).
     active: Arc<Mutex<Option<String>>>,
+    /// Sign-ins this device asked a phone to approve (P3-05, P3-07).
+    phone_sign_ins: Mutex<PhoneSignIns>,
 }
+
+/// How the fake answers a sign-in a phone approves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhoneAnswer {
+    /// Approved by this account's user.
+    Approve(&'static str),
+    Deny,
+    Expire,
+    /// Never: the phone is still deciding.
+    Wait,
+}
+
+struct PhoneSignIns {
+    answer: PhoneAnswer,
+    /// Whether the server has a public web address for the phone to open.
+    web: bool,
+    /// Begun and not yet answered: the server holds at most three.
+    pending: u32,
+}
+
+/// The code a phone sign-in shows (P3-07's alphabet).
+pub const FAKE_PHONE_CODE: &str = "BCDFGHJK";
 
 /// A fake key's fingerprint, made the real way from its bytes.
 fn fingerprint(key: &ServerKey) -> String {
@@ -1495,9 +1620,17 @@ impl FakeClient {
                 converting: None,
                 markers: Vec::new(),
                 reading_subtitle: None,
+                not_set_up: false,
+                web: true,
+                previews: PreviewsAnswer::None,
             },
             gone: Arc::default(),
             active: Arc::default(),
+            phone_sign_ins: Mutex::new(PhoneSignIns {
+                answer: PhoneAnswer::Approve("andrey"),
+                web: true,
+                pending: 0,
+            }),
             servers: Mutex::new(vec![
                 Server {
                     key: home_media(),
@@ -1593,6 +1726,34 @@ impl FakeClient {
         self
     }
 
+    /// A phone sign-in (P3-05) is answered so; approved by andrey unless
+    /// told otherwise.
+    pub fn answering_phone_sign_in(self, answer: PhoneAnswer) -> Self {
+        self.phone_sign_ins().answer = answer;
+        self
+    }
+
+    /// The server has no public web address: a phone sign-in has no page
+    /// for a phone to open, only a code for a Spoolframe app.
+    pub fn without_web_address(mut self) -> Self {
+        self.phone_sign_ins().web = false;
+        self.serving.web = false;
+        self
+    }
+
+    /// Items' preview frames (P3-13) are answered so; none unless told.
+    pub fn with_previews(mut self, answer: PreviewsAnswer) -> Self {
+        self.serving.previews = answer;
+        self
+    }
+
+    /// The server's admin has not finished setup (P3-10): signing in works,
+    /// and the catalog answers [`BackendError::NotSetUp`].
+    pub fn not_set_up(mut self) -> Self {
+        self.serving.not_set_up = true;
+        self
+    }
+
     /// Every converted playback's subtitle is read as text by the server
     /// (P2-07), and not ready the first `waits` times it is asked for.
     pub fn reading_subtitle(mut self, waits: u32) -> Self {
@@ -1676,6 +1837,13 @@ impl FakeClient {
             return Err(BackendError::WrongCredentials);
         };
         *failed = (0, None);
+        drop(failed);
+        Ok(self.signed_in_as(server, username, display_name))
+    }
+
+    /// `username` signed in from this device, as a password or a phone's
+    /// approval does.
+    fn signed_in_as(&self, server: &ServerKey, username: &str, display_name: &str) -> Profile {
         let profile = Profile {
             server: server.clone(),
             username: (*username).into(),
@@ -1696,7 +1864,13 @@ impl FakeClient {
         pin.locked = false;
         drop(pin);
         *self.active.lock().expect("fake state is never poisoned") = Some(profile.username.clone());
-        Ok(profile)
+        profile
+    }
+
+    fn phone_sign_ins(&self) -> std::sync::MutexGuard<'_, PhoneSignIns> {
+        self.phone_sign_ins
+            .lock()
+            .expect("fake state is never poisoned")
     }
 }
 
@@ -1832,6 +2006,56 @@ impl Client for FakeClient {
         Box::pin(async move { self.sign_in_now(server, username, password) })
     }
 
+    fn begin_device_sign_in<'a>(
+        &'a self,
+        server: &'a ServerKey,
+    ) -> BoxFuture<'a, Result<DeviceSignIn, BackendError>> {
+        Box::pin(async move {
+            self.pinned(server)?;
+            let mut sign_ins = self.phone_sign_ins();
+            if sign_ins.pending >= 3 {
+                return Err(BackendError::RateLimited(Duration::from_secs(60)));
+            }
+            sign_ins.pending += 1;
+            let (head, tail) = FAKE_PHONE_CODE.split_at(4);
+            Ok(DeviceSignIn {
+                server: server.clone(),
+                display_code: format!("{head}-{tail}"),
+                web_url: sign_ins.web.then(|| {
+                    format!("https://media.example.org/auth/device?code={FAKE_PHONE_CODE}")
+                }),
+                expires_in: Duration::from_secs(300),
+                request: Arc::new(()),
+            })
+        })
+    }
+
+    fn await_device_sign_in<'a>(
+        &'a self,
+        sign_in: &'a DeviceSignIn,
+    ) -> BoxFuture<'a, Result<Profile, BackendError>> {
+        Box::pin(async move {
+            let answer = self.phone_sign_ins().answer;
+            if answer == PhoneAnswer::Wait {
+                return std::future::pending().await;
+            }
+            self.phone_sign_ins().pending -= 1;
+            match answer {
+                PhoneAnswer::Approve(username) => {
+                    let (_, username, display_name) = self
+                        .accounts
+                        .iter()
+                        .find(|(s, u, _)| *s == sign_in.server && *u == username)
+                        .ok_or_else(|| BackendError::NotFound(username.into()))?;
+                    Ok(self.signed_in_as(&sign_in.server, username, display_name))
+                }
+                PhoneAnswer::Deny => Err(BackendError::SignInDenied),
+                PhoneAnswer::Expire => Err(BackendError::SignInExpired),
+                PhoneAnswer::Wait => unreachable!("waited above"),
+            }
+        })
+    }
+
     fn session(&self, profile: &Profile) -> Result<Arc<dyn Session>, BackendError> {
         self.reach(&profile.server)?;
         Ok(self.fake_session(profile))
@@ -1853,6 +2077,296 @@ impl Client for FakeClient {
 
     fn servers_changed(&self) -> watch::Receiver<()> {
         self.servers_changed.subscribe()
+    }
+}
+
+/// The fake's search (P3-09), shaped as the server answers: a trailing
+/// year as a filter, titles matched by a word's start, the top match left
+/// out of its group, and in All the episodes under a listed show counted
+/// rather than shown.
+mod search {
+    use std::collections::HashSet;
+
+    use super::*;
+
+    /// The top match's tie order: a show before its own episodes.
+    const TOP_ORDER: [SearchKind; 6] = [
+        SearchKind::Shows,
+        SearchKind::Movies,
+        SearchKind::Artists,
+        SearchKind::Albums,
+        SearchKind::Tracks,
+        SearchKind::Episodes,
+    ];
+
+    /// Episodes shown in All, where they are quiet.
+    const QUIET_EPISODES: usize = 3;
+
+    pub fn run(catalog: &Catalog, request: &SearchRequest) -> SearchResults {
+        let (text, year) = split_year(&request.query);
+        let within = request
+            .library
+            .as_ref()
+            .map(|id| library_items(catalog, id));
+        let hits = |kind: SearchKind, year: Option<u16>| -> Vec<Item> {
+            catalog
+                .order
+                .iter()
+                .map(|id| &catalog.items[id])
+                .filter(|item| kind_of(item) == Some(kind))
+                .filter(|item| within.as_ref().is_none_or(|w| w.contains(item.id())))
+                .filter(|item| matches(&text, title(item)))
+                .filter(|item| year.is_none_or(|y| year_of(item).is_none_or(|it| it == y)))
+                .cloned()
+                .collect()
+        };
+        let people = || -> Vec<Person> {
+            if within.is_some() {
+                return Vec::new();
+            }
+            catalog
+                .people
+                .iter()
+                .filter(|(p, _)| matches(&text, &p.name))
+                .map(|(p, _)| p.clone())
+                .collect()
+        };
+        let kinds: Vec<SearchKind> = match request.kind {
+            Some(kind) => vec![kind],
+            None => request.scope.kinds().to_vec(),
+        };
+        let mut found: Vec<(SearchKind, Vec<Item>)> = kinds
+            .iter()
+            .filter(|k| **k != SearchKind::People)
+            .map(|k| (*k, hits(*k, year)))
+            .collect();
+
+        let top = match request.kind {
+            Some(_) => None,
+            None => pick_top(&found, &text),
+        };
+        if let Some(top) = &top {
+            for (_, items) in &mut found {
+                items.retain(|i| i.id() != top.id());
+            }
+        }
+
+        // In All, episodes whose show is listed are counted, not shown.
+        let mut hidden = 0;
+        let quiet = request.kind.is_none() && request.scope == SearchScope::All;
+        if quiet {
+            let mut shows: HashSet<MediaId> = found
+                .iter()
+                .filter(|(k, _)| *k == SearchKind::Shows)
+                .flat_map(|(_, items)| items.iter().map(|i| i.id().clone()))
+                .collect();
+            if let Some(Item::Show(show)) = &top {
+                shows.insert(show.id.clone());
+            }
+            for (kind, items) in &mut found {
+                if *kind == SearchKind::Episodes {
+                    let before = items.len();
+                    items.retain(|i| !matches!(i, Item::Episode(e) if shows.contains(&e.show_id)));
+                    hidden = (before - items.len()) as u32;
+                }
+            }
+        }
+
+        let limit = request.limit as usize;
+        let mut groups = Vec::new();
+        for kind in &kinds {
+            let one_kind = request.kind.is_some();
+            if *kind == SearchKind::People {
+                let people = people();
+                if people.is_empty() && !one_kind {
+                    continue;
+                }
+                groups.push(SearchGroup {
+                    kind: *kind,
+                    items: Vec::new(),
+                    more: people.len() > limit,
+                    people: people.into_iter().take(limit).collect(),
+                    hidden: 0,
+                });
+                continue;
+            }
+            let items = found
+                .iter()
+                .find(|(k, _)| k == kind)
+                .map(|(_, i)| i.clone())
+                .unwrap_or_default();
+            let hidden = if *kind == SearchKind::Episodes {
+                hidden
+            } else {
+                0
+            };
+            if items.is_empty() && hidden == 0 && !one_kind {
+                continue;
+            }
+            let shown = if quiet && *kind == SearchKind::Episodes {
+                QUIET_EPISODES.min(limit)
+            } else {
+                limit
+            };
+            groups.push(SearchGroup {
+                kind: *kind,
+                more: items.len() > shown,
+                items: items.into_iter().take(shown).collect(),
+                people: Vec::new(),
+                hidden,
+            });
+        }
+
+        let count = |scope: SearchScope| -> Option<u32> {
+            let mut n: usize = scope
+                .kinds()
+                .iter()
+                .filter(|k| **k != SearchKind::People)
+                .map(|k| hits(*k, year).len())
+                .sum();
+            if scope == SearchScope::All {
+                n += people().len();
+            }
+            Some(n as u32)
+        };
+        let counts = SearchCounts {
+            all: count(SearchScope::All),
+            movies: count(SearchScope::Movies),
+            shows: count(SearchScope::Shows),
+            episodes: count(SearchScope::Episodes),
+            music: count(SearchScope::Music),
+        };
+
+        let without_year = match (year, request.kind) {
+            (Some(_), None) => {
+                let with: HashSet<MediaId> = found
+                    .iter()
+                    .flat_map(|(_, i)| i.iter().map(|i| i.id().clone()))
+                    .chain(top.iter().map(|t| t.id().clone()))
+                    .collect();
+                kinds
+                    .iter()
+                    .filter(|k| **k != SearchKind::People)
+                    .flat_map(|k| hits(*k, None))
+                    .filter(|i| !with.contains(i.id()))
+                    .take(3)
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+
+        SearchResults {
+            top,
+            groups,
+            counts,
+            year,
+            without_year,
+        }
+    }
+
+    /// "dune 2021": the words, and the year at the end as a filter (1900
+    /// to next year). A query that is only a year is searched for.
+    fn split_year(query: &str) -> (String, Option<u16>) {
+        let query = query.trim().to_lowercase();
+        let next_year = 1970
+            + std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() / 31_556_952) as u16
+            + 1;
+        if let Some((words, last)) = query.rsplit_once(' ')
+            && last.len() == 4
+            && let Ok(year) = last.parse::<u16>()
+            && (1900..=next_year).contains(&year)
+            && !words.trim().is_empty()
+        {
+            return (words.trim().to_owned(), Some(year));
+        }
+        (query, None)
+    }
+
+    /// Whether `title` has a word starting with `text`, or starts with it.
+    fn matches(text: &str, title: &str) -> bool {
+        if text.is_empty() {
+            return false;
+        }
+        let title = title.to_lowercase();
+        title.starts_with(text)
+            || title
+                .split(|c: char| !c.is_alphanumeric())
+                .any(|word| word.starts_with(text))
+    }
+
+    fn pick_top(found: &[(SearchKind, Vec<Item>)], text: &str) -> Option<Item> {
+        let all: Vec<&Item> = TOP_ORDER
+            .iter()
+            .flat_map(|kind| found.iter().filter(move |(k, _)| k == kind))
+            .flat_map(|(_, items)| items.iter())
+            .collect();
+        let exact: Vec<&Item> = all
+            .iter()
+            .copied()
+            .filter(|i| title(i).to_lowercase() == text)
+            .collect();
+        let prefix: Vec<&Item> = all
+            .iter()
+            .copied()
+            .filter(|i| title(i).to_lowercase().starts_with(text))
+            .collect();
+        [exact, prefix, all]
+            .into_iter()
+            .find(|pool| !pool.is_empty())
+            .and_then(|pool| pool.first().map(|i| (*i).clone()))
+    }
+
+    fn kind_of(item: &Item) -> Option<SearchKind> {
+        Some(match item {
+            Item::Movie(_) => SearchKind::Movies,
+            Item::Show(_) => SearchKind::Shows,
+            Item::Episode(_) => SearchKind::Episodes,
+            Item::Artist(_) => SearchKind::Artists,
+            Item::Album(_) => SearchKind::Albums,
+            Item::Track(_) => SearchKind::Tracks,
+            Item::Season(_) => return None,
+        })
+    }
+
+    fn title(item: &Item) -> &str {
+        match item {
+            Item::Movie(m) => &m.title,
+            Item::Show(s) => &s.title,
+            Item::Season(s) => &s.title,
+            Item::Episode(e) => &e.title,
+            Item::Artist(a) => &a.name,
+            Item::Album(a) => &a.title,
+            Item::Track(t) => &t.title,
+        }
+    }
+
+    fn year_of(item: &Item) -> Option<u16> {
+        match item {
+            Item::Movie(m) => m.year,
+            Item::Show(s) => s.year,
+            Item::Album(a) => a.year,
+            _ => None,
+        }
+    }
+
+    /// A library's items and everything under them.
+    fn library_items(catalog: &Catalog, id: &LibraryId) -> HashSet<MediaId> {
+        let mut out = HashSet::new();
+        let mut todo: Vec<MediaId> = catalog
+            .libraries
+            .iter()
+            .find(|(l, _)| &l.id == id)
+            .map(|(_, items)| items.clone())
+            .unwrap_or_default();
+        while let Some(item) = todo.pop() {
+            if let Some(children) = catalog.children.get(&item) {
+                todo.extend(children.iter().cloned());
+            }
+            out.insert(item);
+        }
+        out
     }
 }
 
@@ -2031,10 +2545,101 @@ mod tests {
         );
     }
 
+    fn search(query: &str, scope: SearchScope, kind: Option<SearchKind>) -> SearchResults {
+        let request = SearchRequest {
+            query: query.into(),
+            limit: 10,
+            scope,
+            kind,
+            library: None,
+        };
+        ready(andrey().search(&request)).unwrap()
+    }
+
+    fn group(results: &SearchResults, kind: SearchKind) -> Option<&SearchGroup> {
+        results.groups.iter().find(|g| g.kind == kind)
+    }
+
     #[test]
-    fn search_matches_titles_case_insensitively() {
-        let hits = ready(andrey().search("TIDE", 10)).unwrap();
-        assert_eq!(titles(&hits), ["Low Tide", "Low Tide"]);
+    fn the_top_match_is_not_repeated_in_its_group() {
+        // "Low Tide" is an album and its title track; the album wins.
+        let results = search("LOW TIDE", SearchScope::All, None);
+        assert_eq!(
+            (
+                results.top.as_ref().map(|t| matches!(t, Item::Album(_))),
+                group(&results, SearchKind::Albums).map(|g| g.items.len()),
+                group(&results, SearchKind::Tracks).map(|g| titles(&g.items)),
+            ),
+            (Some(true), None, Some(vec!["Low Tide"]))
+        );
+    }
+
+    #[test]
+    fn see_all_is_one_group_even_when_empty() {
+        let results = search("zzz", SearchScope::All, Some(SearchKind::Movies));
+        assert_eq!(
+            (
+                results.top.is_none(),
+                results.groups.len(),
+                results.groups[0].kind
+            ),
+            (true, 1, SearchKind::Movies)
+        );
+    }
+
+    #[test]
+    fn a_trailing_year_narrows_and_the_rest_is_offered() {
+        let results = search("arrival 1990", SearchScope::All, None);
+        assert_eq!(
+            (
+                results.year,
+                results.top.is_none(),
+                titles(&results.without_year)
+            ),
+            (Some(1990), true, vec!["Arrival"])
+        );
+    }
+
+    #[test]
+    fn every_scope_is_counted() {
+        let counts = search("low tide", SearchScope::Movies, None).counts;
+        assert_eq!(
+            (counts.music, counts.movies, counts.all),
+            (Some(2), Some(0), Some(2))
+        );
+    }
+
+    #[test]
+    fn people_are_found_and_their_items_listed() {
+        let results = search("villeneuve", SearchScope::All, None);
+        let person = &group(&results, SearchKind::People).unwrap().people[0];
+        let (items, total) = ready(andrey().person_items(&person.id, 0, 10)).unwrap();
+        assert_eq!(
+            (person.name.as_str(), titles(&items), total),
+            ("Denis Villeneuve", vec!["Arrival", "Dune: Part Two"], 2)
+        );
+    }
+
+    #[test]
+    fn in_all_episodes_under_a_listed_show_are_counted_not_shown() {
+        // "a": the show Andor, and its episode "Aldhani".
+        let results = search("a", SearchScope::All, None);
+        let episodes = group(&results, SearchKind::Episodes).unwrap();
+        assert!(!titles(&episodes.items).contains(&"Aldhani"));
+        assert_eq!(episodes.hidden, 1);
+    }
+
+    #[test]
+    fn a_library_search_finds_only_its_items_and_no_people() {
+        let request = SearchRequest {
+            query: "low".into(),
+            limit: 10,
+            scope: SearchScope::All,
+            kind: None,
+            library: Some(library("1", "Movies", LibraryKind::Movies).id),
+        };
+        let results = ready(andrey().search(&request)).unwrap();
+        assert!(results.top.is_none() && results.groups.is_empty());
     }
 
     #[test]
@@ -2235,6 +2840,99 @@ mod tests {
         let changes = client.servers_changed();
         ready(client.add_address(&key, "10.0.0.5:4433")).unwrap();
         assert!(!changes.has_changed().unwrap());
+    }
+
+    #[test]
+    fn a_phone_sign_in_shows_a_code_and_the_page_to_open() {
+        let client = FakeClient::new(None);
+        let begun = ready(client.begin_device_sign_in(&home_media())).unwrap();
+        assert_eq!(
+            (begun.display_code.as_str(), begun.web_url.as_deref()),
+            (
+                "BCDF-GHJK",
+                Some("https://media.example.org/auth/device?code=BCDFGHJK")
+            )
+        );
+    }
+
+    #[test]
+    fn a_server_without_a_web_address_gives_only_the_code() {
+        let client = FakeClient::new(None).without_web_address();
+        let begun = ready(client.begin_device_sign_in(&home_media())).unwrap();
+        assert_eq!(begun.web_url, None);
+    }
+
+    #[test]
+    fn an_approved_phone_sign_in_adds_the_profile() {
+        let client = FakeClient::new(None).answering_phone_sign_in(PhoneAnswer::Approve("steve"));
+        let begun = ready(client.begin_device_sign_in(&home_media())).unwrap();
+        let profile = ready(client.await_device_sign_in(&begun)).unwrap();
+        assert!(usernames(&ready(client.profiles(&home_media())).unwrap()).contains(&"steve"));
+        assert_eq!(profile.username, "steve");
+    }
+
+    #[test]
+    fn a_refused_phone_sign_in_says_so() {
+        let client = FakeClient::new(None).answering_phone_sign_in(PhoneAnswer::Deny);
+        let begun = ready(client.begin_device_sign_in(&home_media())).unwrap();
+        assert_eq!(
+            ready(client.await_device_sign_in(&begun)),
+            Err(BackendError::SignInDenied)
+        );
+    }
+
+    #[test]
+    fn a_fourth_pending_phone_sign_in_is_refused() {
+        let client = FakeClient::new(None).answering_phone_sign_in(PhoneAnswer::Wait);
+        for _ in 0..3 {
+            ready(client.begin_device_sign_in(&home_media())).unwrap();
+        }
+        assert!(matches!(
+            ready(client.begin_device_sign_in(&home_media())),
+            Err(BackendError::RateLimited(_))
+        ));
+    }
+
+    #[test]
+    fn previews_come_once_made_with_their_sheet() {
+        let client = FakeClient::new(None).with_previews(PreviewsAnswer::NotReadyFor(1));
+        let session = session_for(&client, "andrey");
+        let movie = media(MediaKind::Movie, "2");
+        let first = ready(session.previews(&movie));
+        let previews = ready(session.previews(&movie)).unwrap();
+        let sheet = ready(session.artwork(&previews.sheets[0], ArtworkSize::Original)).unwrap();
+        assert_eq!(
+            (first.map(|_| ()), previews.count, sheet.as_slice()),
+            (
+                Err(BackendError::PreviewsNotReady(30)),
+                4,
+                FAKE_PREVIEW_SHEET
+            )
+        );
+    }
+
+    #[test]
+    fn music_has_no_previews() {
+        let client = FakeClient::new(None).with_previews(PreviewsAnswer::Ready);
+        let track = media(MediaKind::Track, "40");
+        assert_eq!(
+            ready(session_for(&client, "andrey").previews(&track)).map(|_| ()),
+            Err(BackendError::NoPreviews)
+        );
+    }
+
+    #[test]
+    fn a_server_not_set_up_signs_in_but_has_no_catalog() {
+        let client = FakeClient::new(None).not_set_up();
+        let profile = ready(client.sign_in(&home_media(), "steve", FAKE_PASSWORD)).unwrap();
+        let session = client.session(&profile).unwrap();
+        assert_eq!(
+            [
+                ready(session.libraries()).map(|_| ()),
+                ready(session.home()).map(|_| ())
+            ],
+            [Err(BackendError::NotSetUp), Err(BackendError::NotSetUp)]
+        );
     }
 
     #[test]

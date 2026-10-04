@@ -1,0 +1,1405 @@
+//! Search (P3-09), laid out as the design's "Search (P3-09)" Linux
+//! boards. One box searches everything or a scope (chips with counts);
+//! results come as you type, the top match large, then a row per group
+//! (shows, movies, people, artists, albums, tracks, episodes), each with
+//! See all. A year at the end of the query becomes a removable token, and
+//! when a scope finds nothing the screen says where the query does match.
+//! Recent searches are kept per profile, on this computer.
+//!
+//! Typing waits about 250 ms; a newer query aborts the one in flight, so
+//! an older answer never replaces a newer one, and the earlier results
+//! stay, dimmed, until the newer arrive.
+
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Duration;
+
+use adw::prelude::*;
+use gtk::glib;
+use serde::{Deserialize, Serialize};
+use spoolframe_linux_core::backend::{
+    ArtworkSize, BackendError, Person, PersonRole, Profile, SearchCounts, SearchGroup, SearchKind,
+    SearchRequest, SearchResults, SearchScope, Session,
+};
+use spoolframe_linux_core::format;
+use spoolframe_linux_core::storage::DataStore;
+use spoolframe_types::{ArtworkKind, Item};
+
+use crate::views::{self, Cards, Facts};
+
+/// How long typing pauses before it searches.
+const TYPING_PAUSE: Duration = Duration::from_millis(250);
+
+/// The most items a group shows in the results; See all asks for more.
+const GROUP_LIMIT: u32 = 8;
+
+/// What See all lists.
+const SEE_ALL_LIMIT: u32 = 100;
+
+/// Recent searches kept.
+const RECENT: usize = 6;
+
+/// The scopes, in chip order, with their names.
+const SCOPES: [(SearchScope, &str); 5] = [
+    (SearchScope::All, "All"),
+    (SearchScope::Movies, "Movies"),
+    (SearchScope::Shows, "Shows"),
+    (SearchScope::Episodes, "Episodes"),
+    (SearchScope::Music, "Music"),
+];
+
+/// What the screen needs from the app.
+pub struct Needs {
+    pub session: Arc<dyn Session>,
+    pub cards: Rc<Cards>,
+    /// Plays a movie, an episode or a track from the top result.
+    pub play: Rc<dyn Fn(Item)>,
+    /// Lists a person's items.
+    pub open_person: Rc<dyn Fn(Person)>,
+    /// The server's name, for "Nothing anywhere in … matches".
+    pub server: String,
+    /// The profile's display name and where its searches are kept.
+    pub profile: String,
+    pub recent: Option<RecentSearches>,
+}
+
+pub struct SearchPage {
+    pub widget: gtk::Box,
+    needs: Needs,
+    /// The app's cards, remembering the search when one opens.
+    cards: Rc<Cards>,
+    entry: gtk::SearchEntry,
+    back: gtk::Button,
+    year: gtk::Button,
+    chips_row: gtk::Box,
+    chips: Vec<(SearchScope, gtk::ToggleButton, gtk::Label)>,
+    note: gtk::Label,
+    see_all_head: gtk::Box,
+    see_all_title: gtk::Label,
+    see_all_note: gtk::Label,
+    body: gtk::Stack,
+    recent_list: gtk::ListBox,
+    recent_clear: gtk::Button,
+    recent_note: gtk::Label,
+    recent_empty: gtk::Label,
+    none: adw::StatusPage,
+    elsewhere: gtk::Box,
+    results: gtk::Box,
+    state: RefCell<State>,
+    /// The search in flight, aborted by a newer one.
+    load: RefCell<Option<glib::JoinHandle<()>>>,
+}
+
+struct State {
+    scope: SearchScope,
+    /// See all: one group.
+    kind: Option<SearchKind>,
+    query: String,
+    /// The library search was opened from, for the scope's note.
+    opened_from: Option<String>,
+    /// The last answer, for the counts and the empty state.
+    last: Option<SearchResults>,
+    recent: Vec<Recent>,
+    /// Chips being set by the screen, not the user.
+    setting_chips: bool,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            scope: SearchScope::All,
+            kind: None,
+            query: String::new(),
+            opened_from: None,
+            last: None,
+            recent: Vec::new(),
+            setting_chips: false,
+        }
+    }
+}
+
+impl SearchPage {
+    pub fn new(needs: Needs) -> Rc<Self> {
+        let entry = gtk::SearchEntry::builder()
+            .placeholder_text("Search everything")
+            .hexpand(true)
+            .search_delay(TYPING_PAUSE.as_millis() as u32)
+            .build();
+        let back = gtk::Button::builder()
+            .icon_name(crate::icons::BACK)
+            .label("All results")
+            .css_classes(["flat"])
+            .visible(false)
+            .build();
+        let year = gtk::Button::builder()
+            .css_classes(["pill", "search-year"])
+            .tooltip_text("Search every year")
+            .visible(false)
+            .build();
+        let head = gtk::Box::builder().spacing(10).build();
+        head.append(&back);
+        head.append(&entry);
+        head.append(&year);
+
+        let chips_row = gtk::Box::builder().spacing(8).build();
+        let mut chips = Vec::new();
+        let mut group: Option<gtk::ToggleButton> = None;
+        for (scope, name) in SCOPES {
+            let count = gtk::Label::builder()
+                .css_classes(["search-chip-count"])
+                .visible(false)
+                .build();
+            let label = gtk::Box::builder().spacing(6).build();
+            label.append(&gtk::Label::new(Some(name)));
+            label.append(&count);
+            let chip = gtk::ToggleButton::builder()
+                .child(&label)
+                .css_classes(["pill", "search-chip"])
+                .build();
+            if let Some(first) = &group {
+                chip.set_group(Some(first));
+            } else {
+                group = Some(chip.clone());
+            }
+            chips_row.append(&chip);
+            chips.push((scope, chip, count));
+        }
+        let note = gtk::Label::builder()
+            .css_classes(["dim-label", "caption"])
+            .margin_start(6)
+            .build();
+        chips_row.append(&note);
+
+        let see_all_title = gtk::Label::builder()
+            .xalign(0.0)
+            .css_classes(["title-2"])
+            .build();
+        let see_all_note = gtk::Label::builder().css_classes(["dim-label"]).build();
+        let see_all_head = gtk::Box::builder().spacing(12).visible(false).build();
+        see_all_head.append(&see_all_title);
+        see_all_head.append(&see_all_note);
+
+        // The page's states.
+        let recent_list = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .css_classes(["boxed-list"])
+            .build();
+        let recent_clear = gtk::Button::builder()
+            .label("Clear")
+            .css_classes(["flat"])
+            .halign(gtk::Align::End)
+            .hexpand(true)
+            .build();
+        let recent_head = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        recent_head.append(
+            &gtk::Label::builder()
+                .label("Recent searches")
+                .xalign(0.0)
+                .css_classes(["title-4"])
+                .build(),
+        );
+        recent_head.append(&recent_clear);
+        let recent_note = gtk::Label::builder()
+            .label(format!(
+                "Kept on this computer for {}’s profile only.",
+                needs.profile
+            ))
+            .xalign(0.0)
+            .css_classes(["dim-label", "caption"])
+            .build();
+        let recent_empty = gtk::Label::builder()
+            .label("No recent searches. What you search for on this computer shows up here.")
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["dim-label"])
+            .build();
+        let recent = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(12)
+            .build();
+        for widget in [
+            recent_head.upcast_ref::<gtk::Widget>(),
+            recent_list.upcast_ref(),
+            recent_note.upcast_ref(),
+            recent_empty.upcast_ref(),
+        ] {
+            recent.append(widget);
+        }
+
+        let loading = gtk::Spinner::builder()
+            .spinning(true)
+            .width_request(32)
+            .height_request(32)
+            .halign(gtk::Align::Center)
+            .margin_top(48)
+            .build();
+
+        let elsewhere = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(14)
+            .build();
+        let none = adw::StatusPage::builder()
+            .icon_name(crate::icons::SEARCH)
+            .child(&elsewhere)
+            .build();
+
+        let results = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(28)
+            .build();
+
+        let body = gtk::Stack::builder()
+            .vhomogeneous(false)
+            .transition_type(gtk::StackTransitionType::Crossfade)
+            .build();
+        body.add_named(&recent, Some("recent"));
+        body.add_named(&loading, Some("loading"));
+        body.add_named(&none, Some("none"));
+        body.add_named(&results, Some("results"));
+
+        let widget = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(18)
+            .build();
+        widget.append(&head);
+        widget.append(&chips_row);
+        widget.append(&see_all_head);
+        widget.append(&body);
+
+        let state = State {
+            recent: needs.recent.as_ref().map(|r| r.load()).unwrap_or_default(),
+            ..State::default()
+        };
+        let page = Rc::new_cyclic(|weak: &std::rc::Weak<Self>| {
+            // Opening something from the results remembers the search.
+            let cards = {
+                let (weak, open) = (weak.clone(), needs.cards.open.clone());
+                Rc::new(Cards {
+                    open: Rc::new(move |item| {
+                        if let Some(page) = weak.upgrade() {
+                            page.remember();
+                        }
+                        open(item);
+                    }),
+                    art: needs.cards.art.clone(),
+                    set_watched: None,
+                    hide: None,
+                    enqueue: needs.cards.enqueue.clone(),
+                })
+            };
+            Self {
+                widget,
+                needs,
+                cards,
+                entry,
+                back,
+                year,
+                chips_row,
+                chips,
+                note,
+                see_all_head,
+                see_all_title,
+                see_all_note,
+                body,
+                recent_list,
+                recent_clear: recent_clear.clone(),
+                recent_note,
+                recent_empty,
+                none,
+                elsewhere,
+                results,
+                state: RefCell::new(state),
+                load: RefCell::new(None),
+            }
+        });
+        page.connect(&recent_clear);
+        page.show_recent();
+        page
+    }
+
+    fn connect(self: &Rc<Self>, recent_clear: &gtk::Button) {
+        let weak = Rc::downgrade(self);
+        self.entry.connect_search_changed(move |entry| {
+            if let Some(page) = weak.upgrade() {
+                page.typed(entry.text().trim());
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.entry.connect_activate(move |_| {
+            if let Some(page) = weak.upgrade() {
+                page.remember();
+            }
+        });
+        for (scope, chip, _) in &self.chips {
+            let (weak, scope) = (Rc::downgrade(self), *scope);
+            chip.connect_toggled(move |chip| {
+                if let Some(page) = weak.upgrade()
+                    && chip.is_active()
+                    && !page.state.borrow().setting_chips
+                {
+                    page.pick_scope(scope);
+                }
+            });
+        }
+        let weak = Rc::downgrade(self);
+        self.year.connect_clicked(move |_| {
+            if let Some(page) = weak.upgrade() {
+                page.drop_year();
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.back.connect_clicked(move |_| {
+            if let Some(page) = weak.upgrade() {
+                page.state.borrow_mut().kind = None;
+                page.run();
+            }
+        });
+        let weak = Rc::downgrade(self);
+        recent_clear.connect_clicked(move |_| {
+            if let Some(page) = weak.upgrade() {
+                page.set_recent(Vec::new());
+            }
+        });
+    }
+
+    /// Shows the page in `scope`: the default from where search was
+    /// opened (a library's kind), with its name for the note.
+    pub fn open(self: &Rc<Self>, scope: SearchScope, opened_from: Option<String>) {
+        {
+            let mut state = self.state.borrow_mut();
+            state.scope = scope;
+            state.kind = None;
+            state.opened_from = opened_from;
+        }
+        self.show_chips();
+        if self.state.borrow().query.is_empty() {
+            self.show_recent();
+        } else {
+            self.run();
+        }
+        self.entry.grab_focus();
+    }
+
+    fn typed(self: &Rc<Self>, text: &str) {
+        {
+            let mut state = self.state.borrow_mut();
+            if state.query == text {
+                return;
+            }
+            state.query = text.to_owned();
+            state.kind = None;
+        }
+        self.run();
+    }
+
+    fn pick_scope(self: &Rc<Self>, scope: SearchScope) {
+        {
+            let mut state = self.state.borrow_mut();
+            state.scope = scope;
+            state.kind = None;
+            state.opened_from = None;
+        }
+        self.show_chips();
+        self.run();
+    }
+
+    /// Searches every year: the query without its year.
+    fn drop_year(self: &Rc<Self>) {
+        let year = self.state.borrow().last.as_ref().and_then(|r| r.year);
+        if let Some(year) = year {
+            let words = without_year(&self.state.borrow().query, year);
+            self.entry.set_text(&words);
+            self.entry.set_position(-1);
+        }
+    }
+
+    /// Asks the server for the query as it stands; the earlier results
+    /// stay, dimmed, until the answer comes.
+    fn run(self: &Rc<Self>) {
+        if let Some(load) = self.load.take() {
+            load.abort();
+        }
+        let (request, seeing_all) = {
+            let state = self.state.borrow();
+            if state.query.is_empty() {
+                drop(state);
+                return self.show_recent();
+            }
+            let request = SearchRequest {
+                query: state.query.clone(),
+                limit: if state.kind.is_some() {
+                    SEE_ALL_LIMIT
+                } else {
+                    GROUP_LIMIT
+                },
+                scope: state.scope,
+                kind: state.kind,
+                library: None,
+            };
+            (request, state.kind.is_some())
+        };
+        self.show_see_all_head(seeing_all, None);
+        if self.body.visible_child_name().as_deref() == Some("results") {
+            self.results.set_opacity(0.45);
+        } else {
+            self.body.set_visible_child_name("loading");
+        }
+        for (_, _, count) in &self.chips {
+            count.set_visible(false);
+        }
+        let session = self.needs.session.clone();
+        let asked = relm4::spawn(async move { session.search(&request).await });
+        let weak = Rc::downgrade(self);
+        self.load.replace(Some(glib::spawn_future_local(async move {
+            let Ok(answer) = asked.await else { return };
+            let Some(page) = weak.upgrade() else { return };
+            page.load.take();
+            match answer {
+                Ok(results) => page.show(results),
+                Err(e) => page.failed(&e),
+            }
+        })));
+    }
+
+    fn show(self: &Rc<Self>, results: SearchResults) {
+        self.results.set_opacity(1.0);
+        let (scope, kind, query) = {
+            let state = self.state.borrow();
+            (state.scope, state.kind, state.query.clone())
+        };
+        for (chip_scope, _, count) in &self.chips {
+            match results.counts.of(*chip_scope) {
+                Some(n) => {
+                    count.set_label(&n.to_string());
+                    count.set_visible(true);
+                }
+                None => count.set_visible(false),
+            }
+        }
+        // The year as a token, while the query still ends with it.
+        match results.year.filter(|y| query.ends_with(&y.to_string())) {
+            Some(year) => {
+                self.year.set_label(&format!("{year}  ✕"));
+                self.year.set_visible(true);
+            }
+            None => self.year.set_visible(false),
+        }
+        let empty = results.top.is_none() && results.groups.iter().all(group_is_empty);
+        if empty && kind.is_none() {
+            self.show_none(scope, &query, &results.counts);
+        } else {
+            self.fill(&results, scope, kind, &query);
+            self.body.set_visible_child_name("results");
+        }
+        self.state.borrow_mut().last = Some(results);
+    }
+
+    fn fill(
+        self: &Rc<Self>,
+        results: &SearchResults,
+        scope: SearchScope,
+        kind: Option<SearchKind>,
+        query: &str,
+    ) {
+        clear(&self.results);
+        if let Some(kind) = kind {
+            let count = results
+                .groups
+                .first()
+                .map_or(0, |g| g.items.len() + g.people.len());
+            self.show_see_all_head(true, Some((kind, query, count, scope)));
+        }
+        if let Some(year) = results.year
+            && kind.is_none()
+        {
+            self.results
+                .append(&self.year_note(year, &results.without_year));
+        }
+        if let Some(top) = &results.top {
+            self.results.append(&self.top(top));
+        }
+        for group in &results.groups {
+            self.results.append(&self.group(group, kind.is_some()));
+        }
+    }
+
+    /// "Only 2021 · also matching without the year: …", and searching
+    /// without it.
+    fn year_note(self: &Rc<Self>, year: u16, without: &[Item]) -> gtk::Widget {
+        let others = if without.is_empty() {
+            "nothing else".to_owned()
+        } else {
+            without
+                .iter()
+                .map(|item| {
+                    let facts = Facts::of(item);
+                    match &facts.detail {
+                        Some(year) if year.len() == 4 => format!("{} ({year})", facts.title),
+                        _ => facts.title,
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let note = gtk::Box::builder()
+            .spacing(12)
+            .css_classes(["search-year-note"])
+            .build();
+        note.append(
+            &gtk::Label::builder()
+                .label(format!(
+                    "Only {year} · also matching without the year: {others}"
+                ))
+                .wrap(true)
+                .xalign(0.0)
+                .hexpand(true)
+                .build(),
+        );
+        let button = gtk::Button::builder()
+            .label(format!("Search without {year}"))
+            .css_classes(["flat"])
+            .build();
+        let weak = Rc::downgrade(self);
+        button.connect_clicked(move |_| {
+            if let Some(page) = weak.upgrade() {
+                page.drop_year();
+            }
+        });
+        note.append(&button);
+        note.upcast()
+    }
+
+    /// The top result, large: what it is, and what to do with it.
+    fn top(self: &Rc<Self>, item: &Item) -> gtk::Widget {
+        let facts = Facts::of(item);
+        let (shape, size, kinds) = art_of(item, true);
+        let tile = views::tile(item.id(), &facts.title, shape, size);
+        self.cards
+            .art(&tile, facts.artwork, kinds, ArtworkSize::Small);
+        let text = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(6)
+            .valign(gtk::Align::Center)
+            .build();
+        text.append(&caption(
+            &format!("Top result · {}", kind_name(item)),
+            &["dim-label", "caption"],
+        ));
+        text.append(&caption(&facts.title, &["title-1"]));
+        if let Some(sub) = top_detail(item, &facts) {
+            text.append(&caption(&sub, &["dim-label"]));
+        }
+        let actions = gtk::Box::builder().spacing(10).margin_top(8).build();
+        if matches!(item, Item::Movie(_) | Item::Episode(_) | Item::Track(_)) {
+            let play = gtk::Button::builder()
+                .label(if facts.position().is_some() {
+                    "Resume"
+                } else {
+                    "Play"
+                })
+                .css_classes(["pill", "suggested-action"])
+                .build();
+            let (weak, item) = (Rc::downgrade(self), item.clone());
+            play.connect_clicked(move |_| {
+                if let Some(page) = weak.upgrade() {
+                    page.remember();
+                    (page.needs.play)(item.clone());
+                }
+            });
+            actions.append(&play);
+        }
+        let open = gtk::Button::builder()
+            .label(open_label(item))
+            .css_classes(["pill"])
+            .build();
+        let (open_item, item) = (self.cards.open.clone(), item.clone());
+        open.connect_clicked(move |_| open_item(item.clone()));
+        actions.append(&open);
+        text.append(&actions);
+        let top = gtk::Box::builder()
+            .spacing(24)
+            .css_classes(["search-top"])
+            .build();
+        top.append(&tile);
+        top.append(&text);
+        top.upcast()
+    }
+
+    /// A group: its name, a note, See all, and its items in the shape the
+    /// design gives their kind.
+    fn group(self: &Rc<Self>, group: &SearchGroup, seeing_all: bool) -> gtk::Widget {
+        let head = gtk::Box::builder().spacing(10).build();
+        head.append(&caption(kind_label(group.kind), &["title-3"]));
+        if group.hidden > 0 {
+            head.append(&caption(
+                &hidden_note(group.hidden),
+                &["dim-label", "caption"],
+            ));
+        }
+        if group.more && !seeing_all {
+            let see_all = gtk::Button::builder()
+                .label("See all")
+                .css_classes(["flat"])
+                .halign(gtk::Align::End)
+                .hexpand(true)
+                .build();
+            let (weak, kind) = (Rc::downgrade(self), group.kind);
+            see_all.connect_clicked(move |_| {
+                if let Some(page) = weak.upgrade() {
+                    page.state.borrow_mut().kind = Some(kind);
+                    page.run();
+                }
+            });
+            head.append(&see_all);
+        }
+        let section = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(12)
+            .build();
+        section.append(&head);
+        let body: gtk::Widget = match group.kind {
+            SearchKind::People => self.cards_of(
+                group.people.iter().map(|p| self.person_card(p)).collect(),
+                seeing_all,
+            ),
+            SearchKind::Shows | SearchKind::Movies => self.cards_of(
+                group
+                    .items
+                    .iter()
+                    .map(|i| views::poster_card(i, &self.cards))
+                    .collect(),
+                seeing_all,
+            ),
+            SearchKind::Artists | SearchKind::Albums => self.cards_of(
+                group.items.iter().map(|i| self.small_card(i)).collect(),
+                seeing_all,
+            ),
+            SearchKind::Tracks | SearchKind::Episodes => self.rows_of(&group.items),
+        };
+        if group.items.is_empty() && group.people.is_empty() {
+            section.append(&caption("Nothing here.", &["dim-label"]));
+        } else {
+            section.append(&body);
+        }
+        section.upcast()
+    }
+
+    /// Cards in a row that scrolls, or wrapping for See all.
+    fn cards_of(&self, cards: Vec<gtk::Widget>, seeing_all: bool) -> gtk::Widget {
+        if seeing_all {
+            let flow = gtk::FlowBox::builder()
+                .selection_mode(gtk::SelectionMode::None)
+                .column_spacing(16)
+                .row_spacing(20)
+                .max_children_per_line(12)
+                .halign(gtk::Align::Start)
+                .build();
+            for card in cards {
+                flow.append(&card);
+            }
+            return flow.upcast();
+        }
+        let row = gtk::Box::builder().spacing(16).build();
+        for card in cards {
+            row.append(&card);
+        }
+        gtk::ScrolledWindow::builder()
+            .child(&row)
+            .vscrollbar_policy(gtk::PolicyType::Never)
+            .propagate_natural_height(true)
+            .build()
+            .upcast()
+    }
+
+    /// An album (square) or an artist (round), with its name below.
+    fn small_card(&self, item: &Item) -> gtk::Widget {
+        let facts = Facts::of(item);
+        let (shape, size, kinds) = art_of(item, false);
+        let tile = views::tile(item.id(), &facts.title, shape, size);
+        self.cards
+            .art(&tile, facts.artwork, kinds, ArtworkSize::Small);
+        let below = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(2)
+            .build();
+        below.append(&caption(&facts.title, &["heading"]));
+        let sub = match item {
+            Item::Artist(_) => Some("Artist".to_owned()),
+            _ => facts.detail.clone(),
+        };
+        if let Some(sub) = sub {
+            below.append(&caption(&sub, &["dim-label", "caption"]));
+        }
+        views::card(item, &tile, &below, size.0, &self.cards.open)
+    }
+
+    /// A person: their initials in a circle (people have no artwork), what
+    /// they did, and how many items.
+    fn person_card(self: &Rc<Self>, person: &Person) -> gtk::Widget {
+        let circle = gtk::Label::builder()
+            .label(initials(&person.name))
+            .width_request(120)
+            .height_request(120)
+            .css_classes(["search-person"])
+            .build();
+        let body = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(6)
+            .build();
+        body.append(&circle);
+        body.append(&caption(&person.name, &["heading"]));
+        body.append(&caption(&person_detail(person), &["dim-label", "caption"]));
+        let button = gtk::Button::builder()
+            .child(&body)
+            .width_request(120)
+            .valign(gtk::Align::Start)
+            .css_classes(["card-button", "flat", "lift"])
+            .build();
+        let (weak, person) = (Rc::downgrade(self), person.clone());
+        button.connect_clicked(move |_| {
+            if let Some(page) = weak.upgrade() {
+                page.remember();
+                (page.needs.open_person)(person.clone());
+            }
+        });
+        button.upcast()
+    }
+
+    /// Tracks and episodes, as rows: what, where from, how long.
+    fn rows_of(&self, items: &[Item]) -> gtk::Widget {
+        let list = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .css_classes(["boxed-list"])
+            .build();
+        for item in items {
+            let facts = Facts::of(item);
+            let row = adw::ActionRow::builder()
+                .title(&facts.title)
+                .subtitle(facts.detail.clone().unwrap_or_default())
+                .activatable(true)
+                .build();
+            if let Some(length) = facts.length {
+                row.add_suffix(
+                    &gtk::Label::builder()
+                        .label(format::length(length))
+                        .css_classes(["dim-label", "numeric"])
+                        .build(),
+                );
+            }
+            let (open, item) = (self.cards.open.clone(), item.clone());
+            row.connect_activated(move |_| open(item.clone()));
+            list.append(&row);
+        }
+        list.upcast()
+    }
+
+    /// Nothing in this scope: where else the query matches, or nowhere.
+    fn show_none(self: &Rc<Self>, scope: SearchScope, query: &str, counts: &SearchCounts) {
+        self.none.set_title(&empty_title(scope, query));
+        clear(&self.elsewhere);
+        let places = elsewhere(counts, scope);
+        if places.is_empty() {
+            self.none.set_description(Some(&format!(
+                "Nothing anywhere in {} matches. Check the spelling, or try fewer words.",
+                self.needs.server
+            )));
+        } else {
+            self.none
+                .set_description(Some("It does match in other places:"));
+            let chips = gtk::Box::builder()
+                .spacing(8)
+                .halign(gtk::Align::Center)
+                .build();
+            for (other, count) in places {
+                let chip = gtk::Button::builder()
+                    .label(format!("{}  {count}", scope_name(other)))
+                    .css_classes(["pill"])
+                    .build();
+                let weak = Rc::downgrade(self);
+                chip.connect_clicked(move |_| {
+                    if let Some(page) = weak.upgrade() {
+                        page.pick_scope(other);
+                    }
+                });
+                chips.append(&chip);
+            }
+            self.elsewhere.append(&chips);
+            let everything = gtk::Button::builder()
+                .label("Search everything")
+                .halign(gtk::Align::Center)
+                .css_classes(["pill", "suggested-action"])
+                .build();
+            let weak = Rc::downgrade(self);
+            everything.connect_clicked(move |_| {
+                if let Some(page) = weak.upgrade() {
+                    page.pick_scope(SearchScope::All);
+                }
+            });
+            self.elsewhere.append(&everything);
+        }
+        self.body.set_visible_child_name("none");
+    }
+
+    fn failed(&self, error: &BackendError) {
+        self.results.set_opacity(1.0);
+        self.none.set_title("Search failed");
+        self.none.set_description(Some(&error.to_string()));
+        clear(&self.elsewhere);
+        self.body.set_visible_child_name("none");
+    }
+
+    /// The chips as the state has them, and the box's placeholder.
+    fn show_chips(&self) {
+        let state = self.state.borrow();
+        let scope = state.scope;
+        let note = state
+            .opened_from
+            .as_ref()
+            .map(|from| format!("Opened from {from} · All widens to everything"));
+        drop(state);
+        self.state.borrow_mut().setting_chips = true;
+        for (chip_scope, chip, _) in &self.chips {
+            chip.set_active(*chip_scope == scope);
+        }
+        self.state.borrow_mut().setting_chips = false;
+        self.entry.set_placeholder_text(Some(&match scope {
+            SearchScope::All => "Search everything".to_owned(),
+            other => format!("Search {}", scope_name(other).to_lowercase()),
+        }));
+        self.note.set_label(note.as_deref().unwrap_or_default());
+        self.note.set_visible(note.is_some());
+    }
+
+    /// See all's head instead of the chips, with "Movies matching “dune”"
+    /// and how many there are once known.
+    fn show_see_all_head(&self, on: bool, known: Option<(SearchKind, &str, usize, SearchScope)>) {
+        self.chips_row.set_visible(!on);
+        self.back.set_visible(on);
+        self.see_all_head.set_visible(on);
+        if let Some((kind, query, count, scope)) = known {
+            self.see_all_title.set_label(&see_all_title(kind, query));
+            self.see_all_note.set_label(&match scope {
+                SearchScope::All => format!("{count} results"),
+                other => format!("{count} results in {}", scope_name(other)),
+            });
+        }
+    }
+
+    fn show_recent(self: &Rc<Self>) {
+        if let Some(load) = self.load.take() {
+            load.abort();
+        }
+        self.results.set_opacity(1.0);
+        self.year.set_visible(false);
+        self.show_see_all_head(false, None);
+        for (_, _, count) in &self.chips {
+            count.set_visible(false);
+        }
+        clear(&self.recent_list);
+        let recent = self.state.borrow().recent.clone();
+        let some = !recent.is_empty();
+        self.recent_list.set_visible(some);
+        self.recent_note.set_visible(some);
+        self.recent_empty.set_visible(!some);
+        self.recent_clear.set_visible(some);
+        for search in recent {
+            let row = adw::ActionRow::builder()
+                .title(&search.query)
+                .subtitle(match search.scope {
+                    SearchScope::All => String::new(),
+                    other => format!("in {}", scope_name(other)),
+                })
+                .activatable(true)
+                .build();
+            row.add_prefix(&gtk::Image::from_icon_name(crate::icons::SEARCH));
+            let remove = gtk::Button::builder()
+                .icon_name(crate::icons::CLOSE)
+                .tooltip_text("Remove")
+                .valign(gtk::Align::Center)
+                .css_classes(["flat"])
+                .build();
+            {
+                let (weak, query) = (Rc::downgrade(self), search.query.clone());
+                remove.connect_clicked(move |_| {
+                    if let Some(page) = weak.upgrade() {
+                        let mut recent = page.state.borrow().recent.clone();
+                        recent.retain(|r| r.query != query);
+                        page.set_recent(recent);
+                    }
+                });
+            }
+            row.add_suffix(&remove);
+            let weak = Rc::downgrade(self);
+            row.connect_activated(move |_| {
+                if let Some(page) = weak.upgrade() {
+                    page.state.borrow_mut().scope = search.scope;
+                    page.show_chips();
+                    page.entry.set_text(&search.query);
+                    page.entry.set_position(-1);
+                }
+            });
+            self.recent_list.append(&row);
+        }
+        self.body.set_visible_child_name("recent");
+    }
+
+    /// Keeps the search as it stands among the recent ones.
+    fn remember(self: &Rc<Self>) {
+        let (query, scope, recent) = {
+            let state = self.state.borrow();
+            (state.query.clone(), state.scope, state.recent.clone())
+        };
+        if query.is_empty() {
+            return;
+        }
+        self.set_recent(remembered(recent, &query, scope));
+    }
+
+    fn set_recent(self: &Rc<Self>, recent: Vec<Recent>) {
+        if let Some(store) = &self.needs.recent {
+            store.save(&recent);
+        }
+        let showing = self.body.visible_child_name().as_deref() == Some("recent");
+        self.state.borrow_mut().recent = recent;
+        if showing {
+            self.show_recent();
+        }
+    }
+}
+
+/// A recent search, with the scope it was made in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Recent {
+    pub query: String,
+    pub scope: SearchScope,
+}
+
+/// A profile's recent searches: `searches/<hash>.json` in the app's data
+/// directory, named by a hash of the server and the username.
+pub struct RecentSearches {
+    store: DataStore,
+    key: String,
+}
+
+impl RecentSearches {
+    pub fn for_profile(profile: &Profile) -> Option<Self> {
+        let who = format!("{}/{}", profile.server.0, profile.username);
+        let hash = glib::compute_checksum_for_string(glib::ChecksumType::Sha256, &who)?;
+        Some(Self {
+            store: DataStore::new(DataStore::default_dir()?),
+            key: format!("searches/{hash}.json"),
+        })
+    }
+
+    fn load(&self) -> Vec<Recent> {
+        match self.store.get(&self.key) {
+            Ok(Some(bytes)) => serde_json::from_slice(&bytes)
+                .inspect_err(|e| tracing::warn!(error = %e, "cannot read the recent searches"))
+                .unwrap_or_default(),
+            Ok(None) => Vec::new(),
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot read the recent searches");
+                Vec::new()
+            }
+        }
+    }
+
+    fn save(&self, recent: &[Recent]) {
+        let saved = serde_json::to_vec(recent)
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| {
+                self.store
+                    .set(&self.key, Some(&bytes))
+                    .map_err(|e| e.to_string())
+            });
+        if let Err(e) = saved {
+            tracing::warn!(error = %e, "cannot keep the recent searches");
+        }
+    }
+}
+
+/// `recent` with `query` first, once, and no more than [`RECENT`].
+fn remembered(recent: Vec<Recent>, query: &str, scope: SearchScope) -> Vec<Recent> {
+    std::iter::once(Recent {
+        query: query.to_owned(),
+        scope,
+    })
+    .chain(recent.into_iter().filter(|r| r.query != query))
+    .take(RECENT)
+    .collect()
+}
+
+/// The scopes other than `scope` (and All) that do match, with counts.
+fn elsewhere(counts: &SearchCounts, scope: SearchScope) -> Vec<(SearchScope, u32)> {
+    SCOPES
+        .iter()
+        .map(|(s, _)| *s)
+        .filter(|s| *s != scope && *s != SearchScope::All)
+        .filter_map(|s| counts.of(s).filter(|n| *n > 0).map(|n| (s, n)))
+        .collect()
+}
+
+fn empty_title(scope: SearchScope, query: &str) -> String {
+    let what = match scope {
+        SearchScope::All => "results".to_owned(),
+        other => scope_name(other).to_lowercase(),
+    };
+    format!("No {what} match “{query}”")
+}
+
+fn see_all_title(kind: SearchKind, query: &str) -> String {
+    format!("{} matching “{query}”", kind_label(kind))
+}
+
+fn hidden_note(hidden: u32) -> String {
+    match hidden {
+        1 => "1 more under its show".to_owned(),
+        n => format!("{n} more under their shows"),
+    }
+}
+
+/// The query without the year at its end.
+fn without_year(query: &str, year: u16) -> String {
+    let year = year.to_string();
+    query
+        .trim_end()
+        .strip_suffix(&year)
+        .unwrap_or(query)
+        .trim_end()
+        .to_owned()
+}
+
+fn initials(name: &str) -> String {
+    name.split_whitespace()
+        .filter_map(|word| word.chars().next())
+        .take(2)
+        .flat_map(char::to_uppercase)
+        .collect()
+}
+
+fn person_detail(person: &Person) -> String {
+    let role = match person.role {
+        PersonRole::Actor => "Actor",
+        PersonRole::Director => "Director",
+    };
+    match person.count {
+        Some(1) => format!("{role} · 1 item"),
+        Some(n) => format!("{role} · {n} items"),
+        None => role.to_owned(),
+    }
+}
+
+fn scope_name(scope: SearchScope) -> &'static str {
+    SCOPES
+        .iter()
+        .find(|(s, _)| *s == scope)
+        .map_or("All", |(_, name)| name)
+}
+
+fn kind_label(kind: SearchKind) -> &'static str {
+    match kind {
+        SearchKind::Shows => "Shows",
+        SearchKind::Movies => "Movies",
+        SearchKind::People => "People",
+        SearchKind::Artists => "Artists",
+        SearchKind::Albums => "Albums",
+        SearchKind::Tracks => "Tracks",
+        SearchKind::Episodes => "Episodes",
+    }
+}
+
+fn kind_name(item: &Item) -> &'static str {
+    match item {
+        Item::Movie(_) => "Movie",
+        Item::Show(_) => "Show",
+        Item::Season(_) => "Season",
+        Item::Episode(_) => "Episode",
+        Item::Artist(_) => "Artist",
+        Item::Album(_) => "Album",
+        Item::Track(_) => "Track",
+    }
+}
+
+fn open_label(item: &Item) -> &'static str {
+    match item {
+        Item::Show(_) => "Go to show",
+        Item::Artist(_) => "Go to artist",
+        Item::Album(_) => "Go to album",
+        _ => "Details",
+    }
+}
+
+/// The top result's line: the year and length for a movie, the detail
+/// otherwise.
+fn top_detail(item: &Item, facts: &Facts) -> Option<String> {
+    match item {
+        Item::Movie(_) => {
+            let parts: Vec<String> = [facts.detail.clone(), facts.length.map(format::length)]
+                .into_iter()
+                .flatten()
+                .collect();
+            (!parts.is_empty()).then(|| parts.join(" · "))
+        }
+        _ => facts.detail.clone(),
+    }
+}
+
+/// The shape, size and artwork of an item's tile: posters for films and
+/// shows, squares for albums, circles for artists.
+fn art_of(item: &Item, large: bool) -> (&'static str, (i32, i32), &'static [ArtworkKind]) {
+    match item {
+        Item::Movie(_) | Item::Show(_) => ("portrait", (140, 210), &[ArtworkKind::Poster]),
+        Item::Artist(_) => (
+            "circle",
+            if large { (180, 180) } else { (120, 120) },
+            &[ArtworkKind::Thumb, ArtworkKind::Poster],
+        ),
+        _ => (
+            "square",
+            if large { (180, 180) } else { (140, 140) },
+            &[ArtworkKind::Thumb, ArtworkKind::Poster],
+        ),
+    }
+}
+
+fn group_is_empty(group: &SearchGroup) -> bool {
+    group.items.is_empty() && group.people.is_empty() && group.hidden == 0
+}
+
+fn caption(text: &str, classes: &[&str]) -> gtk::Label {
+    gtk::Label::builder()
+        .label(text)
+        .xalign(0.0)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .css_classes(classes)
+        .build()
+}
+
+fn clear(container: &impl IsA<gtk::Widget>) {
+    while let Some(child) = container.as_ref().first_child() {
+        child.unparent();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use spoolframe_linux_core::backend::Client;
+    use spoolframe_linux_core::fake::FakeClient;
+
+    use super::*;
+
+    /// Runs the main loop until `done` or `limit`.
+    fn run_until(limit: Duration, done: impl Fn() -> bool) -> bool {
+        let context = glib::MainContext::default();
+        let deadline = Instant::now() + limit;
+        while Instant::now() < deadline {
+            if done() {
+                return true;
+            }
+            context.iteration(false);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        done()
+    }
+
+    /// The page on the fake's Home Media, in a window.
+    fn page() -> Rc<SearchPage> {
+        let client = FakeClient::new(None);
+        let session = client.session(&FakeClient::profile("andrey")).unwrap();
+        let page = SearchPage::new(Needs {
+            session,
+            cards: Rc::new(Cards {
+                open: Rc::new(|_| {}),
+                art: None,
+                set_watched: None,
+                hide: None,
+                enqueue: None,
+            }),
+            play: Rc::new(|_| {}),
+            open_person: Rc::new(|_| {}),
+            server: "Home Media".into(),
+            profile: "Andrey".into(),
+            recent: None,
+        });
+        let window = gtk::Window::builder().child(&page.widget).build();
+        window.present();
+        page.open(SearchScope::All, None);
+        page
+    }
+
+    fn showing(page: &SearchPage) -> String {
+        page.body
+            .visible_child_name()
+            .map(|n| n.to_string())
+            .unwrap_or_default()
+    }
+
+    fn reaches(page: &SearchPage, state: &str) -> bool {
+        run_until(Duration::from_secs(5), || showing(page) == state)
+    }
+
+    fn type_in(page: &SearchPage, text: &str) {
+        page.entry.set_text(text);
+    }
+
+    /// One test: GTK binds itself to the first thread that starts it.
+    #[test]
+    #[ignore = "needs a display; run on its own"]
+    fn search_on_the_fake_server() {
+        gtk::init().unwrap();
+        adw::init().unwrap();
+        typing_shows_the_top_result_and_the_counts();
+        a_scope_that_finds_nothing_says_where_else_it_matches();
+        a_year_becomes_a_token_that_can_be_dropped();
+        see_all_shows_one_group_under_its_own_head();
+        a_search_is_remembered_and_shown_when_the_box_is_empty();
+    }
+
+    fn typing_shows_the_top_result_and_the_counts() {
+        let page = page();
+        assert_eq!(showing(&page), "recent");
+        type_in(&page, "low tide");
+        assert!(reaches(&page, "results"), "no results");
+        let all = &page.chips[0];
+        assert!(all.2.is_visible() && all.2.label() == "2");
+        assert!(page.state.borrow().last.as_ref().unwrap().top.is_some());
+    }
+
+    fn a_scope_that_finds_nothing_says_where_else_it_matches() {
+        let page = page();
+        type_in(&page, "low tide");
+        assert!(reaches(&page, "results"));
+        page.chips[1].1.set_active(true); // Movies
+        assert!(reaches(&page, "none"), "no empty state");
+        assert_eq!(page.none.title(), "No movies match “low tide”");
+        // Music, and Search everything.
+        assert!(page.elsewhere.first_child().is_some());
+        page.pick_scope(SearchScope::All);
+        assert!(reaches(&page, "results"));
+        assert!(page.chips[0].1.is_active());
+    }
+
+    fn a_year_becomes_a_token_that_can_be_dropped() {
+        let page = page();
+        type_in(&page, "arrival 1990");
+        assert!(run_until(Duration::from_secs(5), || page.year.is_visible()));
+        assert!(page.year.label().unwrap().starts_with("1990"));
+        page.year.emit_clicked();
+        assert_eq!(page.entry.text(), "arrival");
+        assert!(run_until(Duration::from_secs(5), || !page
+            .year
+            .is_visible()
+            && showing(&page) == "results"));
+    }
+
+    fn see_all_shows_one_group_under_its_own_head() {
+        let page = page();
+        type_in(&page, "a");
+        assert!(reaches(&page, "results"));
+        page.state.borrow_mut().kind = Some(SearchKind::Movies);
+        page.run();
+        assert!(run_until(Duration::from_secs(5), || page
+            .see_all_head
+            .is_visible()
+            && page.see_all_title.label() == "Movies matching “a”"));
+        assert!(page.back.is_visible() && !page.chips_row.is_visible());
+        page.back.emit_clicked();
+        assert!(run_until(Duration::from_secs(5), || page
+            .chips_row
+            .is_visible()));
+    }
+
+    fn a_search_is_remembered_and_shown_when_the_box_is_empty() {
+        let page = page();
+        type_in(&page, "low tide");
+        assert!(reaches(&page, "results"));
+        page.entry.emit_activate();
+        type_in(&page, "");
+        assert!(reaches(&page, "recent"));
+        assert_eq!(page.state.borrow().recent[0].query, "low tide");
+        assert!(page.recent_list.first_child().is_some());
+    }
+
+    #[test]
+    fn a_new_search_goes_first_and_once() {
+        let recent = vec![
+            Recent {
+                query: "dune".into(),
+                scope: SearchScope::Movies,
+            },
+            Recent {
+                query: "severance".into(),
+                scope: SearchScope::All,
+            },
+        ];
+        let queries: Vec<String> = remembered(recent, "severance", SearchScope::Shows)
+            .into_iter()
+            .map(|r| format!("{} {:?}", r.query, r.scope))
+            .collect();
+        assert_eq!(queries, ["severance Shows", "dune Movies"]);
+    }
+
+    #[test]
+    fn only_a_few_searches_are_kept() {
+        let mut recent = Vec::new();
+        for n in 0..10 {
+            recent = remembered(recent, &format!("q{n}"), SearchScope::All);
+        }
+        assert_eq!(recent.len(), RECENT);
+    }
+
+    #[test]
+    fn the_empty_state_offers_the_scopes_that_match() {
+        let counts = SearchCounts {
+            all: Some(3),
+            movies: Some(0),
+            shows: Some(2),
+            episodes: Some(1),
+            music: None,
+        };
+        assert_eq!(
+            elsewhere(&counts, SearchScope::Movies),
+            [(SearchScope::Shows, 2), (SearchScope::Episodes, 1)]
+        );
+    }
+
+    #[test]
+    fn the_empty_title_names_the_scope() {
+        assert_eq!(
+            (
+                empty_title(SearchScope::Movies, "zz"),
+                empty_title(SearchScope::All, "zz")
+            ),
+            (
+                "No movies match “zz”".to_owned(),
+                "No results match “zz”".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn dropping_the_year_keeps_the_words() {
+        assert_eq!(without_year("dune 2021", 2021), "dune");
+    }
+
+    #[test]
+    fn a_person_reads_as_what_they_did() {
+        let person = Person {
+            id: spoolframe_linux_core::backend::PersonId::new(
+                spoolframe_types::Namespace::Plex,
+                "x",
+            )
+            .unwrap(),
+            name: "Denis Villeneuve".into(),
+            role: PersonRole::Director,
+            count: Some(3),
+        };
+        assert_eq!(
+            (initials(&person.name), person_detail(&person)),
+            ("DV".to_owned(), "Director · 3 items".to_owned())
+        );
+    }
+}

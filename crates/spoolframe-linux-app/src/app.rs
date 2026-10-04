@@ -12,8 +12,8 @@ use adw::prelude::*;
 use gtk::glib;
 use relm4::{Component, ComponentParts, ComponentSender};
 use spoolframe_linux_core::backend::{
-    BackendError, ChosenTracks, Client, ConnectionState, HomeScreen, Profile, Selection, Server,
-    ServerKey, Session,
+    BackendError, ChosenTracks, Client, ConnectionState, HomeScreen, Person, Profile, SearchScope,
+    Selection, Server, ServerKey, Session,
 };
 use spoolframe_linux_core::theme::Theme;
 use spoolframe_types::{
@@ -25,7 +25,9 @@ use crate::minibar::MiniBar;
 use crate::mpris::Mpris;
 use crate::playback::{Change, Playback, Playlist};
 use crate::queue::Queued;
+use crate::remote_sign_in::{self, RemoteSignIn, Via};
 use crate::saved_queue::SavedQueue;
+use crate::search::{self, SearchPage};
 use crate::settings::Settings;
 use crate::theme::ThemeApplier;
 use crate::views::{Cards, Enqueue};
@@ -118,6 +120,8 @@ pub struct App {
     saved_queue: Option<Rc<SavedQueue>>,
     /// The session's libraries as far as fetched, kept between visits.
     library_cache: Option<Rc<library::Cache>>,
+    /// The library open last, for search's default scope (P3-09).
+    library: Option<Library>,
     /// Whether the server used last has been opened already. It may be
     /// heard only on a later listing; it is opened once, not on every
     /// change after.
@@ -133,8 +137,11 @@ enum Root {
 }
 
 pub struct AppWidgets {
-    /// "servers", "profiles" or "library".
+    /// "servers", "profiles", "library", or "not-set-up" in its place.
     screens: gtk::Stack,
+    /// What shows where the library would be on a server whose admin has
+    /// not finished setup (P3-10).
+    not_set_up: start::NotSetUp,
     /// The PIN pad on the profiles screen, while it shows (P2-08).
     pin_pad: Option<Rc<pin::Pad>>,
     servers: adw::Bin,
@@ -146,6 +153,7 @@ pub struct AppWidgets {
     /// Says when the connection is not up.
     banner: adw::Banner,
     sign_in: Option<start::SignIn>,
+    remote_sign_in: Option<Rc<RemoteSignIn>>,
     add_server: Option<start::AddServer>,
     sidebar: gtk::ListBox,
     stack: adw::NavigationView,
@@ -162,8 +170,8 @@ pub struct AppWidgets {
     /// which must be the scrolled child itself to load row by row.
     scroller: gtk::ScrolledWindow,
     content: gtk::Box,
-    search_entry: gtk::SearchEntry,
-    search_results: gtk::Box,
+    /// The search page (P3-09), made for the profile on first use.
+    search: Option<Rc<SearchPage>>,
 }
 
 #[derive(Debug)]
@@ -179,12 +187,20 @@ pub enum Msg {
     BackToProfiles,
     ForgotPin,
     OpenSignIn,
+    /// Ask a server that was not set up for its catalog again (P3-10).
+    RetryCatalog,
+    /// Sign in by approving on a phone (P3-05) or in the browser (P3-06).
+    OpenRemoteSignIn(Via),
+    /// The browser sign-in has no page to open: the server has no web
+    /// address.
+    BrowserSignInUnavailable,
     SubmitSignIn(String, Secret),
     /// Back to "Who's watching" from the library.
     SwitchProfile,
     /// A sidebar row was activated: see the `ROW_*` constants.
     Select(usize),
-    Search(String),
+    /// A person a search found: their items.
+    OpenPerson(Box<Person>),
     Open(Box<Item>),
     Play(Box<PlayRequest>),
     /// A track, an album or an artist's albums to the play queue (P1-23).
@@ -230,7 +246,8 @@ const ROW_SEARCH: usize = 1;
 const FIRST_LIBRARY_ROW: usize = 2;
 
 /// How many search results to show.
-const SEARCH_LIMIT: u32 = 60;
+/// The most of a person's items listed.
+const PERSON_ITEMS: u32 = 200;
 
 /// A season with its episodes.
 type SeasonEpisodes = (Season, Vec<Item>);
@@ -254,7 +271,7 @@ pub enum Loaded {
     SignedIn(Result<Profile, BackendError>),
     Libraries(Result<Vec<Library>, BackendError>),
     Home(Result<HomeScreen, BackendError>),
-    Search(String, Result<Vec<Item>, BackendError>),
+    Person(Box<Person>, Result<(Vec<Item>, u32), BackendError>),
     /// A movie or episode, what it belongs to (an episode's show), and its
     /// tracks for the pickers.
     Playable(
@@ -296,7 +313,7 @@ impl Loaded {
         match self {
             Loaded::Libraries(Err(e))
             | Loaded::Home(Err(e))
-            | Loaded::Search(_, Err(e))
+            | Loaded::Person(_, Err(e))
             | Loaded::Show(_, Err(e))
             | Loaded::Season(_, Err(e))
             | Loaded::Artist(_, Err(e))
@@ -398,15 +415,10 @@ impl Component for App {
             let sender = sender.clone();
             profile_button.connect_clicked(move |_| sender.input(Msg::SwitchProfile));
         }
-        // The mark and the name head the sidebar.
+        // The mark and the wordmark head the sidebar.
         let brand = gtk::Box::builder().spacing(10).build();
         brand.append(&crate::logo::mark(26));
-        brand.append(
-            &gtk::Label::builder()
-                .label("Spoolframe")
-                .css_classes(["brand"])
-                .build(),
-        );
+        brand.append(&crate::logo::wordmark());
         let sidebar_header = adw::HeaderBar::builder().title_widget(&brand).build();
         let sidebar_toolbar = toolbar(
             &sidebar_header,
@@ -465,19 +477,6 @@ impl Component for App {
             .child(&stack)
             .build();
 
-        let search_entry = gtk::SearchEntry::builder()
-            .placeholder_text("Movies, shows, episodes, music")
-            .hexpand(true)
-            .build();
-        {
-            let sender = sender.clone();
-            // search-changed is already debounced by the entry.
-            search_entry.connect_search_changed(move |entry| {
-                sender.input(Msg::Search(entry.text().trim().to_owned()));
-            });
-        }
-        let search_results = gtk::Box::new(gtk::Orientation::Vertical, 24);
-
         let split = adw::NavigationSplitView::builder()
             .sidebar(&sidebar_page)
             .content(&content_page)
@@ -509,6 +508,17 @@ impl Component for App {
             .build();
         screens.add_named(&servers, Some("servers"));
         screens.add_named(&profiles, Some("profiles"));
+        let not_set_up = start::NotSetUp::new(
+            {
+                let sender = sender.clone();
+                Rc::new(move || sender.input(Msg::RetryCatalog))
+            },
+            {
+                let sender = sender.clone();
+                Rc::new(move || sender.input(Msg::ShowServers))
+            },
+        );
+        screens.add_named(&not_set_up.page, Some("not-set-up"));
         let mini_bar = MiniBar::new(
             {
                 let sender = sender.clone();
@@ -604,6 +614,7 @@ impl Component for App {
             queued: Vec::new(),
             saved_queue: None,
             library_cache: None,
+            library: None,
             opened_last_server: false,
         };
         model.load_servers(&sender);
@@ -622,12 +633,14 @@ impl Component for App {
                 screens,
                 servers,
                 profiles,
+                not_set_up,
                 toasts,
                 profile_avatar,
                 profile_name,
                 profile_server,
                 banner,
                 sign_in: None,
+                remote_sign_in: None,
                 pin_pad: None,
                 add_server: None,
                 sidebar,
@@ -639,8 +652,7 @@ impl Component for App {
                 mpris,
                 scroller,
                 content,
-                search_entry,
-                search_results,
+                search: None,
             },
         }
     }
@@ -653,6 +665,11 @@ impl Component for App {
         root: &Self::Root,
     ) {
         match msg {
+            Msg::RetryCatalog => {
+                widgets.screens.set_visible_child_name("library");
+                self.load_libraries(&sender);
+                self.load_home(&sender);
+            }
             Msg::ShowServers => {
                 widgets.screens.set_visible_child_name("servers");
                 self.load_servers(&sender);
@@ -758,9 +775,44 @@ impl Component for App {
                     let sender = sender.clone();
                     Rc::new(move |u, p| sender.input(Msg::SubmitSignIn(u, Secret(p))))
                 };
-                let dialog = start::SignIn::new(server, submit);
+                let elsewhere: Rc<dyn Fn(Via)> = {
+                    let sender = sender.clone();
+                    Rc::new(move |via| sender.input(Msg::OpenRemoteSignIn(via)))
+                };
+                let dialog = start::SignIn::new(server, submit, elsewhere);
                 dialog.dialog.present(Some(root));
                 widgets.sign_in = Some(dialog);
+            }
+            Msg::OpenRemoteSignIn(via) => {
+                let Some(server) = &self.server else { return };
+                let ends = remote_sign_in::Ends {
+                    // An approval ends as a password sign-in does.
+                    done: {
+                        let sender = sender.clone();
+                        Rc::new(move |profile| {
+                            sender.command_sender().emit(Loaded::SignedIn(Ok(profile)))
+                        })
+                    },
+                    no_web: {
+                        let sender = sender.clone();
+                        Rc::new(move || sender.input(Msg::BrowserSignInUnavailable))
+                    },
+                    open: {
+                        let window = root.downgrade();
+                        Rc::new(move |url| open_in_browser(url, window.upgrade().as_ref()))
+                    },
+                };
+                let screen = RemoteSignIn::new(self.client.clone(), server, via, ends);
+                screen.dialog.present(Some(root));
+                widgets.remote_sign_in = Some(screen);
+            }
+            Msg::BrowserSignInUnavailable => {
+                if let Some(dialog) = &widgets.sign_in {
+                    dialog.refuse(
+                        "This server has no web address, so it cannot sign you in through \
+                         a browser. Sign in with your password.",
+                    );
+                }
             }
             Msg::SubmitSignIn(username, Secret(password)) => {
                 // Enter in the password field still sends while one is out.
@@ -786,6 +838,7 @@ impl Component for App {
             }
             Msg::Select(ROW_HOME) => {
                 self.select_root(Root::Home);
+                self.library = None;
                 widgets.stack.pop_to_page(&widgets.root_page);
                 self.load_home(&sender);
             }
@@ -795,9 +848,18 @@ impl Component for App {
                 widgets.root_page.set_title("Search");
                 show_content(widgets);
                 clear(&widgets.content);
-                widgets.content.append(&widgets.search_entry);
-                widgets.content.append(&widgets.search_results);
-                widgets.search_entry.grab_focus();
+                if widgets.search.is_none() {
+                    widgets.search = self.search_page(&sender);
+                }
+                let Some(page) = widgets.search.clone() else {
+                    return;
+                };
+                widgets.content.append(&page.widget);
+                // Opened from a library: its kind is the scope.
+                match &self.library {
+                    Some(library) => page.open(scope_of(library.kind), Some(library.title.clone())),
+                    None => page.open(SearchScope::All, None),
+                }
             }
             Msg::Select(row) => {
                 let Some(library) = self.libraries.get(row - FIRST_LIBRARY_ROW).cloned() else {
@@ -807,6 +869,7 @@ impl Component for App {
                     return;
                 };
                 self.select_root(Root::Library);
+                self.library = Some(library.clone());
                 widgets.stack.pop_to_page(&widgets.root_page);
                 widgets.root_page.set_title(&library.title);
                 show_content(widgets);
@@ -830,20 +893,13 @@ impl Component for App {
                     }
                 }));
             }
-            Msg::Search(query) => {
-                // An older query's answer, overtaken while typing, is
-                // aborted.
-                self.select_root(Root::Search);
-                if query.is_empty() {
-                    clear(&widgets.search_results);
-                    return;
-                }
+            Msg::OpenPerson(person) => {
                 let Some(session) = self.session.clone() else {
                     return;
                 };
-                self.load_root(&sender, async move {
-                    let items = session.search(&query, SEARCH_LIMIT).await;
-                    Loaded::Search(query, items)
+                sender.oneshot_command(async move {
+                    let items = session.person_items(&person.id, 0, PERSON_ITEMS).await;
+                    Loaded::Person(person, items)
                 });
             }
             Msg::Open(item) => self.open_item(*item, &sender),
@@ -1143,6 +1199,9 @@ impl Component for App {
                 widgets.screens.set_visible_child_name("servers");
             }
             Loaded::SignedIn(Ok(profile)) => {
+                if let Some(phone) = widgets.remote_sign_in.take() {
+                    phone.dialog.close();
+                }
                 if let Some(dialog) = widgets.sign_in.take() {
                     dialog.dialog.close();
                 }
@@ -1165,6 +1224,15 @@ impl Component for App {
                     }
                 }
                 self.libraries = libraries;
+            }
+            // Signed in, but the admin has not finished setup: its own
+            // page, where the library would be.
+            Loaded::Libraries(Err(BackendError::NotSetUp))
+            | Loaded::Home(Err(BackendError::NotSetUp)) => {
+                if let Some(server) = &self.server {
+                    widgets.not_set_up.show(server);
+                }
+                widgets.screens.set_visible_child_name("not-set-up");
             }
             Loaded::Libraries(Err(e)) => show_error(widgets, "Home", &e),
             Loaded::Home(Ok(home)) => {
@@ -1195,23 +1263,18 @@ impl Component for App {
                 show(widgets, "Home", rows);
             }
             Loaded::Home(Err(e)) => show_error(widgets, "Home", &e),
-            Loaded::Search(query, result) => {
-                clear(&widgets.search_results);
-                match result {
-                    Ok(items) if items.is_empty() => widgets.search_results.append(
-                        &adw::StatusPage::builder()
-                            .icon_name(crate::icons::SEARCH)
-                            .title("Nothing found")
-                            .description(format!("Nothing matches “{query}”."))
-                            .build(),
-                    ),
-                    Ok(items) => widgets.search_results.append(&views::grid(
-                        "Results",
-                        items.iter().map(|i| views::poster_card(i, cards)),
-                    )),
-                    Err(e) => widgets.search_results.append(&error_status(&e)),
-                }
-            }
+            Loaded::Person(person, Ok((items, total))) => push(
+                widgets,
+                &person.name,
+                &views::grid(
+                    &match total {
+                        1 => "1 item".to_owned(),
+                        n => format!("{n} items"),
+                    },
+                    items.iter().map(|i| views::poster_card(i, cards)),
+                ),
+            ),
+            Loaded::Person(person, Err(e)) => push_error(widgets, &person.name, &e),
             Loaded::Playable(item, context, tracks, chosen) => {
                 let title = views::Facts::of(&item).title;
                 // The page opens without pickers if the tracks cannot be
@@ -1442,8 +1505,9 @@ impl App {
         }
         self.libraries.clear();
         self.select_root(Root::Home);
-        widgets.search_entry.set_text("");
-        clear(&widgets.search_results);
+        // The next profile has its own searches.
+        widgets.search = None;
+        self.library = None;
         self.stop_playback(widgets);
         // The queue was the last profile's; this one's comes back paused.
         self.queued.clear();
@@ -1584,6 +1648,38 @@ impl App {
     /// Home again, if it shows: Continue watching moved with what played.
     fn refresh_home(&mut self, sender: &ComponentSender<Self>) {
         self.load_home(sender);
+    }
+
+    /// The search page for the profile in use.
+    fn search_page(&self, sender: &ComponentSender<Self>) -> Option<Rc<SearchPage>> {
+        let (session, profile, server) = (
+            self.session.clone()?,
+            self.profile.as_ref()?,
+            self.server.as_ref()?,
+        );
+        let play: Rc<dyn Fn(Item)> = {
+            let sender = sender.clone();
+            Rc::new(move |item| {
+                // Where it stopped, as Resume on its page plays from.
+                let from = views::Facts::of(&item).position();
+                sender.input(Msg::Play(Box::new(PlayRequest::one(
+                    item, from, None, None,
+                ))));
+            })
+        };
+        let open_person: Rc<dyn Fn(Person)> = {
+            let sender = sender.clone();
+            Rc::new(move |person| sender.input(Msg::OpenPerson(Box::new(person))))
+        };
+        Some(SearchPage::new(search::Needs {
+            session,
+            cards: self.cards.clone(),
+            play,
+            open_person,
+            server: server.name.clone(),
+            profile: profile.display_name.clone(),
+            recent: search::RecentSearches::for_profile(profile),
+        }))
     }
 
     /// The profile in use, for Preferences → Profile.
@@ -1970,6 +2066,25 @@ fn show(widgets: &AppWidgets, title: &str, sections: impl IntoIterator<Item = gt
     }
 }
 
+/// Search's scope when opened from a library of `kind`.
+fn scope_of(kind: LibraryKind) -> SearchScope {
+    match kind {
+        LibraryKind::Movies => SearchScope::Movies,
+        LibraryKind::Shows => SearchScope::Shows,
+        LibraryKind::Music => SearchScope::Music,
+    }
+}
+
+/// Opens `url` in the system browser, through the portal in a sandbox. A
+/// failure is logged; the screen shows the address to open by hand.
+fn open_in_browser(url: &str, window: Option<&adw::ApplicationWindow>) {
+    gtk::UriLauncher::new(url).launch(window, None::<&gtk::gio::Cancellable>, |result| {
+        if let Err(e) = result {
+            tracing::warn!(error = %e, "cannot open the browser");
+        }
+    });
+}
+
 fn show_error(widgets: &AppWidgets, title: &str, error: &BackendError) {
     show_content(widgets);
     widgets.root_page.set_title(title);
@@ -1994,12 +2109,34 @@ fn toast_text(widgets: &AppWidgets, text: &str) {
 }
 
 fn error_status(error: &BackendError) -> adw::StatusPage {
+    let (title, description) = match error {
+        // A library on a Plex server that is down (P3-11), or a mount:
+        // listed, but not there now.
+        BackendError::Unavailable(why) => (
+            "Not available right now",
+            format!("{} Try again once it is back.", sentence(why)),
+        ),
+        other => ("Could not load this page", sentence(&other.to_string())),
+    };
     adw::StatusPage::builder()
         .icon_name(crate::icons::ERROR)
-        .title("Could not load this page")
-        .description(error.to_string())
+        .title(title)
+        .description(description)
         .vexpand(true)
         .build()
+}
+
+/// A message as a sentence: capitalised, with a full stop.
+fn sentence(message: &str) -> String {
+    let mut chars = message.trim().chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    let mut sentence: String = first.to_uppercase().chain(chars).collect();
+    if !sentence.ends_with(['.', '!', '?']) {
+        sentence.push('.');
+    }
+    sentence
 }
 
 /// The tracks the server would choose for `id`, and why. The page opens
@@ -2079,6 +2216,22 @@ fn server_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_server_message_reads_as_a_sentence() {
+        assert_eq!(
+            sentence("Cabin does not answer: connection refused"),
+            "Cabin does not answer: connection refused."
+        );
+    }
+
+    #[test]
+    fn a_message_is_capitalised_once() {
+        assert_eq!(
+            sentence("the media file could not be read."),
+            "The media file could not be read."
+        );
+    }
 
     #[test]
     fn a_secret_never_prints() {

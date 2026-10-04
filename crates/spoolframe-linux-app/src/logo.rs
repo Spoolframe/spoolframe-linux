@@ -1,11 +1,20 @@
-//! The Spoolframe mark, drawn: a reel in a frame with film running out
-//! under it, as in the design's sidebar. Cairo draws the design's paths
-//! (a 64-unit square) so no SVG loader is needed at run time. The reel and
-//! frame take the text colour, the film the accent; the holes are cut out,
-//! so the sidebar shows through in any theme.
+//! The Spoolframe mark and wordmark, from the "Spoolframe Logo" design: a
+//! film reel with five holes and a play cut-out, inside four frame
+//! corners; under 40 px, a three-hole reel alone. Cairo draws the design's
+//! paths, so no SVG loader is needed at run time. The corners take the
+//! text colour and the reel the theme's accent, like the rest of the
+//! chrome; the holes and the play mark are cut out, so what is behind
+//! shows through in any theme, as the design's ground colour does.
+
+use std::f64::consts::{FRAC_PI_2, PI, TAU};
 
 use gtk::prelude::*;
 use gtk::{cairo, gdk};
+use spoolframe_linux_core::paths;
+
+/// Under this many pixels the mark is the small reel: the corners and
+/// five holes no longer read.
+const SMALL: i32 = 40;
 
 /// The mark at `size` pixels square.
 pub fn mark(size: i32) -> gtk::DrawingArea {
@@ -13,15 +22,59 @@ pub fn mark(size: i32) -> gtk::DrawingArea {
         .content_width(size)
         .content_height(size)
         .valign(gtk::Align::Center)
+        .halign(gtk::Align::Center)
         .build();
     area.set_draw_func(|area, cr, width, height| {
-        let scale = f64::from(width.min(height)) / 64.0;
-        cr.scale(scale, scale);
+        let side = width.min(height);
         let ink = area.color();
         let accent = accent(area);
-        let _ = draw(cr, &ink, &accent);
+        let _ = draw(cr, f64::from(side), side < SMALL, &ink, &accent);
     });
     area
+}
+
+/// "spool" in the text colour and "frame" in the accent: the design's
+/// wordmark, beside the mark. Window titles keep plain "Spoolframe".
+pub fn wordmark() -> gtk::Box {
+    let wordmark = gtk::Box::builder()
+        .css_classes(["wordmark"])
+        .valign(gtk::Align::Center)
+        .build();
+    wordmark.update_property(&[gtk::accessible::Property::Label("Spoolframe")]);
+    for (part, classes) in [("spool", &[][..]), ("frame", &["wordmark-accent"][..])] {
+        wordmark.append(
+            &gtk::Label::builder()
+                .label(part)
+                .css_classes(classes)
+                .accessible_role(gtk::AccessibleRole::Presentation)
+                .build(),
+        );
+    }
+    wordmark
+}
+
+/// Makes the wordmark's face, Bricolage Grotesque (`fonts/`, OFL), known
+/// to the app: carried, not hoped to be installed. Pango takes a font only
+/// by path, so it is written to the cache directory first. Call once,
+/// after GTK is up; without it the wordmark falls back to the UI face.
+pub fn register_font() {
+    const FONT: &[u8] = include_bytes!("../fonts/BricolageGrotesque.ttf");
+    let Some(dir) = paths::cache_dir() else {
+        return tracing::warn!("no cache directory; the wordmark uses the UI face");
+    };
+    let path = dir.join("BricolageGrotesque.ttf");
+    let written = std::fs::metadata(&path).is_ok_and(|m| m.len() == FONT.len() as u64);
+    if !written
+        && let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, FONT))
+    {
+        return tracing::warn!(error = %e, path = %path.display(), "cannot write the wordmark's font");
+    }
+    let Some(fonts) = gtk::Label::new(None).pango_context().font_map() else {
+        return;
+    };
+    if let Err(e) = fonts.add_font_file(&path) {
+        tracing::warn!(error = %e, path = %path.display(), "cannot load the wordmark's font");
+    }
 }
 
 /// The theme's accent; libadwaita names it `accent_color`.
@@ -42,75 +95,88 @@ fn set(cr: &cairo::Context, colour: &gdk::RGBA) {
     );
 }
 
-/// A quadratic Bézier from the current point, as SVG's `Q`, in cubic form.
-fn quad(cr: &cairo::Context, cx: f64, cy: f64, x: f64, y: f64) -> Result<(), cairo::Error> {
-    let (x0, y0) = cr.current_point()?;
-    cr.curve_to(
-        x0 + 2.0 / 3.0 * (cx - x0),
-        y0 + 2.0 / 3.0 * (cy - y0),
-        x + 2.0 / 3.0 * (cx - x),
-        y + 2.0 / 3.0 * (cy - y),
-        x,
-        y,
-    );
-    Ok(())
+/// Draws the mark `side` pixels square, `small` or full. In a group of
+/// its own, so cutting the holes clears only the mark.
+fn draw(
+    cr: &cairo::Context,
+    side: f64,
+    small: bool,
+    ink: &gdk::RGBA,
+    accent: &gdk::RGBA,
+) -> Result<(), cairo::Error> {
+    cr.push_group();
+    if small {
+        small_reel(cr, side, accent)?;
+    } else {
+        full(cr, side, ink, accent)?;
+    }
+    cr.pop_group_to_source()?;
+    cr.paint()
 }
 
-fn draw(cr: &cairo::Context, ink: &gdk::RGBA, accent: &gdk::RGBA) -> Result<(), cairo::Error> {
-    // The frame, open at the right where the film leaves it.
+/// The full mark, in the design's 100-unit square.
+fn full(
+    cr: &cairo::Context,
+    side: f64,
+    ink: &gdk::RGBA,
+    accent: &gdk::RGBA,
+) -> Result<(), cairo::Error> {
+    cr.scale(side / 100.0, side / 100.0);
+    // The four frame corners, each a line, a quarter circle of radius 5
+    // and a line.
     set(cr, ink);
     cr.set_line_width(4.0);
     cr.set_line_cap(cairo::LineCap::Round);
     cr.set_line_join(cairo::LineJoin::Round);
-    cr.move_to(9.0, 38.0);
-    cr.line_to(9.0, 9.0);
-    quad(cr, 9.0, 6.0, 12.0, 6.3)?;
-    cr.line_to(52.0, 9.5);
-    quad(cr, 55.0, 9.8, 55.0, 13.0)?;
-    cr.line_to(55.0, 20.0);
-    cr.stroke()?;
-    cr.move_to(55.0, 44.0);
-    cr.line_to(55.0, 52.0);
-    quad(cr, 55.0, 55.0, 52.0, 55.0)?;
-    cr.line_to(46.0, 55.0);
-    cr.stroke()?;
-
-    // The reel: a disc with six holes and a play mark cut out.
-    cr.set_fill_rule(cairo::FillRule::EvenOdd);
-    cr.arc(31.0, 30.0, 15.0, 0.0, std::f64::consts::TAU);
-    for (x, y) in [
-        (31.0, 21.0),
-        (38.8, 25.5),
-        (38.8, 34.5),
-        (31.0, 39.0),
-        (23.2, 34.5),
-        (23.2, 25.5),
+    for (start, corner, from, end) in [
+        ((10.0, 26.0), (15.0, 15.0), PI, (26.0, 10.0)),
+        ((74.0, 10.0), (85.0, 15.0), PI + FRAC_PI_2, (90.0, 26.0)),
+        ((90.0, 74.0), (85.0, 85.0), 0.0, (74.0, 90.0)),
+        ((26.0, 90.0), (15.0, 85.0), FRAC_PI_2, (10.0, 74.0)),
     ] {
-        cr.new_sub_path();
-        cr.arc(x, y, 3.2, 0.0, std::f64::consts::TAU);
+        cr.move_to(start.0, start.1);
+        cr.arc(corner.0, corner.1, 5.0, from, from + FRAC_PI_2);
+        cr.line_to(end.0, end.1);
     }
-    cr.new_sub_path();
-    cr.move_to(28.0, 26.5);
-    cr.line_to(34.5, 30.0);
-    cr.line_to(28.0, 33.5);
-    cr.close_path();
-    cr.fill()?;
+    cr.stroke()?;
 
-    // The film running out, its perforations cut out.
+    // The reel, its five holes and the play mark cut out.
     set(cr, accent);
-    cr.move_to(6.0, 41.0);
-    quad(cr, 28.0, 46.0, 51.0, 53.0)?;
-    cr.line_to(49.6, 58.2);
-    quad(cr, 27.0, 51.5, 5.0, 46.6)?;
-    cr.close_path();
+    cr.arc(50.0, 50.0, 31.0, 0.0, TAU);
     cr.fill()?;
     cr.set_operator(cairo::Operator::Clear);
-    cr.set_line_width(2.0);
-    cr.set_line_cap(cairo::LineCap::Butt);
-    cr.set_dash(&[3.0, 3.0], 0.0);
-    cr.move_to(10.0, 45.6);
-    cr.line_to(47.0, 55.0);
-    cr.stroke()?;
+    for (x, y) in [
+        (50.0, 32.0),
+        (67.12, 44.44),
+        (60.58, 64.56),
+        (39.42, 64.56),
+        (32.88, 44.44),
+    ] {
+        cr.arc(x, y, 7.0, 0.0, TAU);
+        cr.fill()?;
+    }
+    cr.move_to(46.5, 45.0);
+    cr.line_to(55.5, 50.0);
+    cr.line_to(46.5, 55.0);
+    cr.close_path();
+    cr.set_line_width(1.5);
+    cr.fill_preserve()?;
+    cr.stroke()
+}
+
+/// The small mark: the reel with three holes, in the design's square
+/// from 12 to 88.
+fn small_reel(cr: &cairo::Context, side: f64, accent: &gdk::RGBA) -> Result<(), cairo::Error> {
+    cr.scale(side / 76.0, side / 76.0);
+    cr.translate(-12.0, -12.0);
+    set(cr, accent);
+    cr.arc(50.0, 50.0, 38.0, 0.0, TAU);
+    cr.fill()?;
+    cr.set_operator(cairo::Operator::Clear);
+    for (x, y) in [(50.0, 30.0), (67.32, 60.0), (32.68, 60.0)] {
+        cr.arc(x, y, 10.5, 0.0, TAU);
+        cr.fill()?;
+    }
     Ok(())
 }
 
@@ -118,13 +184,14 @@ fn draw(cr: &cairo::Context, ink: &gdk::RGBA, accent: &gdk::RGBA) -> Result<(), 
 mod tests {
     use super::*;
 
-    /// The mark drawn at 64×64, as ARGB pixels.
-    fn drawn() -> cairo::ImageSurface {
-        let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, 64, 64).unwrap();
+    const INK: gdk::RGBA = gdk::RGBA::new(0.804, 0.839, 0.957, 1.0);
+    const TEAL: gdk::RGBA = gdk::RGBA::new(0.58, 0.886, 0.835, 1.0);
+
+    /// The mark drawn `side` pixels square, as ARGB pixels.
+    fn drawn(side: i32, small: bool) -> cairo::ImageSurface {
+        let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, side, side).unwrap();
         let cr = cairo::Context::new(&surface).unwrap();
-        let white = gdk::RGBA::new(1.0, 1.0, 1.0, 1.0);
-        let teal = gdk::RGBA::new(0.58, 0.886, 0.835, 1.0);
-        draw(&cr, &white, &teal).unwrap();
+        draw(&cr, f64::from(side), small, &INK, &TEAL).unwrap();
         drop(cr);
         surface
     }
@@ -136,39 +203,64 @@ mod tests {
         u32::from_ne_bytes(data[y * stride + x * 4..][..4].try_into().unwrap()).to_be_bytes()[0]
     }
 
+    // Drawn at 100 px, the full mark's units are pixels.
+
     #[test]
     fn the_reel_is_solid_between_its_holes() {
-        assert_eq!(alpha(&mut drawn(), 24, 30), 255);
+        assert_eq!(alpha(&mut drawn(100, false), 50, 75), 255);
     }
 
     #[test]
     fn the_reels_holes_are_cut_out() {
-        assert_eq!(alpha(&mut drawn(), 31, 21), 0);
+        assert_eq!(alpha(&mut drawn(100, false), 50, 32), 0);
     }
 
-    /// Writes the mark at 256 px to the path in SPOOLFRAME_LOGO_PNG, to
-    /// look at; run with `--ignored`.
+    #[test]
+    fn the_play_mark_is_cut_out() {
+        assert_eq!(alpha(&mut drawn(100, false), 50, 50), 0);
+    }
+
+    #[test]
+    fn the_frame_has_its_corners() {
+        assert_eq!(alpha(&mut drawn(100, false), 10, 20), 255);
+    }
+
+    // Drawn at 76 px, the small mark's units are pixels, 12 off.
+
+    #[test]
+    fn the_small_reel_has_three_holes_cut_out() {
+        let mut small = drawn(76, true);
+        assert_eq!(
+            [(38, 18), (55, 48), (21, 48)].map(|(x, y)| alpha(&mut small, x, y)),
+            [0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn the_small_reel_is_solid_between_its_holes() {
+        assert_eq!(alpha(&mut drawn(76, true), 38, 50), 255);
+    }
+
+    /// Writes the full mark at 256 px and the small one at 32 px, on the
+    /// design's ground, to the path in SPOOLFRAME_LOGO_PNG, to look at;
+    /// run with `--ignored`.
     #[test]
     #[ignore = "writes a picture to look at"]
     fn the_mark_can_be_looked_at() {
         let path = std::env::var("SPOOLFRAME_LOGO_PNG").expect("set SPOOLFRAME_LOGO_PNG");
-        let mut surface = cairo::ImageSurface::create(cairo::Format::ARgb32, 256, 256).unwrap();
+        let mut surface = cairo::ImageSurface::create(cairo::Format::ARgb32, 320, 256).unwrap();
         {
             let cr = cairo::Context::new(&surface).unwrap();
-            cr.set_source_rgb(0.094, 0.094, 0.145);
+            cr.set_source_rgb(0.118, 0.118, 0.18);
             cr.paint().unwrap();
-            cr.push_group();
-            cr.scale(4.0, 4.0);
-            let white = gdk::RGBA::new(0.804, 0.839, 0.957, 1.0);
-            let teal = gdk::RGBA::new(0.58, 0.886, 0.835, 1.0);
-            draw(&cr, &white, &teal).unwrap();
-            cr.pop_group_to_source().unwrap();
-            cr.paint().unwrap();
+            draw(&cr, 256.0, false, &INK, &TEAL).unwrap();
+            cr.translate(272.0, 112.0);
+            draw(&cr, 32.0, true, &INK, &TEAL).unwrap();
         }
         let stride = surface.stride() as usize;
         let bytes = gtk::glib::Bytes::from(&*surface.data().unwrap());
         let texture = gdk::MemoryTexture::new(
-            256,
+            320,
             256,
             gdk::MemoryFormat::B8g8r8a8Premultiplied,
             &bytes,

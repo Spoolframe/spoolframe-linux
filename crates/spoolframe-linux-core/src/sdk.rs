@@ -24,8 +24,9 @@ use tokio::sync::watch;
 
 use crate::backend::{
     ArtworkSize, BackendError, BoxFuture, ChosenTracks, Chunk, Client, ConnectionState, DeviceInfo,
-    DeviceSignInRequest, HomeScreen, PlaybackHandle, PlaybackPlan, PlaybackStart, Profile,
-    Selection, Server, ServerKey, Session,
+    DeviceSignIn, DeviceSignInRequest, HomeScreen, PersonId, PlaybackHandle, PlaybackPlan,
+    PlaybackStart, Previews, Profile, SearchRequest, SearchResults, Selection, Server, ServerKey,
+    Session,
 };
 use crate::storage::Storage;
 
@@ -47,6 +48,11 @@ pub fn backend_error(error: sdk::SdkError) -> BackendError {
         E::InvalidInput(why) => BackendError::InvalidInput(why),
         E::PlaybackRestarted { epoch } => BackendError::PlaybackRestarted { epoch },
         E::SubtitleNotReady { done_percent } => BackendError::SubtitleNotReady(done_percent),
+        E::NotSetUp => BackendError::NotSetUp,
+        E::PreviewsNotReady { done_percent } => BackendError::PreviewsNotReady(done_percent),
+        E::NoPreviews => BackendError::NoPreviews,
+        E::SignInDenied => BackendError::SignInDenied,
+        E::SignInExpired => BackendError::SignInExpired,
         E::PlaybackFailed(why) => BackendError::Other(format!("the conversion failed: {why}")),
         // The server's own "unavailable" (Plex or a media mount down)
         // arrives as a server error with its message.
@@ -138,6 +144,26 @@ where
     F: Future<Output = Result<T, sdk::SdkError>> + Send + 'static,
 {
     match handle.spawn(call).await {
+        Ok(result) => result.map_err(backend_error),
+        Err(e) => Err(BackendError::Other(format!("the call did not finish: {e}"))),
+    }
+}
+
+/// [`on_runtime`] for a call that stops when its future is dropped: a
+/// wait the UI gives up on must not go on asking the server.
+async fn on_runtime_until_dropped<T, F>(handle: &Handle, call: F) -> Result<T, BackendError>
+where
+    T: Send + 'static,
+    F: Future<Output = Result<T, sdk::SdkError>> + Send + 'static,
+{
+    struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+    impl<T> Drop for AbortOnDrop<T> {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let mut task = AbortOnDrop(handle.spawn(call));
+    match (&mut task.0).await {
         Ok(result) => result.map_err(backend_error),
         Err(e) => Err(BackendError::Other(format!("the call did not finish: {e}"))),
     }
@@ -295,6 +321,45 @@ impl Client for SdkClient {
         })
     }
 
+    fn begin_device_sign_in<'a>(
+        &'a self,
+        key: &'a ServerKey,
+    ) -> BoxFuture<'a, Result<DeviceSignIn, BackendError>> {
+        Box::pin(async move {
+            let (client, id) = (self.client.clone(), key.0.clone());
+            let begun = on_runtime(&self.handle, async move {
+                client.begin_device_sign_in(&id).await
+            })
+            .await?;
+            Ok(DeviceSignIn {
+                server: key.clone(),
+                display_code: begun.display_code.clone(),
+                web_url: begun.web_url.clone(),
+                expires_in: begun.expires_in,
+                request: Arc::new(begun),
+            })
+        })
+    }
+
+    fn await_device_sign_in<'a>(
+        &'a self,
+        sign_in: &'a DeviceSignIn,
+    ) -> BoxFuture<'a, Result<Profile, BackendError>> {
+        Box::pin(async move {
+            let begun = sign_in
+                .request
+                .downcast_ref::<sdk::DeviceSignIn>()
+                .ok_or_else(|| BackendError::Other("a sign-in begun elsewhere".into()))?
+                .clone();
+            let client = self.client.clone();
+            let session = on_runtime_until_dropped(&self.handle, async move {
+                client.await_device_sign_in(&begun).await
+            })
+            .await?;
+            Ok(self.remember(&session))
+        })
+    }
+
     fn session(&self, profile: &Profile) -> Result<Arc<dyn Session>, BackendError> {
         let key = (profile.server.clone(), profile.username.clone());
         let session = self
@@ -403,11 +468,24 @@ impl Session for SdkSession {
 
     fn search<'a>(
         &'a self,
-        query: &'a str,
+        request: &'a SearchRequest,
+    ) -> BoxFuture<'a, Result<SearchResults, BackendError>> {
+        let request = request.clone();
+        Box::pin(self.call(move |s| async move { s.search(request).await }))
+    }
+
+    fn person_items<'a>(
+        &'a self,
+        person: &'a PersonId,
+        offset: u32,
         limit: u32,
-    ) -> BoxFuture<'a, Result<Vec<Item>, BackendError>> {
-        let query = query.to_owned();
-        Box::pin(self.call(move |s| async move { s.search(&query, limit).await }))
+    ) -> BoxFuture<'a, Result<(Vec<Item>, u32), BackendError>> {
+        let person = person.clone();
+        Box::pin(self.call(move |s| async move {
+            s.person_items(&person, offset, limit)
+                .await
+                .map(|page| (page.items, page.total))
+        }))
     }
 
     fn tracks<'a>(&'a self, id: &'a MediaId) -> BoxFuture<'a, Result<MediaTracks, BackendError>> {
@@ -515,6 +593,15 @@ impl Session for SdkSession {
     ) -> BoxFuture<'a, Result<Vec<u8>, BackendError>> {
         let id = id.clone();
         Box::pin(self.call(move |s| async move { s.artwork(&id, size).await }))
+    }
+
+    fn web_url(&self) -> Option<String> {
+        self.session.web_url()
+    }
+
+    fn previews<'a>(&'a self, id: &'a MediaId) -> BoxFuture<'a, Result<Previews, BackendError>> {
+        let id = id.clone();
+        Box::pin(self.call(move |s| async move { s.previews(&id).await }))
     }
 
     fn update_progress<'a>(
@@ -635,6 +722,36 @@ impl Session for SdkSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn previews_not_ready_or_none_keep_their_meaning() {
+        assert_eq!(
+            [
+                backend_error(sdk::SdkError::PreviewsNotReady { done_percent: 40 }),
+                backend_error(sdk::SdkError::NoPreviews)
+            ],
+            [BackendError::PreviewsNotReady(40), BackendError::NoPreviews]
+        );
+    }
+
+    #[test]
+    fn a_server_not_set_up_keeps_its_meaning() {
+        assert_eq!(
+            backend_error(sdk::SdkError::NotSetUp),
+            BackendError::NotSetUp
+        );
+    }
+
+    #[test]
+    fn a_refused_or_expired_device_sign_in_keeps_its_meaning() {
+        assert_eq!(
+            [
+                backend_error(sdk::SdkError::SignInDenied),
+                backend_error(sdk::SdkError::SignInExpired)
+            ],
+            [BackendError::SignInDenied, BackendError::SignInExpired]
+        );
+    }
 
     #[test]
     fn wrong_credentials_keep_their_meaning() {

@@ -39,6 +39,11 @@ pub struct Signed {
     pub display_name: String,
 }
 
+/// The web UI's profile page, where a Plex account is linked.
+fn profile_url(web: &str) -> String {
+    format!("{}/profile", web.trim_end_matches('/'))
+}
+
 /// A code typed (any case, with or without the dash) or a pasted
 /// `spoolframe://approve?…` link, as a code to look up; or what is wrong
 /// with it.
@@ -152,7 +157,8 @@ pub fn page(signed: Signed, dialog: &adw::PreferencesDialog) -> adw::Preferences
         .title("Sign in another device")
         .description("A TV or another device shows a code when it asks to sign in as you.")
         .build();
-    let approve = adw::ButtonRow::builder().title("Approve a Device…").build();
+    // The name the web page and the other clients use for it.
+    let approve = adw::ButtonRow::builder().title("Sign In a Device…").build();
     {
         let view = Rc::downgrade(&view);
         approve.connect_activated(move |_| {
@@ -163,6 +169,39 @@ pub fn page(signed: Signed, dialog: &adw::PreferencesDialog) -> adw::Preferences
     }
     others.add(&approve);
     page.add(&others);
+    // Linking a Plex account is the web UI's (P3-12): the row opens it,
+    // when the server has a web address a browser can reach.
+    if let Some(web) = view.session.web_url() {
+        let plex = adw::PreferencesGroup::builder()
+            .title("Plex")
+            .description("Sign in with Plex, and choose which libraries keep watch state in sync.")
+            .build();
+        let row = adw::ActionRow::builder()
+            .title("Plex Account")
+            .subtitle("Opens your profile in the web UI")
+            .activatable(true)
+            .build();
+        row.add_suffix(&gtk::Image::from_icon_name(crate::icons::RIGHT));
+        let url = profile_url(&web);
+        let page_ = page.downgrade();
+        row.connect_activated(move |_| {
+            let window = page_
+                .upgrade()
+                .and_then(|p| p.root())
+                .and_downcast::<gtk::Window>();
+            gtk::UriLauncher::new(&url).launch(
+                window.as_ref(),
+                None::<&gtk::gio::Cancellable>,
+                |result| {
+                    if let Err(e) = result {
+                        tracing::warn!(error = %e, "cannot open the browser");
+                    }
+                },
+            );
+        });
+        plex.add(&row);
+        page.add(&plex);
+    }
     view.load();
     // The page owns its view.
     page.connect_destroy(move |_| {
@@ -338,7 +377,7 @@ impl View {
         };
         let entry = adw::EntryRow::builder().title("Code or link").build();
         let alert = alert(
-            "Approve a Device",
+            "Sign in a device",
             "Enter the code the device shows, such as BCDF-GHJK, or paste its link.",
             "Continue",
         );
@@ -467,6 +506,20 @@ fn boxed(rows: &[&adw::PasswordEntryRow]) -> gtk::ListBox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_plex_account_is_on_the_web_profile_page() {
+        assert_eq!(
+            [
+                profile_url("https://media.example.org"),
+                profile_url("https://media.example.org/")
+            ],
+            [
+                "https://media.example.org/profile",
+                "https://media.example.org/profile"
+            ]
+        );
+    }
 
     #[test]
     fn a_device_used_hours_ago_was_used_today() {
