@@ -700,6 +700,15 @@ impl Playback {
         self.moved_to(to);
     }
 
+    /// Whether a subtitle shows, and whether it came as a file from the
+    /// server (an external one, or one read as text) rather than a stream.
+    pub fn subtitle_shown(&self) -> (bool, bool) {
+        let from_file = self
+            .now()
+            .is_some_and(|c| c.subtitle_file.borrow().is_some());
+        (self.subtitles_on.get(), from_file)
+    }
+
     /// How the server plays the current item, once it has said.
     pub fn plan(&self) -> Option<PlaybackPlan> {
         self.now()?.plan.borrow().clone()

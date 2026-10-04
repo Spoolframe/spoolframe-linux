@@ -7,12 +7,16 @@ use std::rc::Rc;
 use gtk::prelude::*;
 use spoolframe_linux_core::backend::ArtworkSize;
 use spoolframe_linux_core::format;
-use spoolframe_types::{Artwork, ArtworkKind, Item, MediaId, PlaybackState};
+use spoolframe_types::{
+    Album, Artist, Artwork, ArtworkKind, Episode, Item, MediaId, PlaybackState, Season, Show, Track,
+};
 
 use crate::artwork::Art;
 
 const LANDSCAPE: (i32, i32) = (300, 169);
 const PORTRAIT: (i32, i32) = (140, 210);
+/// Albums and artists: square, as their covers are.
+const ALBUM: (i32, i32) = (160, 160);
 
 /// What a card does when clicked: open the item's page.
 pub type Open = Rc<dyn Fn(Item)>;
@@ -79,6 +83,7 @@ pub fn row(title: &str, cards: impl IntoIterator<Item = gtk::Widget>) -> gtk::Bo
         .spacing(16)
         .halign(gtk::Align::Start)
         .build();
+    lift_room(&cards_box);
     for card in cards {
         cards_box.append(&card);
     }
@@ -89,8 +94,38 @@ pub fn row(title: &str, cards: impl IntoIterator<Item = gtk::Widget>) -> gtk::Bo
         .build();
     wheel_scrolls_row(&scroller);
 
-    let back = row_button(crate::icons::BACK, "Scroll back", &scroller, -1.0);
-    let forward = row_button(crate::icons::RIGHT, "Scroll forward", &scroller, 1.0);
+    let (back, forward) = scroll_buttons(&scroller);
+
+    let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    header.append(&heading(title));
+    header.append(&back);
+    header.append(&forward);
+
+    // The heading's gap, less the room above the cards.
+    let section = gtk::Box::new(gtk::Orientation::Vertical, 14 - LIFT_ABOVE);
+    section.append(&header);
+    section.append(&scroller);
+    section
+}
+
+/// How far a card rises on hover, with a margin, and how far its shadow
+/// falls: a scrolled row clips its cards to itself, and without the room
+/// a lifted card lost its top edge (and its rounded corners) and its
+/// shadow.
+pub const LIFT_ABOVE: i32 = 8;
+pub const LIFT_BELOW: i32 = 20;
+
+/// Room inside a scrolled row for its cards to lift and cast a shadow.
+pub fn lift_room(cards: &impl IsA<gtk::Widget>) {
+    cards.set_margin_top(LIFT_ABOVE);
+    cards.set_margin_bottom(LIFT_BELOW);
+}
+
+/// ‹ and › for a row that scrolls sideways: shown only while it
+/// overflows, each greyed out at its end.
+pub fn scroll_buttons(scroller: &gtk::ScrolledWindow) -> (gtk::Button, gtk::Button) {
+    let back = row_button(crate::icons::BACK, "Scroll back", scroller, -1.0);
+    let forward = row_button(crate::icons::RIGHT, "Scroll forward", scroller, 1.0);
     let adjustment = scroller.hadjustment();
     let update = {
         let (back, forward) = (back.clone(), forward.clone());
@@ -112,15 +147,7 @@ pub fn row(title: &str, cards: impl IntoIterator<Item = gtk::Widget>) -> gtk::Bo
     adjustment.connect_changed(update.clone());
     adjustment.connect_value_changed(update);
 
-    let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    header.append(&heading(title));
-    header.append(&back);
-    header.append(&forward);
-
-    let section = gtk::Box::new(gtk::Orientation::Vertical, 14);
-    section.append(&header);
-    section.append(&scroller);
-    section
+    (back, forward)
 }
 
 /// A ‹ or › button that scrolls the row by most of what is visible, so the
@@ -147,7 +174,7 @@ fn row_button(icon: &str, label: &str, row: &gtk::ScrolledWindow, direction: f64
 /// page it scrolls the page, as the user asked. A wheel turns only up and
 /// down, so its turns move the row along; sideways scrolling (a touchpad,
 /// a tilting wheel) moves it as ever.
-fn wheel_scrolls_row(row: &gtk::ScrolledWindow) {
+pub fn wheel_scrolls_row(row: &gtk::ScrolledWindow) {
     let controller = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
     controller.set_propagation_phase(gtk::PropagationPhase::Capture);
     let row_widget = row.clone();
@@ -201,7 +228,9 @@ fn heading(title: &str) -> gtk::Label {
 /// is left.
 pub fn continue_card(item: &Item, cards: &Cards) -> gtk::Widget {
     let facts = Facts::of(item);
-    let tile = tile(item.id(), &facts.title, "landscape", LANDSCAPE);
+    // An episode's tile shows its show; the caption says which episode.
+    let on_tile = facts.parent.clone().unwrap_or_else(|| facts.title.clone());
+    let tile = tile(item.id(), &on_tile, "landscape", LANDSCAPE);
     cards.art(
         &tile,
         facts.artwork,
@@ -222,49 +251,39 @@ pub fn continue_card(item: &Item, cards: &Cards) -> gtk::Widget {
     }
 
     let caption = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    caption.append(
-        &gtk::Label::builder()
-            .label(facts.caption())
-            .xalign(0.0)
-            .hexpand(true)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
-            .css_classes(["heading"])
-            .build(),
-    );
+    let title = caption_label(&facts.caption(), &["card-caption"]);
+    title.set_hexpand(true);
+    caption.append(&title);
     if let (Some(length), Some(position)) = (facts.length, facts.position()) {
         caption.append(
             &gtk::Label::builder()
                 .label(format::remaining(length, position))
-                .css_classes(["dim-label", "caption"])
+                .css_classes(["dim-label", "small-text"])
                 .build(),
         );
     }
-    // An episode under its show's name: which one, and its title.
     let below = gtk::Box::new(gtk::Orientation::Vertical, 2);
     below.append(&caption);
-    if let (Some(_), Some(episode)) = (&facts.parent, &facts.episode) {
-        below.append(
-            &gtk::Label::builder()
-                .label(episode)
-                .xalign(0.0)
-                .ellipsize(gtk::pango::EllipsizeMode::End)
-                .css_classes(["dim-label", "caption"])
-                .build(),
-        );
-    }
     let card = card(item, &tile, &below, LANDSCAPE.0, &cards.open);
     card.add_css_class("continue-card");
     if let (Some(set_watched), Some(hide)) = (&cards.set_watched, &cards.hide) {
-        card_menu(&card, item, set_watched, hide);
+        card_menu(&card, item, set_watched, hide, &cards.open);
     }
     card
 }
 
-/// A 2:3 poster card: the title on the tile, a badge when watched, and the
-/// title and year below.
+/// A poster card: the title on the tile, a badge when watched, and the
+/// title and year below. 2:3 for films and shows, square for albums and
+/// artists.
 pub fn poster_card(item: &Item, cards: &Cards) -> gtk::Widget {
     let facts = Facts::of(item);
-    let tile = tile(item.id(), &facts.title, "portrait", PORTRAIT);
+    let music = matches!(item, Item::Album(_) | Item::Artist(_) | Item::Track(_));
+    let (shape, size) = if music {
+        ("album", ALBUM)
+    } else {
+        ("portrait", PORTRAIT)
+    };
+    let tile = tile(item.id(), &facts.title, shape, size);
     cards.art(
         &tile,
         facts.artwork,
@@ -274,6 +293,7 @@ pub fn poster_card(item: &Item, cards: &Cards) -> gtk::Widget {
     if facts.playback.is_some_and(|p| p.watched) {
         let badge = gtk::Image::builder()
             .icon_name(crate::icons::CHECK)
+            .pixel_size(12)
             .halign(gtk::Align::End)
             .valign(gtk::Align::Start)
             .margin_top(8)
@@ -285,31 +305,30 @@ pub fn poster_card(item: &Item, cards: &Cards) -> gtk::Widget {
     }
 
     let caption = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    caption.append(
-        &gtk::Label::builder()
-            .label(&facts.title)
-            .xalign(0.0)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
-            .css_classes(["heading"])
-            .build(),
-    );
+    caption.append(&caption_label(&facts.title, &["heading"]));
     if let Some(detail) = &facts.detail {
-        caption.append(
-            &gtk::Label::builder()
-                .label(detail)
-                .xalign(0.0)
-                .css_classes(["dim-label", "caption"])
-                .build(),
-        );
+        caption.append(&caption_label(detail, &["dim-label", "caption"]));
     }
-    let card = card(item, &tile, &caption, PORTRAIT.0, &cards.open);
-    let music = matches!(item, Item::Album(_) | Item::Artist(_) | Item::Track(_));
+    let card = card(item, &tile, &caption, size.0, &cards.open);
     if music && let Some(enqueue) = &cards.enqueue {
         let (item, enqueue) = (item.clone(), enqueue.clone());
         let popover = menu_popover(vec![enqueue_entries(move |at| enqueue(item.clone(), at))]);
         context_menu(&card, &popover);
     }
     card
+}
+
+/// A line under a tile, cut short to the tile's width: a label asks for
+/// its whole text's width otherwise, and a long title widened the card
+/// and stretched its picture.
+pub fn caption_label(text: &str, classes: &[&str]) -> gtk::Label {
+    gtk::Label::builder()
+        .label(text)
+        .xalign(0.0)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .max_width_chars(1)
+        .css_classes(classes)
+        .build()
 }
 
 /// A poster-sized blank for an item whose page has not loaded yet.
@@ -340,6 +359,7 @@ pub(crate) fn card(
     let button = gtk::Button::builder()
         .child(&body)
         .width_request(width)
+        .halign(gtk::Align::Start)
         .valign(gtk::Align::Start)
         // Every card lifts on hover: Continue watching, posters in rows
         // and in library grids alike.
@@ -357,6 +377,7 @@ fn card_menu(
     item: &Item,
     set_watched: &Rc<dyn Fn(MediaId, bool)>,
     hide: &Rc<dyn Fn(Item)>,
+    open: &Open,
 ) {
     let watch = |label, icon, watched| {
         let (id, set_watched) = (item.id().clone(), set_watched.clone());
@@ -373,19 +394,21 @@ fn card_menu(
             )
         }
     };
-    let popover = menu_popover(vec![
-        vec![
-            watch("Mark as watched", crate::icons::WATCHED, true),
-            watch("Reset watch progress", crate::icons::BACK_10, false),
-        ],
-        vec![remove],
-    ]);
+    let mut groups = vec![vec![
+        watch("Mark as watched", crate::icons::WATCHED, true),
+        watch("Reset watch progress", crate::icons::BACK_10, false),
+    ]];
+    if let Item::Episode(episode) = item {
+        groups.push(go_to_entries(episode, open));
+    }
+    groups.push(vec![remove]);
+    let popover = menu_popover(groups);
     context_menu(card, &popover);
 }
 
 /// One row of a menu built by [`menu_popover`].
 pub struct MenuEntry {
-    pub label: &'static str,
+    pub label: String,
     pub icon: &'static str,
     /// Drawn in red.
     pub destructive: bool,
@@ -393,14 +416,104 @@ pub struct MenuEntry {
 }
 
 impl MenuEntry {
-    pub fn new(label: &'static str, icon: &'static str, run: impl Fn() + 'static) -> Self {
+    pub fn new(label: impl Into<String>, icon: &'static str, run: impl Fn() + 'static) -> Self {
         Self {
-            label,
+            label: label.into(),
             icon,
             destructive: false,
             run: Rc::new(run),
         }
     }
+}
+
+/// An episode's show, as an item to open: its page loads the rest.
+pub fn show_of(episode: &Episode) -> Item {
+    Item::Show(Show {
+        id: episode.show_id.clone(),
+        title: episode.show_title.clone().unwrap_or_default(),
+        year: None,
+        summary: None,
+        artwork: Vec::new(),
+    })
+}
+
+/// An episode's season, as an item to open: the show's page, on its tab.
+pub fn season_of(episode: &Episode) -> Item {
+    Item::Season(Season {
+        id: episode.season_id.clone(),
+        show_id: episode.show_id.clone(),
+        show_title: episode.show_title.clone(),
+        season: episode.season,
+        title: season_name(episode.season),
+        artwork: Vec::new(),
+    })
+}
+
+/// "Season 2", or "Specials" for season 0.
+pub fn season_name(season: u32) -> String {
+    match season {
+        0 => "Specials".to_owned(),
+        n => format!("Season {n}"),
+    }
+}
+
+/// "Go to show" and "Go to Season N", for an episode's menu anywhere but
+/// its own show's page.
+pub fn go_to_entries(episode: &Episode, open: &Open) -> Vec<MenuEntry> {
+    let (show, season) = (show_of(episode), season_of(episode));
+    let (open_show, open_season) = (open.clone(), open.clone());
+    vec![
+        MenuEntry::new("Go to show", crate::icons::SHOWS, move || {
+            open_show(show.clone())
+        }),
+        MenuEntry::new(
+            format!("Go to {}", season_name(episode.season)),
+            crate::icons::SEASON,
+            move || open_season(season.clone()),
+        ),
+    ]
+}
+
+/// A track's artist, as an item to open: their page loads the rest.
+pub fn artist_of(track: &Track) -> Item {
+    Item::Artist(Artist {
+        id: track.artist_id.clone(),
+        name: String::new(),
+        summary: None,
+        artwork: Vec::new(),
+    })
+}
+
+/// A track's album, as an item to open: its page loads the rest.
+pub fn album_of(track: &Track) -> Item {
+    Item::Album(Album {
+        id: track.album_id.clone(),
+        artist_id: track.artist_id.clone(),
+        artist_name: None,
+        title: String::new(),
+        year: None,
+        artwork: Vec::new(),
+    })
+}
+
+/// "Go to artist", and "Go to album" unless on the album's own page.
+pub fn track_go_to_entries(track: &Track, open: &Open, with_album: bool) -> Vec<MenuEntry> {
+    let artist = artist_of(track);
+    let open_artist = open.clone();
+    let mut entries = vec![MenuEntry::new(
+        "Go to artist",
+        crate::icons::ARTIST,
+        move || open_artist(artist.clone()),
+    )];
+    if with_album {
+        let (album, open_album) = (album_of(track), open.clone());
+        entries.push(MenuEntry::new(
+            "Go to album",
+            crate::icons::ALBUM,
+            move || open_album(album.clone()),
+        ));
+    }
+    entries
 }
 
 /// "Play next" and "Add to queue", calling `run` with where.
@@ -444,7 +557,7 @@ pub fn menu_popover(groups: Vec<Vec<MenuEntry>>) -> gtk::Popover {
                 .child(
                     &adw::ButtonContent::builder()
                         .icon_name(entry.icon)
-                        .label(entry.label)
+                        .label(&entry.label)
                         .halign(gtk::Align::Start)
                         .build(),
                 )
@@ -539,11 +652,13 @@ pub fn tile(id: &MediaId, title: &str, shape: &str, (width, height): (i32, i32))
         .xalign(0.0)
         .halign(gtk::Align::Start)
         .valign(gtk::Align::End)
-        .margin_start(14)
-        .margin_end(14)
-        .margin_bottom(16)
         .css_classes(["tile-title"])
         .build();
+    // The title's inset: 14 px on wide tiles, 12 on posters and squares.
+    let inset = if shape == "landscape" { 14 } else { 12 };
+    label.set_margin_start(inset);
+    label.set_margin_end(inset);
+    label.set_margin_bottom(inset);
     let overlay = gtk::Overlay::builder()
         .child(&background)
         .css_classes([shape])

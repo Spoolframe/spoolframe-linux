@@ -1,20 +1,46 @@
 //! The Spoolframe mark and wordmark, from the "Spoolframe Logo" design: a
 //! film reel with five holes and a play cut-out, inside four frame
-//! corners; under 40 px, a three-hole reel alone. Cairo draws the design's
-//! paths, so no SVG loader is needed at run time. The corners take the
-//! text colour and the reel the theme's accent, like the rest of the
-//! chrome; the holes and the play mark are cut out, so what is behind
-//! shows through in any theme, as the design's ground colour does.
+//! corners, at every size the app draws it. The three-hole reel is only
+//! the desktop icon's, at sizes where the corners no longer read. Cairo
+//! draws the design's paths, so no SVG loader is needed at run time.
+//!
+//! The logo's colours are its own, never the palette's accent: Mocha's
+//! on a dark scheme, Latte's on a light one. The holes and the play mark
+//! are cut out, so what is behind shows through, as the design's ground
+//! colour does.
 
 use std::f64::consts::{FRAC_PI_2, PI, TAU};
 
 use gtk::prelude::*;
 use gtk::{cairo, gdk};
-use spoolframe_linux_core::paths;
 
-/// Under this many pixels the mark is the small reel: the corners and
-/// five holes no longer read.
-const SMALL: i32 = 40;
+/// The logo's two colours: the corners and "spool", the reel and "frame".
+#[derive(Debug, Clone, Copy)]
+pub struct Colours {
+    pub ink: gdk::RGBA,
+    pub reel: gdk::RGBA,
+}
+
+/// On a dark ground: ink `#cdd6f4`, reel `#94e2d5`.
+pub const MOCHA: Colours = Colours {
+    ink: gdk::RGBA::new(0.804, 0.839, 0.957, 1.0),
+    reel: gdk::RGBA::new(0.58, 0.886, 0.835, 1.0),
+};
+
+/// On a light ground: ink `#4c4f69`, reel `#179299`.
+pub const LATTE: Colours = Colours {
+    ink: gdk::RGBA::new(0.298, 0.31, 0.412, 1.0),
+    reel: gdk::RGBA::new(0.09, 0.573, 0.6, 1.0),
+};
+
+/// The colours for the scheme drawn now.
+fn colours() -> Colours {
+    if adw::StyleManager::default().is_dark() {
+        MOCHA
+    } else {
+        LATTE
+    }
+}
 
 /// The mark at `size` pixels square.
 pub fn mark(size: i32) -> gtk::DrawingArea {
@@ -24,16 +50,19 @@ pub fn mark(size: i32) -> gtk::DrawingArea {
         .valign(gtk::Align::Center)
         .halign(gtk::Align::Center)
         .build();
-    area.set_draw_func(|area, cr, width, height| {
-        let side = width.min(height);
-        let ink = area.color();
-        let accent = accent(area);
-        let _ = draw(cr, f64::from(side), side < SMALL, &ink, &accent);
+    area.set_draw_func(|_, cr, width, height| {
+        let _ = paint(cr, f64::from(width.min(height)), colours());
+    });
+    let weak = area.downgrade();
+    adw::StyleManager::default().connect_dark_notify(move |_| {
+        if let Some(area) = weak.upgrade() {
+            area.queue_draw();
+        }
     });
     area
 }
 
-/// "spool" in the text colour and "frame" in the accent: the design's
+/// "spool" in the logo's ink and "frame" in its reel colour: the design's
 /// wordmark, beside the mark. Window titles keep plain "Spoolframe".
 pub fn wordmark() -> gtk::Box {
     let wordmark = gtk::Box::builder()
@@ -41,49 +70,38 @@ pub fn wordmark() -> gtk::Box {
         .valign(gtk::Align::Center)
         .build();
     wordmark.update_property(&[gtk::accessible::Property::Label("Spoolframe")]);
-    for (part, classes) in [("spool", &[][..]), ("frame", &["wordmark-accent"][..])] {
-        wordmark.append(
-            &gtk::Label::builder()
-                .label(part)
-                .css_classes(classes)
-                .accessible_role(gtk::AccessibleRole::Presentation)
-                .build(),
-        );
-    }
+    let spool = part("spool");
+    let frame = part("frame");
+    wordmark.append(&spool);
+    wordmark.append(&frame);
+    // Coloured by Pango, not the stylesheet: its colours follow the
+    // palette, and the logo's do not.
+    let colour = move || {
+        let Colours { ink, reel } = colours();
+        spool.set_attributes(Some(&foreground(&ink)));
+        frame.set_attributes(Some(&foreground(&reel)));
+    };
+    colour();
+    adw::StyleManager::default().connect_dark_notify(move |_| colour());
     wordmark
 }
 
-/// Makes the wordmark's face, Bricolage Grotesque (`fonts/`, OFL), known
-/// to the app: carried, not hoped to be installed. Pango takes a font only
-/// by path, so it is written to the cache directory first. Call once,
-/// after GTK is up; without it the wordmark falls back to the UI face.
-pub fn register_font() {
-    const FONT: &[u8] = include_bytes!("../fonts/BricolageGrotesque.ttf");
-    let Some(dir) = paths::cache_dir() else {
-        return tracing::warn!("no cache directory; the wordmark uses the UI face");
-    };
-    let path = dir.join("BricolageGrotesque.ttf");
-    let written = std::fs::metadata(&path).is_ok_and(|m| m.len() == FONT.len() as u64);
-    if !written
-        && let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, FONT))
-    {
-        return tracing::warn!(error = %e, path = %path.display(), "cannot write the wordmark's font");
-    }
-    let Some(fonts) = gtk::Label::new(None).pango_context().font_map() else {
-        return;
-    };
-    if let Err(e) = fonts.add_font_file(&path) {
-        tracing::warn!(error = %e, path = %path.display(), "cannot load the wordmark's font");
-    }
+fn part(text: &str) -> gtk::Label {
+    gtk::Label::builder()
+        .label(text)
+        .accessible_role(gtk::AccessibleRole::Presentation)
+        .build()
 }
 
-/// The theme's accent; libadwaita names it `accent_color`.
-#[allow(deprecated)]
-fn accent(widget: &gtk::DrawingArea) -> gdk::RGBA {
-    widget
-        .style_context()
-        .lookup_color("accent_color")
-        .unwrap_or(gdk::RGBA::new(0.58, 0.886, 0.835, 1.0))
+fn foreground(colour: &gdk::RGBA) -> pango::AttrList {
+    let attributes = pango::AttrList::new();
+    let channel = |c: f32| (c * 65535.0).round() as u16;
+    attributes.insert(pango::AttrColor::new_foreground(
+        channel(colour.red()),
+        channel(colour.green()),
+        channel(colour.blue()),
+    ));
+    attributes
 }
 
 fn set(cr: &cairo::Context, colour: &gdk::RGBA) {
@@ -95,23 +113,15 @@ fn set(cr: &cairo::Context, colour: &gdk::RGBA) {
     );
 }
 
-/// Draws the mark `side` pixels square, `small` or full. In a group of
-/// its own, so cutting the holes clears only the mark.
-fn draw(
-    cr: &cairo::Context,
-    side: f64,
-    small: bool,
-    ink: &gdk::RGBA,
-    accent: &gdk::RGBA,
-) -> Result<(), cairo::Error> {
+/// Paints the mark `side` pixels square at the current point. In a group
+/// of its own, so cutting the holes clears only the mark.
+pub fn paint(cr: &cairo::Context, side: f64, colours: Colours) -> Result<(), cairo::Error> {
+    cr.save()?;
     cr.push_group();
-    if small {
-        small_reel(cr, side, accent)?;
-    } else {
-        full(cr, side, ink, accent)?;
-    }
+    full(cr, side, &colours.ink, &colours.reel)?;
     cr.pop_group_to_source()?;
-    cr.paint()
+    cr.paint()?;
+    cr.restore()
 }
 
 /// The full mark, in the design's 100-unit square.
@@ -164,34 +174,15 @@ fn full(
     cr.stroke()
 }
 
-/// The small mark: the reel with three holes, in the design's square
-/// from 12 to 88.
-fn small_reel(cr: &cairo::Context, side: f64, accent: &gdk::RGBA) -> Result<(), cairo::Error> {
-    cr.scale(side / 76.0, side / 76.0);
-    cr.translate(-12.0, -12.0);
-    set(cr, accent);
-    cr.arc(50.0, 50.0, 38.0, 0.0, TAU);
-    cr.fill()?;
-    cr.set_operator(cairo::Operator::Clear);
-    for (x, y) in [(50.0, 30.0), (67.32, 60.0), (32.68, 60.0)] {
-        cr.arc(x, y, 10.5, 0.0, TAU);
-        cr.fill()?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const INK: gdk::RGBA = gdk::RGBA::new(0.804, 0.839, 0.957, 1.0);
-    const TEAL: gdk::RGBA = gdk::RGBA::new(0.58, 0.886, 0.835, 1.0);
-
     /// The mark drawn `side` pixels square, as ARGB pixels.
-    fn drawn(side: i32, small: bool) -> cairo::ImageSurface {
+    fn drawn(side: i32) -> cairo::ImageSurface {
         let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, side, side).unwrap();
         let cr = cairo::Context::new(&surface).unwrap();
-        draw(&cr, f64::from(side), small, &INK, &TEAL).unwrap();
+        paint(&cr, f64::from(side), MOCHA).unwrap();
         drop(cr);
         surface
     }
@@ -207,42 +198,33 @@ mod tests {
 
     #[test]
     fn the_reel_is_solid_between_its_holes() {
-        assert_eq!(alpha(&mut drawn(100, false), 50, 75), 255);
+        assert_eq!(alpha(&mut drawn(100), 50, 75), 255);
     }
 
     #[test]
     fn the_reels_holes_are_cut_out() {
-        assert_eq!(alpha(&mut drawn(100, false), 50, 32), 0);
+        assert_eq!(alpha(&mut drawn(100), 50, 32), 0);
     }
 
     #[test]
     fn the_play_mark_is_cut_out() {
-        assert_eq!(alpha(&mut drawn(100, false), 50, 50), 0);
+        assert_eq!(alpha(&mut drawn(100), 50, 50), 0);
     }
 
     #[test]
     fn the_frame_has_its_corners() {
-        assert_eq!(alpha(&mut drawn(100, false), 10, 20), 255);
-    }
-
-    // Drawn at 76 px, the small mark's units are pixels, 12 off.
-
-    #[test]
-    fn the_small_reel_has_three_holes_cut_out() {
-        let mut small = drawn(76, true);
-        assert_eq!(
-            [(38, 18), (55, 48), (21, 48)].map(|(x, y)| alpha(&mut small, x, y)),
-            [0, 0, 0]
-        );
+        assert_eq!(alpha(&mut drawn(100), 10, 20), 255);
     }
 
     #[test]
-    fn the_small_reel_is_solid_between_its_holes() {
-        assert_eq!(alpha(&mut drawn(76, true), 38, 50), 255);
+    fn a_sidebar_sized_mark_still_has_its_corners() {
+        // The 26 px mark beside the wordmark is the full one: a corner's
+        // stroke at (10, 20) of 100 lands on (2, 5).
+        assert!(alpha(&mut drawn(26), 2, 5) > 0);
     }
 
-    /// Writes the full mark at 256 px and the small one at 32 px, on the
-    /// design's ground, to the path in SPOOLFRAME_LOGO_PNG, to look at;
+    /// Writes the mark at 256 px and at 26 px, on the design's ground, to
+    /// the path in SPOOLFRAME_LOGO_PNG, to look at;
     /// run with `--ignored`.
     #[test]
     #[ignore = "writes a picture to look at"]
@@ -253,9 +235,9 @@ mod tests {
             let cr = cairo::Context::new(&surface).unwrap();
             cr.set_source_rgb(0.118, 0.118, 0.18);
             cr.paint().unwrap();
-            draw(&cr, 256.0, false, &INK, &TEAL).unwrap();
-            cr.translate(272.0, 112.0);
-            draw(&cr, 32.0, true, &INK, &TEAL).unwrap();
+            paint(&cr, 256.0, MOCHA).unwrap();
+            cr.translate(276.0, 115.0);
+            paint(&cr, 26.0, MOCHA).unwrap();
         }
         let stride = surface.stride() as usize;
         let bytes = gtk::glib::Bytes::from(&*surface.data().unwrap());

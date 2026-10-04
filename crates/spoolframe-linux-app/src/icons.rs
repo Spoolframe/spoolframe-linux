@@ -55,6 +55,7 @@ pub const SERVER: &str = "lucide-server-symbolic";
 pub const ERROR: &str = "lucide-circle-alert-symbolic";
 pub const APPEARANCE: &str = "lucide-palette-symbolic";
 pub const VERIFIED: &str = "lucide-shield-check-symbolic";
+pub const UNVERIFIED: &str = "lucide-shield-alert-symbolic";
 pub const REMOVE: &str = "lucide-circle-x-symbolic";
 // The play queue (P1-23).
 pub const PLAY_NEXT: &str = "lucide-list-start-symbolic";
@@ -64,6 +65,28 @@ pub const DRAG: &str = "lucide-grip-vertical-symbolic";
 // The profile PIN (P2-08).
 pub const LOCK: &str = "lucide-lock-symbolic";
 pub const DELETE: &str = "lucide-delete-symbolic";
+// Signing in and setting up.
+pub const BROWSER: &str = "lucide-globe-symbolic";
+pub const PHONE: &str = "lucide-smartphone-symbolic";
+pub const EXPIRED: &str = "lucide-clock-symbolic";
+pub const SET_UP: &str = "lucide-settings-symbolic";
+// Preferences' pages.
+pub const PLAYBACK_PAGE: &str = "lucide-monitor-play-symbolic";
+pub const PROFILE: &str = "lucide-user-round-symbolic";
+pub const SIGN_OUT: &str = "lucide-log-out-symbolic";
+pub const FORGET: &str = "lucide-trash-2-symbolic";
+pub const LINK: &str = "lucide-link-symbolic";
+pub const EXTERNAL: &str = "lucide-external-link-symbolic";
+pub const LAPTOP: &str = "lucide-laptop-symbolic";
+pub const MONITOR: &str = "lucide-monitor-symbolic";
+pub const SEASON: &str = "lucide-layers-2-symbolic";
+// Search.
+pub const HISTORY: &str = "lucide-history-symbolic";
+pub const CLEAR_RECENT: &str = "lucide-list-x-symbolic";
+pub const CALENDAR: &str = "lucide-calendar-symbolic";
+// Going to a track's artist and album.
+pub const ARTIST: &str = "lucide-mic-vocal-symbolic";
+pub const ALBUM: &str = "lucide-disc-3-symbolic";
 
 /// Every name above, for the tests.
 #[cfg(test)]
@@ -101,6 +124,7 @@ const ALL: &[&str] = &[
     ERROR,
     APPEARANCE,
     VERIFIED,
+    UNVERIFIED,
     REMOVE,
     PLAY_NEXT,
     ADD_TO_QUEUE,
@@ -108,6 +132,24 @@ const ALL: &[&str] = &[
     DRAG,
     LOCK,
     DELETE,
+    BROWSER,
+    PHONE,
+    EXPIRED,
+    SET_UP,
+    PLAYBACK_PAGE,
+    PROFILE,
+    SIGN_OUT,
+    FORGET,
+    LINK,
+    EXTERNAL,
+    LAPTOP,
+    MONITOR,
+    SEASON,
+    HISTORY,
+    CLEAR_RECENT,
+    CALENDAR,
+    ARTIST,
+    ALBUM,
 ];
 
 #[cfg(test)]

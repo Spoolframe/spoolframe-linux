@@ -31,6 +31,7 @@ pub fn page(playback: &Rc<Playback>, actions: Actions, cards: &Cards) -> adw::Na
         collapse.connect_clicked(move |_| minimize());
     }
     let header = adw::HeaderBar::builder()
+        .css_classes(["item-header"])
         .title_widget(&adw::WindowTitle::new("Now Playing", ""))
         .show_back_button(false)
         .build();
@@ -59,15 +60,13 @@ pub fn page(playback: &Rc<Playback>, actions: Actions, cards: &Cards) -> adw::Na
     let cover_slot = adw::Bin::builder().halign(gtk::Align::Center).build();
 
     let title = gtk::Label::builder()
-        .css_classes(["title-1"])
+        .css_classes(["title-1", "now-title"])
         .wrap(true)
         .justify(gtk::Justification::Center)
         .build();
-    let artist = gtk::Label::builder()
-        .css_classes(["heading", "accent"])
-        .build();
+    let artist = gtk::Label::builder().css_classes(["now-artist"]).build();
     let detail = gtk::Label::builder()
-        .css_classes(["dim-label", "caption"])
+        .css_classes(["dim-label", "small-text"])
         .build();
     let titles = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -143,7 +142,16 @@ pub fn page(playback: &Rc<Playback>, actions: Actions, cards: &Cards) -> adw::Na
         current.append(widget);
     }
 
-    let queue = Queue::new(playback);
+    // Going to a track's artist or album leaves Now Playing for the bar,
+    // so the page shows.
+    let go_to: crate::views::Open = {
+        let (minimize, open) = (actions.minimize.clone(), cards.open.clone());
+        Rc::new(move |item| {
+            minimize();
+            open(item);
+        })
+    };
+    let queue = Queue::new(playback, go_to);
     let body = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     body.append(&current);
     body.append(&queue.aside);
@@ -448,10 +456,12 @@ struct Queue {
     list: gtk::ListBox,
     rows: Rc<RefCell<Vec<Row>>>,
     playback: std::rc::Weak<Playback>,
+    /// Opens a track's artist or album, leaving Now Playing.
+    go_to: crate::views::Open,
 }
 
 impl Queue {
-    fn new(playback: &Rc<Playback>) -> Self {
+    fn new(playback: &Rc<Playback>, go_to: crate::views::Open) -> Self {
         let heading = gtk::Label::builder()
             .label("Up next")
             .xalign(0.0)
@@ -518,6 +528,7 @@ impl Queue {
             list,
             rows,
             playback: Rc::downgrade(playback),
+            go_to,
         }
     }
 
@@ -546,52 +557,88 @@ impl Queue {
             self.heading("Next in queue", &mut rows);
             for (index, queued) in up_next.queued.iter().enumerate() {
                 let artist = artist_of(queued.album.as_ref());
-                let remove = gtk::Button::builder()
-                    .icon_name(crate::icons::CLOSE)
-                    .tooltip_text("Remove from queue")
-                    .valign(gtk::Align::Center)
-                    .css_classes(["flat", "circular"])
-                    .build();
-                {
-                    let (weak, id) = (self.playback.clone(), queued.id);
-                    remove.connect_clicked(move |_| {
-                        if let Some(playback) = weak.upgrade() {
-                            playback.remove_queued(id);
-                        }
-                    });
-                }
                 let handle = gtk::Image::builder()
                     .icon_name(crate::icons::DRAG)
                     .tooltip_text("Drag to reorder")
                     .css_classes(["dim-label"])
                     .build();
-                let content = queue_row(&handle, &queued.item, &artist, Some(&remove));
+                let content = queue_row(&handle, &queued.item, &artist, None);
                 let row = self.append(&content, Row::Queued(queued.id), &mut rows);
                 self.reorderable(&row, queued.id, index);
+                // Right-click: play it now, or take it out of the queue.
+                let id = queued.id;
+                let mut groups =
+                    vec![vec![self.entry("Play now", crate::icons::PLAY, move |p| {
+                        p.play_queued(id)
+                    })]];
+                if let Item::Track(track) = &queued.item {
+                    groups.push(crate::views::track_go_to_entries(track, &self.go_to, true));
+                }
+                groups.push(vec![crate::views::MenuEntry {
+                    destructive: true,
+                    ..self.entry("Remove from queue", crate::icons::REMOVE, move |p| {
+                        p.remove_queued(id)
+                    })
+                }]);
+                let menu = crate::views::menu_popover(groups);
+                crate::views::context_menu(row.upcast_ref(), &menu);
             }
         }
 
         if !up_next.context.is_empty() {
             let heading = match &up_next.from {
-                Some(album) => format!("Next from: {}", album.title),
+                Some(album) => format!("Next from {}", album.title),
                 None => "Next".to_owned(),
             };
             self.heading(&heading, &mut rows);
             let artist = artist_of(up_next.from.as_ref());
             for (n, (pos, item)) in up_next.context.iter().enumerate() {
                 let content = queue_row(&number(&(n + 1).to_string()), item, &artist, None);
-                self.append(&content, Row::Context(*pos), &mut rows);
+                let row = self.append(&content, Row::Context(*pos), &mut rows);
+                // Right-click: play it now, or queue it next.
+                let mut groups = Vec::new();
+                {
+                    let (pos, item, from) = (*pos, item.clone(), up_next.from.clone());
+                    groups.push(vec![
+                        self.entry("Play now", crate::icons::PLAY, move |p| {
+                            p.play_context_at(pos)
+                        }),
+                        self.entry("Play next", crate::icons::PLAY_NEXT, move |p| {
+                            p.play_next(vec![item.clone()], from.clone())
+                        }),
+                    ]);
+                }
+                if let Item::Track(track) = item {
+                    groups.push(crate::views::track_go_to_entries(track, &self.go_to, true));
+                }
+                let menu = crate::views::menu_popover(groups);
+                crate::views::context_menu(row.upcast_ref(), &menu);
             }
         }
         self.rows.replace(rows);
     }
 
+    /// A menu row that runs `run` on the playback, while there is one.
+    fn entry(
+        &self,
+        label: &'static str,
+        icon: &'static str,
+        run: impl Fn(&Rc<Playback>) + 'static,
+    ) -> crate::views::MenuEntry {
+        let weak = self.playback.clone();
+        crate::views::MenuEntry::new(label, icon, move || {
+            if let Some(playback) = weak.upgrade() {
+                run(&playback);
+            }
+        })
+    }
+
     fn heading(&self, text: &str, rows: &mut Vec<Row>) {
         let label = gtk::Label::builder()
-            .label(text)
+            .label(text.to_uppercase())
             .xalign(0.0)
             .margin_top(10)
-            .css_classes(["heading", "dim-label"])
+            .css_classes(["queue-heading", "dim-label"])
             .build();
         let row = self.append(&label, Row::Inert, rows);
         row.set_activatable(false);

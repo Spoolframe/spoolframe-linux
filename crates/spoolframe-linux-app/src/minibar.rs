@@ -98,7 +98,6 @@ impl MiniBar {
         let open = gtk::Button::builder()
             .child(&what)
             .tooltip_text("Back to the full player")
-            .width_request(340)
             // Never focused, so Space (play/pause) cannot press it.
             .focusable(false)
             .css_classes(["flat", "mini-open"])
@@ -139,15 +138,20 @@ impl MiniBar {
         let length = mono("0:00");
         for label in [&position, &length] {
             label.add_css_class("dim-label");
-            label.add_css_class("caption");
+            label.add_css_class("mini-time");
         }
-        let seek_row = gtk::Box::builder().spacing(10).width_request(520).build();
+        // The seek takes what the window leaves, at least 200 px: fixed
+        // widths here (340 + 520 + 300) kept the window from going below
+        // 1192 px while anything played.
+        scale.set_hexpand(true);
+        scale.set_width_request(200);
+        let seek_row = gtk::Box::builder().spacing(10).hexpand(true).build();
         seek_row.append(&position);
         seek_row.append(&scale);
         seek_row.append(&length);
         let centre = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
-            .spacing(2)
+            .spacing(6)
             .valign(gtk::Align::Center)
             .build();
         centre.append(&video_transport);
@@ -169,7 +173,7 @@ impl MiniBar {
             .icon_name(crate::icons::CLOSE)
             .tooltip_text("Stop")
             .valign(gtk::Align::Center)
-            .css_classes(["flat"])
+            .css_classes(["flat", "dim-label", "mini-button"])
             .build();
         stop_button.connect_clicked(move |_| stop());
         // Video's audio and subtitles, built when its streams are known.
@@ -178,12 +182,11 @@ impl MiniBar {
             .icon_name(crate::icons::TRACKS)
             .tooltip_text("Audio and subtitles")
             .valign(gtk::Align::Center)
-            .css_classes(["flat"])
+            .css_classes(["flat", "dim-label", "mini-button"])
             .visible(false)
             .build();
         let end = gtk::Box::builder()
             .spacing(6)
-            .width_request(300)
             .halign(gtk::Align::End)
             .valign(gtk::Align::Center)
             .build();
@@ -194,7 +197,15 @@ impl MiniBar {
 
         let bar = gtk::CenterBox::builder()
             .start_widget(&open)
-            .center_widget(&centre)
+            // Grows with the window up to the board's 520 px.
+            .center_widget(
+                &adw::Clamp::builder()
+                    .maximum_size(520)
+                    .tightening_threshold(520)
+                    .hexpand(true)
+                    .child(&centre)
+                    .build(),
+            )
             .end_widget(&end)
             .css_classes(["mini-bar"])
             .build();

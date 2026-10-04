@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- @license lucide-static v1.50.0 - ISC -->
+
+<svg
+   class="lucide lucide-loader-circle"
+   width="24"
+   height="24"
+   viewBox="0 0 24 24"
+   version="1.1"
+   id="svg1"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <defs
+     id="defs1" />
+  <path
+     style="baseline-shift:baseline;display:inline;overflow:visible;vector-effect:none;fill:#000000;stroke:none;stroke-linecap:butt;stroke-linejoin:miter;enable-background:accumulate;stop-color:#000000;stop-opacity:1;opacity:1"
+     d="M 11.751953,1.9785156 C 8.5168856,2.0357923 5.6684774,3.7004228 3.9101563,6.1210937 1.565728,9.348655 1.097598,14.005672 3.9101563,17.876953 6.7227145,21.748235 11.295744,22.74196 15.089844,21.509766 18.883944,20.277572 21.999765,16.786357 22,12 a 1,1 0 0 0 -1,-1 1,1 0 0 0 -1,1 c -1.93e-4,3.933419 -2.462251,6.611985 -5.527344,7.607422 -3.065092,0.995437 -6.6322071,0.274882 -8.9433591,-2.90625 C 3.2181449,13.52004 3.6333795,9.904285 5.5273437,7.296875 7.421308,4.689465 10.731731,3.1751985 14.472656,4.390625 A 1,1 0 0 0 15.732422,3.7480469 1,1 0 0 0 15.089844,2.4882813 C 13.951813,2.1185352 12.830309,1.9594234 11.751953,1.9785156 Z"
+     id="path1" />
+</svg>

@@ -1,6 +1,7 @@
 mod app;
 mod artwork;
 mod capabilities;
+mod fonts;
 mod icons;
 mod library;
 mod logo;
@@ -78,7 +79,7 @@ fn main() -> Result<()> {
     icons::register();
     // The app's icon, from the resource when not installed.
     gtk::Window::set_default_icon_name(APP_ID);
-    logo::register_font();
+    fonts::register();
 
     // The SDK's runtime: its tasks (discovery, reconnecting) run here for
     // as long as the app does. Kept in scope until the app returns.
@@ -125,6 +126,7 @@ fn open_sdk(runtime: &tokio::runtime::Runtime) -> Result<SdkClient> {
     capabilities.max_bitrate = settings::Settings::load().max_bitrate();
     tracing::debug!(?capabilities, "decoders found");
     let device = sdk::Device {
+        platform: sdk::types::Platform::Linux,
         name: gtk::glib::host_name().to_string(),
         client_name: "spoolframe-linux".into(),
         client_version: env!("CARGO_PKG_VERSION").into(),

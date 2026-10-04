@@ -11,7 +11,8 @@ use crate::remote_sign_in::Via;
 pub type Choose<T> = Rc<dyn Fn(T)>;
 
 /// "Choose a server": servers on this network, then saved ones, and a way
-/// to add one the network does not show.
+/// to add one the network does not show. Laid out as the design's server
+/// list: a card of nearby servers, each saved one a card of its own.
 pub fn servers(
     servers: &[Server],
     choose: &Choose<Server>,
@@ -23,23 +24,25 @@ pub fn servers(
     column.append(&title("Choose a server"));
     column.append(&dim("Servers on this network appear here on their own."));
 
-    let nearby = adw::PreferencesGroup::builder()
-        .title("On this network")
-        .build();
-    let saved = adw::PreferencesGroup::builder().title("Saved").build();
-    for server in servers {
-        if server.on_network {
-            nearby.add(&server_row(server, choose, verify, true));
+    let nearby: Vec<&Server> = servers.iter().filter(|s| s.on_network).collect();
+    if !nearby.is_empty() {
+        let list = boxed_list();
+        for server in nearby {
+            list.append(&nearby_row(server, choose));
         }
-        if server.pinned {
-            saved.add(&server_row(server, choose, verify, false));
-        }
+        column.append(&section("On this network", &[list]));
     }
-    if servers.iter().any(|s| s.on_network) {
-        column.append(&nearby);
-    }
-    if servers.iter().any(|s| s.pinned) {
-        column.append(&saved);
+    let saved: Vec<gtk::ListBox> = servers
+        .iter()
+        .filter(|s| s.pinned)
+        .map(|server| {
+            let list = boxed_list();
+            list.append(&saved_row(server, choose, verify));
+            list
+        })
+        .collect();
+    if !saved.is_empty() {
+        column.append(&section("Saved", &saved));
     }
     let add_button = gtk::Button::builder()
         .label("Add a server by its key…")
@@ -49,67 +52,180 @@ pub fn servers(
     let add = add.clone();
     add_button.connect_clicked(move |_| add());
     column.append(&add_button);
-    column.append(&dim(
-        "Before a server is saved you check its code against the server's own, \
-         so a stranger on the network cannot pass for it.",
-    ));
+    let footer = dim(
+        "Iroh proves each server's key when you connect. If a saved server's key \
+         changes, Spoolframe asks before trusting the new one.",
+    );
+    footer.add_css_class("caption");
+    column.append(&footer);
     page(&adw::HeaderBar::new(), &clamp)
 }
 
-fn server_row(
-    server: &Server,
-    choose: &Choose<Server>,
-    verify: &Choose<Server>,
-    nearby: bool,
-) -> adw::ActionRow {
-    let subtitle = if nearby {
-        let address = server
-            .addresses
-            .first()
-            .map_or("no address", String::as_str);
-        format!("{address} · key {}", server.key.short())
-    } else {
-        server.fingerprint.clone()
-    };
-    let row = adw::ActionRow::builder()
-        .title(&server.name)
-        .subtitle(subtitle)
-        .activatable(true)
+/// A small upper-case heading over its cards.
+fn section(heading: &str, cards: &[gtk::ListBox]) -> gtk::Box {
+    let section = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(10)
         .build();
-    row.add_prefix(&gtk::Image::from_icon_name(crate::icons::SERVER));
-    if nearby {
-        let connect = gtk::Button::builder()
-            .label("Connect")
-            .valign(gtk::Align::Center)
-            .css_classes(if server.pinned {
-                vec!["suggested-action", "pill"]
-            } else {
-                vec!["pill"]
-            })
-            .build();
-        let (server_, choose_) = (server.clone(), choose.clone());
-        connect.connect_clicked(move |_| choose_(server_.clone()));
-        row.add_suffix(&connect);
-        row.set_activatable_widget(Some(&connect));
-    } else {
-        if server.verified {
-            row.add_suffix(&badge("Verified", "pinned-badge"));
-        } else {
-            // Skipped at the check: say so, and offer it again.
-            row.add_suffix(&badge("Not verified", "unverified-badge"));
-            let check = gtk::Button::builder()
-                .label("Verify now")
-                .valign(gtk::Align::Center)
-                .css_classes(["flat"])
-                .build();
-            let (server, verify) = (server.clone(), verify.clone());
-            check.connect_clicked(move |_| verify(server.clone()));
-            row.add_suffix(&check);
-        }
-        let (server, choose) = (server.clone(), choose.clone());
-        row.connect_activated(move |_| choose(server.clone()));
+    section.append(
+        &gtk::Label::builder()
+            .label(heading.to_uppercase())
+            .halign(gtk::Align::Start)
+            .css_classes(["caption-heading", "dim-label", "server-section"])
+            .build(),
+    );
+    for card in cards {
+        section.append(card);
     }
+    section
+}
+
+fn boxed_list() -> gtk::ListBox {
+    gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .css_classes(["boxed-list"])
+        .build()
+}
+
+/// The icon in its rounded tile, at the start of a row.
+fn tile(icon: &str, tint: &str) -> gtk::Image {
+    gtk::Image::builder()
+        .icon_name(icon)
+        .width_request(36)
+        .height_request(36)
+        .valign(gtk::Align::Center)
+        .css_classes(["server-tile", tint])
+        .build()
+}
+
+/// A server on this network: its address and fingerprint, and Connect,
+/// filled for one whose fingerprint the user has checked.
+fn nearby_row(server: &Server, choose: &Choose<Server>) -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .use_markup(false)
+        .css_classes(["server-row", "server-code"])
+        .build();
+    row.set_title(&server.name);
+    row.set_subtitle(&nearby_subtitle(server));
+    row.add_prefix(&tile(
+        crate::icons::SERVER,
+        if server.verified {
+            "tint-accent"
+        } else {
+            "tint-other"
+        },
+    ));
+    let connect = gtk::Button::builder()
+        .label("Connect")
+        .valign(gtk::Align::Center)
+        .css_classes(if server.verified {
+            vec!["server-connect", "suggested-action"]
+        } else {
+            vec!["server-connect", "outlined"]
+        })
+        .build();
+    // Which of two servers with one name is the saved one.
+    if server.pinned {
+        row.add_suffix(&badge("Saved", "saved-badge"));
+    }
+    let (server, choose) = (server.clone(), choose.clone());
+    connect.connect_clicked(move |_| choose(server.clone()));
+    row.add_suffix(&connect);
+    row.set_activatable_widget(Some(&connect));
     row
+}
+
+/// A saved server: whether its fingerprint was checked, and if not, a way
+/// to check it now.
+fn saved_row(server: &Server, choose: &Choose<Server>, verify: &Choose<Server>) -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .use_markup(false)
+        .activatable(true)
+        .css_classes(["server-row", "server-code"])
+        .build();
+    row.set_title(&server.name);
+    // Its fingerprint, as the nearby rows show it: with two servers of
+    // one name, that is how to tell which was saved. Whether it was
+    // checked is the badge's to say.
+    row.set_subtitle(&match server.last_connected_at {
+        Some(at) => format!("{}  ·  connected {}", nearby_subtitle(server), day(at)),
+        None => nearby_subtitle(server),
+    });
+    if server.verified {
+        row.add_prefix(&tile(crate::icons::VERIFIED, "tint-success"));
+        let verified = badge("Verified", "pinned-badge");
+        if let Some(at) = server.verified_at {
+            verified.set_tooltip_text(Some(&format!("Fingerprint checked {}", day(at))));
+        }
+        row.add_suffix(&verified);
+    } else {
+        row.add_prefix(&tile(crate::icons::UNVERIFIED, "tint-warning"));
+        let check = gtk::Button::builder()
+            .label("Verify now")
+            .valign(gtk::Align::Center)
+            .css_classes(["server-connect", "outlined"])
+            .build();
+        let (server, verify) = (server.clone(), verify.clone());
+        check.connect_clicked(move |_| verify(server.clone()));
+        row.add_suffix(&check);
+    }
+    let (server, choose) = (server.clone(), choose.clone());
+    row.connect_activated(move |_| choose(server.clone()));
+    row
+}
+
+/// A nearby server is told apart by its fingerprint, the code its log
+/// prints at start (`server identity … fingerprint=…`), never its raw key,
+/// after the host it answered from.
+fn nearby_subtitle(server: &Server) -> String {
+    match server.addresses.first() {
+        Some(address) => format!("{}  ·  {}", host(address), server.fingerprint),
+        None => server.fingerprint.clone(),
+    }
+}
+
+/// `10.10.0.6:7440` as `10.10.0.6`, `[fe80::1]:7430` as `fe80::1`.
+pub(crate) fn host(address: &str) -> &str {
+    match address.rsplit_once(':') {
+        Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => {
+            host.trim_start_matches('[').trim_end_matches(']')
+        }
+        _ => address,
+    }
+}
+
+/// When something happened, as a person says it: "today", "yesterday",
+/// "12 Sep", or "12 Sep 2025" in another year, in local time.
+pub fn day(at: std::time::SystemTime) -> String {
+    let secs = at
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    match (
+        gtk::glib::DateTime::from_unix_local(secs),
+        gtk::glib::DateTime::now_local(),
+    ) {
+        (Ok(at), Ok(now)) => day_between(&at, &now),
+        _ => String::new(),
+    }
+}
+
+fn day_between(at: &gtk::glib::DateTime, now: &gtk::glib::DateTime) -> String {
+    let date = |t: &gtk::glib::DateTime| (t.year(), t.day_of_year());
+    let yesterday = now.add_days(-1).ok();
+    if date(at) == date(now) {
+        "today".to_owned()
+    } else if yesterday.as_ref().map(date) == Some(date(at)) {
+        "yesterday".to_owned()
+    } else {
+        let pattern = if at.year() == now.year() {
+            "%-d %b"
+        } else {
+            "%-d %b %Y"
+        };
+        at.format(pattern)
+            .map(|s| s.to_string())
+            .unwrap_or_default()
+    }
 }
 
 fn badge(text: &str, class: &str) -> gtk::Label {
@@ -149,7 +265,7 @@ pub fn fingerprint_check(
         .build();
     let heading = gtk::Label::builder()
         .label("Is this your server?")
-        .css_classes(["title-2"])
+        .css_classes(["title-2", "dialog-title"])
         .build();
     let address = server.addresses.first().map(String::as_str);
     let who = gtk::Label::builder()
@@ -182,34 +298,35 @@ pub fn fingerprint_check(
         )
         .wrap(true)
         .justify(gtk::Justification::Center)
-        .css_classes(["dim-label"])
+        .css_classes(["dim-label", "small-text"])
         .build();
-    let full = full_keys(&[("", &server.key.0)]);
-    let matches = gtk::Button::builder()
-        .child(
-            &adw::ButtonContent::builder()
-                .icon_name(crate::icons::CHECK)
-                .label("It matches")
-                .build(),
-        )
-        .hexpand(true)
-        .css_classes(["action", "suggested-action"])
+    let full = full_keys(&[&server.key.0]);
+    let matches = action(
+        "It matches",
+        Some(crate::icons::CHECK),
+        &["suggested-action"],
+    );
+    let skip = action(
+        if verifying { "Not now" } else { "Skip" },
+        None,
+        &["secondary"],
+    );
+    let buttons = gtk::Box::builder()
+        .spacing(10)
+        .homogeneous(true)
+        .margin_start(24)
+        .margin_end(24)
+        .margin_bottom(if verifying { 22 } else { 0 })
         .build();
-    let skip = gtk::Button::builder()
-        .label(if verifying { "Not now" } else { "Skip" })
-        .hexpand(true)
-        .css_classes(["action"])
-        .build();
-    let buttons = gtk::Box::builder().spacing(10).homogeneous(true).build();
     buttons.append(&skip);
     buttons.append(&matches);
-    let body = gtk::Box::builder()
+    let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(14)
-        .margin_top(24)
-        .margin_bottom(22)
-        .margin_start(28)
-        .margin_end(28)
+        .margin_top(26)
+        .margin_bottom(24)
+        .margin_start(30)
+        .margin_end(30)
         .build();
     for widget in [
         icon.upcast_ref::<gtk::Widget>(),
@@ -218,18 +335,21 @@ pub fn fingerprint_check(
         code_box.upcast_ref(),
         how.upcast_ref(),
         full.upcast_ref(),
-        buttons.upcast_ref(),
     ] {
-        body.append(widget);
+        content.append(widget);
     }
+    let body = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .build();
+    body.append(&content);
+    body.append(&buttons);
     if !verifying {
-        body.append(&dim(
-            "Skip saves the server as Not verified. You can verify it later.",
-        ));
+        let note = dim("Skip saves the server as Not verified. You can verify it later.");
+        note.add_css_class("caption");
+        note.set_margin_top(12);
+        note.set_margin_bottom(18);
+        body.append(&note);
     }
-    let toolbar = adw::ToolbarView::new();
-    toolbar.add_top_bar(&adw::HeaderBar::new());
-    toolbar.set_content(Some(&body));
     let dialog = adw::Dialog::builder()
         .title(if verifying {
             "Verify server"
@@ -237,8 +357,8 @@ pub fn fingerprint_check(
             "Add server"
         })
         .content_width(440)
-        .child(&toolbar)
         .build();
+    with_cancel(&dialog, &body);
     for (button, choice) in [(&matches, Check::Matches), (&skip, Check::Skip)] {
         let (decide, dialog) = (decide.clone(), dialog.downgrade());
         button.connect_clicked(move |_| {
@@ -280,7 +400,7 @@ pub fn identity_changed(
                 .label(code(key))
                 .xalign(0.0)
                 .selectable(true)
-                .css_classes(["monospace", class])
+                .css_classes(["monospace", "identity-code", class])
                 .build(),
         );
         column
@@ -291,7 +411,7 @@ pub fn identity_changed(
         .build();
     extra.append(&row("Previously", saved, "dim-label"));
     extra.append(&row("Now", now, "identity-new"));
-    extra.append(&full_keys(&[("Previously ", saved), ("Now ", now)]));
+    extra.append(&full_keys(&[saved, now]));
     extra.append(
         &gtk::Label::builder()
             .use_markup(true)
@@ -301,11 +421,12 @@ pub fn identity_changed(
                  in to this server again.",
             )
             .wrap(true)
-            .xalign(0.0)
+            .justify(gtk::Justification::Center)
             .css_classes(["dim-label", "caption"])
             .build(),
     );
     let dialog = adw::AlertDialog::builder()
+        .content_width(460)
         .heading("Server identity changed")
         .body_use_markup(true)
         .body(format!(
@@ -329,34 +450,96 @@ pub fn identity_changed(
     dialog
 }
 
-/// "Show full key(s)": the hex keys behind the codes, for whoever wants to
-/// compare all of them.
-fn full_keys(keys: &[(&str, &str)]) -> gtk::Expander {
+/// "Show full key(s)": a link that shows the hex keys behind the codes,
+/// for whoever wants to compare all of them, in the codes' order.
+pub(crate) fn full_keys(keys: &[&str]) -> gtk::Box {
     let column = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(4)
         .build();
-    for (label, key) in keys {
+    for key in keys {
         column.append(
             &gtk::Label::builder()
-                .label(format!("{label}{key}"))
+                .label(*key)
                 .wrap(true)
                 .wrap_mode(gtk::pango::WrapMode::Char)
                 .selectable(true)
                 .xalign(0.0)
-                .css_classes(["monospace", "caption", "dim-label"])
+                .css_classes(["monospace", "full-key", "dim-label"])
                 .build(),
         );
     }
-    gtk::Expander::builder()
-        .label(if keys.len() > 1 {
-            "Show full keys"
-        } else {
-            "Show full key"
-        })
-        .child(&column)
+    let revealer = gtk::Revealer::builder().child(&column).build();
+    let (show, hide) = if keys.len() > 1 {
+        ("Show full keys", "Hide full keys")
+    } else {
+        ("Show full key", "Hide full key")
+    };
+    let link = gtk::Button::builder()
+        .label(show)
         .halign(gtk::Align::Center)
-        .build()
+        .css_classes(["flat", "text-link"])
+        .build();
+    {
+        let revealer = revealer.clone();
+        link.connect_clicked(move |link| {
+            let open = !revealer.reveals_child();
+            revealer.set_reveal_child(open);
+            link.set_label(if open { hide } else { show });
+        });
+    }
+    let block = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(6)
+        .build();
+    block.append(&link);
+    block.append(&revealer);
+    block
+}
+
+/// Puts `body` in `dialog` under the boards' dialog header: "Cancel" at
+/// the start, the title in the middle, no close button.
+pub fn with_cancel(dialog: &adw::Dialog, body: &impl IsA<gtk::Widget>) {
+    let cancel = gtk::Button::builder()
+        .label("Cancel")
+        .css_classes(["flat", "dialog-cancel"])
+        .build();
+    let weak = dialog.downgrade();
+    cancel.connect_clicked(move |_| {
+        if let Some(dialog) = weak.upgrade() {
+            dialog.close();
+        }
+    });
+    let header = adw::HeaderBar::builder()
+        .show_end_title_buttons(false)
+        .show_start_title_buttons(false)
+        .css_classes(["dialog-header"])
+        .build();
+    header.pack_start(&cancel);
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&header);
+    toolbar.set_content(Some(body));
+    dialog.set_child(Some(&toolbar));
+}
+
+/// A button as the boards draw them: 44 px, 10 px corners, with an icon
+/// when given one.
+fn action(label: &str, icon: Option<&str>, classes: &[&str]) -> gtk::Button {
+    let button = gtk::Button::builder().hexpand(true).build();
+    match icon {
+        Some(icon) => button.set_child(Some(
+            &adw::ButtonContent::builder()
+                .icon_name(icon)
+                .label(label)
+                .build(),
+        )),
+        None => button.set_label(label),
+    }
+    button.add_css_class("action");
+    for class in classes {
+        button.add_css_class(class);
+    }
+    button
 }
 
 fn glib_escape(text: &str) -> String {
@@ -372,12 +555,25 @@ pub fn profiles(
     sign_in: &Rc<dyn Fn()>,
     back: &Rc<dyn Fn()>,
 ) -> gtk::Widget {
-    let header = adw::HeaderBar::builder()
-        .title_widget(&adw::WindowTitle::new(&server.name, "Direct · LAN"))
-        .build();
+    // The server, and how it is reached beside it.
+    let where_ = gtk::Box::builder().spacing(8).build();
+    where_.append(
+        &gtk::Label::builder()
+            .label(&server.name)
+            .css_classes(["title"])
+            .build(),
+    );
+    where_.append(
+        &gtk::Label::builder()
+            .label("Direct · LAN")
+            .valign(gtk::Align::Center)
+            .css_classes(["status-chip"])
+            .build(),
+    );
+    let header = adw::HeaderBar::builder().title_widget(&where_).build();
     let back_button = gtk::Button::builder()
         .icon_name(crate::icons::BACK)
-        .tooltip_text("Choose another server")
+        .tooltip_text("Back to servers")
         .build();
     let back = back.clone();
     back_button.connect_clicked(move |_| back());
@@ -386,7 +582,7 @@ pub fn profiles(
     let tiles = gtk::FlowBox::builder()
         .selection_mode(gtk::SelectionMode::None)
         .halign(gtk::Align::Center)
-        .column_spacing(40)
+        .column_spacing(32)
         .row_spacing(32)
         // As many columns as tiles, up to six: a flow box is as wide as its
         // most columns, and centring a six-column box leaves two tiles on
@@ -394,13 +590,15 @@ pub fn profiles(
         .max_children_per_line((profiles.len() as u32 + 1).min(6))
         .homogeneous(true)
         .build();
-    for profile in profiles {
-        let avatar = adw::Avatar::new(128, Some(&profile.display_name), true);
+    for (i, profile) in profiles.iter().enumerate() {
+        let avatar = adw::Avatar::new(148, Some(&profile.display_name), true);
+        avatar.add_css_class("profile-avatar");
+        avatar.add_css_class(PROFILE_TINTS[i % PROFILE_TINTS.len()]);
         // A locked profile asks for its PIN when chosen (P2-08).
         let detail = gtk::Box::builder()
             .spacing(6)
             .halign(gtk::Align::Center)
-            .css_classes(["dim-label", "caption"])
+            .css_classes(["dim-label", "profile-detail"])
             .build();
         if profile.locked {
             detail.append(&gtk::Image::from_icon_name(crate::icons::LOCK));
@@ -417,9 +615,9 @@ pub fn profiles(
     // its name, which no stylesheet rule reliably undoes.
     let add = gtk::Image::builder()
         .icon_name(crate::icons::ADD)
-        .pixel_size(48)
-        .width_request(128)
-        .height_request(128)
+        .pixel_size(40)
+        .width_request(148)
+        .height_request(148)
         .halign(gtk::Align::Center)
         .css_classes(["add-profile"])
         .build();
@@ -428,7 +626,7 @@ pub fn profiles(
         "Sign in",
         &gtk::Label::builder()
             .label("Another account")
-            .css_classes(["dim-label", "caption"])
+            .css_classes(["dim-label", "profile-detail"])
             .build(),
     );
     let sign_in = sign_in.clone();
@@ -437,7 +635,7 @@ pub fn profiles(
 
     let column = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .spacing(48)
+        .spacing(56)
         .valign(gtk::Align::Center)
         .vexpand(true)
         .margin_top(48)
@@ -448,11 +646,18 @@ pub fn profiles(
     heading.add_css_class("profiles-title");
     column.append(&heading);
     column.append(&tiles);
-    let note = dim("Each profile has its own session on this device.");
+    let note = dim(
+        "Switching profile keeps the same connection. Each profile has its own \
+         session on this device.",
+    );
     note.set_halign(gtk::Align::Center);
+    note.set_max_width_chars(70);
     column.append(&note);
     page(&header, &column)
 }
+
+/// The avatars' fills, in turn, as on the boards: the accent, mauve, peach.
+pub const PROFILE_TINTS: [&str; 3] = ["tint-accent", "tint-purple", "tint-orange"];
 
 fn profile_tile(
     avatar: &impl IsA<gtk::Widget>,
@@ -461,14 +666,13 @@ fn profile_tile(
 ) -> gtk::Button {
     let body = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .spacing(8)
+        .spacing(16)
         .build();
     body.append(avatar);
     body.append(
         &gtk::Label::builder()
             .label(name)
-            .css_classes(["title-4"])
-            .margin_top(8)
+            .css_classes(["profile-name"])
             .build(),
     );
     body.append(detail);
@@ -493,71 +697,66 @@ impl SignIn {
         submit: Rc<dyn Fn(String, String)>,
         elsewhere: Rc<dyn Fn(Via)>,
     ) -> Self {
-        let username = adw::EntryRow::builder().title("Username").build();
-        let password = adw::PasswordEntryRow::builder().title("Password").build();
-        let fields = adw::PreferencesGroup::new();
-        fields.add(&username);
-        fields.add(&password);
+        let username = gtk::Entry::builder().css_classes(["field"]).build();
+        let password = gtk::PasswordEntry::builder()
+            .show_peek_icon(true)
+            .css_classes(["field"])
+            .build();
+        {
+            let password = password.clone();
+            username.connect_activate(move |_| {
+                password.grab_focus();
+            });
+        }
 
         let error = gtk::Label::builder()
             .visible(false)
             .wrap(true)
             .css_classes(["error"])
             .build();
-        let button = gtk::Button::builder()
-            .label("Sign in")
-            .halign(gtk::Align::Center)
-            .css_classes(["suggested-action", "pill"])
-            .build();
+        let button = action("Sign in", None, &["suggested-action"]);
         let send = {
             let (username, password) = (username.clone(), password.clone());
             move || submit(username.text().to_string(), password.text().to_string())
         };
         let send_ = send.clone();
         button.connect_clicked(move |_| send_());
-        password.connect_entry_activated(move |_| send());
+        password.connect_activate(move |_| send());
 
         let body = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
-            .spacing(18)
-            .margin_top(12)
-            .margin_bottom(24)
-            .margin_start(24)
-            .margin_end(24)
+            .spacing(16)
+            .margin_top(24)
+            .margin_bottom(28)
+            .margin_start(28)
+            .margin_end(28)
             .build();
-        body.append(&fields);
+        body.append(&field("Username", &username));
+        body.append(&field("Password", &password));
         body.append(&error);
         body.append(&button);
         // A passkey or a sign-in provider cannot sign in an app; the web
         // sign-in can, for it, in the browser or on a phone.
-        let others = gtk::Box::builder()
-            .spacing(12)
-            .halign(gtk::Align::Center)
-            .build();
-        for (label, via) in [
-            ("Sign in with browser", Via::Browser),
-            ("Sign in with your phone", Via::Phone),
+        body.append(&or_rule());
+        for (label, icon, via) in [
+            ("Sign in with browser", crate::icons::BROWSER, Via::Browser),
+            ("Sign in with your phone", crate::icons::PHONE, Via::Phone),
         ] {
-            let button = gtk::Button::builder()
-                .label(label)
-                .css_classes(["pill"])
-                .build();
+            let button = action(label, Some(icon), &["secondary"]);
             let elsewhere = elsewhere.clone();
             button.connect_clicked(move |_| elsewhere(via));
-            others.append(&button);
+            body.append(&button);
         }
-        body.append(&dim("or, with a passkey"));
-        body.append(&others);
+        let hint = dim("Use a passkey or your sign-in provider in your browser.");
+        hint.add_css_class("caption");
+        body.append(&hint);
 
-        let toolbar = adw::ToolbarView::new();
-        toolbar.add_top_bar(&adw::HeaderBar::new());
-        toolbar.set_content(Some(&body));
         let dialog = adw::Dialog::builder()
             .title(format!("Sign in to {}", server.name))
             .content_width(420)
-            .child(&toolbar)
             .focus_widget(&username)
             .build();
+        with_cancel(&dialog, &body);
         Self {
             dialog,
             error,
@@ -578,6 +777,43 @@ impl SignIn {
         self.error.set_label(reason);
         self.error.set_visible(true);
     }
+}
+
+/// A label over its field, as the boards lay out a form.
+fn field(label: &str, entry: &impl IsA<gtk::Widget>) -> gtk::Box {
+    let column = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(6)
+        .build();
+    column.append(
+        &gtk::Label::builder()
+            .label(label)
+            .xalign(0.0)
+            .css_classes(["field-label"])
+            .build(),
+    );
+    column.append(entry);
+    column
+}
+
+/// "or" between two rules.
+fn or_rule() -> gtk::Box {
+    let row = gtk::Box::builder().spacing(12).build();
+    let rule = || {
+        gtk::Separator::builder()
+            .hexpand(true)
+            .valign(gtk::Align::Center)
+            .build()
+    };
+    row.append(&rule());
+    row.append(
+        &gtk::Label::builder()
+            .label("or")
+            .css_classes(["or-label"])
+            .build(),
+    );
+    row.append(&rule());
+    row
 }
 
 /// The "Add a server" dialog: the server's key, which the first connect
@@ -730,32 +966,34 @@ impl NotSetUp {
             .wrap(true)
             .justify(gtk::Justification::Center)
             .selectable(true)
-            .css_classes(["dim-label", "caption"])
+            .css_classes(["small-text"])
             .build();
-        let other = gtk::Button::builder()
-            .label("Choose another server")
-            .css_classes(["pill"])
-            .build();
+        let other = action("Choose another server", None, &["secondary", "compact"]);
+        other.set_hexpand(false);
         other.connect_clicked(move |_| choose_server());
-        let again = gtk::Button::builder()
-            .label("Try again")
-            .css_classes(["pill", "suggested-action"])
-            .build();
+        let again = action(
+            "Try again",
+            Some(crate::icons::BACK_10),
+            &["suggested-action", "compact"],
+        );
+        again.set_hexpand(false);
         again.connect_clicked(move |_| try_again());
         let buttons = gtk::Box::builder()
             .spacing(10)
             .halign(gtk::Align::Center)
+            .margin_top(8)
             .build();
         buttons.append(&other);
         buttons.append(&again);
         let child = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
-            .spacing(18)
+            .spacing(14)
             .build();
         child.append(&hint);
         child.append(&buttons);
         let status = adw::StatusPage::builder()
-            .icon_name(crate::icons::SERVER)
+            .icon_name(crate::icons::SET_UP)
+            .css_classes(["small-icon", "warning-icon", "not-set-up"])
             .description(
                 "The server is running, but its admin hasn't finished setup in the web UI. \
                  Once they do, you can sign in here.",
@@ -775,11 +1013,16 @@ impl NotSetUp {
         self.title.set_label(&server.name);
         self.status
             .set_title(&format!("{} isn't set up yet", server.name));
+        // The words dimmed, the address not: it is what to type.
         let hint = "If that's you: open the address in the server's log";
         self.hint
-            .set_label(&match admin_example(&server.addresses) {
-                Some(address) => format!("{hint}, for example {address}"),
-                None => format!("{hint}."),
+            .set_markup(&match admin_example(&server.addresses) {
+                Some(address) => format!(
+                    "<span fgalpha=\"55%\">{hint}, for example</span> \
+                     <span font_family=\"JetBrains Mono\">{}</span>",
+                    glib_escape(&address)
+                ),
+                None => format!("<span fgalpha=\"55%\">{hint}.</span>"),
             });
     }
 }
@@ -822,5 +1065,64 @@ mod not_set_up_tests {
     #[test]
     fn with_no_address_there_is_no_example() {
         assert_eq!(admin_example(&[]), None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use spoolframe_linux_core::backend::ServerKey;
+
+    use super::*;
+
+    fn nimble(address: &str) -> Server {
+        Server {
+            key: ServerKey("f5e5a1c0d800".into()),
+            name: "Nimble".into(),
+            addresses: vec![address.into()],
+            pinned: false,
+            fingerprint: "VVWT-BWMQ-SZ8C-6ZDC".into(),
+            verified: false,
+            on_network: true,
+            verified_at: None,
+            last_connected_at: None,
+        }
+    }
+
+    #[test]
+    fn a_nearby_server_shows_its_host_and_fingerprint_not_its_key() {
+        assert_eq!(
+            nearby_subtitle(&nimble("10.10.0.6:7440")),
+            "10.10.0.6  ·  VVWT-BWMQ-SZ8C-6ZDC"
+        );
+    }
+
+    fn local(y: i32, m: i32, d: i32) -> gtk::glib::DateTime {
+        gtk::glib::DateTime::new(&gtk::glib::TimeZone::utc(), y, m, d, 12, 0, 0.0).unwrap()
+    }
+
+    #[test]
+    fn a_day_is_today_yesterday_or_its_date() {
+        let now = local(2026, 10, 4);
+        assert_eq!(
+            [
+                day_between(&local(2026, 10, 4), &now),
+                day_between(&local(2026, 10, 3), &now),
+                day_between(&local(2026, 9, 12), &now),
+                day_between(&local(2025, 9, 12), &now),
+            ],
+            ["today", "yesterday", "12 Sep", "12 Sep 2025"]
+        );
+    }
+
+    #[test]
+    fn an_ipv6_host_loses_its_brackets_and_port() {
+        assert_eq!(host("[fe80::1]:7430"), "fe80::1");
+    }
+
+    #[test]
+    fn a_saved_server_without_an_address_shows_its_fingerprint() {
+        let mut server = nimble("10.10.0.6:7440");
+        server.addresses.clear();
+        assert_eq!(nearby_subtitle(&server), "VVWT-BWMQ-SZ8C-6ZDC");
     }
 }

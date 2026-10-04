@@ -15,6 +15,7 @@ use spoolframe_linux_core::backend::{
     BackendError, ChosenTracks, Client, ConnectionState, HomeScreen, Person, Profile, SearchScope,
     Selection, Server, ServerKey, Session,
 };
+use spoolframe_linux_core::next_episode::next_episode;
 use spoolframe_linux_core::theme::Theme;
 use spoolframe_types::{
     Album, Artist, Item, Library, LibraryKind, MediaId, MediaTracks, Season, Show, TrackPreferences,
@@ -126,6 +127,10 @@ pub struct App {
     /// heard only on a later listing; it is opened once, not on every
     /// change after.
     opened_last_server: bool,
+    /// The item whose page is loading: a second click on it while it loads
+    /// opens nothing more, and the page of an item clicked before it is
+    /// dropped when it arrives, so only the last click opens a page.
+    opening: Option<MediaId>,
 }
 
 /// The sidebar's choice.
@@ -152,6 +157,8 @@ pub struct AppWidgets {
     profile_server: gtk::Label,
     /// Says when the connection is not up.
     banner: adw::Banner,
+    /// The root page's header bar: search puts its field there.
+    root_header: adw::HeaderBar,
     sign_in: Option<start::SignIn>,
     remote_sign_in: Option<Rc<RemoteSignIn>>,
     add_server: Option<start::AddServer>,
@@ -222,6 +229,7 @@ pub enum Msg {
     SetMaxBitrate(Option<u64>),
     /// Skip intros without asking (P2-10).
     SetSkipIntros(bool),
+    SetShowDiagnostics(bool),
     /// Leave the full player and keep playing in the bar.
     MinimizePlayer,
     /// Take an item out of Continue watching (`true`), or put it back
@@ -279,9 +287,15 @@ pub enum Loaded {
         Option<String>,
         Result<MediaTracks, BackendError>,
         Option<ChosenTracks>,
+        Option<Box<Item>>,
     ),
-    Show(Show, Result<Vec<SeasonEpisodes>, BackendError>),
-    Season(Season, Result<Vec<Item>, BackendError>),
+    /// A show, its seasons with their episodes, and the season to open on
+    /// ("Go to season"), if one was asked for.
+    Show(
+        Show,
+        Result<Vec<SeasonEpisodes>, BackendError>,
+        Option<MediaId>,
+    ),
     Artist(Artist, Result<Vec<Item>, BackendError>),
     /// An album, its artist's name and its tracks.
     Album(Album, Result<(String, Vec<Item>), BackendError>),
@@ -308,14 +322,25 @@ impl Loaded {
         self.session_error() == Some(&BackendError::ProfileLocked)
     }
 
+    /// The item an item page's answer is for: what [`App::open_item`] was
+    /// asked to open (a season's show page answers for the season).
+    fn opened(&self) -> Option<&MediaId> {
+        match self {
+            Loaded::Playable(item, ..) => Some(item.id()),
+            Loaded::Show(show, _, open) => Some(open.as_ref().unwrap_or(&show.id)),
+            Loaded::Artist(artist, _) => Some(&artist.id),
+            Loaded::Album(album, _) => Some(&album.id),
+            _ => None,
+        }
+    }
+
     /// The error of an answer that comes from the profile's session.
     fn session_error(&self) -> Option<&BackendError> {
         match self {
             Loaded::Libraries(Err(e))
             | Loaded::Home(Err(e))
             | Loaded::Person(_, Err(e))
-            | Loaded::Show(_, Err(e))
-            | Loaded::Season(_, Err(e))
+            | Loaded::Show(_, Err(e), _)
             | Loaded::Artist(_, Err(e))
             | Loaded::Album(_, Err(e))
             | Loaded::WatchChanged(Err(e))
@@ -358,7 +383,7 @@ impl Component for App {
         theme.apply(settings.theme());
 
         let sidebar = gtk::ListBox::builder()
-            .css_classes(["navigation-sidebar"])
+            .css_classes(["navigation-sidebar", "app-sidebar"])
             .build();
         sidebar.append(&sidebar_row("Home", crate::icons::HOME));
         sidebar.append(&sidebar_row("Search", crate::icons::SEARCH));
@@ -371,6 +396,8 @@ impl Component for App {
                         gtk::Separator::builder()
                             .margin_top(8)
                             .margin_bottom(8)
+                            .margin_start(4)
+                            .margin_end(4)
                             .build()
                     })
                     .as_ref(),
@@ -384,6 +411,7 @@ impl Component for App {
         }
         // Who is watching, at the foot of the sidebar; it switches profile.
         let profile_avatar = adw::Avatar::new(34, None, true);
+        profile_avatar.add_css_class("sidebar-avatar");
         let profile_name = gtk::Label::builder()
             .xalign(0.0)
             .css_classes(["heading"])
@@ -405,11 +433,11 @@ impl Component for App {
         let profile_button = gtk::Button::builder()
             .child(&profile_body)
             .tooltip_text("Switch profile")
-            .margin_top(6)
-            .margin_bottom(6)
-            .margin_start(6)
-            .margin_end(6)
-            .css_classes(["flat"])
+            .css_classes(["flat", "sidebar-profile"])
+            .build();
+        let profile_foot = adw::Bin::builder()
+            .child(&profile_button)
+            .css_classes(["sidebar-foot"])
             .build();
         {
             let sender = sender.clone();
@@ -419,7 +447,11 @@ impl Component for App {
         let brand = gtk::Box::builder().spacing(10).build();
         brand.append(&crate::logo::mark(26));
         brand.append(&crate::logo::wordmark());
-        let sidebar_header = adw::HeaderBar::builder().title_widget(&brand).build();
+        // At the start, not centred, as designed.
+        let sidebar_header = adw::HeaderBar::builder()
+            .title_widget(&adw::Bin::new())
+            .build();
+        sidebar_header.pack_start(&brand);
         let sidebar_toolbar = toolbar(
             &sidebar_header,
             &gtk::ScrolledWindow::builder()
@@ -427,7 +459,7 @@ impl Component for App {
                 .vexpand(true)
                 .build(),
         );
-        sidebar_toolbar.add_bottom_bar(&profile_button);
+        sidebar_toolbar.add_bottom_bar(&profile_foot);
         let sidebar_page = adw::NavigationPage::builder()
             .title("Spoolframe")
             .child(&sidebar_toolbar)
@@ -453,13 +485,16 @@ impl Component for App {
         header.pack_end(&menu_button);
         let content = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
-            .spacing(32)
+            // 32 between rows, less the room each row keeps for a lifted
+            // card's shadow.
+            .spacing(32 - views::LIFT_BELOW)
             .margin_top(28)
             .margin_bottom(28)
             .margin_start(28)
             .margin_end(28)
             .build();
         let banner = adw::Banner::new("");
+        banner.set_use_markup(false);
         let scroller = gtk::ScrolledWindow::builder()
             .child(&content)
             .vexpand(true)
@@ -616,6 +651,7 @@ impl Component for App {
             library_cache: None,
             library: None,
             opened_last_server: false,
+            opening: None,
         };
         model.load_servers(&sender);
         // Discovery hears servers a moment after the client opens, so the
@@ -639,6 +675,7 @@ impl Component for App {
                 profile_name,
                 profile_server,
                 banner,
+                root_header: header.clone(),
                 sign_in: None,
                 remote_sign_in: None,
                 pin_pad: None,
@@ -838,6 +875,7 @@ impl Component for App {
             }
             Msg::Select(ROW_HOME) => {
                 self.select_root(Root::Home);
+                plain_header(widgets);
                 self.library = None;
                 widgets.stack.pop_to_page(&widgets.root_page);
                 self.load_home(&sender);
@@ -854,6 +892,8 @@ impl Component for App {
                 let Some(page) = widgets.search.clone() else {
                     return;
                 };
+                // The field sits in the header bar while search shows.
+                widgets.root_header.set_title_widget(Some(&page.head));
                 widgets.content.append(&page.widget);
                 // Opened from a library: its kind is the scope.
                 match &self.library {
@@ -869,6 +909,7 @@ impl Component for App {
                     return;
                 };
                 self.select_root(Root::Library);
+                plain_header(widgets);
                 self.library = Some(library.clone());
                 widgets.stack.pop_to_page(&widgets.root_page);
                 widgets.root_page.set_title(&library.title);
@@ -933,9 +974,15 @@ impl Component for App {
                             playback.toggle_shuffle();
                         }
                         self.attach_playback(&playback, widgets);
-                        widgets
-                            .window_stack
-                            .push(&player_page(&playback, &sender, &self.cards));
+                        // Video opens the player; music keeps the page it
+                        // was started from, playing in the bar.
+                        if playback.is_video() {
+                            widgets.window_stack.push(&player_page(
+                                &playback,
+                                &sender,
+                                &self.cards,
+                            ));
+                        }
                         self.playback = Some(playback);
                     }
                     Err(e) => {
@@ -1029,6 +1076,7 @@ impl Component for App {
                     playback.set_skip_intros(on);
                 }
             }
+            Msg::SetShowDiagnostics(on) => self.settings.set_show_diagnostics(on),
             Msg::SetMaxBitrate(limit) => {
                 // The server learns it with the device's capabilities, at
                 // the next start.
@@ -1051,6 +1099,14 @@ impl Component for App {
         sender: ComponentSender<Self>,
         root: &Self::Root,
     ) {
+        // A page for an item no longer the one being opened is dropped:
+        // a later click asked for another.
+        if let Some(id) = loaded.opened() {
+            if self.opening.as_ref() != Some(id) {
+                return;
+            }
+            self.opening = None;
+        }
         // The answer is in: the next try may go.
         match &loaded {
             Loaded::SignedIn(_) => self.sign_in_in_flight = false,
@@ -1141,10 +1197,13 @@ impl Component for App {
                 self.load_home(&sender);
                 if hide {
                     let title = views::Facts::of(&item).caption();
+                    // Markup off before the title: a builder sets the title
+                    // first, and "Crime & Punishment" failed to parse.
                     let toast = adw::Toast::builder()
-                        .title(format!("{title} removed from Continue watching"))
+                        .use_markup(false)
                         .button_label("Undo")
                         .build();
+                    toast.set_title(&format!("{title} removed from Continue watching"));
                     let sender = sender.clone();
                     toast.connect_button_clicked(move |_| {
                         sender.input(Msg::HideFromContinue(item.clone(), false))
@@ -1275,8 +1334,12 @@ impl Component for App {
                 ),
             ),
             Loaded::Person(person, Err(e)) => push_error(widgets, &person.name, &e),
-            Loaded::Playable(item, context, tracks, chosen) => {
-                let title = views::Facts::of(&item).title;
+            Loaded::Playable(item, context, tracks, chosen, next) => {
+                // An episode's page is titled with its season, as designed.
+                let title = match &item {
+                    Item::Episode(e) => views::season_name(e.season),
+                    other => views::Facts::of(other).title,
+                };
                 // The page opens without pickers if the tracks cannot be
                 // had; playback then takes the server's choice.
                 let tracks = tracks
@@ -1320,22 +1383,33 @@ impl Component for App {
                         tracks.as_ref(),
                         chosen.as_ref(),
                         actions,
+                        next.as_deref(),
                         cards,
                     ),
                 );
             }
-            Loaded::Show(show, Ok(seasons)) => {
-                push(widgets, &show.title, &pages::show(&show, &seasons, cards));
-            }
-            Loaded::Show(show, Err(e)) => push_error(widgets, &show.title, &e),
-            Loaded::Season(season, Ok(episodes)) => {
+            Loaded::Show(show, Ok(seasons), open) => {
+                let actions = pages::ShowActions {
+                    play: {
+                        let sender = sender.clone();
+                        Rc::new(move |item, from| {
+                            sender.input(Msg::Play(Box::new(PlayRequest::one(
+                                item, from, None, None,
+                            ))))
+                        })
+                    },
+                    set_watched: {
+                        let sender = sender.clone();
+                        Rc::new(move |id, watched| sender.input(Msg::SetWatched(id, watched)))
+                    },
+                };
                 push(
                     widgets,
-                    &season.title,
-                    &pages::season(&season, &episodes, cards),
+                    &show.title,
+                    &pages::show(&show, &seasons, open.as_ref(), actions, cards),
                 );
             }
-            Loaded::Season(season, Err(e)) => push_error(widgets, &season.title, &e),
+            Loaded::Show(show, Err(e), _) => push_error(widgets, &show.title, &e),
             Loaded::Artist(artist, Ok(albums)) => {
                 push(
                     widgets,
@@ -1417,13 +1491,23 @@ impl App {
             let sender = sender.clone();
             Rc::new(move |p| sender.input(Msg::SetTrackPreferences(Box::new(p))))
         };
-        let server = self.server.clone().map(|server| {
-            let sender = sender.clone();
-            let check = server.clone();
-            let verify: Rc<dyn Fn()> =
-                Rc::new(move || sender.input(Msg::CheckServer(check.clone(), true)));
-            (server, verify)
-        });
+        let servers = preferences::Servers {
+            client: self.client.clone(),
+            current: self.server.clone(),
+            user: self.profile.as_ref().map(|p| p.display_name.clone()),
+            verify: {
+                let sender = sender.clone();
+                Rc::new(move |server| sender.input(Msg::CheckServer(server, true)))
+            },
+            use_server: {
+                let sender = sender.clone();
+                Rc::new(move |server| sender.input(Msg::ChooseServer(server)))
+            },
+            add: {
+                let sender = sender.clone();
+                Rc::new(move || sender.input(Msg::ShowServers))
+            },
+        };
         let set_bitrate: preferences::SetBitrate = {
             let sender = sender.clone();
             Rc::new(move |limit| sender.input(Msg::SetMaxBitrate(limit)))
@@ -1432,10 +1516,14 @@ impl App {
             let sender = sender.clone();
             Rc::new(move |on| sender.input(Msg::SetSkipIntros(on)))
         };
+        let set_show_diagnostics: preferences::SetSkipIntros = {
+            let sender = sender.clone();
+            Rc::new(move |on| sender.input(Msg::SetShowDiagnostics(on)))
+        };
         preferences::dialog(
             self.settings.theme(),
             tracks,
-            server,
+            servers,
             set_theme,
             set_tracks,
             preferences::Device {
@@ -1443,6 +1531,8 @@ impl App {
                 set_bitrate,
                 skip_intros: self.settings.skip_intros(),
                 set_skip_intros,
+                show_diagnostics: self.settings.show_diagnostics(),
+                set_show_diagnostics,
             },
             self.signed(),
         )
@@ -1505,6 +1595,7 @@ impl App {
         }
         self.libraries.clear();
         self.select_root(Root::Home);
+        plain_header(widgets);
         // The next profile has its own searches.
         widgets.search = None;
         self.library = None;
@@ -1694,6 +1785,7 @@ impl App {
             server_key: server.key.0.clone(),
             server_name: server.name.clone(),
             display_name: profile.display_name.clone(),
+            username: profile.username.clone(),
         })
     }
 
@@ -1833,10 +1925,17 @@ impl App {
     }
 
     /// Loads what the item's page needs, then pushes the page.
-    fn open_item(&self, item: Item, sender: &ComponentSender<Self>) {
+    fn open_item(&mut self, item: Item, sender: &ComponentSender<Self>) {
         let Some(backend) = self.session.clone() else {
             return;
         };
+        // A track plays; anything else opens a page once its load is in.
+        if !matches!(item, Item::Track(_)) {
+            if self.opening.as_ref() == Some(item.id()) {
+                return;
+            }
+            self.opening = Some(item.id().clone());
+        }
         match item {
             Item::Movie(ref m) => {
                 let id = m.id.clone();
@@ -1848,56 +1947,70 @@ impl App {
                         backend.tracks(&id),
                         server_choice(backend.as_ref(), &id),
                     );
-                    Loaded::Playable(item, None, tracks, chosen)
+                    Loaded::Playable(item, None, tracks, chosen, None)
                 });
             }
             Item::Episode(ref e) => {
-                let (id, show) = (e.id.clone(), e.show_id.clone());
+                let (id, show, episode) = (e.id.clone(), e.show_id.clone(), e.clone());
                 sender.oneshot_command(async move {
-                    let (item, show, tracks, chosen) = tokio::join!(
+                    let (item, show, tracks, chosen, next) = tokio::join!(
                         fresh(backend.as_ref(), item),
                         backend.item(&show),
                         backend.tracks(&id),
                         server_choice(backend.as_ref(), &id),
+                        next_episode(backend.as_ref(), &episode),
                     );
+                    // "Next episode" is a convenience: none if it cannot be had.
+                    let next = next.ok().flatten().map(Box::new);
                     // The show's title is context, not essential: the page
                     // opens without it if the show cannot be loaded.
                     let context = match show {
                         Ok((Item::Show(s), _)) => Some(s.title),
                         _ => None,
                     };
-                    Loaded::Playable(item, context, tracks, chosen)
+                    Loaded::Playable(item, context, tracks, chosen, next)
                 });
             }
             Item::Show(show) => sender.oneshot_command(async move {
-                let seasons = async {
-                    let mut seasons = Vec::new();
-                    for child in backend.item(&show.id).await?.1 {
-                        if let Item::Season(season) = child {
-                            let episodes = backend.item(&season.id).await?.1;
-                            seasons.push((season, episodes));
-                        }
-                    }
-                    Ok(seasons)
-                }
-                .await;
-                Loaded::Show(show, seasons)
+                let (show, seasons) = show_with_seasons(backend.as_ref(), show).await;
+                Loaded::Show(show, seasons, None)
             }),
+            // A season opens its show's page, on that season's tab.
             Item::Season(season) => sender.oneshot_command(async move {
-                let episodes = backend.item(&season.id).await.map(|(_, c)| c);
-                Loaded::Season(season, episodes)
+                let show = Show {
+                    id: season.show_id.clone(),
+                    title: season.show_title.clone().unwrap_or_default(),
+                    year: None,
+                    summary: None,
+                    artwork: Vec::new(),
+                };
+                let (show, seasons) = show_with_seasons(backend.as_ref(), show).await;
+                Loaded::Show(show, seasons, Some(season.id))
             }),
+            // The artist and the album as the server has them: one opened
+            // from a track's menu carries only its ID.
             Item::Artist(artist) => sender.oneshot_command(async move {
-                let albums = backend.item(&artist.id).await.map(|(_, c)| c);
-                Loaded::Artist(artist, albums)
+                match backend.item(&artist.id).await {
+                    Ok((Item::Artist(full), albums)) => Loaded::Artist(full, Ok(albums)),
+                    Ok((_, albums)) => Loaded::Artist(artist, Ok(albums)),
+                    Err(e) => Loaded::Artist(artist, Err(e)),
+                }
             }),
             Item::Album(album) => sender.oneshot_command(async move {
+                let (album, tracks) = match backend.item(&album.id).await {
+                    Ok((Item::Album(full), tracks)) => (full, Ok(tracks)),
+                    Ok((_, tracks)) => (album, Ok(tracks)),
+                    Err(e) => (album, Err(e)),
+                };
                 let loaded = async {
-                    let artist = match backend.item(&album.artist_id).await?.0 {
-                        Item::Artist(a) => a.name,
-                        other => other.id().to_string(),
+                    let tracks = tracks?;
+                    let artist = match &album.artist_name {
+                        Some(name) => name.clone(),
+                        None => match backend.item(&album.artist_id).await?.0 {
+                            Item::Artist(a) => a.name,
+                            other => other.id().to_string(),
+                        },
                     };
-                    let tracks = backend.item(&album.id).await?.1;
                     Ok((artist, tracks))
                 }
                 .await;
@@ -1944,6 +2057,29 @@ type AlbumTracks = (Vec<Item>, Option<Album>);
 /// The tracks an item stands for in the play queue, grouped by album, in
 /// album order: a track (with its album, for the cover), an album, or each
 /// of an artist's albums.
+/// A show as the server has it (an item opened from an episode carries
+/// only its ID and title), and its seasons with their episodes.
+async fn show_with_seasons(
+    backend: &dyn Session,
+    show: Show,
+) -> (Show, Result<Vec<SeasonEpisodes>, BackendError>) {
+    let (full, children) = match backend.item(&show.id).await {
+        Ok((Item::Show(full), children)) => (full, children),
+        Ok((_, children)) => (show, children),
+        Err(e) => return (show, Err(e)),
+    };
+    let mut seasons = Vec::new();
+    for child in children {
+        if let Item::Season(season) = child {
+            match backend.item(&season.id).await {
+                Ok((_, episodes)) => seasons.push((season, episodes)),
+                Err(e) => return (full, Err(e)),
+            }
+        }
+    }
+    (full, Ok(seasons))
+}
+
 async fn tracks_of(session: &dyn Session, item: Item) -> Result<Vec<AlbumTracks>, BackendError> {
     match item {
         Item::Track(ref track) => {
@@ -2025,11 +2161,7 @@ fn toolbar(header: &adw::HeaderBar, content: &impl IsA<gtk::Widget>) -> adw::Too
 }
 
 fn sidebar_row(title: &str, icon: &str) -> gtk::Box {
-    let row = gtk::Box::builder()
-        .spacing(12)
-        .margin_top(6)
-        .margin_bottom(6)
-        .build();
+    let row = gtk::Box::builder().spacing(12).build();
     row.append(&gtk::Image::from_icon_name(icon));
     row.append(&gtk::Label::builder().label(title).xalign(0.0).build());
     row
@@ -2092,6 +2224,13 @@ fn show_error(widgets: &AppWidgets, title: &str, error: &BackendError) {
     widgets.content.append(&error_status(error));
 }
 
+/// The root page's header back to its title, when search, which puts its
+/// field there, gives way to another root. Done as the choice is made: a
+/// header changed while GTK maps or unmaps the page breaks its widget tree.
+fn plain_header(widgets: &AppWidgets) {
+    widgets.root_header.set_title_widget(None::<&gtk::Widget>);
+}
+
 fn push(widgets: &AppWidgets, title: &str, body: &impl IsA<gtk::Widget>) {
     widgets.stack.push(&pages::page(title, body));
 }
@@ -2121,7 +2260,8 @@ fn error_status(error: &BackendError) -> adw::StatusPage {
     adw::StatusPage::builder()
         .icon_name(crate::icons::ERROR)
         .title(title)
-        .description(description)
+        // The description is markup; the error's text is not.
+        .description(glib::markup_escape_text(&description))
         .vexpand(true)
         .build()
 }

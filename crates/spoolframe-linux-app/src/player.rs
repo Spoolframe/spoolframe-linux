@@ -101,6 +101,10 @@ pub fn page(playback: &Rc<Playback>, actions: Actions) -> adw::NavigationPage {
 
     let diagnostics = Diagnostics::new();
     video.add_overlay(&diagnostics.panel);
+    // Open as Preferences › Appearance says; the button toggles them after.
+    controls
+        .diagnostics
+        .set_active(crate::settings::Settings::load().show_diagnostics());
     controls
         .diagnostics
         .bind_property("active", &diagnostics.panel, "visible")
@@ -174,6 +178,7 @@ pub fn page(playback: &Rc<Playback>, actions: Actions) -> adw::NavigationPage {
                 }
             }
             if view.diagnostics.panel.is_visible() {
+                view.diagnostics.show_subtitles(&playback);
                 view.diagnostics.show_video(playback.video_sink());
             }
             glib::ControlFlow::Continue
@@ -844,16 +849,19 @@ struct Diagnostics {
     panel: gtk::Box,
     badge: gtk::Label,
     rows: Rc<RefCell<Vec<(&'static str, gtk::Label)>>>,
+    /// The key labels, to hide a row with its value.
+    keys: Rc<RefCell<Vec<(&'static str, gtk::Label)>>>,
 }
 
 impl Diagnostics {
-    const ROWS: [&'static str; 11] = [
+    const ROWS: [&'static str; 12] = [
         "path",
         "conversion",
         "why",
         "video",
         "decoder",
         "audio",
+        "subtitles",
         "buffer",
         "reads",
         "throughput",
@@ -866,14 +874,17 @@ impl Diagnostics {
             .row_spacing(6)
             .column_spacing(12)
             .build();
-        let mut rows = Vec::new();
+        let (mut rows, mut keys) = (Vec::new(), Vec::new());
         for (i, name) in Self::ROWS.into_iter().enumerate() {
             let key = mono(name);
             key.add_css_class("dim-label");
             let value = mono("—");
+            value.set_wrap(true);
+            value.set_xalign(0.0);
             grid.attach(&key, 0, i as i32, 1, 1);
             grid.attach(&value, 1, i as i32, 1, 1);
             rows.push((name, value));
+            keys.push((name, key));
         }
         let heading = gtk::Label::builder()
             .label("DIAGNOSTICS")
@@ -905,7 +916,26 @@ impl Diagnostics {
             panel,
             badge,
             rows: Rc::new(RefCell::new(rows)),
+            keys: Rc::new(RefCell::new(keys)),
         }
+    }
+
+    /// Shows or hides a row, its name with its value.
+    fn show_row(&self, name: &str, visible: bool) {
+        for list in [&self.rows, &self.keys] {
+            if let Some((_, label)) = list.borrow().iter().find(|(n, _)| *n == name) {
+                label.set_visible(visible);
+            }
+        }
+    }
+
+    /// Which subtitle shows and how it got here.
+    fn show_subtitles(&self, playback: &Playback) {
+        let (on, from_file) = playback.subtitle_shown();
+        self.set(
+            "subtitles",
+            &subtitle_summary(playback.plan().as_ref(), on, from_file),
+        );
     }
 
     fn set(&self, name: &str, value: &str) {
@@ -978,6 +1008,10 @@ impl Diagnostics {
         self.set("path", &shown.path);
         self.set("conversion", &shown.conversion);
         self.set("why", &shown.why);
+        // Only a converted playback has a conversion, and a reason for it.
+        let converted = matches!(plan, Some(PlaybackPlan::Converted { .. }));
+        self.show_row("conversion", converted);
+        self.show_row("why", converted && shown.why != "—");
     }
 
     fn show_media(&self, info: &gst_play::PlayMediaInfo) {
@@ -1034,6 +1068,41 @@ impl Diagnostics {
         if !decoders.is_empty() {
             self.set("decoder", &decoders.join(", "));
         }
+    }
+}
+
+/// The subtitles row: off, burned into the picture by the server, a text
+/// file the server sent (an external one, or one it read as text), or a
+/// stream in the file or the converted output.
+fn subtitle_summary(plan: Option<&PlaybackPlan>, on: bool, from_file: bool) -> String {
+    let converted = match plan {
+        Some(PlaybackPlan::Converted { subtitle, .. }) => subtitle.map(|s| s.action),
+        _ => None,
+    };
+    if let Some(SubtitleAction::BurnIn { format }) = converted {
+        return format!("{format} burned into the video");
+    }
+    if !on {
+        return "off".to_owned();
+    }
+    let direct = match plan {
+        Some(PlaybackPlan::Direct { subtitle, .. }) => subtitle.as_ref(),
+        _ => None,
+    };
+    match (from_file, converted, direct) {
+        (true, Some(SubtitleAction::Ocr { from, .. }), _) => {
+            format!("{from} read as text · file from server")
+        }
+        (true, _, Some(planned)) => format!("{} · file from server", planned.format),
+        (true, _, None) => "file from server".to_owned(),
+        (false, Some(SubtitleAction::Copy { format }), _) => {
+            format!("{format} · in the converted stream")
+        }
+        (false, Some(SubtitleAction::Convert { from, to }), _) => {
+            format!("{from} → {to} · in the converted stream")
+        }
+        (false, _, Some(planned)) => format!("{} · in the file", planned.format),
+        (false, _, None) => "in the file".to_owned(),
     }
 }
 
@@ -1258,6 +1327,51 @@ mod tests {
             subtitle: None,
         };
         assert_eq!(PlanSummary::of(&direct).badge, "Direct");
+    }
+
+    fn direct_with(delivery: spoolframe_protocol::SubtitleDelivery) -> PlaybackPlan {
+        PlaybackPlan::Direct {
+            container: Container::Matroska,
+            video: Some(VideoCodec::H264),
+            audio: None,
+            subtitle: Some(spoolframe_protocol::PlannedSubtitle {
+                index: 0,
+                format: SubtitleFormat::Srt,
+                delivery,
+            }),
+        }
+    }
+
+    #[test]
+    fn a_burned_in_subtitle_says_so_whatever_the_switch() {
+        assert_eq!(
+            subtitle_summary(Some(&transcode()), false, false),
+            format!("{} burned into the video", SubtitleFormat::Pgs)
+        );
+    }
+
+    #[test]
+    fn subtitles_turned_off_read_off() {
+        let plan = direct_with(spoolframe_protocol::SubtitleDelivery::Embedded);
+        assert_eq!(subtitle_summary(Some(&plan), false, false), "off");
+    }
+
+    #[test]
+    fn an_external_subtitle_comes_as_a_file() {
+        let plan = direct_with(spoolframe_protocol::SubtitleDelivery::External);
+        assert_eq!(
+            subtitle_summary(Some(&plan), true, true),
+            format!("{} · file from server", SubtitleFormat::Srt)
+        );
+    }
+
+    #[test]
+    fn an_embedded_subtitle_is_in_the_file() {
+        let plan = direct_with(spoolframe_protocol::SubtitleDelivery::Embedded);
+        assert_eq!(
+            subtitle_summary(Some(&plan), true, false),
+            format!("{} · in the file", SubtitleFormat::Srt)
+        );
     }
 
     #[test]

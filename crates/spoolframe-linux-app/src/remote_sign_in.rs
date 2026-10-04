@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use adw::prelude::*;
-use gtk::{gdk, glib};
+use gtk::glib;
 use spoolframe_linux_core::backend::{BackendError, Client, DeviceSignIn, Profile, Server};
 
 /// Where the user approves.
@@ -55,13 +55,14 @@ pub struct RemoteSignIn {
     qr: gtk::Picture,
     /// What to do on the phone: open the page, or, without one, use a
     /// signed-in app.
-    lead: gtk::Label,
+    phone: gtk::Image,
+    use_password: gtk::Button,
     page: gtk::Label,
     code: gtk::Label,
     countdown: gtk::Label,
     /// The expired code, struck through.
     expired_code: gtk::Label,
-    expired_page: adw::StatusPage,
+    expired_note: gtk::Label,
     new_code: gtk::Button,
     try_again: gtk::Button,
     problem: adw::StatusPage,
@@ -96,12 +97,19 @@ impl RemoteSignIn {
             .halign(gtk::Align::Center)
             .css_classes(["qr-code"])
             .build();
-        let lead = wrapped("", &[]);
+        // Without a QR code (no web address), a phone stands in for it.
+        let phone = gtk::Image::builder()
+            .icon_name(crate::icons::PHONE)
+            .pixel_size(40)
+            .visible(false)
+            .css_classes(["accent"])
+            .build();
+        // One dim paragraph: where to go, its address bold.
         let page = gtk::Label::builder()
             .selectable(true)
             .wrap(true)
             .justify(gtk::Justification::Center)
-            .css_classes(["heading"])
+            .css_classes(["dim-label"])
             .build();
         let code = code_label(&["sign-in-code"]);
         let fingerprint = gtk::Box::builder()
@@ -113,10 +121,12 @@ impl RemoteSignIn {
             &gtk::Label::builder()
                 .label(&server.fingerprint)
                 .selectable(true)
-                .css_classes(["monospace", "caption"])
+                .css_classes(["monospace", "sign-in-fingerprint"])
                 .build(),
         );
-        let countdown = gtk::Label::builder().css_classes(["dim-label"]).build();
+        let countdown = gtk::Label::builder()
+            .css_classes(["dim-label", "small-text"])
+            .build();
         let waiting_row = gtk::Box::builder()
             .spacing(8)
             .halign(gtk::Align::Center)
@@ -129,12 +139,12 @@ impl RemoteSignIn {
                 Via::Browser => "Cancel",
             })
             .halign(gtk::Align::Center)
-            .css_classes(["flat"])
+            .css_classes(["flat", "dialog-text-button"])
             .build();
         let waiting = column();
         for widget in [
             qr.upcast_ref::<gtk::Widget>(),
-            lead.upcast_ref(),
+            phone.upcast_ref(),
             page.upcast_ref(),
             code.upcast_ref(),
             fingerprint.upcast_ref(),
@@ -144,17 +154,30 @@ impl RemoteSignIn {
             waiting.append(widget);
         }
 
-        // 2 · Expired: the old code struck through, and a new one.
+        // 2 · Expired: the old code struck through, how long codes last,
+        // and a new one.
         let expired_code = code_label(&["sign-in-code", "expired"]);
+        let expired_note = wrapped("", &["dim-label", "small-text"]);
         let new_code = pill("Get a new code", true);
-        let expired = column();
-        expired.append(&expired_code);
-        expired.append(&new_code);
-        let expired_page = adw::StatusPage::builder()
-            .icon_name(crate::icons::BACK_10)
-            .title("This code expired")
-            .child(&expired)
-            .build();
+        new_code.set_child(Some(
+            &adw::ButtonContent::builder()
+                .icon_name(crate::icons::BACK_10)
+                .label("Get a new code")
+                .build(),
+        ));
+        let expired_page = column();
+        expired_page.set_margin_top(12);
+        expired_page.append(
+            &gtk::Image::builder()
+                .icon_name(crate::icons::EXPIRED)
+                .pixel_size(44)
+                .css_classes(["dim-label"])
+                .build(),
+        );
+        expired_page.append(&wrapped("This code expired", &["title-3"]));
+        expired_page.append(&expired_code);
+        expired_page.append(&expired_note);
+        expired_page.append(&new_code);
 
         // 3 · Denied on the phone.
         let try_again = pill("Try again", true);
@@ -167,6 +190,7 @@ impl RemoteSignIn {
         denied_actions.append(&try_again);
         let denied = adw::StatusPage::builder()
             .icon_name(crate::icons::REMOVE)
+            .css_classes(["small-icon", "destructive-icon"])
             .title("Sign-in was denied")
             .description("Someone chose Deny on the approval page.")
             .child(&denied_actions)
@@ -176,6 +200,7 @@ impl RemoteSignIn {
         let problem_retry = pill("Try again", true);
         let problem = adw::StatusPage::builder()
             .icon_name(crate::icons::ERROR)
+            .css_classes(["small-icon"])
             .title("No code")
             .child(&problem_retry)
             .build();
@@ -191,24 +216,21 @@ impl RemoteSignIn {
         stack.add_named(&problem, Some("problem"));
 
         let body = adw::Clamp::builder()
-            .maximum_size(380)
-            .margin_top(6)
+            .maximum_size(408)
+            .margin_top(22)
             .margin_bottom(24)
-            .margin_start(24)
-            .margin_end(24)
+            .margin_start(26)
+            .margin_end(26)
             .child(&stack)
             .build();
-        let toolbar = adw::ToolbarView::new();
-        toolbar.add_top_bar(&adw::HeaderBar::new());
-        toolbar.set_content(Some(&body));
         let dialog = adw::Dialog::builder()
             .title(match via {
                 Via::Phone => "Sign in with your phone",
                 Via::Browser => "Sign in with browser",
             })
-            .content_width(440)
-            .child(&toolbar)
+            .content_width(460)
             .build();
+        crate::start::with_cancel(&dialog, &body);
 
         let this = Rc::new(Self {
             dialog,
@@ -218,12 +240,13 @@ impl RemoteSignIn {
             ends,
             stack,
             qr,
-            lead,
+            phone,
+            use_password: use_password.clone(),
             page,
             code,
             countdown,
             expired_code,
-            expired_page,
+            expired_note,
             new_code,
             try_again,
             problem,
@@ -292,26 +315,30 @@ impl RemoteSignIn {
             return self.show_in_browser(sign_in);
         }
         let texture = sign_in.web_url.as_deref().and_then(|url| {
-            crate::qr::texture(url, crate::qr::MODULE, &accent(&self.dialog))
+            crate::qr::texture(url, crate::qr::MODULE)
                 .inspect_err(|e| tracing::warn!(error = %e, "cannot draw the QR code"))
                 .ok()
         });
         self.qr.set_paintable(texture.as_ref());
         self.qr.set_visible(texture.is_some());
+        self.phone.set_visible(texture.is_none());
+        // Without a web address there is only the code: no password
+        // detour, as designed.
+        self.use_password.set_visible(sign_in.web_url.is_some());
         match sign_in.web_url.as_deref().map(page_address) {
             Some(page) => {
                 self.dialog.set_title("Sign in with your phone");
-                self.lead.set_label("Scan with your phone, or open");
-                self.page.set_label(&format!("{page}  and type"));
+                self.page
+                    .set_markup(&lead("Scan with your phone, or open", &page, "and type"));
             }
             None => {
                 self.dialog.set_title("Sign in with another device");
-                self.lead.set_label(
+                self.page.set_markup(&lead(
                     "This server has no web address, so there's no QR. On a phone or \
                      computer that's already signed in, open",
-                );
-                self.page
-                    .set_label("Preferences › Sign In a Device…  and type:");
+                    "Preferences › Sign In a Device…",
+                    "and type:",
+                ));
             }
         }
         self.showing(sign_in);
@@ -329,11 +356,12 @@ impl RemoteSignIn {
         };
         (self.ends.open)(url);
         self.qr.set_visible(false);
-        self.lead.set_label(
+        self.page.set_markup(&lead(
             "Sign in in your browser, then approve this computer. If the browser \
              did not open, go to",
-        );
-        self.page.set_label(url);
+            url,
+            "",
+        ));
         self.showing(sign_in);
     }
 
@@ -341,10 +369,10 @@ impl RemoteSignIn {
     fn showing(self: &Rc<Self>, sign_in: &DeviceSignIn) {
         self.code.set_label(&sign_in.display_code);
         self.expired_code.set_label(&sign_in.display_code);
-        self.expired_page.set_description(Some(&format!(
+        self.expired_note.set_label(&format!(
             "Codes last {} minutes.",
             sign_in.expires_in.as_secs().div_ceil(60)
-        )));
+        ));
         self.expires.set(Some(Instant::now() + sign_in.expires_in));
         self.tick();
         self.stack.set_visible_child_name("waiting");
@@ -415,16 +443,6 @@ fn page_address(url: &str) -> String {
     bare.split(['?', '#']).next().unwrap_or(bare).to_owned()
 }
 
-/// The theme's accent, for the reel in the QR code; libadwaita names it
-/// `accent_color`.
-#[allow(deprecated)]
-fn accent(widget: &impl IsA<gtk::Widget>) -> gdk::RGBA {
-    widget
-        .style_context()
-        .lookup_color("accent_color")
-        .unwrap_or(gdk::RGBA::new(0.58, 0.886, 0.835, 1.0))
-}
-
 fn column() -> gtk::Box {
     gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -448,16 +466,34 @@ fn code_label(classes: &[&str]) -> gtk::Label {
         .build()
 }
 
+/// A 40 px button with 10 px corners, as the boards draw them: the
+/// accent for the way on, the surface for the other.
 fn pill(label: &str, suggested: bool) -> gtk::Button {
-    let button = gtk::Button::builder()
+    gtk::Button::builder()
         .label(label)
         .halign(gtk::Align::Center)
-        .css_classes(["pill"])
-        .build();
-    if suggested {
-        button.add_css_class("suggested-action");
-    }
-    button
+        .css_classes([
+            "action",
+            "compact",
+            if suggested {
+                "suggested-action"
+            } else {
+                "secondary"
+            },
+        ])
+        .build()
+}
+
+/// "`before` **`address`** `after`" as markup, the address escaped.
+fn lead(before: &str, address: &str, after: &str) -> String {
+    format!(
+        "{} <b>{}</b> {}",
+        glib::markup_escape_text(before),
+        glib::markup_escape_text(address),
+        glib::markup_escape_text(after)
+    )
+    .trim_end()
+    .to_owned()
 }
 
 #[cfg(test)]
@@ -637,7 +673,7 @@ mod tests {
         let (screen, ended) =
             open(FakeClient::new(None).answering_phone_sign_in(PhoneAnswer::Wait));
         assert!(reaches(&screen, "waiting"), "the code was never shown");
-        assert!(screen.qr.is_visible() && screen.page.label().starts_with("media.example.org"));
+        assert!(screen.qr.is_visible() && screen.page.text().contains("media.example.org"));
         assert!(screen.call.borrow().is_some(), "not waiting");
         screen.dialog.force_close();
         assert!(run_until(Duration::from_secs(2), || screen

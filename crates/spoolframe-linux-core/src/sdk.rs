@@ -24,9 +24,9 @@ use tokio::sync::watch;
 
 use crate::backend::{
     ArtworkSize, BackendError, BoxFuture, ChosenTracks, Chunk, Client, ConnectionState, DeviceInfo,
-    DeviceSignIn, DeviceSignInRequest, HomeScreen, PersonId, PlaybackHandle, PlaybackPlan,
-    PlaybackStart, Previews, Profile, SearchRequest, SearchResults, Selection, Server, ServerKey,
-    Session,
+    DeviceSignIn, DeviceSignInRequest, HomeScreen, PersonId, PinProof, PinState, PlaybackHandle,
+    PlaybackPlan, PlaybackStart, PlexLink, Previews, Profile, SearchRequest, SearchResults,
+    Selection, Server, ServerKey, Session,
 };
 use crate::storage::Storage;
 
@@ -36,6 +36,7 @@ pub fn backend_error(error: sdk::SdkError) -> BackendError {
     match error {
         E::Unreachable(what) => BackendError::Unreachable(what),
         E::InvalidCredentials => BackendError::WrongCredentials,
+        E::NoPassword => BackendError::NoPassword,
         E::RateLimited { retry_after } => BackendError::RateLimited(retry_after),
         E::SignInRequired => BackendError::SignInRequired,
         E::CannotPlay { reasons } => BackendError::CannotPlay(reasons),
@@ -83,6 +84,8 @@ fn server(entry: sdk::ServerEntry) -> Server {
         fingerprint: entry.fingerprint,
         verified: entry.verified,
         on_network: entry.on_network,
+        verified_at: entry.verified_at,
+        last_connected_at: entry.last_connected_at,
     }
 }
 
@@ -282,6 +285,37 @@ impl Client for SdkClient {
                 .retain(|(server, _), _| server != saved);
             self.servers_changed.send_replace(());
             Ok(server(entry))
+        })
+    }
+
+    fn forget<'a>(&'a self, key: &'a ServerKey) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            let (client, id) = (self.client.clone(), key.0.clone());
+            on_runtime(&self.handle, async move { client.forget(&id).await }).await?;
+            self.sessions
+                .lock()
+                .expect("never poisoned")
+                .retain(|(server, _), _| server != key);
+            self.servers_changed.send_replace(());
+            Ok(())
+        })
+    }
+
+    fn sign_out<'a>(&'a self, key: &'a ServerKey) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            let (client, id) = (self.client.clone(), key.0.clone());
+            on_runtime(&self.handle, async move {
+                for session in client.profiles(&id).await? {
+                    session.sign_out().await?;
+                }
+                Ok::<_, sdk::SdkError>(())
+            })
+            .await?;
+            self.sessions
+                .lock()
+                .expect("never poisoned")
+                .retain(|(server, _), _| server != key);
+            Ok(())
         })
     }
 
@@ -672,13 +706,25 @@ impl Session for SdkSession {
         Box::pin(self.call(move |s| async move { s.unlock(&pin).await }))
     }
 
-    fn set_pin<'a>(&'a self, pin: &'a str) -> BoxFuture<'a, Result<(), BackendError>> {
-        let pin = pin.to_owned();
-        Box::pin(self.call(move |s| async move { s.set_pin(&pin).await }))
+    fn pin(&self) -> BoxFuture<'_, Result<Option<PinState>, BackendError>> {
+        Box::pin(self.call(|s| async move { s.whoami().await.map(|user| user.pin) }))
     }
 
-    fn clear_pin(&self) -> BoxFuture<'_, Result<(), BackendError>> {
-        Box::pin(self.call(|s| async move { s.clear_pin().await }))
+    fn set_pin<'a>(
+        &'a self,
+        pin: &'a str,
+        proof: Option<PinProof>,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        let pin = pin.to_owned();
+        Box::pin(self.call(move |s| async move { s.set_pin(&pin, proof).await }))
+    }
+
+    fn clear_pin(&self, proof: PinProof) -> BoxFuture<'_, Result<(), BackendError>> {
+        Box::pin(self.call(move |s| async move { s.clear_pin(proof).await }))
+    }
+
+    fn plex_link(&self) -> BoxFuture<'_, Result<Option<PlexLink>, BackendError>> {
+        Box::pin(self.call(|s| async move { s.plex_link().await }))
     }
 
     fn devices(&self) -> BoxFuture<'_, Result<Vec<DeviceInfo>, BackendError>> {

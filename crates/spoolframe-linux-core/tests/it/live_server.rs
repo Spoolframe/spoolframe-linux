@@ -86,6 +86,7 @@ fn title(item: &Item) -> String {
 fn the_server_list_changes_when_the_lan_server_is_heard() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let device = sdk::Device {
+        platform: sdk::types::Platform::Linux,
         name: "spoolframe-linux discovery test".into(),
         client_name: "spoolframe-linux".into(),
         client_version: env!("CARGO_PKG_VERSION").into(),
@@ -121,6 +122,7 @@ fn the_server_list_changes_when_the_lan_server_is_heard() {
 fn the_app_backend_works_against_a_live_server() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let device = sdk::Device {
+        platform: sdk::types::Platform::Linux,
         name: "spoolframe-linux live test".into(),
         client_name: "spoolframe-linux".into(),
         client_version: env!("CARGO_PKG_VERSION").into(),

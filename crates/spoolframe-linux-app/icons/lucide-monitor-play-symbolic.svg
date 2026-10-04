@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- @license lucide-static v1.50.0 - ISC -->
+
+<svg
+   class="lucide lucide-monitor-play"
+   width="24"
+   height="24"
+   viewBox="0 0 24 24"
+   version="1.1"
+   id="svg3"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <defs
+     id="defs3" />
+  <path
+     style="baseline-shift:baseline;display:inline;overflow:visible;vector-effect:none;fill:#000000;stroke:none;stroke-linecap:butt;stroke-linejoin:miter;enable-background:accumulate;stop-color:#000000;stop-opacity:1;opacity:1"
+     d="M 11.466797,6.2207031 C 10.410795,5.6122773 8.9978728,6.431655 9,7.6503906 v 4.7011724 c -0.00177,1.219361 1.41294,2.03662 2.46875,1.425781 l 4.064453,-2.351563 c 1.054676,-0.610301 1.054676,-2.241261 0,-2.8515622 L 11.466797,6.2226562 a 1.0001,1.0001 0 0 0 0,-0.00195 z M 11,8.2617188 14.005859,10 11,11.738281 Z"
+     id="path1" />
+  <path
+     style="baseline-shift:baseline;display:inline;overflow:visible;vector-effect:none;fill:#000000;stroke:none;stroke-linecap:butt;stroke-linejoin:miter;enable-background:accumulate;stop-color:#000000;stop-opacity:1;opacity:1"
+     d="m 12,16 a 1,1 0 0 0 -1,1 v 4 a 1,1 0 0 0 1,1 1,1 0 0 0 1,-1 v -4 a 1,1 0 0 0 -1,-1 z"
+     id="path2" />
+  <path
+     style="baseline-shift:baseline;display:inline;overflow:visible;vector-effect:none;fill:#000000;stroke:none;stroke-linecap:butt;stroke-linejoin:miter;enable-background:accumulate;stop-color:#000000;stop-opacity:1;opacity:1"
+     d="m 8,20 a 1,1 0 0 0 -1,1 1,1 0 0 0 1,1 h 8 a 1,1 0 0 0 1,-1 1,1 0 0 0 -1,-1 z"
+     id="path3" />
+  <path
+     style="baseline-shift:baseline;display:inline;overflow:visible;vector-effect:none;fill:#000000;stroke:none;stroke-linecap:butt;stroke-linejoin:miter;enable-background:accumulate;stop-color:#000000;stop-opacity:1;opacity:1"
+     d="M 4,2 C 2.3552972,2 1,3.3552972 1,5 v 10 c 0,1.644703 1.3552972,3 3,3 h 16 c 1.644703,0 3,-1.355297 3,-3 V 5 C 23,3.3552972 21.644703,2 20,2 Z m 0,2 h 16 c 0.571297,0 1,0.4287028 1,1 v 10 c 0,0.571297 -0.428703,1 -1,1 H 4 C 3.4287028,16 3,15.571297 3,15 V 5 C 3,4.4287028 3.4287028,4 4,4 Z"
+     id="rect3" />
+</svg>

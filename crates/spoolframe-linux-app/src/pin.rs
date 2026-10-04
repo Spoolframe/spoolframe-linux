@@ -84,6 +84,7 @@ impl Pad {
         self.digits.borrow_mut().clear();
         self.message.set_label(why);
         self.message.add_css_class("error");
+        self.message.set_visible(true);
         self.busy(false);
         self.redraw();
     }
@@ -154,9 +155,11 @@ pub fn pad(
     header.pack_start(&back_button);
 
     let avatar = adw::Avatar::new(88, Some(&profile.display_name), true);
+    avatar.add_css_class("profile-avatar");
+    avatar.add_css_class("tint-purple");
     let name = gtk::Label::builder()
         .label(&profile.display_name)
-        .css_classes(["title-2"])
+        .css_classes(["pin-name"])
         .margin_top(4)
         .build();
     let prompt = gtk::Box::builder()
@@ -170,11 +173,11 @@ pub fn pad(
         .spacing(18)
         .halign(gtk::Align::Center)
         .margin_top(10)
-        .margin_bottom(4)
         .build();
+    // Empty until a try fails, so the pad sits 28 px under the dots.
     let message = gtk::Label::builder()
         .css_classes(["caption"])
-        .height_request(20)
+        .visible(false)
         .build();
 
     let keys = gtk::Grid::builder()
@@ -202,6 +205,7 @@ pub fn pad(
             if digits.borrow_mut().push(c) {
                 message.set_label("");
                 message.remove_css_class("error");
+                message.set_visible(false);
                 redraw(&digits.borrow(), &dots, &unlock_button);
             }
         })
@@ -238,7 +242,7 @@ pub fn pad(
         .tooltip_text("Delete")
         .width_request(64)
         .height_request(64)
-        .css_classes(["flat", "circular", "pin-key"])
+        .css_classes(["flat", "circular", "pin-key", "pin-delete"])
         .build();
     {
         let delete = delete.clone();
@@ -253,7 +257,7 @@ pub fn pad(
         .label("Forgot your PIN? Sign in with your password")
         .halign(gtk::Align::Center)
         .margin_top(10)
-        .css_classes(["link", "caption"])
+        .css_classes(["flat", "text-link"])
         .build();
     forgot_link.connect_clicked(move |_| forgot());
 

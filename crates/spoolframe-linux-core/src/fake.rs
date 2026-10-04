@@ -28,9 +28,9 @@ use tokio::sync::watch;
 use crate::backend::{
     ArtworkSize, BackendError, BoxFuture, ChosenTracks, Chunk, Client, ConnectionState, DeviceInfo,
     DeviceSignIn, DeviceSignInRequest, HomeScreen, MAX_READ, Marker, Person, PersonId, PersonRole,
-    PlaybackHandle, PlaybackPlan, PlaybackStart, Previews, Profile, SearchCounts, SearchGroup,
-    SearchKind, SearchRequest, SearchResults, SearchScope, Selection, Server, ServerKey, Session,
-    TrackReason,
+    PinProof, PinState, Platform, PlaybackHandle, PlaybackPlan, PlaybackStart, PlexLink, Previews,
+    Profile, SearchCounts, SearchGroup, SearchKind, SearchRequest, SearchResults, SearchScope,
+    Selection, Server, ServerKey, Session, TrackReason,
 };
 
 /// Every fake account's password.
@@ -376,7 +376,7 @@ pub struct FakeSession {
     /// Tracks remembered per movie, or per show for its episodes.
     overrides: Mutex<HashMap<MediaId, Selection>>,
     username: String,
-    pin: Mutex<PinState>,
+    pin: Mutex<FakePin>,
     /// Devices waiting to be signed in by code (P3-07), and wrong codes
     /// tried.
     sign_ins: Mutex<SignIns>,
@@ -420,7 +420,7 @@ fn unix_now() -> i64 {
 
 /// One user's PIN, as the fake server keeps it (P2-08).
 #[derive(Default)]
-struct PinState {
+struct FakePin {
     pin: Option<String>,
     /// The fake's devices, by endpoint id, where the PIN is asked for.
     required: std::collections::HashSet<String>,
@@ -486,13 +486,13 @@ impl FakeSession {
     ) -> Self {
         // Alice has a PIN, asked for here, so the fake opens her locked.
         let pin = match username {
-            "alice" => PinState {
+            "alice" => FakePin {
                 pin: Some(FAKE_PIN.into()),
                 required: [THIS_DEVICE.to_owned()].into(),
                 locked: true,
-                ..PinState::default()
+                ..FakePin::default()
             },
-            _ => PinState::default(),
+            _ => FakePin::default(),
         };
         let session = FakeSession {
             catalog,
@@ -801,8 +801,39 @@ impl FakeSession {
         }
     }
 
-    fn pin_state(&self) -> std::sync::MutexGuard<'_, PinState> {
+    fn pin_state(&self) -> std::sync::MutexGuard<'_, FakePin> {
         self.pin.lock().expect("fake state is never poisoned")
+    }
+
+    /// The proof given to change or remove the PIN: the current PIN, as an
+    /// unlock checks it, or the password, which never revokes. "sso" has
+    /// no password.
+    fn check_proof(&self, proof: &PinProof) -> Result<(), BackendError> {
+        match proof {
+            PinProof::Pin { pin } => self.check_current(pin),
+            PinProof::Password { .. } if self.username == "sso" => Err(BackendError::NoPassword),
+            PinProof::Password { password } if password == FAKE_PASSWORD => Ok(()),
+            PinProof::Password { .. } => Err(BackendError::WrongCredentials),
+        }
+    }
+
+    /// The current PIN, given to change or remove it: a wrong one counts
+    /// toward the lockout as an unlock does.
+    fn check_current(&self, given: &str) -> Result<(), BackendError> {
+        let mut pin = self.pin_state();
+        if pin.revoked {
+            return Err(BackendError::SignInRequired);
+        }
+        if pin.pin.as_deref() != Some(given) {
+            pin.wrong += 1;
+            if pin.wrong >= WRONG_PINS {
+                pin.revoked = true;
+                return Err(BackendError::SignInRequired);
+            }
+            return Err(BackendError::WrongCredentials);
+        }
+        pin.wrong = 0;
+        Ok(())
     }
 
     /// Whether choosing this profile now asks for its PIN: it is locked,
@@ -1404,25 +1435,55 @@ impl Session for FakeSession {
 
     // The unlocked session is the proof: it came from a sign-in with the
     // password, and a PIN only ever locks such a session.
-    fn set_pin<'a>(&'a self, new: &'a str) -> BoxFuture<'a, Result<(), BackendError>> {
+    fn pin(&self) -> BoxFuture<'_, Result<Option<PinState>, BackendError>> {
         Box::pin(async move {
             self.guard()?;
-            let mut pin = self.pin_state();
+            let pin = self.pin_state();
+            Ok(pin.pin.as_ref().map(|p| PinState {
+                digits: Some(p.len() as u8),
+            }))
+        })
+    }
+
+    fn set_pin<'a>(
+        &'a self,
+        new: &'a str,
+        proof: Option<PinProof>,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
             if !(4..=8).contains(&new.len()) || !new.bytes().all(|b| b.is_ascii_digit()) {
                 return Err(BackendError::InvalidInput("a PIN is 4 to 8 digits".into()));
             }
-            pin.pin = Some(new.to_owned());
+            let has_pin = self.pin_state().pin.is_some();
+            if has_pin {
+                let Some(proof) = proof else {
+                    return Err(BackendError::InvalidInput(
+                        "give the current PIN or your password".into(),
+                    ));
+                };
+                self.check_proof(&proof)?;
+            }
+            self.pin_state().pin = Some(new.to_owned());
             Ok(())
         })
     }
 
-    fn clear_pin(&self) -> BoxFuture<'_, Result<(), BackendError>> {
+    fn clear_pin(&self, proof: PinProof) -> BoxFuture<'_, Result<(), BackendError>> {
         Box::pin(async move {
             self.guard()?;
+            self.check_proof(&proof)?;
             let mut pin = self.pin_state();
             pin.pin = None;
             pin.required.clear();
             Ok(())
+        })
+    }
+
+    fn plex_link(&self) -> BoxFuture<'_, Result<Option<PlexLink>, BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            Ok(None)
         })
     }
 
@@ -1436,6 +1497,11 @@ impl Session for FakeSession {
                 last_seen_at: 1_790_000_000 - ago,
                 pin_required: pin.required.contains(id),
                 this_device: id == THIS_DEVICE,
+                platform: Some(if id == THIS_DEVICE {
+                    Platform::Linux
+                } else {
+                    Platform::Tvos
+                }),
             };
             Ok(vec![
                 device(THIS_DEVICE, "This computer", 0),
@@ -1640,6 +1706,8 @@ impl FakeClient {
                     fingerprint: fingerprint(&home_media()),
                     verified: true,
                     on_network: true,
+                    verified_at: None,
+                    last_connected_at: None,
                 },
                 Server {
                     key: basement(),
@@ -1649,6 +1717,8 @@ impl FakeClient {
                     fingerprint: fingerprint(&basement()),
                     verified: false,
                     on_network: true,
+                    verified_at: None,
+                    last_connected_at: None,
                 },
             ]),
             accounts: vec![
@@ -1903,6 +1973,8 @@ impl Client for FakeClient {
                         fingerprint: fingerprint(server),
                         verified: false,
                         on_network: false,
+                        verified_at: None,
+                        last_connected_at: None,
                     });
                     servers.last_mut().expect("just pushed")
                 }
@@ -1962,6 +2034,8 @@ impl Client for FakeClient {
                 fingerprint: fingerprint(now),
                 verified: true,
                 on_network: true,
+                verified_at: None,
+                last_connected_at: None,
             };
             servers.push(entry.clone());
             drop(servers);
@@ -1971,6 +2045,33 @@ impl Client for FakeClient {
                 .retain(|p| &p.server != saved);
             self.servers_changed.send_replace(());
             Ok(entry)
+        })
+    }
+
+    fn forget<'a>(&'a self, server: &'a ServerKey) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            self.pinned(server)?;
+            self.servers
+                .lock()
+                .expect("fake state is never poisoned")
+                .retain(|s| &s.key != server);
+            self.signed_in
+                .lock()
+                .expect("fake state is never poisoned")
+                .retain(|p| &p.server != server);
+            self.servers_changed.send_replace(());
+            Ok(())
+        })
+    }
+
+    fn sign_out<'a>(&'a self, server: &'a ServerKey) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            self.pinned(server)?;
+            self.signed_in
+                .lock()
+                .expect("fake state is never poisoned")
+                .retain(|p| &p.server != server);
+            Ok(())
         })
     }
 
@@ -2763,6 +2864,25 @@ mod tests {
         assert!(changes.has_changed().unwrap());
     }
 
+    #[test]
+    fn forgetting_a_server_drops_it_and_its_profiles() {
+        let client = FakeClient::new(None);
+        let key = home_media();
+        ready(client.sign_in(&key, "andrey", FAKE_PASSWORD)).unwrap();
+        ready(client.forget(&key)).unwrap();
+        let servers = ready(client.servers()).unwrap();
+        assert!(!servers.iter().any(|s| s.key == key));
+    }
+
+    #[test]
+    fn signing_out_keeps_the_server_but_no_profiles() {
+        let client = FakeClient::new(None);
+        let key = home_media();
+        ready(client.sign_in(&key, "andrey", FAKE_PASSWORD)).unwrap();
+        ready(client.sign_out(&key)).unwrap();
+        assert_eq!(ready(client.profiles(&key)), Ok(Vec::new()));
+    }
+
     fn added_server(client: &FakeClient) -> ServerKey {
         // Home Media's address under a key not saved yet: it answers, as an
         // unsaved server would.
@@ -3107,7 +3227,10 @@ mod tests {
     fn a_locked_session_cannot_remove_its_pin() {
         let alice = session_for(&FakeClient::new(None), "alice");
         assert_eq!(
-            ready(alice.clear_pin()).unwrap_err(),
+            ready(alice.clear_pin(PinProof::Pin {
+                pin: FAKE_PIN.into()
+            }))
+            .unwrap_err(),
             BackendError::ProfileLocked
         );
     }
@@ -3116,7 +3239,7 @@ mod tests {
     fn a_pin_must_be_four_to_eight_digits() {
         let andrey = andrey();
         assert!(matches!(
-            ready(andrey.set_pin("12a4")),
+            ready(andrey.set_pin("12a4", None)),
             Err(BackendError::InvalidInput(_))
         ));
     }
@@ -3141,9 +3264,57 @@ mod tests {
         let alice = session_for(&client, "alice");
         ready(alice.unlock(FAKE_PIN)).unwrap();
         ready(alice.set_pin_required(Some(LIVING_ROOM_TV), true)).unwrap();
-        ready(alice.clear_pin()).unwrap();
+        ready(alice.clear_pin(PinProof::Pin {
+            pin: FAKE_PIN.into(),
+        }))
+        .unwrap();
         let devices = ready(alice.devices()).unwrap();
         assert!(devices.iter().all(|d| !d.pin_required));
+    }
+
+    #[test]
+    fn changing_a_pin_needs_the_current_one() {
+        let client = FakeClient::new(None);
+        let alice = session_for(&client, "alice");
+        ready(alice.unlock(FAKE_PIN)).unwrap();
+        assert!(matches!(
+            ready(alice.set_pin("5678", None)),
+            Err(BackendError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn a_wrong_current_pin_is_refused() {
+        let client = FakeClient::new(None);
+        let alice = session_for(&client, "alice");
+        ready(alice.unlock(FAKE_PIN)).unwrap();
+        assert_eq!(
+            ready(alice.clear_pin(PinProof::Pin { pin: "0000".into() })),
+            Err(BackendError::WrongCredentials)
+        );
+    }
+
+    #[test]
+    fn the_password_removes_a_forgotten_pin() {
+        let client = FakeClient::new(None);
+        let alice = session_for(&client, "alice");
+        ready(alice.unlock(FAKE_PIN)).unwrap();
+        ready(alice.clear_pin(PinProof::Password {
+            password: FAKE_PASSWORD.into(),
+        }))
+        .unwrap();
+        assert_eq!(ready(alice.pin()), Ok(None));
+    }
+
+    #[test]
+    fn the_pin_state_says_how_many_digits() {
+        let client = FakeClient::new(None);
+        let alice = session_for(&client, "alice");
+        ready(alice.unlock(FAKE_PIN)).unwrap();
+        assert_eq!(
+            ready(alice.pin()).unwrap().and_then(|p| p.digits),
+            Some(FAKE_PIN.len() as u8)
+        );
     }
 
     #[test]

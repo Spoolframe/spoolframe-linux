@@ -17,6 +17,7 @@ const STREAMING: &str = "streaming";
 const MAX_BITRATE: &str = "max-bitrate";
 const PLAYBACK: &str = "playback";
 const SKIP_INTROS: &str = "skip-intros";
+const DIAGNOSTICS: &str = "show-diagnostics";
 
 pub struct Settings {
     /// `None` without a home directory: settings then last for this run.
@@ -98,6 +99,17 @@ impl Settings {
 
     pub fn set_skip_intros(&mut self, on: bool) {
         self.file.set_boolean(PLAYBACK, SKIP_INTROS, on);
+        self.save();
+    }
+
+    /// Whether the player opens with its diagnostics showing; off by
+    /// default. The player's own button still toggles them while it plays.
+    pub fn show_diagnostics(&self) -> bool {
+        self.file.boolean(PLAYBACK, DIAGNOSTICS).unwrap_or(false)
+    }
+
+    pub fn set_show_diagnostics(&mut self, on: bool) {
+        self.file.set_boolean(PLAYBACK, DIAGNOSTICS, on);
         self.save();
     }
 

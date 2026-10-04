@@ -16,7 +16,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use adw::prelude::*;
 use gtk::glib;
 use spoolframe_linux_core::backend::{
-    BackendError, BoxFuture, DeviceInfo, DeviceSignInRequest, Session,
+    BackendError, BoxFuture, DeviceInfo, DeviceSignInRequest, PinProof, PinState, Platform,
+    PlexLink, Session,
 };
 use spoolframe_protocol::device_sign_in;
 
@@ -37,6 +38,7 @@ pub struct Signed {
     pub server_key: String,
     pub server_name: String,
     pub display_name: String,
+    pub username: String,
 }
 
 /// The web UI's profile page, where a Plex account is linked.
@@ -97,6 +99,64 @@ fn capitalized(text: &str) -> String {
     }
 }
 
+/// The PIN row's line: "Set · 4 digits", "Set" (a PIN from before the
+/// server kept its length), or "Not set".
+pub fn pin_summary(pin: Option<&PinState>) -> String {
+    match pin {
+        Some(PinState {
+            digits: Some(digits),
+        }) => format!("Set · {digits} digits"),
+        Some(_) => "Set".to_owned(),
+        None => "Not set".to_owned(),
+    }
+}
+
+/// The Plex row's line: who is linked, or that nobody is.
+pub fn plex_summary(link: Option<&PlexLink>) -> String {
+    match link {
+        Some(link) if link.by_config => "Linked by the server's config".to_owned(),
+        Some(link) => match link.email.as_ref().or(link.username.as_ref()) {
+            Some(who) => format!("Linked as {who} · managed in the web app"),
+            None => "Linked · managed in the web app".to_owned(),
+        },
+        None => "Not linked · link it in the web app".to_owned(),
+    }
+}
+
+/// A device's row: "This computer" for this one, with its name; else its
+/// name. The line under says what it runs and when it was last used.
+pub fn device_line(device: &DeviceInfo, now: i64) -> (String, String) {
+    let name = device
+        .name
+        .clone()
+        .unwrap_or_else(|| "Unnamed device".into());
+    let used = last_used(device.last_seen_at, now);
+    let runs = device.platform.map(Platform::label);
+    if device.this_device {
+        let line = match runs {
+            Some(runs) => format!("{name} · {runs}"),
+            None => name,
+        };
+        ("This computer".to_owned(), line)
+    } else {
+        let line = match runs {
+            Some(runs) => format!("{runs} · {used}"),
+            None => used,
+        };
+        (name, line)
+    }
+}
+
+/// An icon for what a device runs.
+fn device_icon(platform: Option<Platform>) -> &'static str {
+    match platform {
+        Some(Platform::Tvos) => crate::icons::SHOWS,
+        Some(Platform::Ios) => crate::icons::PHONE,
+        Some(Platform::Linux | Platform::Macos) => crate::icons::LAPTOP,
+        _ => crate::icons::MONITOR,
+    }
+}
+
 fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -107,7 +167,7 @@ fn now() -> i64 {
 pub fn page(signed: Signed, dialog: &adw::PreferencesDialog) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::builder()
         .title("Profile")
-        .icon_name(crate::icons::LOCK)
+        .icon_name(crate::icons::PROFILE)
         .build();
     let view = Rc::new(View {
         session: signed.session,
@@ -117,48 +177,95 @@ pub fn page(signed: Signed, dialog: &adw::PreferencesDialog) -> adw::Preferences
         dialog: dialog.downgrade(),
         devices: adw::PreferencesGroup::builder()
             .title("Asked for on")
-            .description("Where your PIN is asked for before your profile opens.")
+            .description("Your devices that are signed in to this profile.")
             .build(),
         rows: std::cell::RefCell::new(Vec::new()),
+        pin_row: adw::ActionRow::builder().title("PIN").subtitle("…").build(),
+        set_button: gtk::Button::builder()
+            .label("Set PIN…")
+            .valign(gtk::Align::Center)
+            .css_classes(["row-button"])
+            .build(),
+        remove_button: gtk::Button::builder()
+            .label("Remove PIN…")
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .css_classes(["row-button", "destructive-tint"])
+            .build(),
+        has_pin: std::cell::Cell::new(false),
+        plex_row: adw::ActionRow::builder()
+            .use_markup(false)
+            .title("Plex account")
+            .activatable(true)
+            .build(),
     });
 
+    // Who: the avatar, the name, the username and the server.
+    let avatar = adw::Avatar::new(48, Some(&view.display_name), true);
+    avatar.add_css_class("profile-avatar");
+    avatar.add_css_class("tint-purple");
+    let names = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .valign(gtk::Align::Center)
+        .build();
+    names.append(
+        &gtk::Label::builder()
+            .label(&view.display_name)
+            .xalign(0.0)
+            .css_classes(["title-4", "profile-header-name"])
+            .build(),
+    );
+    names.append(
+        &gtk::Label::builder()
+            .label(format!("{} · {}", signed.username, view.server_name))
+            .xalign(0.0)
+            .css_classes(["dim-label", "small-text"])
+            .build(),
+    );
+    let who = gtk::Box::builder().spacing(14).build();
+    who.append(&avatar);
+    who.append(&names);
+    let header = adw::PreferencesGroup::new();
+    header.add(&who);
+    page.add(&header);
+
     let pin = adw::PreferencesGroup::builder()
-        .title("PIN")
-        .description("4 to 8 digits, asked for before your profile opens.")
+        .title("Profile PIN")
+        .description("Asked for when someone opens your profile.")
         .build();
-    let set = adw::ButtonRow::builder()
-        .title("Set or Change PIN…")
-        .build();
+    view.pin_row
+        .add_prefix(&gtk::Image::from_icon_name(crate::icons::LOCK));
     {
-        let view = Rc::downgrade(&view);
-        set.connect_activated(move |_| {
-            if let Some(view) = view.upgrade() {
+        let weak = Rc::downgrade(&view);
+        view.set_button.connect_clicked(move |_| {
+            if let Some(view) = weak.upgrade() {
                 view.set_pin();
             }
         });
-    }
-    let remove = adw::ButtonRow::builder()
-        .title("Remove PIN…")
-        .css_classes(["destructive-action"])
-        .build();
-    {
-        let view = Rc::downgrade(&view);
-        remove.connect_activated(move |_| {
-            if let Some(view) = view.upgrade() {
+        let weak = Rc::downgrade(&view);
+        view.remove_button.connect_clicked(move |_| {
+            if let Some(view) = weak.upgrade() {
                 view.remove_pin();
             }
         });
     }
-    pin.add(&set);
-    pin.add(&remove);
+    view.pin_row.add_suffix(&view.set_button);
+    view.pin_row.add_suffix(&view.remove_button);
+    pin.add(&view.pin_row);
     page.add(&pin);
     page.add(&view.devices);
     let others = adw::PreferencesGroup::builder()
         .title("Sign in another device")
-        .description("A TV or another device shows a code when it asks to sign in as you.")
         .build();
     // The name the web page and the other clients use for it.
-    let approve = adw::ButtonRow::builder().title("Sign In a Device…").build();
+    let approve = adw::ActionRow::builder()
+        .title("Sign In a Device…")
+        .subtitle("Type the code a TV or phone shows, and approve it here")
+        .activatable(true)
+        .build();
+    approve.add_prefix(&gtk::Image::from_icon_name(crate::icons::PHONE));
+    approve.add_suffix(&gtk::Image::from_icon_name(crate::icons::RIGHT));
     {
         let view = Rc::downgrade(&view);
         approve.connect_activated(move |_| {
@@ -172,33 +279,13 @@ pub fn page(signed: Signed, dialog: &adw::PreferencesDialog) -> adw::Preferences
     // Linking a Plex account is the web UI's (P3-12): the row opens it,
     // when the server has a web address a browser can reach.
     if let Some(web) = view.session.web_url() {
-        let plex = adw::PreferencesGroup::builder()
-            .title("Plex")
-            .description("Sign in with Plex, and choose which libraries keep watch state in sync.")
-            .build();
-        let row = adw::ActionRow::builder()
-            .title("Plex Account")
-            .subtitle("Opens your profile in the web UI")
-            .activatable(true)
-            .build();
-        row.add_suffix(&gtk::Image::from_icon_name(crate::icons::RIGHT));
+        let plex = adw::PreferencesGroup::builder().title("Plex").build();
+        let row = view.plex_row.clone();
+        row.set_subtitle("…");
+        row.add_prefix(&gtk::Image::from_icon_name(crate::icons::LINK));
+        row.add_suffix(&gtk::Image::from_icon_name(crate::icons::EXTERNAL));
         let url = profile_url(&web);
-        let page_ = page.downgrade();
-        row.connect_activated(move |_| {
-            let window = page_
-                .upgrade()
-                .and_then(|p| p.root())
-                .and_downcast::<gtk::Window>();
-            gtk::UriLauncher::new(&url).launch(
-                window.as_ref(),
-                None::<&gtk::gio::Cancellable>,
-                |result| {
-                    if let Err(e) = result {
-                        tracing::warn!(error = %e, "cannot open the browser");
-                    }
-                },
-            );
-        });
+        row.connect_activated(move |row| open_in_browser(row, &url));
         plex.add(&row);
         page.add(&plex);
     }
@@ -218,6 +305,12 @@ struct View {
     dialog: glib::WeakRef<adw::PreferencesDialog>,
     devices: adw::PreferencesGroup,
     rows: std::cell::RefCell<Vec<adw::SwitchRow>>,
+    pin_row: adw::ActionRow,
+    set_button: gtk::Button,
+    remove_button: gtk::Button,
+    /// Whether the user has a PIN, as the server last said.
+    has_pin: std::cell::Cell<bool>,
+    plex_row: adw::ActionRow,
 }
 
 impl View {
@@ -253,6 +346,34 @@ impl View {
                 Err(e) => this.toast(&refusal(&e)),
             },
         );
+        self.load_pin();
+        self.run(
+            |s| Box::pin(async move { s.plex_link().await }),
+            |this, link| match link {
+                Ok(link) => this.plex_row.set_subtitle(&plex_summary(link.as_ref())),
+                Err(_) => this.plex_row.set_subtitle("Managed in the web app"),
+            },
+        );
+    }
+
+    /// Whether there is a PIN: the row's line and which buttons it shows.
+    fn load_pin(self: &Rc<Self>) {
+        self.run(
+            |s| Box::pin(async move { s.pin().await }),
+            |this, pin| match pin {
+                Ok(pin) => {
+                    this.has_pin.set(pin.is_some());
+                    this.pin_row.set_subtitle(&pin_summary(pin.as_ref()));
+                    this.set_button.set_label(if pin.is_some() {
+                        "Change PIN…"
+                    } else {
+                        "Set PIN…"
+                    });
+                    this.remove_button.set_visible(pin.is_some());
+                }
+                Err(e) => this.toast(&refusal(&e)),
+            },
+        );
     }
 
     fn show(self: &Rc<Self>, devices: Vec<DeviceInfo>) {
@@ -262,19 +383,14 @@ impl View {
         let now = now();
         let mut rows = Vec::new();
         for device in devices {
-            let name = device
-                .name
-                .clone()
-                .unwrap_or_else(|| "Unnamed device".into());
-            let mut subtitle = last_used(device.last_seen_at, now);
-            if device.this_device {
-                subtitle = format!("This device · {subtitle}");
-            }
+            let (title, subtitle) = device_line(&device, now);
             let row = adw::SwitchRow::builder()
-                .title(&name)
-                .subtitle(&subtitle)
+                .use_markup(false)
                 .active(device.pin_required)
                 .build();
+            row.set_title(&title);
+            row.set_subtitle(&subtitle);
+            row.add_prefix(&gtk::Image::from_icon_name(device_icon(device.platform)));
             let this = Rc::downgrade(self);
             let id = (!device.this_device).then(|| device.endpoint_id.clone());
             row.connect_active_notify(move |row| {
@@ -304,203 +420,815 @@ impl View {
         );
     }
 
+    /// "Set a PIN" or "Change PIN": changing proves who it is first, with
+    /// the current PIN or the account password; then a new PIN, then the
+    /// same again, a mismatch starting it over. The dialog stays until
+    /// the server answers, so a wrong proof can say so and ask again.
     fn set_pin(self: &Rc<Self>) {
-        let Some(dialog) = self.dialog.upgrade() else {
+        let Some(parent) = self.dialog.upgrade() else {
             return;
         };
-        let new = pin_row("New PIN, 4 to 8 digits");
-        let again = pin_row("The same again");
-        let alert = alert(
-            "Set PIN",
-            "It is asked for on the devices you choose.",
-            "Save",
-        );
-        alert.set_extra_child(Some(&boxed(&[&new, &again])));
-        let this = Rc::downgrade(self);
-        alert.connect_response(None, move |_, response| {
-            let Some(this) = this.upgrade() else { return };
-            if response != "confirm" {
-                return;
-            }
-            let pin = new.text().to_string();
-            // A typo would lock the user out of their own profile.
-            if pin != again.text().as_str() {
-                return this.toast("The two PINs differ; nothing was changed");
-            }
-            this.run(
-                move |s| Box::pin(async move { s.set_pin(&pin).await }),
-                |this, result| match result {
-                    Ok(()) => this.toast("PIN saved"),
-                    Err(e) => this.toast(&refusal(&e)),
-                },
-            );
+        let changing = self.has_pin.get();
+        let dialog = adw::Dialog::builder()
+            .title(if changing { "Change PIN" } else { "Set a PIN" })
+            .content_width(400)
+            .build();
+        let heading = gtk::Label::builder().css_classes(["title-3"]).build();
+        let hint = gtk::Label::builder()
+            .wrap(true)
+            .justify(gtk::Justification::Center)
+            .css_classes(["dim-label", "small-text"])
+            .build();
+        let entry = pin_entry();
+        let proof = ProofInput::new(self.session.as_ref());
+        let fields = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(8)
+            .build();
+        fields.append(&proof.root);
+        fields.append(&entry);
+        let next = gtk::Button::builder()
+            .sensitive(false)
+            .css_classes(["action", "suggested-action"])
+            .build();
+        let body = pin_body(&heading, &hint, &fields, &next);
+        crate::start::with_cancel(&dialog, &body);
+        let flow = Rc::new(PinFlow {
+            heading,
+            hint,
+            entry: entry.clone(),
+            proof: proof.clone(),
+            next: next.clone(),
+            changing,
+            step: std::cell::Cell::new(if changing {
+                PinStep::Prove
+            } else {
+                PinStep::Choose
+            }),
+            given: std::cell::RefCell::new(None),
+            chosen: std::cell::RefCell::new(None),
         });
-        alert.present(Some(&dialog));
-    }
-
-    fn remove_pin(self: &Rc<Self>) {
-        let Some(dialog) = self.dialog.upgrade() else {
-            return;
-        };
-        let alert = alert(
-            "Remove Your PIN?",
-            "It will no longer be asked for on any device.",
-            "Remove",
-        );
-        alert.set_response_appearance("confirm", adw::ResponseAppearance::Destructive);
-        let this = Rc::downgrade(self);
-        alert.connect_response(None, move |_, response| {
-            let Some(this) = this.upgrade() else { return };
-            if response != "confirm" {
-                return;
-            }
-            this.run(
-                |s| Box::pin(async move { s.clear_pin().await }),
-                |this, result| match result {
-                    Ok(()) => {
-                        this.toast("PIN removed");
-                        this.load();
+        flow.show(None);
+        {
+            let flow_ = flow.clone();
+            entry.connect_changed(move |_| flow_.update_next());
+            let flow_ = flow.clone();
+            proof.on_change(Rc::new(move || flow_.update_next()));
+        }
+        let go = {
+            let (flow, this, dialog) = (flow.clone(), Rc::downgrade(self), dialog.downgrade());
+            Rc::new(move || match flow.step.get() {
+                PinStep::Prove => {
+                    let Some(given) = flow.proof.proof() else {
+                        return;
+                    };
+                    flow.given.replace(Some(given));
+                    flow.step.set(PinStep::Choose);
+                    flow.show(None);
+                }
+                PinStep::Choose => {
+                    let typed = flow.entry.text().to_string();
+                    if !pin_ok(&typed) {
+                        return;
                     }
-                    Err(e) => this.toast(&refusal(&e)),
-                },
+                    flow.chosen.replace(Some(typed));
+                    flow.step.set(PinStep::Again);
+                    flow.show(None);
+                }
+                PinStep::Again => {
+                    let typed = flow.entry.text().to_string();
+                    let chosen = flow.chosen.borrow().clone().unwrap_or_default();
+                    // A typo would lock the user out of their profile.
+                    if chosen != typed {
+                        flow.step.set(PinStep::Choose);
+                        flow.show(Some("Those don't match. Start again."));
+                        return;
+                    }
+                    let Some(this) = this.upgrade() else { return };
+                    let given = flow.given.borrow().clone();
+                    flow.next.set_sensitive(false);
+                    let (flow, dialog) = (flow.clone(), dialog.clone());
+                    this.run(
+                        move |s| Box::pin(async move { s.set_pin(&chosen, given).await }),
+                        move |this, result| match result {
+                            Ok(()) => {
+                                if let Some(dialog) = dialog.upgrade() {
+                                    dialog.close();
+                                }
+                                this.toast("PIN saved");
+                                this.load_pin();
+                            }
+                            // The proof was refused: back to it, saying why.
+                            Err(
+                                e @ (BackendError::WrongCredentials
+                                | BackendError::NoPassword
+                                | BackendError::RateLimited(_)),
+                            ) => {
+                                flow.step.set(PinStep::Prove);
+                                flow.show(None);
+                                flow.proof.refused(&e);
+                            }
+                            Err(e) => {
+                                if let Some(dialog) = dialog.upgrade() {
+                                    dialog.close();
+                                }
+                                this.toast(&refusal(&e));
+                            }
+                        },
+                    );
+                }
+            })
+        };
+        {
+            let go = go.clone();
+            next.connect_clicked(move |_| go());
+        }
+        {
+            let go = go.clone();
+            entry.connect_activate(move |_| go());
+        }
+        proof.on_activate(go);
+        dialog.set_focus(Some(if changing {
+            proof.pin.upcast_ref::<gtk::Widget>()
+        } else {
+            entry.upcast_ref()
+        }));
+        dialog.present(Some(&parent));
+    }
+
+    /// "Remove your PIN?": what that means, and the current PIN or the
+    /// account password to say so.
+    fn remove_pin(self: &Rc<Self>) {
+        let Some(parent) = self.dialog.upgrade() else {
+            return;
+        };
+        let dialog = adw::Dialog::builder()
+            .title("Remove PIN")
+            .content_width(400)
+            .build();
+        let heading = gtk::Label::builder()
+            .label("Remove your PIN?")
+            .css_classes(["title-3"])
+            .build();
+        let hint = gtk::Label::builder()
+            .label(
+                "Anyone using a device signed in to your profile can open it without \
+                 asking. Type your current PIN to confirm.",
+            )
+            .wrap(true)
+            .justify(gtk::Justification::Center)
+            .css_classes(["dim-label", "small-text"])
+            .build();
+        let proof = ProofInput::new(self.session.as_ref());
+        let remove = gtk::Button::builder()
+            .label("Remove PIN")
+            .sensitive(false)
+            .css_classes(["action", "destructive-action"])
+            .build();
+        let body = pin_body(&heading, &hint, &proof.root, &remove);
+        crate::start::with_cancel(&dialog, &body);
+        {
+            let (remove, proof_) = (remove.clone(), proof.clone());
+            proof.on_change(Rc::new(move || {
+                remove.set_sensitive(proof_.proof().is_some())
+            }));
+        }
+        let go = {
+            let (proof, remove, this, dialog) = (
+                proof.clone(),
+                remove.clone(),
+                Rc::downgrade(self),
+                dialog.downgrade(),
             );
-        });
-        alert.present(Some(&dialog));
-    }
-}
-
-impl View {
-    /// Asks for the code the other device shows, or its link.
-    fn ask_code(self: &Rc<Self>) {
-        let Some(dialog) = self.dialog.upgrade() else {
-            return;
-        };
-        let entry = adw::EntryRow::builder().title("Code or link").build();
-        let alert = alert(
-            "Sign in a device",
-            "Enter the code the device shows, such as BCDF-GHJK, or paste its link.",
-            "Continue",
-        );
-        let list = gtk::ListBox::builder()
-            .selection_mode(gtk::SelectionMode::None)
-            .css_classes(["boxed-list"])
-            .build();
-        list.append(&entry);
-        alert.set_extra_child(Some(&list));
-        let this = Rc::downgrade(self);
-        alert.connect_response(None, move |_, response| {
-            let Some(this) = this.upgrade() else { return };
-            if response != "confirm" {
-                return;
-            }
-            match code_from(&entry.text(), &this.server_key) {
-                Ok(code) => this.look_up(code),
-                Err(why) => this.toast(why),
-            }
-        });
-        alert.present(Some(&dialog));
-    }
-
-    fn look_up(self: &Rc<Self>, code: String) {
-        let asked_for = code.clone();
-        self.run(
-            move |s| Box::pin(async move { s.lookup_device_sign_in(&asked_for).await }),
-            move |this, result| match result {
-                Ok(request) => this.confirm(code, request),
-                Err(e) => this.toast(&approval_refusal(&e)),
-            },
-        );
-    }
-
-    /// "Sign in on Living Room Apple TV?", with the code to compare.
-    fn confirm(self: &Rc<Self>, code: String, request: DeviceSignInRequest) {
-        let Some(dialog) = self.dialog.upgrade() else {
-            return;
-        };
-        let device = request
-            .device_name
-            .clone()
-            .unwrap_or_else(|| "a device".to_owned());
-        let alert = adw::AlertDialog::new(
-            Some(&format!("Sign in on {device}?")),
-            Some(&format!(
-                "It will sign in to {} as {}. It asked {}, from {}. Check that the code matches the one on the device.",
-                self.server_name,
-                self.display_name,
-                asked(request.requested_at, now()),
-                request.client_name,
-            )),
-        );
-        let shown = gtk::Label::builder()
-            .label(device_sign_in::display(&code))
-            .css_classes(["title-1", "monospace", "accent"])
-            .build();
-        alert.set_extra_child(Some(&shown));
-        alert.add_responses(&[
-            ("cancel", "Cancel"),
-            ("deny", "Not Me"),
-            ("approve", "Approve"),
-        ]);
-        alert.set_response_appearance("deny", adw::ResponseAppearance::Destructive);
-        alert.set_response_appearance("approve", adw::ResponseAppearance::Suggested);
-        alert.set_default_response(Some("approve"));
-        alert.set_close_response("cancel");
-        let this = Rc::downgrade(self);
-        alert.connect_response(None, move |_, response| {
-            let Some(this) = this.upgrade() else { return };
-            let approve = match response {
-                "approve" => true,
-                "deny" => false,
-                // Left pending: it expires on its own.
-                _ => return,
-            };
-            let (code, device) = (code.clone(), device.clone());
-            this.run(
-                move |s| {
-                    Box::pin(async move {
-                        if approve {
-                            s.approve_device_sign_in(&code).await
-                        } else {
-                            s.deny_device_sign_in(&code).await
+            Rc::new(move || {
+                let Some(given) = proof.proof() else { return };
+                let Some(this) = this.upgrade() else { return };
+                remove.set_sensitive(false);
+                let (proof, dialog) = (proof.clone(), dialog.clone());
+                this.run(
+                    move |s| Box::pin(async move { s.clear_pin(given).await }),
+                    move |this, result| match result {
+                        Ok(()) => {
+                            if let Some(dialog) = dialog.upgrade() {
+                                dialog.close();
+                            }
+                            this.toast("PIN removed");
+                            this.load();
                         }
-                    })
-                },
-                move |this, result| match result {
-                    Ok(()) if approve => this.toast(&format!("{device} is signing in")),
-                    Ok(()) => this.toast(&format!("{device} was not signed in")),
-                    Err(e) => this.toast(&approval_refusal(&e)),
-                },
-            );
-        });
-        alert.present(Some(&dialog));
+                        Err(
+                            e @ (BackendError::WrongCredentials
+                            | BackendError::NoPassword
+                            | BackendError::RateLimited(_)),
+                        ) => proof.refused(&e),
+                        Err(e) => {
+                            if let Some(dialog) = dialog.upgrade() {
+                                dialog.close();
+                            }
+                            this.toast(&refusal(&e));
+                        }
+                    },
+                );
+            })
+        };
+        {
+            let go = go.clone();
+            remove.connect_clicked(move |_| go());
+        }
+        proof.on_activate(go);
+        dialog.set_focus(Some(&proof.pin));
+        dialog.present(Some(&parent));
     }
 }
 
-fn pin_row(title: &str) -> adw::PasswordEntryRow {
-    adw::PasswordEntryRow::builder()
-        .title(title)
-        .input_purpose(gtk::InputPurpose::Pin)
+/// Where the PIN dialog is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PinStep {
+    /// Changing: the current PIN or the password.
+    Prove,
+    Choose,
+    Again,
+}
+
+/// The PIN dialog's widgets and what has been typed so far.
+struct PinFlow {
+    heading: gtk::Label,
+    hint: gtk::Label,
+    /// The new PIN, twice.
+    entry: gtk::PasswordEntry,
+    proof: Rc<ProofInput>,
+    next: gtk::Button,
+    changing: bool,
+    step: std::cell::Cell<PinStep>,
+    given: std::cell::RefCell<Option<PinProof>>,
+    chosen: std::cell::RefCell<Option<String>>,
+}
+
+impl PinFlow {
+    /// Shows the step it is on, with `problem` in place of the hint and
+    /// the field marked when something went wrong.
+    fn show(&self, problem: Option<&str>) {
+        let step = self.step.get();
+        let (heading, hint, button) = match (step, self.changing) {
+            (PinStep::Prove, _) => (
+                "Confirm it's you",
+                "Step 1 of 3. Your current PIN.",
+                "Continue",
+            ),
+            (PinStep::Choose, true) => ("New PIN", "Step 2 of 3. 4 to 8 digits.", "Continue"),
+            (PinStep::Choose, false) => ("Choose a PIN", "Step 1 of 2. 4 to 8 digits.", "Continue"),
+            (PinStep::Again, true) => ("Type it again", "Step 3 of 3.", "Save PIN"),
+            (PinStep::Again, false) => ("Type it again", "Step 2 of 2.", "Save PIN"),
+        };
+        self.heading.set_label(heading);
+        self.hint.set_label(problem.unwrap_or(hint));
+        self.next.set_label(button);
+        self.proof.root.set_visible(step == PinStep::Prove);
+        self.entry.set_visible(step != PinStep::Prove);
+        self.entry.set_text("");
+        if problem.is_some() {
+            self.entry.add_css_class("error");
+        } else {
+            self.entry.remove_css_class("error");
+        }
+        self.update_next();
+    }
+
+    /// Next only once what the step asks for is there.
+    fn update_next(&self) {
+        let ready = match self.step.get() {
+            PinStep::Prove => self.proof.proof().is_some(),
+            _ => pin_ok(&self.entry.text()),
+        };
+        self.next.set_sensitive(ready);
+    }
+}
+
+/// Proving it is the user, to change or remove the PIN: the current PIN,
+/// or the account password instead (which covers a forgotten PIN). A
+/// refusal is said under the field; an account with no password is sent
+/// to My profile in the web UI, which proves it there.
+struct ProofInput {
+    root: gtk::Box,
+    pin: gtk::PasswordEntry,
+    password: gtk::PasswordEntry,
+    switch: gtk::Button,
+    problem: gtk::Label,
+    web: Option<gtk::Button>,
+    using_password: std::cell::Cell<bool>,
+    changed: std::cell::RefCell<Option<Rc<dyn Fn()>>>,
+}
+
+impl ProofInput {
+    fn new(session: &dyn Session) -> Rc<Self> {
+        let pin = pin_entry();
+        let password = gtk::PasswordEntry::builder()
+            .show_peek_icon(true)
+            .placeholder_text("Account password")
+            .visible(false)
+            .css_classes(["field"])
+            .build();
+        let switch = gtk::Button::builder()
+            .label("Use your password instead")
+            .halign(gtk::Align::Center)
+            .css_classes(["flat", "text-link"])
+            .build();
+        let problem = gtk::Label::builder()
+            .wrap(true)
+            .justify(gtk::Justification::Center)
+            .visible(false)
+            .css_classes(["error", "small-text"])
+            .build();
+        let web = web_profile_link(session);
+        let root = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(8)
+            .build();
+        root.append(&pin);
+        root.append(&password);
+        root.append(&problem);
+        root.append(&switch);
+        if let Some(web) = &web {
+            web.set_visible(false);
+            root.append(web);
+        }
+        let this = Rc::new(Self {
+            root,
+            pin,
+            password,
+            switch,
+            problem,
+            web,
+            using_password: std::cell::Cell::new(false),
+            changed: std::cell::RefCell::new(None),
+        });
+        {
+            let weak = Rc::downgrade(&this);
+            this.switch.connect_clicked(move |_| {
+                if let Some(this) = weak.upgrade() {
+                    this.use_password(!this.using_password.get());
+                }
+            });
+        }
+        for entry in [&this.pin, &this.password] {
+            let weak = Rc::downgrade(&this);
+            entry.connect_changed(move |entry| {
+                entry.remove_css_class("error");
+                if let Some(this) = weak.upgrade() {
+                    this.problem.set_visible(false);
+                    this.notify();
+                }
+            });
+        }
+        this
+    }
+
+    /// The PIN field or the password field.
+    fn use_password(&self, on: bool) {
+        self.using_password.set(on);
+        self.pin.set_visible(!on);
+        self.password.set_visible(on);
+        self.switch.set_label(if on {
+            "Use your PIN instead"
+        } else {
+            "Use your password instead"
+        });
+        self.problem.set_visible(false);
+        if let Some(web) = &self.web {
+            web.set_visible(false);
+        }
+        if on {
+            self.password.grab_focus();
+        } else {
+            self.pin.grab_focus();
+        }
+        self.notify();
+    }
+
+    /// What was typed, once it could be a proof.
+    fn proof(&self) -> Option<PinProof> {
+        if self.using_password.get() {
+            let password = self.password.text().to_string();
+            (!password.is_empty()).then_some(PinProof::Password { password })
+        } else {
+            let pin = self.pin.text().to_string();
+            pin_ok(&pin).then_some(PinProof::Pin { pin })
+        }
+    }
+
+    fn on_change(&self, run: Rc<dyn Fn()>) {
+        self.changed.replace(Some(run));
+    }
+
+    fn on_activate(&self, run: Rc<dyn Fn()>) {
+        for entry in [&self.pin, &self.password] {
+            let run = run.clone();
+            entry.connect_activate(move |_| run());
+        }
+    }
+
+    fn notify(&self) {
+        let changed = self.changed.borrow().clone();
+        if let Some(changed) = changed {
+            changed();
+        }
+    }
+
+    /// Says under the field why the server refused the proof.
+    fn refused(&self, error: &BackendError) {
+        let field = if self.using_password.get() {
+            &self.password
+        } else {
+            &self.pin
+        };
+        let why = match error {
+            BackendError::NoPassword => {
+                if let Some(web) = &self.web {
+                    web.set_visible(true);
+                }
+                "Your account signs in with a passkey or a sign-in provider, so it has no \
+                 password. Use your PIN, or set it in My profile in the web app."
+                    .to_owned()
+            }
+            BackendError::RateLimited(wait) => format!(
+                "Too many tries. Try again in {} min.",
+                wait.as_secs().div_ceil(60).max(1)
+            ),
+            _ if self.using_password.get() => "That password isn't right.".to_owned(),
+            _ => "That PIN isn't right.".to_owned(),
+        };
+        field.set_text("");
+        field.add_css_class("error");
+        self.problem.set_label(&why);
+        self.problem.set_visible(true);
+    }
+}
+
+/// Opens `url` in the browser, over the window `widget` is in.
+fn open_in_browser(widget: &impl IsA<gtk::Widget>, url: &str) {
+    let window = widget.root().and_downcast::<gtk::Window>();
+    gtk::UriLauncher::new(url).launch(window.as_ref(), None::<&gtk::gio::Cancellable>, |result| {
+        if let Err(e) = result {
+            tracing::warn!(error = %e, "cannot open the browser");
+        }
+    });
+}
+
+/// "Open My profile in the web app", for an account with no password:
+/// the web UI proves who it is with a passkey or provider, and sets or
+/// removes the PIN there. None when the server has no web address.
+fn web_profile_link(session: &dyn Session) -> Option<gtk::Button> {
+    let url = profile_url(&session.web_url()?);
+    let body = gtk::Box::builder().spacing(4).build();
+    body.append(&gtk::Label::new(Some("Open My profile in the web app")));
+    body.append(&gtk::Image::from_icon_name(crate::icons::EXTERNAL));
+    let link = gtk::Button::builder()
+        .child(&body)
+        .halign(gtk::Align::Center)
+        .css_classes(["flat", "text-link"])
+        .build();
+    link.connect_clicked(move |link| open_in_browser(link, &url));
+    Some(link)
+}
+
+/// A PIN as the server takes it: 4 to 8 digits.
+fn pin_ok(pin: &str) -> bool {
+    (4..=8).contains(&pin.len()) && pin.chars().all(|c| c.is_ascii_digit())
+}
+
+/// The PIN typed large and spaced, digits only.
+fn pin_entry() -> gtk::PasswordEntry {
+    gtk::PasswordEntry::builder()
+        .halign(gtk::Align::Center)
+        .width_chars(8)
+        .css_classes(["field", "pin-field"])
         .build()
 }
 
-fn alert(heading: &str, body: &str, confirm: &str) -> adw::AlertDialog {
-    let alert = adw::AlertDialog::new(Some(heading), Some(body));
-    alert.add_responses(&[("cancel", "Cancel"), ("confirm", confirm)]);
-    alert.set_response_appearance("confirm", adw::ResponseAppearance::Suggested);
-    alert.set_default_response(Some("confirm"));
-    alert.set_close_response("cancel");
-    alert
+/// A dialog's body: the lock, a heading, a hint, the field and its button.
+fn pin_body(
+    heading: &gtk::Label,
+    hint: &gtk::Label,
+    entry: &impl IsA<gtk::Widget>,
+    button: &gtk::Button,
+) -> gtk::Box {
+    let body = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(14)
+        .margin_top(26)
+        .margin_bottom(24)
+        .margin_start(28)
+        .margin_end(28)
+        .build();
+    body.append(
+        &gtk::Image::builder()
+            .icon_name(crate::icons::LOCK)
+            .pixel_size(30)
+            .width_request(56)
+            .height_request(56)
+            .halign(gtk::Align::Center)
+            .css_classes(["check-icon"])
+            .build(),
+    );
+    body.append(heading);
+    body.append(hint);
+    body.append(entry);
+    body.append(button);
+    body
 }
 
-fn boxed(rows: &[&adw::PasswordEntryRow]) -> gtk::ListBox {
-    let list = gtk::ListBox::builder()
-        .selection_mode(gtk::SelectionMode::None)
-        .css_classes(["boxed-list"])
-        .build();
-    for row in rows {
-        list.append(*row);
+impl View {
+    /// "Sign In a Device": the code the other device shows (or its link),
+    /// then who it signs in as, then that it is signed in; a wrong code or
+    /// too many says so under the field.
+    fn ask_code(self: &Rc<Self>) {
+        let Some(parent) = self.dialog.upgrade() else {
+            return;
+        };
+        let dialog = adw::Dialog::builder()
+            .title("Sign In a Device")
+            .content_width(420)
+            .build();
+        let stack = gtk::Stack::builder()
+            .transition_type(gtk::StackTransitionType::SlideLeftRight)
+            .vhomogeneous(false)
+            .build();
+
+        // 1 · The code.
+        let entry = gtk::Entry::builder()
+            .placeholder_text("BCDF-GHJK")
+            .css_classes(["field", "code-field"])
+            .build();
+        let problem = gtk::Label::builder()
+            .wrap(true)
+            .xalign(0.0)
+            .visible(false)
+            .css_classes(["error", "small-text"])
+            .build();
+        let next = gtk::Button::builder()
+            .label("Continue")
+            .css_classes(["action", "suggested-action"])
+            .build();
+        let code_page = step_body(
+            crate::icons::PHONE,
+            "Enter the code",
+            "Type the code the TV or phone shows, or paste its link.",
+        );
+        code_page.append(&entry);
+        code_page.append(&problem);
+        code_page.append(&next);
+        stack.add_named(&code_page, Some("code"));
+
+        // 2 · Who it signs in as, and 3 · done, filled in as they come.
+        let confirm_page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        stack.add_named(&confirm_page, Some("confirm"));
+        let done_page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        stack.add_named(&done_page, Some("done"));
+        crate::start::with_cancel(&dialog, &stack);
+
+        let refuse = {
+            let (entry, problem) = (entry.clone(), problem.clone());
+            Rc::new(move |why: &str| {
+                entry.add_css_class("error");
+                problem.set_label(why);
+                problem.set_visible(true);
+            })
+        };
+        let submit = {
+            let (this, entry, refuse, stack, confirm_page, done_page, dialog) = (
+                Rc::downgrade(self),
+                entry.clone(),
+                refuse.clone(),
+                stack.clone(),
+                confirm_page.clone(),
+                done_page.clone(),
+                dialog.downgrade(),
+            );
+            Rc::new(move || {
+                let Some(this) = this.upgrade() else { return };
+                let code = match code_from(&entry.text(), &this.server_key) {
+                    Ok(code) => code,
+                    Err(why) => return refuse(why),
+                };
+                let asked_for = code.clone();
+                let (refuse, stack, confirm_page, done_page, dialog) = (
+                    refuse.clone(),
+                    stack.clone(),
+                    confirm_page.clone(),
+                    done_page.clone(),
+                    dialog.clone(),
+                );
+                this.run(
+                    move |s| Box::pin(async move { s.lookup_device_sign_in(&asked_for).await }),
+                    move |this, result| match result {
+                        Ok(request) => {
+                            this.fill_confirm(
+                                &confirm_page,
+                                &done_page,
+                                &stack,
+                                &dialog,
+                                code,
+                                request,
+                            );
+                            stack.set_visible_child_name("confirm");
+                        }
+                        Err(e) => refuse(&approval_refusal(&e)),
+                    },
+                );
+            })
+        };
+        {
+            let submit = submit.clone();
+            next.connect_clicked(move |_| submit());
+        }
+        entry.connect_activate(move |_| submit());
+        {
+            let problem = problem.clone();
+            entry.connect_changed(move |entry| {
+                entry.remove_css_class("error");
+                problem.set_visible(false);
+            });
+        }
+        dialog.set_focus(Some(&entry));
+        dialog.present(Some(&parent));
     }
-    list
+
+    /// Step 2: the device, who it signs in as and the code to compare, and
+    /// Sign In; approving moves to step 3.
+    fn fill_confirm(
+        self: &Rc<Self>,
+        page: &gtk::Box,
+        done: &gtk::Box,
+        stack: &gtk::Stack,
+        dialog: &glib::WeakRef<adw::Dialog>,
+        code: String,
+        request: DeviceSignInRequest,
+    ) {
+        while let Some(child) = page.first_child() {
+            page.remove(&child);
+        }
+        let device = request
+            .device_name
+            .clone()
+            .unwrap_or_else(|| "A device".to_owned());
+        let body = step_body(
+            crate::icons::PHONE,
+            "Sign in this device?",
+            &format!(
+                "It asked {}, from {}.",
+                asked(request.requested_at, now()),
+                request.client_name
+            ),
+        );
+        let facts = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .css_classes(["boxed-list"])
+            .build();
+        for (label, value, mono) in [
+            ("Device", device.clone(), false),
+            ("Signs in as", self.display_name.clone(), false),
+            ("Code", device_sign_in::display(&code), true),
+        ] {
+            let row = adw::ActionRow::builder().use_markup(false).build();
+            row.set_title(label);
+            let value = gtk::Label::builder()
+                .label(value)
+                .css_classes(if mono {
+                    vec!["monospace", "sign-in-fingerprint"]
+                } else {
+                    vec!["heading"]
+                })
+                .build();
+            row.add_suffix(&value);
+            facts.append(&row);
+        }
+        body.append(&facts);
+        let warning = gtk::Label::builder()
+            .label("Only continue if you started this on a device in front of you.")
+            .wrap(true)
+            .justify(gtk::Justification::Center)
+            .css_classes(["dim-label", "small-text"])
+            .build();
+        body.append(&warning);
+        let sign_in = gtk::Button::builder()
+            .label("Sign In")
+            .css_classes(["action", "suggested-action"])
+            .build();
+        let not_me = gtk::Button::builder()
+            .label("Not me")
+            .halign(gtk::Align::Center)
+            .css_classes(["flat", "dialog-text-button"])
+            .build();
+        body.append(&sign_in);
+        body.append(&not_me);
+        page.append(&body);
+        for (button, approve) in [(&sign_in, true), (&not_me, false)] {
+            let (this, code, device, stack, done, dialog) = (
+                Rc::downgrade(self),
+                code.clone(),
+                device.clone(),
+                stack.clone(),
+                done.clone(),
+                dialog.clone(),
+            );
+            button.connect_clicked(move |_| {
+                let Some(this) = this.upgrade() else { return };
+                let (code, device, stack, done, dialog) = (
+                    code.clone(),
+                    device.clone(),
+                    stack.clone(),
+                    done.clone(),
+                    dialog.clone(),
+                );
+                this.run(
+                    move |s| {
+                        Box::pin(async move {
+                            if approve {
+                                s.approve_device_sign_in(&code).await
+                            } else {
+                                s.deny_device_sign_in(&code).await
+                            }
+                        })
+                    },
+                    move |this, result| match result {
+                        Ok(()) if approve => {
+                            fill_done(&done, &device, &dialog);
+                            stack.set_visible_child_name("done");
+                        }
+                        Ok(()) => {
+                            if let Some(dialog) = dialog.upgrade() {
+                                dialog.close();
+                            }
+                            this.toast(&format!("{device} was not signed in"));
+                        }
+                        Err(e) => this.toast(&approval_refusal(&e)),
+                    },
+                );
+            });
+        }
+    }
+}
+
+/// Step 3: "Apple TV is signed in", and Done.
+fn fill_done(page: &gtk::Box, device: &str, dialog: &glib::WeakRef<adw::Dialog>) {
+    while let Some(child) = page.first_child() {
+        page.remove(&child);
+    }
+    let body = step_body(
+        crate::icons::CHECK,
+        &format!("{device} is signed in"),
+        "It shows up under Devices in your profile on the web.",
+    );
+    let done = gtk::Button::builder()
+        .label("Done")
+        .css_classes(["action", "suggested-action"])
+        .build();
+    let dialog = dialog.clone();
+    done.connect_clicked(move |_| {
+        if let Some(dialog) = dialog.upgrade() {
+            dialog.close();
+        }
+    });
+    body.append(&done);
+    page.append(&body);
+}
+
+/// A step's top: its icon in a tile, a heading, a line under it.
+fn step_body(icon: &str, heading: &str, line: &str) -> gtk::Box {
+    let body = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(14)
+        .margin_top(26)
+        .margin_bottom(24)
+        .margin_start(28)
+        .margin_end(28)
+        .build();
+    body.append(
+        &gtk::Image::builder()
+            .icon_name(icon)
+            .pixel_size(30)
+            .width_request(56)
+            .height_request(56)
+            .halign(gtk::Align::Center)
+            .css_classes(["check-icon"])
+            .build(),
+    );
+    body.append(
+        &gtk::Label::builder()
+            .label(heading)
+            .wrap(true)
+            .justify(gtk::Justification::Center)
+            .css_classes(["title-3"])
+            .build(),
+    );
+    body.append(
+        &gtk::Label::builder()
+            .label(line)
+            .wrap(true)
+            .justify(gtk::Justification::Center)
+            .css_classes(["dim-label", "small-text"])
+            .build(),
+    );
+    body
 }
 
 #[cfg(test)]
@@ -575,6 +1303,67 @@ mod tests {
         assert_eq!(
             (asked(100, 130), asked(100, 100 + 4 * 60 + 5)),
             ("just now".to_owned(), "4 min ago".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_pin_row_says_how_many_digits_or_just_set() {
+        assert_eq!(
+            [
+                pin_summary(Some(&PinState { digits: Some(4) })),
+                pin_summary(Some(&PinState { digits: None })),
+                pin_summary(None)
+            ],
+            ["Set · 4 digits", "Set", "Not set"]
+        );
+    }
+
+    #[test]
+    fn a_plex_link_names_the_account() {
+        let link = PlexLink {
+            username: Some("alice".into()),
+            email: Some("alice@example.com".into()),
+            by_config: false,
+            linked_at: None,
+            last_sync: None,
+            syncing: false,
+        };
+        assert_eq!(
+            plex_summary(Some(&link)),
+            "Linked as alice@example.com · managed in the web app"
+        );
+    }
+
+    #[test]
+    fn this_device_is_this_computer_with_what_it_runs() {
+        let device = DeviceInfo {
+            endpoint_id: "x".into(),
+            name: Some("andoriyu-desktop".into()),
+            platform: Some(Platform::Linux),
+            last_seen_at: 0,
+            pin_required: false,
+            this_device: true,
+        };
+        assert_eq!(
+            device_line(&device, 0),
+            (
+                "This computer".to_owned(),
+                "andoriyu-desktop · Linux app".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn a_pin_is_four_to_eight_digits() {
+        assert_eq!(
+            [
+                pin_ok("123"),
+                pin_ok("1234"),
+                pin_ok("12345678"),
+                pin_ok("123456789"),
+                pin_ok("12a4")
+            ],
+            [false, true, true, false, false]
         );
     }
 

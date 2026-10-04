@@ -66,12 +66,16 @@ pub struct Needs {
 
 pub struct SearchPage {
     pub widget: gtk::Box,
+    /// The field, All results and the year: the header bar's, while the
+    /// page shows.
+    pub head: gtk::Box,
     needs: Needs,
     /// The app's cards, remembering the search when one opens.
     cards: Rc<Cards>,
     entry: gtk::SearchEntry,
     back: gtk::Button,
     year: gtk::Button,
+    year_label: gtk::Label,
     chips_row: gtk::Box,
     chips: Vec<(SearchScope, gtk::ToggleButton, gtk::Label)>,
     note: gtk::Label,
@@ -123,7 +127,12 @@ impl SearchPage {
     pub fn new(needs: Needs) -> Rc<Self> {
         let entry = gtk::SearchEntry::builder()
             .placeholder_text("Search everything")
-            .hexpand(true)
+            // About the board's 560 px when there is room, and narrower,
+            // down to 16 characters, when the window is: a fixed width
+            // kept the window from getting narrow.
+            .width_chars(16)
+            .max_width_chars(64)
+            .css_classes(["search-field"])
             .search_delay(TYPING_PAUSE.as_millis() as u32)
             .build();
         let back = gtk::Button::builder()
@@ -132,11 +141,19 @@ impl SearchPage {
             .css_classes(["flat"])
             .visible(false)
             .build();
+        let year_label = gtk::Label::new(None);
+        let year_body = gtk::Box::builder().spacing(4).build();
+        year_body.append(&gtk::Image::from_icon_name(crate::icons::CALENDAR));
+        year_body.append(&year_label);
+        year_body.append(&gtk::Image::from_icon_name(crate::icons::CLOSE));
         let year = gtk::Button::builder()
-            .css_classes(["pill", "search-year"])
-            .tooltip_text("Search every year")
+            .child(&year_body)
+            .valign(gtk::Align::Center)
+            .css_classes(["search-year"])
+            .tooltip_text("Remove year filter")
             .visible(false)
             .build();
+        // In the header bar, as designed: All results, the field, the year.
         let head = gtk::Box::builder().spacing(10).build();
         head.append(&back);
         head.append(&entry);
@@ -155,7 +172,7 @@ impl SearchPage {
             label.append(&count);
             let chip = gtk::ToggleButton::builder()
                 .child(&label)
-                .css_classes(["pill", "search-chip"])
+                .css_classes(["search-chip"])
                 .build();
             if let Some(first) = &group {
                 chip.set_group(Some(first));
@@ -167,27 +184,36 @@ impl SearchPage {
         }
         let note = gtk::Label::builder()
             .css_classes(["dim-label", "caption"])
-            .margin_start(6)
+            .hexpand(true)
+            .xalign(1.0)
             .build();
         chips_row.append(&note);
 
         let see_all_title = gtk::Label::builder()
             .xalign(0.0)
-            .css_classes(["title-2"])
+            .css_classes(["title-2", "see-all-title"])
             .build();
-        let see_all_note = gtk::Label::builder().css_classes(["dim-label"]).build();
-        let see_all_head = gtk::Box::builder().spacing(12).visible(false).build();
+        let see_all_note = gtk::Label::builder()
+            .valign(gtk::Align::Baseline)
+            .css_classes(["dim-label", "small-text"])
+            .build();
+        let see_all_head = gtk::Box::builder().spacing(10).visible(false).build();
         see_all_head.append(&see_all_title);
         see_all_head.append(&see_all_note);
 
         // The page's states.
         let recent_list = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::None)
-            .css_classes(["boxed-list"])
+            .css_classes(["plain-list"])
             .build();
         let recent_clear = gtk::Button::builder()
-            .label("Clear")
-            .css_classes(["flat"])
+            .child(
+                &adw::ButtonContent::builder()
+                    .icon_name(crate::icons::CLEAR_RECENT)
+                    .label("Clear")
+                    .build(),
+            )
+            .css_classes(["small-button"])
             .halign(gtk::Align::End)
             .hexpand(true)
             .build();
@@ -196,7 +222,7 @@ impl SearchPage {
             &gtk::Label::builder()
                 .label("Recent searches")
                 .xalign(0.0)
-                .css_classes(["title-4"])
+                .css_classes(["title-3"])
                 .build(),
         );
         recent_head.append(&recent_clear);
@@ -227,13 +253,7 @@ impl SearchPage {
             recent.append(widget);
         }
 
-        let loading = gtk::Spinner::builder()
-            .spinning(true)
-            .width_request(32)
-            .height_request(32)
-            .halign(gtk::Align::Center)
-            .margin_top(48)
-            .build();
+        let loading = skeleton();
 
         let elsewhere = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -241,19 +261,27 @@ impl SearchPage {
             .build();
         let none = adw::StatusPage::builder()
             .icon_name(crate::icons::SEARCH)
+            .css_classes(["small-icon", "search-none"])
             .child(&elsewhere)
             .build();
 
         let results = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
-            .spacing(28)
+            .spacing(22)
             .build();
 
         let body = gtk::Stack::builder()
             .vhomogeneous(false)
             .transition_type(gtk::StackTransitionType::Crossfade)
             .build();
-        body.add_named(&recent, Some("recent"));
+        body.add_named(
+            &adw::Clamp::builder()
+                .maximum_size(640)
+                .halign(gtk::Align::Start)
+                .child(&recent)
+                .build(),
+            Some("recent"),
+        );
         body.add_named(&loading, Some("loading"));
         body.add_named(&none, Some("none"));
         body.add_named(&results, Some("results"));
@@ -262,7 +290,6 @@ impl SearchPage {
             .orientation(gtk::Orientation::Vertical)
             .spacing(18)
             .build();
-        widget.append(&head);
         widget.append(&chips_row);
         widget.append(&see_all_head);
         widget.append(&body);
@@ -290,11 +317,13 @@ impl SearchPage {
             };
             Self {
                 widget,
+                head,
                 needs,
                 cards,
                 entry,
                 back,
                 year,
+                year_label,
                 chips_row,
                 chips,
                 note,
@@ -480,7 +509,7 @@ impl SearchPage {
         // The year as a token, while the query still ends with it.
         match results.year.filter(|y| query.ends_with(&y.to_string())) {
             Some(year) => {
-                self.year.set_label(&format!("{year}  ✕"));
+                self.year_label.set_label(&year.to_string());
                 self.year.set_visible(true);
             }
             None => self.year.set_visible(false),
@@ -543,9 +572,10 @@ impl SearchPage {
                 .join(", ")
         };
         let note = gtk::Box::builder()
-            .spacing(12)
+            .spacing(10)
             .css_classes(["search-year-note"])
             .build();
+        note.append(&gtk::Image::from_icon_name(crate::icons::CALENDAR));
         note.append(
             &gtk::Label::builder()
                 .label(format!(
@@ -553,12 +583,11 @@ impl SearchPage {
                 ))
                 .wrap(true)
                 .xalign(0.0)
-                .hexpand(true)
                 .build(),
         );
         let button = gtk::Button::builder()
             .label(format!("Search without {year}"))
-            .css_classes(["flat"])
+            .css_classes(["flat", "text-link"])
             .build();
         let weak = Rc::downgrade(self);
         button.connect_clicked(move |_| {
@@ -583,22 +612,23 @@ impl SearchPage {
             .valign(gtk::Align::Center)
             .build();
         text.append(&caption(
-            &format!("Top result · {}", kind_name(item)),
-            &["dim-label", "caption"],
+            &format!("Top result · {}", kind_name(item)).to_uppercase(),
+            &["search-kicker"],
         ));
-        text.append(&caption(&facts.title, &["title-1"]));
+        text.append(&caption(&facts.title, &["search-top-title"]));
         if let Some(sub) = top_detail(item, &facts) {
             text.append(&caption(&sub, &["dim-label"]));
         }
-        let actions = gtk::Box::builder().spacing(10).margin_top(8).build();
+        let actions = gtk::Box::builder().spacing(8).margin_top(6).build();
         if matches!(item, Item::Movie(_) | Item::Episode(_) | Item::Track(_)) {
             let play = gtk::Button::builder()
-                .label(if facts.position().is_some() {
-                    "Resume"
-                } else {
-                    "Play"
-                })
-                .css_classes(["pill", "suggested-action"])
+                .child(
+                    &adw::ButtonContent::builder()
+                        .icon_name(crate::icons::PLAY)
+                        .label("Play")
+                        .build(),
+                )
+                .css_classes(["small-button", "suggested-action"])
                 .build();
             let (weak, item) = (Rc::downgrade(self), item.clone());
             play.connect_clicked(move |_| {
@@ -611,14 +641,14 @@ impl SearchPage {
         }
         let open = gtk::Button::builder()
             .label(open_label(item))
-            .css_classes(["pill"])
+            .css_classes(["small-button"])
             .build();
         let (open_item, item) = (self.cards.open.clone(), item.clone());
         open.connect_clicked(move |_| open_item(item.clone()));
         actions.append(&open);
         text.append(&actions);
         let top = gtk::Box::builder()
-            .spacing(24)
+            .spacing(20)
             .css_classes(["search-top"])
             .build();
         top.append(&tile);
@@ -634,13 +664,13 @@ impl SearchPage {
         if group.hidden > 0 {
             head.append(&caption(
                 &hidden_note(group.hidden),
-                &["dim-label", "caption"],
+                &["dim-label", "small-text"],
             ));
         }
         if group.more && !seeing_all {
             let see_all = gtk::Button::builder()
                 .label("See all")
-                .css_classes(["flat"])
+                .css_classes(["flat", "text-link", "see-all"])
                 .halign(gtk::Align::End)
                 .hexpand(true)
                 .build();
@@ -655,7 +685,7 @@ impl SearchPage {
         }
         let section = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
-            .spacing(12)
+            .spacing(10)
             .build();
         section.append(&head);
         let body: gtk::Widget = match group.kind {
@@ -663,19 +693,22 @@ impl SearchPage {
                 group.people.iter().map(|p| self.person_card(p)).collect(),
                 seeing_all,
             ),
-            SearchKind::Shows | SearchKind::Movies => self.cards_of(
-                group
-                    .items
-                    .iter()
-                    .map(|i| views::poster_card(i, &self.cards))
-                    .collect(),
-                seeing_all,
+            SearchKind::Shows | SearchKind::Movies | SearchKind::Artists | SearchKind::Albums => {
+                self.cards_of(
+                    group.items.iter().map(|i| self.small_card(i)).collect(),
+                    seeing_all,
+                )
+            }
+            // Rows in columns: three for episodes among everything, two
+            // otherwise.
+            SearchKind::Tracks | SearchKind::Episodes => self.rows_of(
+                &group.items,
+                if group.kind == SearchKind::Episodes && !seeing_all {
+                    3
+                } else {
+                    2
+                },
             ),
-            SearchKind::Artists | SearchKind::Albums => self.cards_of(
-                group.items.iter().map(|i| self.small_card(i)).collect(),
-                seeing_all,
-            ),
-            SearchKind::Tracks | SearchKind::Episodes => self.rows_of(&group.items),
         };
         if group.items.is_empty() && group.people.is_empty() {
             section.append(&caption("Nothing here.", &["dim-label"]));
@@ -690,8 +723,8 @@ impl SearchPage {
         if seeing_all {
             let flow = gtk::FlowBox::builder()
                 .selection_mode(gtk::SelectionMode::None)
-                .column_spacing(16)
-                .row_spacing(20)
+                .column_spacing(14)
+                .row_spacing(14)
                 .max_children_per_line(12)
                 .halign(gtk::Align::Start)
                 .build();
@@ -700,7 +733,8 @@ impl SearchPage {
             }
             return flow.upcast();
         }
-        let row = gtk::Box::builder().spacing(16).build();
+        let row = gtk::Box::builder().spacing(14).build();
+        views::lift_room(&row);
         for card in cards {
             row.append(&card);
         }
@@ -723,13 +757,13 @@ impl SearchPage {
             .orientation(gtk::Orientation::Vertical)
             .spacing(2)
             .build();
-        below.append(&caption(&facts.title, &["heading"]));
+        below.append(&views::caption_label(&facts.title, &["heading"]));
         let sub = match item {
             Item::Artist(_) => Some("Artist".to_owned()),
             _ => facts.detail.clone(),
         };
         if let Some(sub) = sub {
-            below.append(&caption(&sub, &["dim-label", "caption"]));
+            below.append(&views::caption_label(&sub, &["dim-label", "caption"]));
         }
         views::card(item, &tile, &below, size.0, &self.cards.open)
     }
@@ -748,8 +782,11 @@ impl SearchPage {
             .spacing(6)
             .build();
         body.append(&circle);
-        body.append(&caption(&person.name, &["heading"]));
-        body.append(&caption(&person_detail(person), &["dim-label", "caption"]));
+        body.append(&views::caption_label(&person.name, &["heading"]));
+        body.append(&views::caption_label(
+            &person_detail(person),
+            &["dim-label", "caption"],
+        ));
         let button = gtk::Button::builder()
             .child(&body)
             .width_request(120)
@@ -767,31 +804,60 @@ impl SearchPage {
     }
 
     /// Tracks and episodes, as rows: what, where from, how long.
-    fn rows_of(&self, items: &[Item]) -> gtk::Widget {
-        let list = gtk::ListBox::builder()
-            .selection_mode(gtk::SelectionMode::None)
-            .css_classes(["boxed-list"])
-            .build();
-        for item in items {
+    fn rows_of(&self, items: &[Item], columns: usize) -> gtk::Widget {
+        let lists: Vec<gtk::ListBox> = (0..columns)
+            .map(|_| {
+                gtk::ListBox::builder()
+                    .selection_mode(gtk::SelectionMode::None)
+                    .valign(gtk::Align::Start)
+                    .hexpand(true)
+                    .css_classes(["plain-list"])
+                    .build()
+            })
+            .collect();
+        let grid = gtk::Box::builder().spacing(18).homogeneous(true).build();
+        for list in &lists {
+            grid.append(list);
+        }
+        for (index, item) in items.iter().enumerate() {
+            let list = &lists[index % columns];
             let facts = Facts::of(item);
             let row = adw::ActionRow::builder()
-                .title(&facts.title)
-                .subtitle(facts.detail.clone().unwrap_or_default())
+                .use_markup(false)
                 .activatable(true)
                 .build();
+            row.set_title(&facts.title);
+            row.set_subtitle(&facts.detail.clone().unwrap_or_default());
             if let Some(length) = facts.length {
                 row.add_suffix(
                     &gtk::Label::builder()
                         .label(format::length(length))
-                        .css_classes(["dim-label", "numeric"])
+                        .css_classes(["dim-label", "monospace", "caption"])
                         .build(),
                 );
+            }
+            // An episode's menu goes to its show or season.
+            if let Item::Episode(episode) = item {
+                let menu = crate::views::menu_popover(vec![crate::views::go_to_entries(
+                    episode,
+                    &self.cards.open,
+                )]);
+                crate::views::context_menu(row.upcast_ref(), &menu);
+            }
+            // A track's menu on right-click, as on the album page.
+            if let (Item::Track(track), Some(enqueue)) = (item, &self.cards.enqueue) {
+                let (enqueue, queued) = (enqueue.clone(), item.clone());
+                let menu = crate::views::menu_popover(vec![
+                    crate::views::enqueue_entries(move |at| enqueue(queued.clone(), at)),
+                    crate::views::track_go_to_entries(track, &self.cards.open, true),
+                ]);
+                crate::views::context_menu(row.upcast_ref(), &menu);
             }
             let (open, item) = (self.cards.open.clone(), item.clone());
             row.connect_activated(move |_| open(item.clone()));
             list.append(&row);
         }
-        list.upcast()
+        grid.upcast()
     }
 
     /// Nothing in this scope: where else the query matches, or nowhere.
@@ -813,8 +879,16 @@ impl SearchPage {
                 .build();
             for (other, count) in places {
                 let chip = gtk::Button::builder()
-                    .label(format!("{}  {count}", scope_name(other)))
-                    .css_classes(["pill"])
+                    .child(
+                        &gtk::Label::builder()
+                            .use_markup(true)
+                            .label(format!(
+                                "{} <span fgalpha=\"65%\" weight=\"500\">{count}</span>",
+                                glib::markup_escape_text(scope_name(other))
+                            ))
+                            .build(),
+                    )
+                    .css_classes(["elsewhere-chip"])
                     .build();
                 let weak = Rc::downgrade(self);
                 chip.connect_clicked(move |_| {
@@ -828,7 +902,7 @@ impl SearchPage {
             let everything = gtk::Button::builder()
                 .label("Search everything")
                 .halign(gtk::Align::Center)
-                .css_classes(["pill", "suggested-action"])
+                .css_classes(["small-button", "suggested-action"])
                 .build();
             let weak = Rc::downgrade(self);
             everything.connect_clicked(move |_| {
@@ -905,19 +979,31 @@ impl SearchPage {
         self.recent_clear.set_visible(some);
         for search in recent {
             let row = adw::ActionRow::builder()
-                .title(&search.query)
-                .subtitle(match search.scope {
-                    SearchScope::All => String::new(),
-                    other => format!("in {}", scope_name(other)),
-                })
+                .use_markup(false)
                 .activatable(true)
+                .css_classes(["recent-row"])
                 .build();
-            row.add_prefix(&gtk::Image::from_icon_name(crate::icons::SEARCH));
+            row.set_title(&search.query);
+            row.add_prefix(
+                &gtk::Image::builder()
+                    .icon_name(crate::icons::HISTORY)
+                    .css_classes(["dim-label"])
+                    .build(),
+            );
+            // The scope beside the query, not under it.
+            if search.scope != SearchScope::All {
+                row.add_suffix(
+                    &gtk::Label::builder()
+                        .label(format!("in {}", scope_name(search.scope)))
+                        .css_classes(["dim-label", "caption"])
+                        .build(),
+                );
+            }
             let remove = gtk::Button::builder()
                 .icon_name(crate::icons::CLOSE)
-                .tooltip_text("Remove")
+                .tooltip_text("Remove from recent searches")
                 .valign(gtk::Align::Center)
-                .css_classes(["flat"])
+                .css_classes(["flat", "circular", "dim-label"])
                 .build();
             {
                 let (weak, query) = (Rc::downgrade(self), search.query.clone());
@@ -1124,9 +1210,8 @@ fn kind_name(item: &Item) -> &'static str {
 fn open_label(item: &Item) -> &'static str {
     match item {
         Item::Show(_) => "Go to show",
-        Item::Artist(_) => "Go to artist",
-        Item::Album(_) => "Go to album",
-        _ => "Details",
+        Item::Movie(_) => "Details",
+        _ => "Open",
     }
 }
 
@@ -1149,18 +1234,59 @@ fn top_detail(item: &Item, facts: &Facts) -> Option<String> {
 /// shows, squares for albums, circles for artists.
 fn art_of(item: &Item, large: bool) -> (&'static str, (i32, i32), &'static [ArtworkKind]) {
     match item {
-        Item::Movie(_) | Item::Show(_) => ("portrait", (140, 210), &[ArtworkKind::Poster]),
+        Item::Movie(_) | Item::Show(_) => (
+            "portrait",
+            if large { (98, 146) } else { (110, 165) },
+            &[ArtworkKind::Poster],
+        ),
         Item::Artist(_) => (
             "circle",
-            if large { (180, 180) } else { (120, 120) },
+            if large { (146, 146) } else { (96, 96) },
             &[ArtworkKind::Thumb, ArtworkKind::Poster],
         ),
         _ => (
             "square",
-            if large { (180, 180) } else { (140, 140) },
+            if large { (146, 146) } else { (140, 140) },
             &[ArtworkKind::Thumb, ArtworkKind::Poster],
         ),
     }
+}
+
+/// While the first answer is on its way: the shape of a page of results,
+/// pulsing.
+fn skeleton() -> gtk::Box {
+    let block = |w: i32, h: i32| {
+        gtk::Box::builder()
+            .width_request(w)
+            .height_request(h)
+            .halign(gtk::Align::Start)
+            .css_classes(["skeleton-block"])
+            .build()
+    };
+    let bars = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(10)
+        .margin_top(18)
+        .build();
+    bars.append(&block(90, 12));
+    bars.append(&block(280, 26));
+    bars.append(&block(180, 12));
+    let hero = gtk::Box::builder().spacing(20).build();
+    hero.append(&block(260, 146));
+    hero.append(&bars);
+    let posters = gtk::Box::builder().spacing(14).build();
+    for _ in 0..6 {
+        posters.append(&block(110, 165));
+    }
+    let page = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(24)
+        .css_classes(["search-skeleton"])
+        .build();
+    page.append(&hero);
+    page.append(&block(120, 16));
+    page.append(&posters);
+    page
 }
 
 fn group_is_empty(group: &SearchGroup) -> bool {
@@ -1176,9 +1302,24 @@ fn caption(text: &str, classes: &[&str]) -> gtk::Label {
         .build()
 }
 
+/// Empties a list or a box the way each expects. A list box keeps its rows
+/// in a list of its own: a row unparented behind its back stayed in it,
+/// and the next append went after a row with no parent (GTK criticals in
+/// gtk_widget_insert_after and on a freed widget, then a crash).
 fn clear(container: &impl IsA<gtk::Widget>) {
-    while let Some(child) = container.as_ref().first_child() {
-        child.unparent();
+    let container = container.as_ref();
+    if let Some(list) = container.downcast_ref::<gtk::ListBox>() {
+        list.remove_all();
+    } else if let Some(flow) = container.downcast_ref::<gtk::FlowBox>() {
+        flow.remove_all();
+    } else if let Some(row) = container.downcast_ref::<gtk::Box>() {
+        while let Some(child) = row.first_child() {
+            row.remove(&child);
+        }
+    } else {
+        while let Some(child) = container.first_child() {
+            child.unparent();
+        }
     }
 }
 
@@ -1256,6 +1397,27 @@ mod tests {
         a_year_becomes_a_token_that_can_be_dropped();
         see_all_shows_one_group_under_its_own_head();
         a_search_is_remembered_and_shown_when_the_box_is_empty();
+        recent_searches_show_again_without_stale_rows();
+    }
+
+    fn recent_searches_show_again_without_stale_rows() {
+        let page = page();
+        let recent = |query: &str| Recent {
+            query: query.into(),
+            scope: SearchScope::All,
+        };
+        page.set_recent(vec![recent("low tide"), recent("arrival")]);
+        page.show_recent();
+        page.set_recent(vec![recent("dune")]);
+        page.show_recent();
+        let mut rows = 0;
+        let mut child = page.recent_list.first_child();
+        while let Some(row) = child {
+            assert!(row.parent().as_ref() == Some(page.recent_list.upcast_ref()));
+            rows += 1;
+            child = row.next_sibling();
+        }
+        assert_eq!(rows, 1);
     }
 
     fn typing_shows_the_top_result_and_the_counts() {
@@ -1286,7 +1448,7 @@ mod tests {
         let page = page();
         type_in(&page, "arrival 1990");
         assert!(run_until(Duration::from_secs(5), || page.year.is_visible()));
-        assert!(page.year.label().unwrap().starts_with("1990"));
+        assert_eq!(page.year_label.label(), "1990");
         page.year.emit_clicked();
         assert_eq!(page.entry.text(), "arrival");
         assert!(run_until(Duration::from_secs(5), || !page

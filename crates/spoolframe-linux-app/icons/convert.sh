@@ -16,9 +16,12 @@ ICONS=(
   house search film tv music
   eye check plus menu
   chevron-right server circle-alert palette
-  shield-check circle-x
+  shield-check shield-alert circle-x
   list-start list-plus ellipsis grip-vertical
   lock delete
+  globe settings triangle-alert clock smartphone history list-x calendar loader-circle
+  monitor-play user-round log-out trash-2 external-link link laptop monitor layers-2
+  mic-vocal disc-3
 )
 
 here="$(cd "$(dirname "$0")" && pwd)"

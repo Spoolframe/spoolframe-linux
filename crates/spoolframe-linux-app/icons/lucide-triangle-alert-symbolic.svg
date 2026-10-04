@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- @license lucide-static v1.50.0 - ISC -->
+
+<svg
+   class="lucide lucide-triangle-alert"
+   width="24"
+   height="24"
+   viewBox="0 0 24 24"
+   version="1.1"
+   id="svg3"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <defs
+     id="defs3" />
+  <path
+     style="baseline-shift:baseline;display:inline;overflow:visible;vector-effect:none;fill:#000000;stroke:none;stroke-linecap:butt;stroke-linejoin:miter;enable-background:accumulate;stop-color:#000000;stop-opacity:1;opacity:1"
+     d="m 11.990234,2.0195313 c -1.023852,0 -2.0470789,0.4960986 -2.6093746,1.4882812 v -0.00391 l -8,13.9999997 0.00391,-0.0039 c -1.13626742,1.96786 0.3527411,4.520447 2.625,4.5 H 20 a 1.0001,1.0001 0 0 0 0.002,0 c 2.25783,-0.0023 3.719561,-2.537668 2.595703,-4.494141 -3.37e-4,-5.87e-4 3.38e-4,-0.0014 0,-0.002 L 22.595703,17.5 14.599609,3.5078125 C 14.037314,2.5156299 13.014086,2.0195313 11.990234,2.0195313 Z m 0,1.9335937 c 0.33308,0 0.665301,0.179383 0.869141,0.5390625 a 1.0001,1.0001 0 0 0 0.002,0.00391 l 8,14.0000003 a 1,1 0 0 0 0.002,0 1,1 0 0 0 0,0.0039 c 0.408673,0.70784 -0.04789,1.499162 -0.865234,1.5 H 4 a 1.0001,1.0001 0 0 0 -0.00977,0 c -0.822918,0.0074 -1.286509,-0.787323 -0.875,-1.5 a 1.0001,1.0001 0 0 0 0.00391,-0.0039 L 11.119141,4.4960937 a 1.0001,1.0001 0 0 0 0,-0.00391 C 11.32298,4.132508 11.657154,3.953125 11.990234,3.953125 Z"
+     id="path1" />
+  <path
+     style="baseline-shift:baseline;display:inline;overflow:visible;vector-effect:none;fill:#000000;stroke:none;stroke-linecap:butt;stroke-linejoin:miter;enable-background:accumulate;stop-color:#000000;stop-opacity:1;opacity:1"
+     d="m 12,8 a 1,1 0 0 0 -1,1 v 4 a 1,1 0 0 0 1,1 1,1 0 0 0 1,-1 V 9 A 1,1 0 0 0 12,8 Z"
+     id="path2" />
+  <path
+     style="baseline-shift:baseline;display:inline;overflow:visible;vector-effect:none;fill:#000000;stroke:none;stroke-linecap:butt;stroke-linejoin:miter;enable-background:accumulate;stop-color:#000000;stop-opacity:1;opacity:1"
+     d="m 12,16 a 1,1 0 0 0 -1,1 1,1 0 0 0 1,1 h 0.0098 a 1,1 0 0 0 1,-1 1,1 0 0 0 -1,-1 z"
+     id="path3" />
+</svg>

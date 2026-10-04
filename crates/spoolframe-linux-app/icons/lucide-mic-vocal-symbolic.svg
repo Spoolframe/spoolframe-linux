@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- @license lucide-static v1.50.0 - ISC -->
+
+<svg
+   class="lucide lucide-mic-vocal"
+   width="24"
+   height="24"
+   viewBox="0 0 24 24"
+   version="1.1"
+   id="svg2"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <defs
+     id="defs2" />
+  <path
+     style="baseline-shift:baseline;display:inline;overflow:visible;vector-effect:none;fill:#000000;stroke:none;stroke-linecap:butt;stroke-linejoin:miter;enable-background:accumulate;stop-color:#000000;stop-opacity:1;opacity:1"
+     d="M 11.589844,6.7949219 A 1,1 0 0 0 10.193359,7.0097656 L 4.1992187,15.201172 c -0.5786206,0.790417 -0.4936452,1.903243 0.1992188,2.595703 l 0.8164062,0.816406 a 1.0001,1.0001 0 0 0 0.00195,0.002 c 0.7033613,0.702599 1.8370995,0.777561 2.6269531,0.173828 l 7.853516,-5.99414 a 1,1 0 0 0 0.1875,-1.402344 1,1 0 0 0 -1.402344,-0.1875 l -7.8515626,5.994141 h -0.00195 L 5.8144531,16.382812 a 1.0001,1.0001 0 0 0 -0.00195,-0.002 L 11.806641,8.1914063 A 1,1 0 0 0 11.589844,6.7949219 Z"
+     id="path1" />
+  <path
+     style="baseline-shift:baseline;display:inline;overflow:visible;vector-effect:none;fill:#000000;stroke:none;stroke-linecap:butt;stroke-linejoin:miter;enable-background:accumulate;stop-color:#000000;stop-opacity:1;opacity:1"
+     d="m 5.5605469,16.501953 a 1,1 0 0 0 -0.7246094,0.25 C 3.8004003,17.670536 3.6776047,19.10289 4.0351562,20.322266 4.3927078,21.541641 5.3486608,22.731799 6.8300781,22.986328 8.2783964,23.23517 9.4858475,22.563735 10.490234,22.007812 11.494621,21.45189 12.3526,21 13,21 c 1.129046,0 2.040345,0.396591 2.941406,1.003906 a 1,1 0 0 0 1.388672,-0.271484 1,1 0 0 0 -0.271484,-1.386719 C 15.959655,19.605018 14.614954,19 13,19 11.5894,19 10.484598,19.724735 9.5214844,20.257812 8.5583712,20.79089 7.7936036,21.12083 7.1699219,21.013672 6.5793392,20.912201 6.1482766,20.41864 5.9550781,19.759766 5.7618797,19.100891 5.9245997,18.460464 6.1640625,18.248047 a 1,1 0 0 0 0.083984,-1.41211 1,1 0 0 0 -0.6875,-0.333984 z"
+     id="path2" />
+  <path
+     style="baseline-shift:baseline;display:inline;overflow:visible;vector-effect:none;fill:#000000;stroke:none;stroke-linecap:butt;stroke-linejoin:miter;enable-background:accumulate;stop-color:#000000;stop-opacity:1;opacity:1"
+     d="m 16,1 c -3.301864,0 -6,2.6981361 -6,6 0,3.301864 2.698136,6 6,6 3.301864,0 6,-2.698136 6,-6 0,-3.3018639 -2.698136,-6 -6,-6 z m 0,2 c 2.220984,0 4,1.7790164 4,4 0,2.2209836 -1.779016,4 -4,4 -2.220984,0 -4,-1.7790164 -4,-4 0,-2.2209836 1.779016,-4 4,-4 z"
+     id="circle2" />
+</svg>

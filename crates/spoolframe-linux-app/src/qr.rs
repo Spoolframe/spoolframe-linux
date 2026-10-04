@@ -4,11 +4,12 @@
 //! number of pixels and the picture is shown at that size, so no scaling
 //! blurs the edges.
 //!
-//! The Spoolframe reel sits in the middle, as the design has it. The code
-//! uses the highest error correction (H, 30% of it may be lost), and the
-//! reel with its clear margin covers far less than that.
+//! The Spoolframe mark sits in the middle on a dark tile, as the design
+//! has it, in its Mocha colours whatever the theme: the code is always
+//! white. The code uses the highest error correction (H, 30% of it may be
+//! lost), and the mark with its clear margin covers far less than that.
 
-use std::f64::consts::TAU;
+use std::f64::consts::{FRAC_PI_2, PI};
 
 use gtk::{cairo, gdk, glib};
 use qrcode::{EcLevel, QrCode};
@@ -24,10 +25,13 @@ pub const MODULE: usize = 6;
 /// about a sixteenth of its area.
 const MARK_SHARE: f64 = 0.25;
 
-/// `data` as a QR code texture, `module` pixels per module, with the reel
-/// in `accent` in the middle.
-pub fn texture(data: &str, module: usize, accent: &gdk::RGBA) -> anyhow::Result<gdk::Texture> {
-    let (side, mut surface) = draw(data, module, accent)?;
+/// The tile under the mark: `#11111b`.
+const TILE: (f64, f64, f64) = (0.067, 0.067, 0.106);
+
+/// `data` as a QR code texture, `module` pixels per module, with the mark
+/// in the middle.
+pub fn texture(data: &str, module: usize) -> anyhow::Result<gdk::Texture> {
+    let (side, mut surface) = draw(data, module)?;
     let stride = surface.stride() as usize;
     let bytes = glib::Bytes::from(&*surface.data()?);
     let texture = gdk::MemoryTexture::new(
@@ -41,11 +45,7 @@ pub fn texture(data: &str, module: usize, accent: &gdk::RGBA) -> anyhow::Result<
 }
 
 /// The code drawn: its side in pixels, and the picture.
-fn draw(
-    data: &str,
-    module: usize,
-    accent: &gdk::RGBA,
-) -> anyhow::Result<(usize, cairo::ImageSurface)> {
+fn draw(data: &str, module: usize) -> anyhow::Result<(usize, cairo::ImageSurface)> {
     let code = QrCode::with_error_correction_level(data, EcLevel::H)?;
     let width = code.width();
     let side = (width + 2 * QUIET) * module;
@@ -64,33 +64,36 @@ fn draw(
         }
         cr.fill()?;
 
-        // The reel: a clear square of whole modules, and the three-hole
-        // mark inside it with a module's margin.
+        // A clear square of whole modules; in it, with a module's margin,
+        // the dark tile, a quarter of it rounded, and the mark on it at
+        // the design's 37 of 48.
         let (start, span) = mark_square(width);
         let (x, size) = ((start + QUIET) as f64 * m, span as f64 * m);
         cr.set_source_rgb(1.0, 1.0, 1.0);
         cr.rectangle(x, x, size, size);
         cr.fill()?;
-        let reel = size - 2.0 * m;
-        cr.translate(x + m, x + m);
-        // The design's small mark: its square from 12 to 88.
-        cr.scale(reel / 76.0, reel / 76.0);
-        cr.translate(-12.0, -12.0);
-        cr.set_source_rgba(
-            f64::from(accent.red()),
-            f64::from(accent.green()),
-            f64::from(accent.blue()),
-            1.0,
-        );
-        cr.arc(50.0, 50.0, 38.0, 0.0, TAU);
+        let tile = size - 2.0 * m;
+        rounded(&cr, x + m, tile, tile / 4.0);
+        cr.set_source_rgb(TILE.0, TILE.1, TILE.2);
         cr.fill()?;
-        cr.set_source_rgb(1.0, 1.0, 1.0);
-        for (hx, hy) in [(50.0, 30.0), (67.32, 60.0), (32.68, 60.0)] {
-            cr.arc(hx, hy, 10.5, 0.0, TAU);
-            cr.fill()?;
-        }
+        let mark = tile * 37.0 / 48.0;
+        let at = x + m + (tile - mark) / 2.0;
+        cr.translate(at, at);
+        crate::logo::paint(&cr, mark, crate::logo::MOCHA)?;
     }
     Ok((side, surface))
+}
+
+/// A square at (`at`, `at`), `side` across, its corners rounded by
+/// `radius`.
+fn rounded(cr: &cairo::Context, at: f64, side: f64, radius: f64) {
+    let (near, far) = (at + radius, at + side - radius);
+    cr.new_sub_path();
+    cr.arc(far, near, radius, -FRAC_PI_2, 0.0);
+    cr.arc(far, far, radius, 0.0, FRAC_PI_2);
+    cr.arc(near, far, radius, FRAC_PI_2, PI);
+    cr.arc(near, near, radius, PI, PI + FRAC_PI_2);
+    cr.close_path();
 }
 
 /// Where the cleared square starts in a code `width` modules wide, and
@@ -109,7 +112,6 @@ mod tests {
     use super::*;
 
     const URL: &str = "https://media.example.org/auth/device?code=BCDFGHJK";
-    const TEAL: gdk::RGBA = gdk::RGBA::new(0.58, 0.886, 0.835, 1.0);
 
     /// The pixel at (`x`, `y`) as 0xRRGGBB.
     fn rgb(surface: &mut cairo::ImageSurface, x: usize, y: usize) -> u32 {
@@ -120,19 +122,19 @@ mod tests {
 
     #[test]
     fn the_quiet_zone_is_white() {
-        let (_, mut surface) = draw(URL, 2, &TEAL).unwrap();
+        let (_, mut surface) = draw(URL, 2).unwrap();
         assert_eq!(rgb(&mut surface, QUIET * 2 - 1, QUIET * 2 - 1), 0xffffff);
     }
 
     #[test]
     fn a_finder_pattern_starts_where_the_quiet_zone_ends() {
-        let (_, mut surface) = draw(URL, 2, &TEAL).unwrap();
+        let (_, mut surface) = draw(URL, 2).unwrap();
         assert_eq!(rgb(&mut surface, QUIET * 2, QUIET * 2), 0x000000);
     }
 
     #[test]
     fn a_module_is_a_square_of_whole_pixels() {
-        let (_, mut surface) = draw(URL, 3, &TEAL).unwrap();
+        let (_, mut surface) = draw(URL, 3).unwrap();
         let corner = QUIET * 3;
         assert_eq!(
             [(0, 0), (2, 0), (0, 2), (2, 2)].map(|(dx, dy)| rgb(
@@ -144,12 +146,31 @@ mod tests {
         );
     }
 
+    /// The pixel under the mark's point (`ux`, `uy`) of its 100 units,
+    /// placed as `draw` places it.
+    fn at_mark(ux: f64, uy: f64) -> u32 {
+        let (_, mut surface) = draw(URL, MODULE).unwrap();
+        let width = QrCode::with_error_correction_level(URL, EcLevel::H)
+            .unwrap()
+            .width();
+        let (start, span) = mark_square(width);
+        let m = MODULE as f64;
+        let tile = span as f64 * m - 2.0 * m;
+        let mark = tile * 37.0 / 48.0;
+        let at = (start + QUIET) as f64 * m + m + (tile - mark) / 2.0;
+        let pixel = |u: f64| (at + u / 100.0 * mark) as usize;
+        rgb(&mut surface, pixel(ux), pixel(uy))
+    }
+
     #[test]
-    fn the_reel_sits_in_the_middle_in_the_accent() {
-        let (side, mut surface) = draw(URL, MODULE, &TEAL).unwrap();
-        // Between the reel's centre and its top hole: solid reel.
-        let colour = rgb(&mut surface, side / 2, side / 2 + MODULE * 2);
-        assert_eq!(colour >> 16, (0.58_f64 * 255.0).round() as u32);
+    fn the_reel_sits_in_the_middle_in_its_teal() {
+        // Below the play mark, between the lower holes: solid reel.
+        assert_eq!(at_mark(50.0, 75.0), 0x94e2d5);
+    }
+
+    #[test]
+    fn a_reel_hole_shows_the_dark_tile() {
+        assert_eq!(at_mark(50.0, 32.0), 0x11111b);
     }
 
     #[test]
@@ -168,7 +189,7 @@ mod tests {
     fn a_web_address_reads_from_across_a_desk() {
         // A camera wants the code a few centimetres across: about
         // 250 to 360 px on a desktop screen.
-        let (side, _) = draw(URL, MODULE, &TEAL).unwrap();
+        let (side, _) = draw(URL, MODULE).unwrap();
         assert!((250..=360).contains(&side), "{side} px");
     }
 }

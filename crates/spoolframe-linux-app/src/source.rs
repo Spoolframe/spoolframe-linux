@@ -429,6 +429,7 @@ mod tests {
         register().unwrap();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let device = sdk::Device {
+            platform: sdk::types::Platform::Linux,
             name: "spoolframe-linux playbin test".into(),
             client_name: "spoolframe-linux".into(),
             client_version: env!("CARGO_PKG_VERSION").into(),

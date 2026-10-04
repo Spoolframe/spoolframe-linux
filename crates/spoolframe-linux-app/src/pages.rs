@@ -7,11 +7,13 @@ use std::time::Duration;
 use adw::prelude::*;
 use spoolframe_linux_core::backend::{ArtworkSize, ChosenTracks, Selection, TrackReason};
 use spoolframe_linux_core::format;
-use spoolframe_types::{Album, Artist, ArtworkKind, Item, MediaTracks, Season, Show};
+use spoolframe_types::{Album, Artist, ArtworkKind, Item, MediaId, MediaTracks, Season, Show};
 
 use crate::views::{self, Cards, Enqueue, Facts};
 
 const POSTER_LARGE: (i32, i32) = (220, 330);
+/// An episode's still in its row.
+const THUMB: (i32, i32) = (112, 63);
 const SQUARE: (i32, i32) = (300, 300);
 const BACKDROP_HEIGHT: i32 = 240;
 /// How far a page's poster reaches up into the backdrop.
@@ -42,7 +44,11 @@ pub struct PlayableActions {
 /// A page with its own header bar, which shows the Back button.
 pub fn page(title: &str, body: &impl IsA<gtk::Widget>) -> adw::NavigationPage {
     let toolbar = adw::ToolbarView::new();
-    toolbar.add_top_bar(&adw::HeaderBar::new());
+    toolbar.add_top_bar(
+        &adw::HeaderBar::builder()
+            .css_classes(["item-header"])
+            .build(),
+    );
     toolbar.set_content(Some(
         &gtk::ScrolledWindow::builder()
             .child(body)
@@ -67,6 +73,7 @@ pub fn playable(
     tracks: Option<&MediaTracks>,
     chosen: Option<&ChosenTracks>,
     actions: PlayableActions,
+    next: Option<&Item>,
     cards: &Cards,
 ) -> gtk::Widget {
     let facts = Facts::of(item);
@@ -78,14 +85,21 @@ pub fn playable(
 
     let info = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .spacing(16)
+        .spacing(18)
         .margin_top(28)
         .margin_start(48 + POSTER_LARGE.0 + 40)
         .margin_end(48)
         .margin_bottom(32)
         .build();
-    if let Some(context) = context {
-        info.append(&label(context, &["dim-label", "heading"]));
+    // An episode's place: the show and the season as links, then which
+    // episode; a movie's context, if any, as a line.
+    match item {
+        Item::Episode(e) => info.append(&breadcrumb(e, context, &cards.open)),
+        _ => {
+            if let Some(context) = context {
+                info.append(&label(context, &["dim-label", "heading"]));
+            }
+        }
     }
     let title = label(&title, &["page-title"]);
     // A long title wraps; unwrapped it made the page wider than the window.
@@ -97,20 +111,36 @@ pub fn playable(
         .into_iter()
         .flatten()
         .collect();
+    // The facts as separate spans, as designed, not joined by dots.
     if !meta.is_empty() {
-        info.append(&label(&meta.join(" · "), &["dim-label"]));
+        let row = gtk::Box::builder()
+            .spacing(14)
+            .css_classes(["item-meta"])
+            .build();
+        for fact in &meta {
+            row.append(&label(fact, &[]));
+        }
+        info.append(&row);
     }
     if let Some(summary) = summary {
-        let text = label(&summary, &["body"]);
+        let text = label(&summary, &["item-summary"]);
         text.set_wrap(true);
         text.set_max_width_chars(70);
         info.append(&text);
     }
     let series = matches!(item, Item::Episode(_));
     let pickers = tracks.map(|t| TrackPickers::new(t, chosen, series, &actions.forget));
-    info.append(&playback_buttons(&facts, &actions, pickers.clone()));
+    let buttons = playback_buttons(&facts, &actions, pickers.clone());
+    if let Item::Episode(e) = item {
+        let menu = views::menu_popover(vec![views::go_to_entries(e, &cards.open)]);
+        buttons.append(&views::menu_button(&menu, "More"));
+    }
+    info.append(&buttons);
     if let Some(pickers) = &pickers {
         info.append(&pickers.column);
+    }
+    if let Some(next) = next {
+        info.append(&next_card(next, cards));
     }
 
     let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -150,6 +180,83 @@ pub fn playable(
     let overlay = gtk::Overlay::builder().child(&column).build();
     overlay.add_overlay(&poster);
     overlay.upcast()
+}
+
+/// "Severance › Season 2 › Episode 4": the show and season open their
+/// page, the show's on that season's tab.
+fn breadcrumb(
+    episode: &spoolframe_types::Episode,
+    show: Option<&str>,
+    open: &views::Open,
+) -> gtk::Box {
+    let row = gtk::Box::builder().spacing(6).build();
+    let link = |text: &str, item: Item| {
+        let button = gtk::Button::builder()
+            .label(text)
+            .css_classes(["flat", "text-link", "crumb"])
+            .build();
+        let open = open.clone();
+        button.connect_clicked(move |_| open(item.clone()));
+        button
+    };
+    let show_title = episode
+        .show_title
+        .clone()
+        .or_else(|| show.map(str::to_owned))
+        .unwrap_or_else(|| "Show".to_owned());
+    let mut show_item = views::show_of(episode);
+    if let Item::Show(s) = &mut show_item {
+        s.title = show_title.clone();
+    }
+    row.append(&link(&show_title, show_item));
+    row.append(&label("›", &["dim-label"]));
+    row.append(&link(
+        &views::season_name(episode.season),
+        views::season_of(episode),
+    ));
+    row.append(&label("›", &["dim-label"]));
+    row.append(&label(
+        &format!("Episode {}", episode.episode),
+        &["dim-label", "crumb"],
+    ));
+    row
+}
+
+/// "Next episode": its still, "5. Title", and a chevron; it opens it.
+fn next_card(next: &Item, cards: &Cards) -> gtk::Button {
+    let thumb = views::tile(next.id(), "", "thumb", THUMB);
+    if let Item::Episode(e) = next {
+        cards.art(
+            &thumb,
+            &e.artwork,
+            &[ArtworkKind::Thumb, ArtworkKind::Background],
+            ArtworkSize::Small,
+        );
+    }
+    let names = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .valign(gtk::Align::Center)
+        .hexpand(true)
+        .build();
+    names.append(&label("Next episode", &["dim-label", "caption"]));
+    let title = match next {
+        Item::Episode(e) => format!("{}. {}", e.episode, e.title),
+        other => Facts::of(other).title,
+    };
+    names.append(&label(&title, &["heading"]));
+    let row = gtk::Box::builder().spacing(14).build();
+    row.append(&thumb);
+    row.append(&names);
+    row.append(&gtk::Image::from_icon_name(crate::icons::RIGHT));
+    let button = gtk::Button::builder()
+        .child(&row)
+        .halign(gtk::Align::Start)
+        .css_classes(["next-card"])
+        .build();
+    let (open, next) = (cards.open.clone(), next.clone());
+    button.connect_clicked(move |_| open(next.clone()));
+    button
 }
 
 /// Audio and subtitle pickers, read when Play is pressed.
@@ -276,6 +383,7 @@ fn picker(row: &gtk::Box, title: &str, names: &[String], selected: usize) -> gtk
     let dropdown = gtk::DropDown::builder()
         .model(&gtk::StringList::new(&names))
         .selected(selected as u32)
+        .css_classes(["picker"])
         .build();
     // Long lists (dozens of subtitle languages) can be searched.
     if names.len() > crate::tracks::SEARCH_FROM {
@@ -288,10 +396,7 @@ fn picker(row: &gtk::Box, title: &str, names: &[String], selected: usize) -> gtk
         dropdown.set_search_match_mode(gtk::StringFilterMatchMode::Substring);
     }
     let column = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    column.append(&label(
-        &title.to_uppercase(),
-        &["caption-heading", "dim-label"],
-    ));
+    column.append(&label(&title.to_uppercase(), &["picker-label"]));
     column.append(&dropdown);
     row.append(&column);
     dropdown
@@ -333,6 +438,7 @@ fn playback_buttons(
                 .width_request(160)
                 .valign(gtk::Align::Center)
                 .margin_start(8)
+                .css_classes(["item-progress"])
                 .build(),
         );
     }
@@ -418,8 +524,69 @@ fn play_button(
     button
 }
 
-/// A show: its facts, then each season with its episodes.
-pub fn show(show: &Show, seasons: &[(Season, Vec<Item>)], cards: &Cards) -> gtk::Widget {
+/// The show page's seasons with their episodes, changed as they are marked.
+type Seasons = Rc<std::cell::RefCell<Vec<(Season, Vec<Item>)>>>;
+
+/// Draws a season again; set once the page has made its drawing.
+type Redraw = Rc<std::cell::RefCell<Option<Rc<dyn Fn(usize)>>>>;
+
+/// What the show page does: play an episode (from a position, or the
+/// start), and mark an item watched or not.
+pub struct ShowActions {
+    pub play: Rc<dyn Fn(Item, Option<Duration>)>,
+    pub set_watched: Rc<dyn Fn(MediaId, bool)>,
+}
+
+/// The episode to watch next: the first one part-way through, else the
+/// first not watched.
+fn up_next(seasons: &[(Season, Vec<Item>)]) -> Option<&Item> {
+    let episodes = || seasons.iter().flat_map(|(_, e)| e.iter());
+    let watched = |item: &Item| matches!(item, Item::Episode(e) if e.playback.watched);
+    episodes()
+        .find(|e| !watched(e) && Facts::of(e).position().is_some())
+        .or_else(|| episodes().find(|e| !watched(e)))
+}
+
+/// "S2 · E4".
+fn episode_code(item: &Item) -> String {
+    match item {
+        Item::Episode(e) => format!("S{} · E{}", e.season, e.episode),
+        _ => String::new(),
+    }
+}
+
+/// A show, as on the LinuxShow board: its facts and Resume, then one
+/// season at a time under tabs, opening on `open` or the season of the
+/// episode up next.
+pub fn show(
+    show: &Show,
+    seasons: &[(Season, Vec<Item>)],
+    open: Option<&MediaId>,
+    actions: ShowActions,
+    cards: &Cards,
+) -> gtk::Widget {
+    // The seasons as this page knows them. Marking something watched
+    // changes them here at once, as well as on the server, and the season
+    // showing is drawn again: the page does not reload.
+    let model: Seasons = Rc::new(std::cell::RefCell::new(seasons.to_vec()));
+    let current = Rc::new(Cell::new(0usize));
+    let redraw: Redraw = Rc::default();
+    let actions = {
+        let outer = actions;
+        let (model, current, redraw) = (model.clone(), current.clone(), redraw.clone());
+        let set_watched = outer.set_watched.clone();
+        Rc::new(ShowActions {
+            play: outer.play,
+            set_watched: Rc::new(move |id: MediaId, watched| {
+                set_watched(id.clone(), watched);
+                mark_in(&mut model.borrow_mut(), &id, watched);
+                let again = redraw.borrow().clone();
+                if let Some(again) = again {
+                    again(current.get());
+                }
+            }),
+        })
+    };
     let body = content();
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 28);
     let poster = views::tile(&show.id, &show.title, "poster-large", POSTER_LARGE);
@@ -432,63 +599,317 @@ pub fn show(show: &Show, seasons: &[(Season, Vec<Item>)], cards: &Cards) -> gtk:
     header.append(&poster);
     let facts = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .spacing(12)
+        .spacing(18)
         .valign(gtk::Align::End)
         .build();
-    facts.append(&label(&show.title, &["title-1"]));
+    let title = label(&show.title, &["page-title"]);
+    title.set_wrap(true);
+    facts.append(&title);
+    let meta = gtk::Box::builder()
+        .spacing(14)
+        .css_classes(["item-meta"])
+        .build();
     if let Some(year) = show.year {
-        facts.append(&label(&year.to_string(), &["dim-label"]));
+        meta.append(&label(&year.to_string(), &[]));
     }
+    let real_seasons = seasons.iter().filter(|(s, _)| s.season > 0).count();
+    meta.append(&label(
+        &match real_seasons {
+            1 => "1 season".to_owned(),
+            n => format!("{n} seasons"),
+        },
+        &[],
+    ));
+    facts.append(&meta);
     if let Some(summary) = &show.summary {
-        let text = label(summary, &["body"]);
+        let text = label(summary, &["item-summary"]);
         text.set_wrap(true);
         text.set_max_width_chars(70);
         facts.append(&text);
     }
+    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    let next = up_next(seasons).or_else(|| seasons.iter().flat_map(|(_, e)| e.first()).next());
+    if let Some(next) = next {
+        let position = Facts::of(next).position();
+        let word = if position.is_some() { "Resume" } else { "Play" };
+        let play = gtk::Button::builder()
+            .child(
+                &adw::ButtonContent::builder()
+                    .icon_name(crate::icons::PLAY)
+                    .label(format!("{word} {}", episode_code(next)))
+                    .build(),
+            )
+            .css_classes(["action", "suggested-action"])
+            .build();
+        let (actions, next) = (actions.clone(), next.clone());
+        play.connect_clicked(move |_| (actions.play)(next.clone(), position));
+        buttons.append(&play);
+    }
+    let all_watched = up_next(seasons).is_none();
+    let mark = gtk::Button::builder()
+        .icon_name(crate::icons::WATCHED)
+        .tooltip_text(if all_watched {
+            "Mark show as unwatched"
+        } else {
+            "Mark show as watched"
+        })
+        .css_classes(["action", "outlined", "square-action"])
+        .build();
+    {
+        let (actions, id) = (actions.clone(), show.id.clone());
+        mark.connect_clicked(move |_| (actions.set_watched)(id.clone(), !all_watched));
+    }
+    buttons.append(&mark);
+    facts.append(&buttons);
     header.append(&facts);
     body.append(&header);
 
-    for (season, episodes) in seasons {
-        body.append(&episode_list(&season.title, episodes, cards));
+    // The tabs, one per season, and the picked season under them.
+    let picked = open
+        .and_then(|id| seasons.iter().position(|(s, _)| &s.id == id))
+        .or_else(|| {
+            let next = up_next(seasons)?;
+            seasons
+                .iter()
+                .position(|(_, e)| e.iter().any(|e| e.id() == next.id()))
+        })
+        .unwrap_or(0);
+    let tabs = gtk::Box::builder()
+        .css_classes(["linked", "season-tabs"])
+        .build();
+    let tab_scroller = gtk::ScrolledWindow::builder()
+        .child(&tabs)
+        .vscrollbar_policy(gtk::PolicyType::Never)
+        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .propagate_natural_height(true)
+        .hexpand(true)
+        .build();
+    let watched_count = label("", &["dim-label", "small-text"]);
+    let mark_season = gtk::Button::builder()
+        .css_classes(["row-button"])
+        .valign(gtk::Align::Center)
+        .build();
+    // The tabs get the page's width and the row's ‹ ›, so it shows
+    // there are more seasons than fit; how many are watched goes under.
+    crate::views::wheel_scrolls_row(&tab_scroller);
+    let (back, forward) = crate::views::scroll_buttons(&tab_scroller);
+    let tab_line = gtk::Box::builder().spacing(6).build();
+    tab_line.append(&tab_scroller);
+    tab_line.append(&back);
+    tab_line.append(&forward);
+    let season_line = gtk::Box::builder().spacing(12).build();
+    watched_count.set_hexpand(true);
+    season_line.append(&watched_count);
+    season_line.append(&mark_season);
+    let bar = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(10)
+        .build();
+    bar.append(&tab_line);
+    bar.append(&season_line);
+    body.append(&bar);
+    let list_slot = adw::Bin::new();
+    body.append(&list_slot);
+
+    let open_season: Rc<dyn Fn(usize)> = {
+        let (model, current, actions, cards_open, art) = (
+            model.clone(),
+            current.clone(),
+            actions.clone(),
+            cards.open.clone(),
+            cards.art.clone(),
+        );
+        let (watched_count, mark_season, list_slot) = (
+            watched_count.clone(),
+            mark_season.clone(),
+            list_slot.clone(),
+        );
+        let mark_handler: Rc<std::cell::RefCell<Option<gtk::glib::SignalHandlerId>>> =
+            Rc::default();
+        Rc::new(move |index| {
+            current.set(index);
+            let seasons = model.borrow();
+            let Some((season, episodes)) = seasons.get(index) else {
+                return;
+            };
+            let total = episodes.len();
+            let seen = episodes
+                .iter()
+                .filter(|e| matches!(e, Item::Episode(e) if e.playback.watched))
+                .count();
+            watched_count.set_label(&if seen == total {
+                format!("All {total} watched")
+            } else {
+                format!("{seen} of {total} watched")
+            });
+            let all = seen == total;
+            mark_season.set_label(if all {
+                "Mark season as unwatched"
+            } else {
+                "Mark season as watched"
+            });
+            if let Some(old) = mark_handler.borrow_mut().take() {
+                mark_season.disconnect(old);
+            }
+            let (actions_, id) = (actions.clone(), season.id.clone());
+            mark_handler.replace(Some(
+                mark_season.connect_clicked(move |_| (actions_.set_watched)(id.clone(), !all)),
+            ));
+            list_slot.set_child(Some(&episode_list(
+                episodes,
+                &actions,
+                &cards_open,
+                art.as_ref(),
+            )));
+        })
+    };
+    redraw.replace(Some(open_season.clone()));
+    let mut first: Option<gtk::ToggleButton> = None;
+    for (index, (season, _)) in seasons.iter().enumerate() {
+        let tab = gtk::ToggleButton::builder()
+            .label(&season.title)
+            .css_classes(["season-tab"])
+            .build();
+        match &first {
+            Some(first) => tab.set_group(Some(first)),
+            None => first = Some(tab.clone()),
+        }
+        tab.set_active(index == picked);
+        let open_season = open_season.clone();
+        tab.connect_toggled(move |tab| {
+            if tab.is_active() {
+                open_season(index);
+            }
+        });
+        tabs.append(&tab);
     }
+    open_season(picked);
     body.upcast()
 }
 
-/// A season on its own page, when one is opened directly.
-pub fn season(season: &Season, episodes: &[Item], cards: &Cards) -> gtk::Widget {
-    let body = content();
-    body.append(&episode_list(&season.title, episodes, cards));
-    body.upcast()
+/// Marks `id` watched or not in the page's copy: the whole show when it is
+/// neither a season nor an episode of it, else that season or episode.
+/// Watched or not, the episode's position is cleared, as the server does.
+fn mark_in(seasons: &mut [(Season, Vec<Item>)], id: &MediaId, watched: bool) {
+    let whole = !seasons
+        .iter()
+        .any(|(s, e)| &s.id == id || e.iter().any(|i| i.id() == id));
+    for (season, episodes) in seasons.iter_mut() {
+        let all = whole || &season.id == id;
+        for item in episodes.iter_mut() {
+            if let Item::Episode(e) = item
+                && (all || &e.id == id)
+            {
+                e.playback.watched = watched;
+                e.playback.position = None;
+            }
+        }
+    }
 }
 
-fn episode_list(title: &str, episodes: &[Item], cards: &Cards) -> gtk::Box {
+/// A season's episodes: a thumbnail with its progress, "4. Title", how
+/// far along, a check when watched; right-click to play or mark it.
+fn episode_list(
+    episodes: &[Item],
+    actions: &Rc<ShowActions>,
+    open: &views::Open,
+    art: Option<&Rc<crate::artwork::Art>>,
+) -> gtk::ListBox {
     let list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
-        .css_classes(["boxed-list"])
+        .css_classes(["boxed-list", "episode-list"])
         .build();
     for episode in episodes {
         let Item::Episode(e) = episode else { continue };
         let facts = Facts::of(episode);
-        let status = match (facts.length, facts.position(), e.playback.watched) {
+        let position = facts.position();
+        let status = match (facts.length, position, e.playback.watched) {
             (_, _, true) => "Watched".to_owned(),
             (Some(length), Some(position), _) => format::remaining(length, position),
             (Some(length), None, _) => format::length(length),
             (None, _, _) => String::new(),
         };
         let row = adw::ActionRow::builder()
-            .title(format!("{}. {}", e.episode, e.title))
-            .subtitle(status)
+            .use_markup(false)
             .activatable(true)
             .build();
+        row.set_title(&format!("{}. {}", e.episode, e.title));
+        row.set_subtitle(&status);
+        if position.is_some() && !e.playback.watched {
+            row.add_css_class("in-progress");
+        }
+        let thumb = views::tile(&e.id, "", "thumb", THUMB);
+        if let Some(art) = art {
+            art.show(
+                &thumb,
+                &e.artwork,
+                &[ArtworkKind::Thumb, ArtworkKind::Background],
+                ArtworkSize::Small,
+            );
+        }
+        if let (Some(length), Some(position)) = (facts.length, position) {
+            thumb.add_overlay(
+                &gtk::ProgressBar::builder()
+                    .fraction(format::progress(length, position))
+                    .valign(gtk::Align::End)
+                    .css_classes(["tile-progress"])
+                    .build(),
+            );
+        }
+        thumb.set_valign(gtk::Align::Center);
+        thumb.set_margin_top(6);
+        thumb.set_margin_bottom(6);
+        row.add_prefix(&thumb);
         if e.playback.watched {
-            row.add_suffix(&gtk::Image::from_icon_name(crate::icons::CHECK));
+            row.add_suffix(
+                &gtk::Image::builder()
+                    .icon_name(crate::icons::CHECK)
+                    .css_classes(["accent"])
+                    .build(),
+            );
         }
         row.add_suffix(&gtk::Image::from_icon_name(crate::icons::RIGHT));
-        let (episode, open) = (episode.clone(), cards.open.clone());
+        // Right-click: play it, from where it was or the start, or mark it.
+        let play = |label: String, from: Option<Duration>| {
+            let (actions, item) = (actions.clone(), episode.clone());
+            views::MenuEntry::new(label, crate::icons::PLAY, move || {
+                (actions.play)(item.clone(), from)
+            })
+        };
+        let mut first = vec![match position {
+            Some(at) => play(format!("Resume from {}", format::timestamp(at)), Some(at)),
+            None => play("Play".to_owned(), None),
+        }];
+        if position.is_some() {
+            first.push(views::MenuEntry::new(
+                "Play from beginning",
+                crate::icons::BACK_10,
+                {
+                    let (actions, item) = (actions.clone(), episode.clone());
+                    move || (actions.play)(item.clone(), None)
+                },
+            ));
+        }
+        let watched = e.playback.watched;
+        let mark = {
+            let (actions, id) = (actions.clone(), e.id.clone());
+            views::MenuEntry::new(
+                if watched {
+                    "Mark as unwatched"
+                } else {
+                    "Mark as watched"
+                },
+                crate::icons::WATCHED,
+                move || (actions.set_watched)(id.clone(), !watched),
+            )
+        };
+        let menu = views::menu_popover(vec![first, vec![mark]]);
+        views::context_menu(row.upcast_ref(), &menu);
+        let (episode, open) = (episode.clone(), open.clone());
         row.connect_activated(move |_| open(episode.clone()));
         list.append(&row);
     }
-    titled(title, &list)
+    list
 }
 
 /// An artist: their albums as a grid, and a "⋯" to queue them all.
@@ -533,10 +954,12 @@ pub fn album(
 
     let side = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .spacing(16)
+        .spacing(18)
         .width_request(SQUARE.0)
         .build();
     let cover = views::tile(&album.id, &album.title, "square", SQUARE);
+    // A square, whatever the column does.
+    cover.set_halign(gtk::Align::Start);
     cards.art(
         &cover,
         &album.artwork,
@@ -544,8 +967,17 @@ pub fn album(
         ArtworkSize::Medium,
     );
     side.append(&cover);
-    side.append(&label(&album.title, &["title-1"]));
-    side.append(&label(artist, &["heading", "accent"]));
+    // The title, artist and facts close together.
+    let names = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(4)
+        .build();
+    // Wraps at the column's width: asking for its whole width on one line,
+    // it widened the column and the cover stretched with it.
+    let title = label(&album.title, &["album-title"]);
+    title.set_wrap(true);
+    title.set_max_width_chars(1);
+    names.append(&title);
     let length: Duration = tracks
         .iter()
         .filter_map(|t| match t {
@@ -561,10 +993,42 @@ pub fn album(
     .into_iter()
     .flatten()
     .collect();
-    side.append(&label(&meta.join(" · "), &["dim-label", "caption"]));
+    // The artist is a link to their page.
+    let artist_name = label(artist, &[]);
+    artist_name.set_wrap(true);
+    artist_name.set_max_width_chars(1);
+    let artist_link = gtk::Button::builder()
+        .child(&artist_name)
+        .halign(gtk::Align::Start)
+        .css_classes(["flat", "text-link", "album-artist"])
+        .tooltip_text("Go to artist")
+        .build();
+    {
+        let (open, item) = (
+            cards.open.clone(),
+            Item::Artist(Artist {
+                id: album.artist_id.clone(),
+                name: artist.to_owned(),
+                summary: None,
+                artwork: Vec::new(),
+            }),
+        );
+        artist_link.connect_clicked(move |_| open(item.clone()));
+    }
+    names.append(&artist_link);
+    let facts_line = label(&meta.join(" · "), &["dim-label", "small-text"]);
+    facts_line.set_wrap(true);
+    facts_line.set_max_width_chars(1);
+    names.append(&facts_line);
+    side.append(&names);
     let buttons = gtk::Box::builder().spacing(10).homogeneous(true).build();
     let play_all = gtk::Button::builder()
-        .label("Play")
+        .child(
+            &adw::ButtonContent::builder()
+                .icon_name(crate::icons::PLAY)
+                .label("Play")
+                .build(),
+        )
         .css_classes(["action", "suggested-action"])
         .build();
     {
@@ -602,32 +1066,36 @@ pub fn album(
         .selection_mode(gtk::SelectionMode::None)
         .hexpand(true)
         .valign(gtk::Align::Start)
-        .css_classes(["boxed-list"])
+        .css_classes(["track-list"])
         .build();
     for (index, track) in tracks.iter().enumerate() {
         let Item::Track(t) = track else { continue };
         let row = adw::ActionRow::builder()
-            .title(&t.title)
+            .use_markup(false)
             .activatable(true)
             .build();
+        row.set_title(&t.title);
         if let Some(number) = t.track {
-            let number = label(&number.to_string(), &["dim-label", "numeric"]);
+            let number = label(&number.to_string(), &["dim-label", "numeric", "small-text"]);
             number.set_width_chars(2);
             row.add_prefix(&number);
         }
         if let Some(length) = t.duration {
             row.add_suffix(&label(
                 &format::timestamp(length),
-                &["dim-label", "numeric"],
+                &["dim-label", "numeric", "small-text"],
             ));
         }
+        // Right-click (or a long press) for the track's menu, as designed:
+        // no button on every row.
         let menu = {
             let (enqueue, track) = (enqueue.clone(), track.clone());
-            views::menu_popover(vec![views::enqueue_entries(move |at| {
-                enqueue(vec![track.clone()], at)
-            })])
+            views::menu_popover(vec![
+                views::enqueue_entries(move |at| enqueue(vec![track.clone()], at)),
+                views::track_go_to_entries(t, &cards.open, false),
+            ])
         };
-        row.add_suffix(&views::menu_button(&menu, "More"));
+        views::context_menu(row.upcast_ref(), &menu);
         let (play, tracks) = (play.clone(), tracks.to_vec());
         row.connect_activated(move |_| play(tracks.clone(), index, false));
         list.append(&row);
@@ -647,17 +1115,107 @@ fn content() -> gtk::Box {
         .build()
 }
 
-fn titled(title: &str, body: &impl IsA<gtk::Widget>) -> gtk::Box {
-    let section = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    section.append(&label(title, &["title-3"]));
-    section.append(body);
-    section
-}
-
 fn label(text: &str, classes: &[&str]) -> gtk::Label {
     gtk::Label::builder()
         .label(text)
         .xalign(0.0)
         .css_classes(classes)
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use spoolframe_types::{Episode, MediaKind, Namespace, PlaybackState};
+
+    use super::*;
+
+    fn id(kind: MediaKind, key: &str) -> MediaId {
+        MediaId::new(Namespace::Plex, kind, key).unwrap()
+    }
+
+    fn season(n: u32) -> Season {
+        Season {
+            id: id(MediaKind::Season, &format!("s{n}")),
+            show_id: id(MediaKind::Show, "show"),
+            show_title: None,
+            season: n,
+            title: format!("Season {n}"),
+            artwork: Vec::new(),
+        }
+    }
+
+    fn episode(season: u32, n: u32, position: Option<u64>, watched: bool) -> Item {
+        Item::Episode(Episode {
+            id: id(MediaKind::Episode, &format!("s{season}e{n}")),
+            show_id: id(MediaKind::Show, "show"),
+            show_title: None,
+            season_id: id(MediaKind::Season, &format!("s{season}")),
+            season,
+            episode: n,
+            title: format!("Episode {n}"),
+            summary: None,
+            duration: Some(Duration::from_secs(3000)),
+            artwork: Vec::new(),
+            playback: PlaybackState {
+                position: position.map(Duration::from_secs),
+                watched,
+            },
+        })
+    }
+
+    #[test]
+    fn up_next_is_the_episode_part_way_through() {
+        let seasons = vec![
+            (
+                season(1),
+                vec![episode(1, 1, None, true), episode(1, 2, None, false)],
+            ),
+            (season(2), vec![episode(2, 1, Some(600), false)]),
+        ];
+        assert_eq!(up_next(&seasons).map(episode_code), Some("S2 · E1".into()));
+    }
+
+    #[test]
+    fn without_one_part_way_up_next_is_the_first_not_watched() {
+        let seasons = vec![(
+            season(1),
+            vec![episode(1, 1, None, true), episode(1, 2, None, false)],
+        )];
+        assert_eq!(up_next(&seasons).map(episode_code), Some("S1 · E2".into()));
+    }
+
+    #[test]
+    fn marking_a_season_marks_its_episodes_only() {
+        let mut seasons = vec![
+            (season(1), vec![episode(1, 1, None, false)]),
+            (
+                season(2),
+                vec![episode(2, 1, Some(60), false), episode(2, 2, None, false)],
+            ),
+        ];
+        let id = seasons[1].0.id.clone();
+        mark_in(&mut seasons, &id, true);
+        let watched: Vec<bool> = seasons
+            .iter()
+            .flat_map(|(_, e)| e.iter())
+            .map(|i| matches!(i, Item::Episode(e) if e.playback.watched))
+            .collect();
+        assert_eq!(watched, [false, true, true]);
+    }
+
+    #[test]
+    fn marking_the_show_marks_every_episode() {
+        let mut seasons = vec![
+            (season(1), vec![episode(1, 1, None, false)]),
+            (season(2), vec![episode(2, 1, None, false)]),
+        ];
+        mark_in(&mut seasons, &id(MediaKind::Show, "show"), true);
+        assert_eq!(up_next(&seasons), None);
+    }
+
+    #[test]
+    fn a_show_all_watched_has_nothing_up_next() {
+        let seasons = vec![(season(1), vec![episode(1, 1, None, true)])];
+        assert_eq!(up_next(&seasons), None);
+    }
 }

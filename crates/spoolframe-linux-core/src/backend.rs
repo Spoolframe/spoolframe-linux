@@ -19,8 +19,10 @@ pub use spoolframe_protocol::{
     PlaybackPlan, Selection, TrackReason,
 };
 pub use spoolframe_protocol::{
-    PreviewTile, Previews, SearchCounts, SearchGroup, SearchRequest, SearchResults,
+    PinProof, PinState, PlexLink, PlexSyncSummary, PreviewTile, Previews, SearchCounts,
+    SearchGroup, SearchRequest, SearchResults,
 };
+pub use spoolframe_types::Platform;
 use spoolframe_types::{
     ArtworkId, Item, Library, LibraryId, MediaId, MediaTracks, SubtitleFormat, TrackPreferences,
 };
@@ -105,6 +107,10 @@ pub enum BackendError {
     /// code.
     #[error("the sign-in code expired")]
     SignInExpired,
+    /// The account has no password to prove it with (passkey or provider
+    /// only); the PIN, or My profile in the web UI, does instead.
+    #[error("this account has no password")]
+    NoPassword,
     #[error("{0}")]
     Other(String),
 }
@@ -144,6 +150,11 @@ pub struct Server {
     pub verified: bool,
     /// Whether it answered on this network just now (mDNS).
     pub on_network: bool,
+    /// When the user said its fingerprint matched; `None` if they have not,
+    /// or it was saved before the date was kept.
+    pub verified_at: Option<std::time::SystemTime>,
+    /// When this device last connected to it.
+    pub last_connected_at: Option<std::time::SystemTime>,
 }
 
 /// A user signed in on a server from this device: one profile on "Who's
@@ -260,6 +271,14 @@ pub trait Client: Send + Sync {
         saved: &'a ServerKey,
         now: &'a ServerKey,
     ) -> BoxFuture<'a, Result<Server, BackendError>>;
+
+    /// Forgets saved server `server`: its pin, so its fingerprint is
+    /// checked again if it is added back, and every session on it.
+    fn forget<'a>(&'a self, server: &'a ServerKey) -> BoxFuture<'a, Result<(), BackendError>>;
+
+    /// Signs every user on `server` out, on the server and here; the
+    /// server stays saved.
+    fn sign_out<'a>(&'a self, server: &'a ServerKey) -> BoxFuture<'a, Result<(), BackendError>>;
 
     /// The users signed in on `server` from this device.
     fn profiles<'a>(
@@ -476,12 +495,27 @@ pub trait Session: Send + Sync {
     /// session here ([`BackendError::SignInRequired`]).
     fn unlock<'a>(&'a self, pin: &'a str) -> BoxFuture<'a, Result<(), BackendError>>;
 
-    /// Sets or changes the user's PIN, 4 to 8 digits. The signed-in,
-    /// unlocked session is all it takes.
-    fn set_pin<'a>(&'a self, pin: &'a str) -> BoxFuture<'a, Result<(), BackendError>>;
+    /// Whether the user has a PIN, and how many digits; `None` for none.
+    fn pin(&self) -> BoxFuture<'_, Result<Option<PinState>, BackendError>>;
 
-    /// Removes the user's PIN, and with it every device's requirement.
-    fn clear_pin(&self) -> BoxFuture<'_, Result<(), BackendError>>;
+    /// Sets or changes the user's PIN, 4 to 8 digits. The first PIN takes no
+    /// proof; changing one takes the current PIN or the account password.
+    /// A wrong PIN counts toward [`Session::unlock`]'s lockout, a wrong
+    /// password toward the sign-in limit; either is
+    /// [`BackendError::WrongCredentials`].
+    fn set_pin<'a>(
+        &'a self,
+        pin: &'a str,
+        proof: Option<PinProof>,
+    ) -> BoxFuture<'a, Result<(), BackendError>>;
+
+    /// Removes the user's PIN, and with it every device's requirement, on
+    /// the current PIN or the account password.
+    fn clear_pin(&self, proof: PinProof) -> BoxFuture<'_, Result<(), BackendError>>;
+
+    /// The user's Plex account link, if any (P3-12); linking is the web
+    /// UI's.
+    fn plex_link(&self) -> BoxFuture<'_, Result<Option<PlexLink>, BackendError>>;
 
     /// The devices the user has signed in from, and where the PIN is
     /// asked for.

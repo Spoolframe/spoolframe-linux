@@ -15,6 +15,17 @@ pub enum Theme {
     Latte,
 }
 
+/// A theme's look in miniature, as `#rrggbb`: its window, sidebar,
+/// borders, text and accent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Swatch {
+    pub base: &'static str,
+    pub mantle: &'static str,
+    pub surface: &'static str,
+    pub text: &'static str,
+    pub accent: &'static str,
+}
+
 /// How the theme sets libadwaita's light or dark style.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scheme {
@@ -82,6 +93,18 @@ impl Theme {
             Some(p) if p.dark => Scheme::ForceDark,
             Some(_) => Scheme::ForceLight,
         }
+    }
+
+    /// The colours Preferences draws this theme's swatch in, or `None`
+    /// for "Follow system", which has no colours of its own.
+    pub fn swatch(self) -> Option<Swatch> {
+        self.palette().map(|p| Swatch {
+            base: p.base,
+            mantle: p.mantle,
+            surface: p.surface,
+            text: p.text,
+            accent: p.accent,
+        })
     }
 
     /// The stylesheet for this theme, or `None` for "Follow system".
