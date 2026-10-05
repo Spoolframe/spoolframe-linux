@@ -357,8 +357,8 @@ fn metadata(
     metadata.set_title(Some(title));
     let (artist, album) = match item {
         Item::Track(_) => (
-            album.and_then(|a| a.artist_name.clone()),
-            album.map(|a| a.title.clone()),
+            crate::views::track_artist(item, album),
+            crate::views::track_album(item, album),
         ),
         Item::Episode(e) => (
             e.show_title.clone(),
@@ -728,6 +728,9 @@ mod tests {
             bit_depth: None,
             sample_rate: None,
             album_track_count: None,
+            artist_name: None,
+            album_title: None,
+            artwork: Vec::new(),
         });
         let album = Album {
             id: id(MediaKind::Album, "5"),

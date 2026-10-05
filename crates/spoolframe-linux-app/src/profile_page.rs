@@ -34,6 +34,10 @@ pub fn last_used(seen: i64, now: i64) -> String {
 /// The signed-in profile the page is for.
 pub struct Signed {
     pub session: Arc<dyn Session>,
+    /// For the passkeys, whose "Confirm it's you" signs in again.
+    pub client: Arc<dyn spoolframe_linux_core::backend::Client>,
+    pub server: spoolframe_linux_core::backend::Server,
+    pub profile: spoolframe_linux_core::backend::Profile,
     /// The server's key, hex: a pasted link must name this server.
     pub server_key: String,
     pub server_name: String,
@@ -79,6 +83,11 @@ pub fn approval_refusal(error: &BackendError) -> String {
         BackendError::ProfileLocked => {
             "Your profile is locked. Enter your PIN, then try again".to_owned()
         }
+        BackendError::TimedOut(_) | BackendError::Unreachable(_) => {
+            "The server didn't answer. The device may be signed in already: look at it before \
+             trying again"
+                .to_owned()
+        }
         other => refusal(other),
     }
 }
@@ -87,6 +96,11 @@ pub fn approval_refusal(error: &BackendError) -> String {
 pub fn refusal(error: &BackendError) -> String {
     match error {
         BackendError::InvalidInput(why) => capitalized(why),
+        // What it shows now is read again: the change may have gone
+        // through before the answer was lost.
+        BackendError::TimedOut(_) | BackendError::Unreachable(_) => {
+            "The server didn't answer. What's shown now is what it has".to_owned()
+        }
         other => capitalized(&other.to_string()),
     }
 }
@@ -169,6 +183,15 @@ pub fn page(signed: Signed, dialog: &adw::ToastOverlay) -> adw::PreferencesPage 
         .title("Profile")
         .icon_name(crate::icons::PROFILE)
         .build();
+    let passkeys = crate::passkeys::group(
+        crate::passkeys::Needs {
+            client: signed.client,
+            server: signed.server,
+            profile: signed.profile,
+            session: signed.session.clone(),
+        },
+        dialog,
+    );
     let view = Rc::new(View {
         session: signed.session,
         server_key: signed.server_key,
@@ -229,6 +252,7 @@ pub fn page(signed: Signed, dialog: &adw::ToastOverlay) -> adw::PreferencesPage 
     let header = adw::PreferencesGroup::new();
     header.add(&who);
     page.add(&header);
+    page.add(&passkeys);
 
     let pin = adw::PreferencesGroup::builder()
         .title("Profile PIN")
@@ -534,6 +558,7 @@ impl View {
                                     dialog.close();
                                 }
                                 this.toast(&refusal(&e));
+                                this.load_pin();
                             }
                         },
                     );
@@ -626,6 +651,7 @@ impl View {
                                 dialog.close();
                             }
                             this.toast(&refusal(&e));
+                            this.load();
                         }
                     },
                 );
@@ -1235,6 +1261,14 @@ fn step_body(icon: &str, heading: &str, line: &str) -> gtk::Box {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_approval_without_an_answer_says_to_look_at_the_device() {
+        assert!(
+            approval_refusal(&BackendError::TimedOut("Home Media".into()))
+                .contains("may be signed in already")
+        );
+    }
 
     #[test]
     fn the_plex_account_is_on_the_web_profile_page() {

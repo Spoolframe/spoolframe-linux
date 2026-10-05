@@ -772,7 +772,18 @@ impl<'a> Facts<'a> {
                     &a.artwork,
                 )
             },
-            Item::Track(t) => plain(&t.title, t.track.map(|n| format!("Track {n}")), &[]),
+            // Whose it is, "Adele · 25", as the search board has it; the
+            // number only where the server says neither.
+            Item::Track(t) => Facts {
+                parent: t.artist_name.clone(),
+                ..plain(
+                    &t.title,
+                    Some(joined(&[t.artist_name.clone(), t.album_title.clone()]))
+                        .filter(|d| !d.is_empty())
+                        .or_else(|| t.track.map(|n| format!("Track {n}"))),
+                    &t.artwork,
+                )
+            },
         }
     }
 
@@ -808,6 +819,48 @@ fn joined(parts: &[Option<String>]) -> String {
         .cloned()
         .collect::<Vec<_>>()
         .join(" · ")
+}
+
+/// A track's artist: its own, else its album's (P1-23's queue can mix
+/// albums, and a track played from search has no album with it).
+pub fn track_artist(item: &Item, album: Option<&Album>) -> Option<String> {
+    match item {
+        Item::Track(t) => t
+            .artist_name
+            .clone()
+            .or_else(|| album.and_then(|a| a.artist_name.clone())),
+        _ => None,
+    }
+}
+
+/// A track's album title: its own, else the album's played from.
+pub fn track_album(item: &Item, album: Option<&Album>) -> Option<String> {
+    match item {
+        Item::Track(t) => t
+            .album_title
+            .clone()
+            .or_else(|| album.map(|a| a.title.clone())),
+        _ => None,
+    }
+}
+
+/// The cover for what plays, and the id it is kept under: its album's,
+/// else a track's own (the album cover the server gives with it).
+pub fn cover_of<'a>(item: &'a Item, album: Option<&'a Album>) -> (MediaId, &'a [Artwork]) {
+    let own: &[Artwork] = match item {
+        Item::Track(t) => &t.artwork,
+        _ => &[],
+    };
+    let id = match (album, item) {
+        (Some(album), _) => album.id.clone(),
+        (None, Item::Track(t)) => t.album_id.clone(),
+        (None, other) => other.id().clone(),
+    };
+    let artwork = album
+        .map(|a| a.artwork.as_slice())
+        .filter(|a| !a.is_empty())
+        .unwrap_or(own);
+    (id, artwork)
 }
 
 /// A page under `header`, with `above` (a banner, a heading, tabs) between
@@ -883,6 +936,52 @@ mod tests {
     fn an_episode_without_a_show_name_leads_with_its_label() {
         let item = episode(None);
         assert_eq!(Facts::of(&item).caption(), "S1 · E4 · Seven");
+    }
+
+    fn track(artist: Option<&str>, album: Option<&str>) -> Item {
+        Item::Track(Track {
+            id: id(MediaKind::Track, "7"),
+            album_id: id(MediaKind::Album, "5"),
+            artist_id: id(MediaKind::Artist, "4"),
+            title: "Can I Get It".into(),
+            track: Some(6),
+            disc: None,
+            duration: None,
+            playback: PlaybackState::default(),
+            codec: None,
+            bit_depth: None,
+            sample_rate: None,
+            album_track_count: None,
+            artist_name: artist.map(Into::into),
+            album_title: album.map(Into::into),
+            artwork: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn a_track_says_whose_it_is() {
+        assert_eq!(
+            Facts::of(&track(Some("Adele"), Some("30")))
+                .detail
+                .as_deref(),
+            Some("Adele · 30")
+        );
+    }
+
+    #[test]
+    fn a_track_the_server_says_nothing_about_shows_its_number() {
+        assert_eq!(
+            Facts::of(&track(None, None)).detail.as_deref(),
+            Some("Track 6")
+        );
+    }
+
+    #[test]
+    fn a_tracks_own_artist_wins_over_the_album_played_from() {
+        assert_eq!(
+            track_artist(&track(Some("Adele"), None), None).as_deref(),
+            Some("Adele")
+        );
     }
 
     #[test]

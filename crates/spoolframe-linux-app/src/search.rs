@@ -1054,6 +1054,18 @@ impl SearchPage {
                 still.set_valign(gtk::Align::Center);
                 row.add_prefix(&still);
             }
+            // A track leads with its album's cover, square.
+            if let Item::Track(track) = item {
+                let cover = views::tile(&track.album_id, "", "thumb", (44, 44));
+                self.cards.art(
+                    &cover,
+                    &track.artwork,
+                    &[ArtworkKind::Poster, ArtworkKind::Thumb],
+                    ArtworkSize::Small,
+                );
+                cover.set_valign(gtk::Align::Center);
+                row.add_prefix(&cover);
+            }
             // An episode's menu goes to its show or season.
             if let Item::Episode(episode) = item {
                 let menu = crate::views::menu_popover(vec![crate::views::go_to_entries(

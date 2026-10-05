@@ -79,6 +79,12 @@ glib-build-tools = "0.22"
 # The backend's connection state is a tokio watch channel, as in the SDK.
 # Relm4 runs its commands on tokio already. `macros`: join! for calls
 # that do not wait on each other.
+# 0.6: pure-Rust crypto (crypto-glue), no OpenSSL. A prerelease, chosen
+# for that and for its phone (caBLE) support; see the passkey commits.
+# `cable`, the phone flow, brings OpenSSL back: its websocket uses
+# tokio-tungstenite with native-tls, which the crate fixes (accepted).
+webauthn-authenticator-rs = { version = "=0.6.1-dev", default-features = false, features = ["usb", "cable"] }
+webauthn-rs-proto = "=0.6.1-dev"
 tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros"] }
 
 # Where config, data and cache live, by each platform's rules.

@@ -12,6 +12,7 @@ pub mod fake;
 pub mod format;
 pub mod markers;
 pub mod next_episode;
+pub mod passkey;
 pub mod paths;
 pub mod progressive;
 pub mod reader;

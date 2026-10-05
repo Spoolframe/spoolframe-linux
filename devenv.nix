@@ -31,8 +31,17 @@ in {
       # egl.pc: the video sink's GL path (gst-plugin-gtk4's wayland and
       # x11egl features) links GStreamer's EGL library.
       pkgs.libGL
+      # Passkeys (P3-19): libudev finds security keys; the phone flow
+      # reaches BlueZ over D-Bus (libdbus) and its tunnel over TLS
+      # (OpenSSL, through native-tls).
+      pkgs.systemdLibs
+      pkgs.dbus
+      pkgs.openssl
     ]
     ++ gstPlugins;
+
+  # fido-hid-rs generates its Linux bindings with bindgen.
+  env.LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
 
   # Nix keeps each plugin set in its own store path; GStreamer finds them
   # only through this list.

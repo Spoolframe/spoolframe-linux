@@ -223,7 +223,7 @@ impl View {
                 self.title.set_label(&facts.title);
                 let album = playback.album();
                 self.show_cover(item, album.as_ref());
-                let artist = album.as_ref().and_then(|a| a.artist_name.clone());
+                let artist = crate::views::track_artist(item, album.as_ref());
                 self.artist.set_label(artist.as_deref().unwrap_or_default());
                 self.artist.set_visible(artist.is_some());
                 let number = match item {
@@ -231,7 +231,7 @@ impl View {
                     _ => None,
                 };
                 let detail: Vec<String> = [
-                    album.as_ref().map(|a| a.title.clone()),
+                    crate::views::track_album(item, album.as_ref()),
                     album.as_ref().and_then(|a| a.year).map(|y| y.to_string()),
                     number,
                 ]
@@ -288,26 +288,22 @@ impl View {
 impl View {
     /// The album's cover, kept while the album stays the same.
     fn show_cover(&self, item: &Item, album: Option<&spoolframe_types::Album>) {
-        let id = album.map(|a| a.id.clone());
-        if *self.cover_album.borrow() == id && self.cover_slot.child().is_some() {
+        let (id, artwork) = crate::views::cover_of(item, album);
+        if self.cover_album.borrow().as_ref() == Some(&id) && self.cover_slot.child().is_some() {
             return;
         }
-        let cover = crate::views::tile(
-            id.as_ref().unwrap_or(item.id()),
-            album.map_or("", |a| a.title.as_str()),
-            "now-cover",
-            COVER,
-        );
-        if let (Some(art), Some(album)) = (&self.art, album) {
+        let title = crate::views::track_album(item, album).unwrap_or_default();
+        let cover = crate::views::tile(&id, &title, "now-cover", COVER);
+        if let Some(art) = &self.art {
             art.show(
                 &cover,
-                &album.artwork,
+                artwork,
                 &[ArtworkKind::Poster, ArtworkKind::Thumb],
                 ArtworkSize::Large,
             );
         }
         self.cover_slot.set_child(Some(&cover));
-        self.cover_album.replace(id);
+        self.cover_album.replace(Some(id));
     }
 }
 
@@ -555,9 +551,9 @@ impl Queue {
 
         if let Some(item) = playback.current() {
             self.heading("Now playing", false, &mut rows);
-            let artist = artist_of(album.as_ref());
+            let artist = artist_of(&item, album.as_ref());
             let row = self.append(
-                &queue_row(&self.thumb(album.as_ref()), &item, &artist, None),
+                &queue_row(&self.thumb(&item, album.as_ref()), &item, &artist, None),
                 Row::Inert,
                 &mut rows,
             );
@@ -567,14 +563,14 @@ impl Queue {
         if !up_next.queued.is_empty() {
             self.heading("Next in queue", true, &mut rows);
             for (index, queued) in up_next.queued.iter().enumerate() {
-                let artist = artist_of(queued.album.as_ref());
+                let artist = artist_of(&queued.item, queued.album.as_ref());
                 let handle = gtk::Image::builder()
                     .icon_name(crate::icons::DRAG)
                     .tooltip_text("Drag to reorder")
                     .css_classes(["dim-label"])
                     .build();
                 let content = queue_row(
-                    &self.thumb(queued.album.as_ref()),
+                    &self.thumb(&queued.item, queued.album.as_ref()),
                     &queued.item,
                     &artist,
                     Some(handle.upcast_ref()),
@@ -607,9 +603,14 @@ impl Queue {
                 None => "Next".to_owned(),
             };
             self.heading(&heading, false, &mut rows);
-            let artist = artist_of(up_next.from.as_ref());
             for (pos, item) in up_next.context.iter() {
-                let content = queue_row(&self.thumb(up_next.from.as_ref()), item, &artist, None);
+                let artist = artist_of(item, up_next.from.as_ref());
+                let content = queue_row(
+                    &self.thumb(item, up_next.from.as_ref()),
+                    item,
+                    &artist,
+                    None,
+                );
                 let row = self.append(&content, Row::Context(*pos), &mut rows);
                 // Right-click: play it now, or queue it next.
                 let mut groups = Vec::new();
@@ -683,15 +684,16 @@ impl Queue {
     }
 
     /// A row's album cover, 40 px, in place of a number.
-    fn thumb(&self, album: Option<&spoolframe_types::Album>) -> gtk::Widget {
-        let Some(album) = album else {
+    fn thumb(&self, item: &Item, album: Option<&spoolframe_types::Album>) -> gtk::Widget {
+        if album.is_none() && !matches!(item, Item::Track(_)) {
             return number("").upcast();
-        };
-        let tile = crate::views::tile(&album.id, "", "queue-thumb", (40, 40));
+        }
+        let (id, artwork) = crate::views::cover_of(item, album);
+        let tile = crate::views::tile(&id, "", "queue-thumb", (40, 40));
         if let Some(art) = &self.art {
             art.show(
                 &tile,
-                &album.artwork,
+                artwork,
                 &[ArtworkKind::Poster, ArtworkKind::Thumb],
                 ArtworkSize::Small,
             );
@@ -743,10 +745,8 @@ impl Queue {
     }
 }
 
-fn artist_of(album: Option<&spoolframe_types::Album>) -> String {
-    album
-        .and_then(|a| a.artist_name.clone())
-        .unwrap_or_default()
+fn artist_of(item: &Item, album: Option<&spoolframe_types::Album>) -> String {
+    crate::views::track_artist(item, album).unwrap_or_default()
 }
 
 /// A row's mark: its number, or ▶ for the track playing.

@@ -15,6 +15,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use spoolframe_protocol::{
+    APP_ORIGIN, APP_RP_ID, FinishPasskeyRegistration, FinishPasskeySignIn, PasskeyCreation,
+    PasskeyInfo, PasskeyRequest,
+};
+pub use spoolframe_protocol::{
     ArtworkSize, ChosenTracks, DeviceInfo, DeviceSignInRequest, HomeScreen, PlaybackHandle,
     PlaybackPlan, Selection, TrackReason,
 };
@@ -42,6 +46,11 @@ pub enum BackendError {
     NotFound(String),
     #[error("{0} cannot be reached")]
     Unreachable(String),
+    /// A request had no answer in time (P1-15): the connection may have
+    /// died quietly. The SDK checks it and dials again; an action may
+    /// still have gone through, so re-read before offering it again.
+    #[error("{0} did not answer in time")]
+    TimedOut(String),
     #[error("the username or password is wrong")]
     WrongCredentials,
     #[error("too many failed sign-ins; try again in {} s", .0.as_secs().max(1))]
@@ -111,6 +120,13 @@ pub enum BackendError {
     /// only); the PIN, or My profile in the web UI, does instead.
     #[error("this account has no password")]
     NoPassword,
+    /// Adding or removing a passkey needs a sign-in in the last 10
+    /// minutes (P3-19): sign in again, then ask.
+    #[error("confirm it's you: sign in again first")]
+    RecentSignInRequired,
+    /// The passkey is the user's last way to sign in, and is kept.
+    #[error("this is your only way to sign in")]
+    LastSignInMethod,
     #[error("{0}")]
     Other(String),
 }
@@ -179,6 +195,9 @@ pub enum ProfileSignIn {
     /// The server ended its session: the user signs in again, and only
     /// the profile's name is kept here.
     Password,
+    /// As `Password`, for someone whose last sign-in here was a passkey:
+    /// they are offered a passkey again.
+    Passkey,
 }
 
 /// A sign-in this device began and another approves (P3-05, P3-07): a
@@ -279,6 +298,12 @@ pub trait Client: Send + Sync {
     /// chosen. Asks nothing and never dials.
     fn connection_path(&self, server: &ServerKey) -> ConnectionPath;
 
+    /// Checks every open connection after the machine wakes or its network
+    /// changes (P1-15): one that does not answer is dropped and dialled
+    /// again, so the next request does not wait out its time limit. Never
+    /// dials a server it has no connection to.
+    fn resume(&self) -> BoxFuture<'_, ()>;
+
     /// Forgets a profile kept on this device for `server`: its session,
     /// if any, and its name.
     fn forget_profile<'a>(
@@ -317,6 +342,24 @@ pub trait Client: Send + Sync {
     fn await_device_sign_in<'a>(
         &'a self,
         sign_in: &'a DeviceSignIn,
+    ) -> BoxFuture<'a, Result<Profile, BackendError>>;
+
+    /// Begins a passkey sign-in on `server` (P3-19): what the passkey
+    /// signs, for [`APP_RP_ID`]. With `username`, only that user's
+    /// passkeys may answer; without, any of this server's on the key.
+    fn begin_passkey_sign_in<'a>(
+        &'a self,
+        server: &'a ServerKey,
+        username: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<PasskeyRequest, BackendError>>;
+
+    /// Finishes it with what the passkey signed, adding a profile as a
+    /// password sign-in does. A passkey that does not sign in is
+    /// [`BackendError::WrongCredentials`].
+    fn finish_passkey_sign_in<'a>(
+        &'a self,
+        server: &'a ServerKey,
+        signed: FinishPasskeySignIn,
     ) -> BoxFuture<'a, Result<Profile, BackendError>>;
 
     /// The session behind a profile.
@@ -534,6 +577,30 @@ pub trait Session: Send + Sync {
     /// The devices the user has signed in from, and where the PIN is
     /// asked for.
     fn devices(&self) -> BoxFuture<'_, Result<Vec<DeviceInfo>, BackendError>>;
+
+    /// Begins making a passkey for this user (P3-19). Only soon after
+    /// signing in: [`BackendError::RecentSignInRequired`] otherwise.
+    fn begin_passkey_registration(&self) -> BoxFuture<'_, Result<PasskeyCreation, BackendError>>;
+
+    /// Keeps the passkey made for it, named for this device (1 to 64
+    /// characters).
+    fn finish_passkey_registration(
+        &self,
+        made: FinishPasskeyRegistration,
+    ) -> BoxFuture<'_, Result<(), BackendError>>;
+
+    /// This user's passkeys, the web UI's too, oldest first.
+    fn passkeys(&self) -> BoxFuture<'_, Result<Vec<PasskeyInfo>, BackendError>>;
+
+    fn rename_passkey<'a>(
+        &'a self,
+        id: &'a str,
+        name: &'a str,
+    ) -> BoxFuture<'a, Result<(), BackendError>>;
+
+    /// Removes one; [`BackendError::RecentSignInRequired`] as for adding,
+    /// [`BackendError::LastSignInMethod`] for their only way in.
+    fn remove_passkey<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), BackendError>>;
 
     /// Asks for the PIN on `device` (an endpoint id from
     /// [`Session::devices`]; this device for `None`), or stops asking.

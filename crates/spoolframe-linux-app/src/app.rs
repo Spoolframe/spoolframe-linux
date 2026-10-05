@@ -24,6 +24,7 @@ use spoolframe_types::{
 use crate::artwork::Art;
 use crate::minibar::MiniBar;
 use crate::mpris::Mpris;
+use crate::passkey_dialog::{self, PasskeySignIn};
 use crate::playback::{Change, Playback, Playlist};
 use crate::queue::Queued;
 use crate::remote_sign_in::{self, RemoteSignIn, Via};
@@ -168,6 +169,7 @@ pub struct AppWidgets {
     root_header: adw::HeaderBar,
     sign_in: Option<start::SignIn>,
     remote_sign_in: Option<Rc<RemoteSignIn>>,
+    passkey_sign_in: Option<Rc<PasskeySignIn>>,
     add_server: Option<start::AddServer>,
     sidebar: gtk::ListBox,
     stack: adw::NavigationView,
@@ -179,6 +181,8 @@ pub struct AppWidgets {
     mini_bar: Rc<MiniBar>,
     /// The desktop's Now Playing and media keys (P1-24).
     mpris: Rc<Mpris>,
+    /// Checks the connections after a wake or a network change.
+    _wake: crate::wake::Wake,
     root_page: adw::NavigationPage,
     /// The root page's scrolled area: `content`, or a library's grid,
     /// which must be the scrolled child itself to load row by row.
@@ -209,6 +213,8 @@ pub enum Msg {
     RetryCatalog,
     /// Sign in by approving on a phone (P3-05) or in the browser (P3-06).
     OpenRemoteSignIn(Via),
+    /// Sign in with a passkey (P3-19), narrowed to a typed username.
+    OpenPasskeySignIn(Option<String>),
     /// The browser sign-in has no page to open: the server has no web
     /// address.
     BrowserSignInUnavailable,
@@ -618,6 +624,13 @@ impl Component for App {
                 Rc::new(move || sender.input(Msg::StopPlayback))
             },
         );
+        let wake = {
+            let client = client.clone();
+            crate::wake::watch(Rc::new(move || {
+                let client = client.clone();
+                relm4::spawn(async move { client.resume().await });
+            }))
+        };
         let mpris = Mpris::start(
             {
                 let (sender, window) = (sender.clone(), root.clone());
@@ -744,6 +757,7 @@ impl Component for App {
                 root_header: header.clone(),
                 sign_in: None,
                 remote_sign_in: None,
+                passkey_sign_in: None,
                 pin_pad: None,
                 add_server: None,
                 sidebar,
@@ -753,6 +767,7 @@ impl Component for App {
                 library_page,
                 mini_bar,
                 mpris,
+                _wake: wake,
                 scroller,
                 content,
                 search: None,
@@ -844,6 +859,10 @@ impl Component for App {
             Msg::ChooseProfile(profile) if profile.sign_in == ProfileSignIn::Password => {
                 sender.input(Msg::SignInAs(profile.username))
             }
+            // Last in with a passkey: offered one again.
+            Msg::ChooseProfile(profile) if profile.sign_in == ProfileSignIn::Passkey => {
+                sender.input(Msg::OpenPasskeySignIn(Some(profile.username)))
+            }
             Msg::ChooseProfile(profile) if profile.locked => {
                 self.ask_pin(profile, widgets, &sender)
             }
@@ -909,7 +928,11 @@ impl Component for App {
                     let sender = sender.clone();
                     Rc::new(move |via| sender.input(Msg::OpenRemoteSignIn(via)))
                 };
-                let dialog = start::SignIn::new(server, submit, elsewhere);
+                let passkey: Rc<dyn Fn(Option<String>)> = {
+                    let sender = sender.clone();
+                    Rc::new(move |username| sender.input(Msg::OpenPasskeySignIn(username)))
+                };
+                let dialog = start::SignIn::new(server, submit, elsewhere, passkey);
                 if !username.is_empty() {
                     dialog.fill_username(&username);
                 }
@@ -942,6 +965,25 @@ impl Component for App {
                 let screen = RemoteSignIn::new(self.client.clone(), server, via, ends);
                 screen.dialog.present(Some(root));
                 widgets.remote_sign_in = Some(screen);
+            }
+            Msg::OpenPasskeySignIn(username) => {
+                let Some(server) = &self.server else { return };
+                let token = self.profile_scope.token();
+                let ends = passkey_dialog::Ends {
+                    // A passkey sign-in ends as a password sign-in does.
+                    done: {
+                        let sender = sender.clone();
+                        Rc::new(move |profile| {
+                            sender.command_sender().emit(Completion {
+                                token: token.clone(),
+                                loaded: Loaded::SignedIn(Ok(profile)),
+                            })
+                        })
+                    },
+                };
+                let screen = PasskeySignIn::new(self.client.clone(), server, username, ends);
+                screen.dialog.present(Some(root));
+                widgets.passkey_sign_in = Some(screen);
             }
             Msg::BrowserSignInUnavailable => {
                 if let Some(dialog) = &widgets.sign_in {
@@ -1036,7 +1078,7 @@ impl Component for App {
                         }
                         Err(e) => {
                             clear(&content);
-                            content.append(&error_status(&e));
+                            content.append(&error_status(&e, None));
                         }
                     }
                 }));
@@ -1413,6 +1455,9 @@ impl Component for App {
                 if let Some(phone) = widgets.remote_sign_in.take() {
                     phone.dialog.close();
                 }
+                if let Some(passkey) = widgets.passkey_sign_in.take() {
+                    passkey.dialog.close();
+                }
                 if let Some(dialog) = widgets.sign_in.take() {
                     dialog.dialog.close();
                 }
@@ -1445,7 +1490,7 @@ impl Component for App {
                 }
                 widgets.screens.set_visible_child_name("not-set-up");
             }
-            Loaded::Libraries(Err(e)) => show_error(widgets, "Home", &e),
+            Loaded::Libraries(Err(e)) => show_error(widgets, "Home", &e, home_again(&sender)),
             Loaded::Home(Ok(home)) => {
                 let mut rows = Vec::new();
                 // A row with nothing in it is left out, not shown empty.
@@ -1473,7 +1518,7 @@ impl Component for App {
                 }
                 show(widgets, "Home", rows);
             }
-            Loaded::Home(Err(e)) => show_error(widgets, "Home", &e),
+            Loaded::Home(Err(e)) => show_error(widgets, "Home", &e, home_again(&sender)),
             Loaded::Person(person, Ok((items, total))) => push(
                 widgets,
                 &person.name,
@@ -1485,7 +1530,7 @@ impl Component for App {
                     items.iter().map(|i| views::poster_card(i, cards)),
                 ),
             ),
-            Loaded::Person(person, Err(e)) => push_error(widgets, &person.name, &e),
+            Loaded::Person(person, Err(e)) => push_error(widgets, &person.name, &e, None),
             Loaded::Playable(item, context, tracks, chosen, next) => {
                 // An episode's page is titled with its season, as designed.
                 let title = match &item {
@@ -1561,7 +1606,10 @@ impl Component for App {
                     &pages::show(&show, &seasons, open.as_ref(), actions, cards),
                 );
             }
-            Loaded::Show(show, Err(e), _) => push_error(widgets, &show.title, &e),
+            Loaded::Show(show, Err(e), _) => {
+                let title = show.title.clone();
+                push_error(widgets, &title, &e, Some((Item::Show(show), &sender)))
+            }
             Loaded::Artist(artist, Ok(albums)) => {
                 push(
                     widgets,
@@ -1569,7 +1617,10 @@ impl Component for App {
                     &pages::artist(&artist, &albums, cards),
                 );
             }
-            Loaded::Artist(artist, Err(e)) => push_error(widgets, &artist.name, &e),
+            Loaded::Artist(artist, Err(e)) => {
+                let title = artist.name.clone();
+                push_error(widgets, &title, &e, Some((Item::Artist(artist), &sender)))
+            }
             Loaded::Album(album, Ok((artist, tracks))) => {
                 let play: pages::PlayTracks = {
                     let (sender, album) = (sender.clone(), album.clone());
@@ -1605,7 +1656,10 @@ impl Component for App {
                     ),
                 );
             }
-            Loaded::Album(album, Err(e)) => push_error(widgets, &album.title, &e),
+            Loaded::Album(album, Err(e)) => {
+                let title = album.title.clone();
+                push_error(widgets, &title, &e, Some((Item::Album(album), &sender)))
+            }
             // Home shows watch state (Continue watching, Next up): show it
             // again, if it is what is on screen.
             Loaded::WatchChanged(Ok(())) => {
@@ -1613,6 +1667,14 @@ impl Component for App {
                     && widgets.stack.visible_page().as_ref() == Some(&widgets.root_page)
                     && widgets.window_stack.visible_page().as_ref() == Some(&widgets.library_page);
                 if on_home {
+                    self.load_home(&sender);
+                }
+            }
+            // The change may have gone through before its answer was lost:
+            // Home shows what the server has now.
+            Loaded::WatchChanged(Err(BackendError::TimedOut(_) | BackendError::Unreachable(_))) => {
+                toast_text(widgets, "The server didn't answer; showing what it has now");
+                if self.root == Root::Home {
                     self.load_home(&sender);
                 }
             }
@@ -2000,6 +2062,9 @@ impl App {
         );
         Some(crate::profile_page::Signed {
             session,
+            client: self.client.clone(),
+            server: server.clone(),
+            profile: profile.clone(),
             server_key: server.key.0.clone(),
             server_name: server.name.clone(),
             display_name: profile.display_name.clone(),
@@ -2462,11 +2527,11 @@ fn open_in_browser(url: &str, window: Option<&adw::ApplicationWindow>) {
     });
 }
 
-fn show_error(widgets: &AppWidgets, title: &str, error: &BackendError) {
+fn show_error(widgets: &AppWidgets, title: &str, error: &BackendError, retry: Rc<dyn Fn()>) {
     show_content(widgets);
     widgets.root_page.set_title(title);
     clear(&widgets.content);
-    widgets.content.append(&error_status(error));
+    widgets.content.append(&error_status(error, Some(retry)));
 }
 
 /// The root page's header back to its title, when search, which puts its
@@ -2504,8 +2569,28 @@ fn close_player(widgets: &AppWidgets) {
     }
 }
 
-fn push_error(widgets: &AppWidgets, title: &str, error: &BackendError) {
-    push(widgets, title, &error_status(error));
+/// An item page that did not load; `reopen` gives it another go in its
+/// place.
+fn push_error(
+    widgets: &AppWidgets,
+    title: &str,
+    error: &BackendError,
+    reopen: Option<(Item, &ComponentSender<App>)>,
+) {
+    let retry = reopen.map(|(item, sender)| -> Rc<dyn Fn()> {
+        let (window_stack, sender) = (widgets.window_stack.clone(), sender.clone());
+        Rc::new(move || {
+            window_stack.pop();
+            sender.input(Msg::Open(Box::new(item.clone())));
+        })
+    });
+    push(widgets, title, &error_status(error, retry));
+}
+
+/// Home, loaded again.
+fn home_again(sender: &ComponentSender<App>) -> Rc<dyn Fn()> {
+    let sender = sender.clone();
+    Rc::new(move || sender.input(Msg::Select(ROW_HOME)))
 }
 
 fn toast(widgets: &AppWidgets, error: &BackendError) {
@@ -2516,8 +2601,13 @@ fn toast_text(widgets: &AppWidgets, text: &str) {
     widgets.toasts.add_toast(adw::Toast::new(text));
 }
 
-fn error_status(error: &BackendError) -> adw::StatusPage {
+fn error_status(error: &BackendError, retry: Option<Rc<dyn Fn()>>) -> adw::StatusPage {
     let (title, description) = match error {
+        // Off, asleep or out of reach; the SDK dials again on its own.
+        BackendError::TimedOut(_) | BackendError::Unreachable(_) => (
+            "The server didn't answer",
+            "It may be off, asleep or out of reach. Try again in a moment.".to_owned(),
+        ),
         // A library on a Plex server that is down (P3-11), or a mount:
         // listed, but not there now.
         BackendError::Unavailable(why) => (
@@ -2526,13 +2616,23 @@ fn error_status(error: &BackendError) -> adw::StatusPage {
         ),
         other => ("Could not load this page", sentence(&other.to_string())),
     };
-    adw::StatusPage::builder()
+    let page = adw::StatusPage::builder()
         .icon_name(crate::icons::ERROR)
         .title(title)
         // The description is markup; the error's text is not.
         .description(glib::markup_escape_text(&description))
         .vexpand(true)
-        .build()
+        .build();
+    if let Some(retry) = retry {
+        let button = gtk::Button::builder()
+            .label("Try again")
+            .halign(gtk::Align::Center)
+            .css_classes(["pill", "suggested-action"])
+            .build();
+        button.connect_clicked(move |_| retry());
+        page.set_child(Some(&button));
+    }
+    page
 }
 
 /// A message as a sentence: capitalised, with a full stop.

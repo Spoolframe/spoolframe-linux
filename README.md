@@ -10,6 +10,26 @@ cargo run -p spoolframe-linux-app -- --version
 devenv --no-tui tasks run --profile ci ci:static ci:style ci:test
 ```
 
+## Installing on NixOS
+
+The foundry flake has a NixOS module for the client:
+
+```nix
+{
+  imports = [inputs.foundry.nixosModules.spoolframe-linux];
+  programs.spoolframe.enable = true;
+}
+```
+
+It installs the app (with its launcher and icons) and sets up what a user
+cannot alone:
+
+- `securityKeys` (default on): libfido2's udev rules, so the logged-in user
+  can open FIDO2 security keys for passkey sign-in.
+- `phonePasskeys` (default on): Bluetooth, for a passkey on a phone (a
+  default only; a host's own Bluetooth setting wins).
+- the graphics stack (a default), for VA-API hardware decoding.
+
 ## License
 
 GPL-3.0-or-later (see `LICENSE`). The client links the permissively

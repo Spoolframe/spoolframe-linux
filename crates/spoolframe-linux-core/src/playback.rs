@@ -74,6 +74,7 @@ fn error(e: BackendError) -> SdkError {
         BackendError::CannotPlay(reasons) => SdkError::CannotPlay { reasons },
         BackendError::Unavailable(message) => SdkError::Unavailable(message),
         BackendError::Unreachable(message) => SdkError::Unreachable(message),
+        BackendError::TimedOut(message) => SdkError::TimedOut(message),
         BackendError::InvalidInput(message) => SdkError::InvalidInput(message),
         BackendError::NotFound(message) => SdkError::NotFound(message),
         other => SdkError::Server(other.to_string()),

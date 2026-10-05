@@ -9,6 +9,8 @@ mod minibar;
 mod mpris;
 mod nowplaying;
 mod pages;
+mod passkey_dialog;
+mod passkeys;
 mod pin;
 mod pipeline;
 mod playback;
@@ -30,6 +32,7 @@ mod tracks;
 mod transport;
 mod views;
 mod volume;
+mod wake;
 
 use std::sync::Arc;
 

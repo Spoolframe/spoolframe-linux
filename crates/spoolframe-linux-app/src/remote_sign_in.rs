@@ -225,7 +225,7 @@ impl RemoteSignIn {
             .build();
         let dialog = adw::Dialog::builder()
             .title(match via {
-                Via::Phone => "Sign in with your phone",
+                Via::Phone => "Approve from another device",
                 Via::Browser => "Sign in with browser",
             })
             .content_width(460)
@@ -327,9 +327,12 @@ impl RemoteSignIn {
         self.use_password.set_visible(sign_in.web_url.is_some());
         match sign_in.web_url.as_deref().map(page_address) {
             Some(page) => {
-                self.dialog.set_title("Sign in with your phone");
-                self.page
-                    .set_markup(&lead("Scan with your phone, or open", &page, "and type"));
+                self.dialog.set_title("Approve from another device");
+                self.page.set_markup(&lead(
+                    "Scan with your phone, or open",
+                    &page,
+                    "on any device and type",
+                ));
             }
             None => {
                 self.dialog.set_title("Sign in with another device");
@@ -397,10 +400,13 @@ impl RemoteSignIn {
         ));
     }
 
-    /// Waits for the phone.
+    /// Waits for the phone. A wait that timed out or lost the server is
+    /// waited again on the same code: the approval is kept by the server,
+    /// and a lost one comes back as expired.
     fn wait(self: &Rc<Self>, sign_in: DeviceSignIn) {
         let client = self.client.clone();
-        let waited = relm4::spawn(async move { client.await_device_sign_in(&sign_in).await });
+        let asked = sign_in.clone();
+        let waited = relm4::spawn(async move { client.await_device_sign_in(&asked).await });
         self.call.replace(Some(waited.abort_handle()));
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
@@ -408,8 +414,17 @@ impl RemoteSignIn {
             let Some(this) = weak.upgrade().filter(|t| t.open.get()) else {
                 return;
             };
-            this.expires.set(None);
             this.call.take();
+            if let Err(BackendError::TimedOut(_) | BackendError::Unreachable(_)) = answer {
+                // A pause first, so a server that is down is not asked in
+                // a tight loop; the countdown keeps running meanwhile.
+                glib::timeout_future_seconds(2).await;
+                if this.open.get() {
+                    this.wait(sign_in);
+                }
+                return;
+            }
+            this.expires.set(None);
             match answer {
                 Ok(profile) => (this.ends.done)(profile),
                 Err(BackendError::SignInExpired) => this.stack.set_visible_child_name("expired"),

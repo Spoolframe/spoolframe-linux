@@ -670,8 +670,11 @@ pub fn profiles(
             .halign(gtk::Align::Center)
             .css_classes(["dim-label", "profile-detail"])
             .build();
-        let password = profile.sign_in == ProfileSignIn::Password;
-        if password {
+        let ended = profile.sign_in != ProfileSignIn::Automatic;
+        if profile.sign_in == ProfileSignIn::Passkey {
+            detail.append(&gtk::Image::from_icon_name(crate::icons::PASSKEY));
+            detail.append(&gtk::Label::new(Some("Passkey")));
+        } else if ended {
             detail.append(&gtk::Label::new(Some("Password")));
         } else if profile.locked {
             detail.append(&gtk::Image::from_icon_name(crate::icons::LOCK));
@@ -681,7 +684,7 @@ pub fn profiles(
         }
         let tile = profile_tile(&avatar, &profile.display_name, &detail);
         // One whose session ended is only a name here: it can go.
-        if password {
+        if ended {
             let (profile, forget) = (profile.clone(), forget.clone());
             let menu = crate::views::menu_popover(vec![vec![crate::views::MenuEntry::new(
                 "Forget on this device",
@@ -777,10 +780,13 @@ pub struct SignIn {
 }
 
 impl SignIn {
+    /// `passkey` opens Sign in with a passkey, with the username typed,
+    /// if any.
     pub fn new(
         server: &Server,
         submit: Rc<dyn Fn(String, String)>,
         elsewhere: Rc<dyn Fn(Via)>,
+        passkey: Rc<dyn Fn(Option<String>)>,
     ) -> Self {
         let username = gtk::Entry::builder().css_classes(["field"]).build();
         let password = gtk::PasswordEntry::builder()
@@ -820,21 +826,38 @@ impl SignIn {
         body.append(&field("Password", &password));
         body.append(&error);
         body.append(&button);
-        // A passkey or a sign-in provider cannot sign in an app; the web
-        // sign-in can, for it, in the browser or on a phone.
+        // A passkey on a security key or a phone signs in here (P3-19); a
+        // sign-in provider cannot, and the web sign-in does it for the app,
+        // in the browser or on a phone.
         body.append(&or_rule());
+        let with_passkey = action(
+            "Sign in with a passkey",
+            Some(crate::icons::PASSKEY),
+            &["secondary"],
+        );
+        {
+            let username = username.clone();
+            with_passkey.connect_clicked(move |_| {
+                let typed = username.text().trim().to_owned();
+                passkey((!typed.is_empty()).then_some(typed));
+            });
+        }
+        body.append(&with_passkey);
         for (label, icon, via) in [
             ("Sign in with browser", crate::icons::BROWSER, Via::Browser),
-            ("Sign in with your phone", crate::icons::PHONE, Via::Phone),
+            // P3-05: another device approves this one; a passkey saved on a
+            // phone is under Sign in with a passkey.
+            (
+                "Approve from another device",
+                crate::icons::PHONE,
+                Via::Phone,
+            ),
         ] {
             let button = action(label, Some(icon), &["secondary"]);
             let elsewhere = elsewhere.clone();
             button.connect_clicked(move |_| elsewhere(via));
             body.append(&button);
         }
-        let hint = dim("Use a passkey or your sign-in provider in your browser.");
-        hint.add_css_class("caption");
-        body.append(&hint);
 
         let dialog = adw::Dialog::builder()
             .title(format!("Sign in to {}", server.name))

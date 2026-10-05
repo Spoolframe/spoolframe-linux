@@ -28,6 +28,9 @@ use crate::backend::{
     PinState, PlaybackHandle, PlaybackPlan, PlaybackStart, PlexLink, Previews, Profile,
     ProfileSignIn, SearchRequest, SearchResults, Selection, Server, ServerKey, Session,
 };
+use crate::backend::{
+    FinishPasskeyRegistration, FinishPasskeySignIn, PasskeyCreation, PasskeyInfo, PasskeyRequest,
+};
 use crate::storage::Storage;
 
 /// The SDK's errors, in the kinds the UI acts on.
@@ -35,6 +38,7 @@ pub fn backend_error(error: sdk::SdkError) -> BackendError {
     use sdk::SdkError as E;
     match error {
         E::Unreachable(what) => BackendError::Unreachable(what),
+        E::TimedOut(what) => BackendError::TimedOut(what),
         E::InvalidCredentials => BackendError::WrongCredentials,
         E::NoPassword => BackendError::NoPassword,
         E::RateLimited { retry_after } => BackendError::RateLimited(retry_after),
@@ -56,6 +60,8 @@ pub fn backend_error(error: sdk::SdkError) -> BackendError {
         E::SignInExpired => BackendError::SignInExpired,
         E::PlaybackFailed(why) => BackendError::Other(format!("the conversion failed: {why}")),
         E::Unavailable(message) => BackendError::Unavailable(message),
+        E::RecentSignInRequired => BackendError::RecentSignInRequired,
+        E::LastSignInMethod => BackendError::LastSignInMethod,
         other => BackendError::Other(other.to_string()),
     }
 }
@@ -307,6 +313,17 @@ impl Client for SdkClient {
         })
     }
 
+    fn resume(&self) -> BoxFuture<'_, ()> {
+        let client = self.client.clone();
+        Box::pin(async move {
+            let _ = on_runtime(&self.handle, async move {
+                client.resume().await;
+                Ok::<_, sdk::SdkError>(())
+            })
+            .await;
+        })
+    }
+
     fn connection_path(&self, key: &ServerKey) -> ConnectionPath {
         // A malformed id has no connection either.
         self.client
@@ -380,12 +397,18 @@ impl Client for SdkClient {
                 if saved.sign_in == sdk::ProfileSignIn::Password
                     && !profiles.iter().any(|p| p.username == saved.username)
                 {
+                    // Offered the way they last signed in, as far as it
+                    // can be offered again here.
+                    let sign_in = match saved.method {
+                        Some(sdk::SignInMethod::Passkey) => ProfileSignIn::Passkey,
+                        _ => ProfileSignIn::Password,
+                    };
                     profiles.push(Profile {
                         server: key.clone(),
                         username: saved.username,
                         display_name: saved.display_name,
                         locked: false,
-                        sign_in: ProfileSignIn::Password,
+                        sign_in,
                     });
                 }
             }
@@ -405,6 +428,39 @@ impl Client for SdkClient {
                 (key.0.clone(), username.to_owned(), password.to_owned());
             let session = on_runtime(&self.handle, async move {
                 client.sign_in(&id, &username, &password).await
+            })
+            .await?;
+            Ok(self.remember(&session))
+        })
+    }
+
+    fn begin_passkey_sign_in<'a>(
+        &'a self,
+        key: &'a ServerKey,
+        username: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<PasskeyRequest, BackendError>> {
+        Box::pin(async move {
+            let (client, id, username) = (
+                self.client.clone(),
+                key.0.clone(),
+                username.map(str::to_owned),
+            );
+            on_runtime(&self.handle, async move {
+                client.begin_passkey_sign_in(&id, username.as_deref()).await
+            })
+            .await
+        })
+    }
+
+    fn finish_passkey_sign_in<'a>(
+        &'a self,
+        key: &'a ServerKey,
+        signed: FinishPasskeySignIn,
+    ) -> BoxFuture<'a, Result<Profile, BackendError>> {
+        Box::pin(async move {
+            let (client, id) = (self.client.clone(), key.0.clone());
+            let session = on_runtime(&self.handle, async move {
+                client.finish_passkey_sign_in(&id, signed).await
             })
             .await?;
             Ok(self.remember(&session))
@@ -778,6 +834,35 @@ impl Session for SdkSession {
 
     fn plex_link(&self) -> BoxFuture<'_, Result<Option<PlexLink>, BackendError>> {
         Box::pin(self.call(|s| async move { s.plex_link().await }))
+    }
+
+    fn begin_passkey_registration(&self) -> BoxFuture<'_, Result<PasskeyCreation, BackendError>> {
+        Box::pin(self.call(|s| async move { s.begin_passkey_registration().await }))
+    }
+
+    fn finish_passkey_registration(
+        &self,
+        made: FinishPasskeyRegistration,
+    ) -> BoxFuture<'_, Result<(), BackendError>> {
+        Box::pin(self.call(move |s| async move { s.finish_passkey_registration(made).await }))
+    }
+
+    fn passkeys(&self) -> BoxFuture<'_, Result<Vec<PasskeyInfo>, BackendError>> {
+        Box::pin(self.call(|s| async move { s.passkeys().await }))
+    }
+
+    fn rename_passkey<'a>(
+        &'a self,
+        id: &'a str,
+        name: &'a str,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        let (id, name) = (id.to_owned(), name.to_owned());
+        Box::pin(self.call(move |s| async move { s.rename_passkey(&id, &name).await }))
+    }
+
+    fn remove_passkey<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), BackendError>> {
+        let id = id.to_owned();
+        Box::pin(self.call(move |s| async move { s.remove_passkey(&id).await }))
     }
 
     fn devices(&self) -> BoxFuture<'_, Result<Vec<DeviceInfo>, BackendError>> {

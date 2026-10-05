@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Spoolframe
+GenericName=Media Player
+Comment=Watch and listen to your Spoolframe server
+Exec=spoolframe-linux
+Icon=casa.coldsteel.Spoolframe
+Terminal=false
+Categories=AudioVideo;Video;Audio;Player;GTK;
+Keywords=media;movies;shows;music;plex;
+StartupWMClass=casa.coldsteel.Spoolframe

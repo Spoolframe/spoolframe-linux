@@ -19,6 +19,9 @@ oo7 = { workspace = true }
 foyer = { workspace = true }
 anyhow = { workspace = true }
 directories = { workspace = true }
+webauthn-authenticator-rs = { workspace = true }
+webauthn-rs-proto = { workspace = true }
+url = "2"
 spoolframe-test-dir = { workspace = true, optional = true }
 
 [features]

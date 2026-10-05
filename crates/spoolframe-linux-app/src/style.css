@@ -1173,6 +1173,65 @@ button.pin-key.flat:hover {
   color: var(--destructive-color);
 }
 
+/* A security key, as the passkey boards draw it: its icon on a 64 px
+   tile, a dot that blinks while the key waits for a touch. */
+.key-tile {
+  border-radius: 16px;
+  background-color: var(--window-bg-color);
+}
+
+.key-blink {
+  border-radius: 8px;
+  margin: -6px -6px 0 0;
+  background-color: var(--accent-bg-color);
+  box-shadow: 0 0 0 6px alpha(var(--accent-bg-color), 0.25);
+  animation: key-blink 1100ms ease-in-out infinite;
+}
+
+@keyframes key-blink {
+  50% { opacity: 0.25; }
+}
+
+.key-title {
+  font-family: "Outfit", sans-serif;
+  font-size: 20px;
+  font-weight: 700;
+}
+
+.key-body {
+  font-size: 13px;
+}
+
+image.accent {
+  color: var(--accent-color);
+}
+
+image.warning {
+  color: var(--warning-color);
+}
+
+image.error {
+  color: var(--error-color);
+}
+
+/* Which kind of passkey: a row each, its icon on a small tile. */
+button.passkey-option {
+  padding: 14px;
+  border-radius: 12px;
+  border: 1px solid alpha(currentColor, 0.15);
+  background-color: var(--window-bg-color);
+}
+
+button.passkey-option:hover {
+  border-color: var(--accent-color);
+}
+
+.passkey-option-icon {
+  border-radius: 10px;
+  background-color: var(--card-bg-color);
+  color: var(--accent-color);
+}
+
 /* A library page while its first page loads: blank posters, pulsing. */
 @keyframes loading-pulse {
   from { opacity: 0.35; }

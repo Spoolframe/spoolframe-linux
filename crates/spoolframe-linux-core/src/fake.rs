@@ -29,6 +29,10 @@ use spoolframe_types::{
 use tokio::sync::watch;
 
 use crate::backend::{
+    APP_RP_ID, FinishPasskeyRegistration, FinishPasskeySignIn, PasskeyCreation, PasskeyInfo,
+    PasskeyRequest,
+};
+use crate::backend::{
     ArtworkSize, BackendError, BoxFuture, ChosenTracks, Chunk, Client, ConnectionPath,
     ConnectionState, DeviceInfo, DeviceSignIn, DeviceSignInRequest, HomeScreen, MAX_READ, Marker,
     Person, PersonId, PersonRole, PinProof, PinState, Platform, PlaybackHandle, PlaybackPlan,
@@ -39,6 +43,68 @@ use crate::backend::{
 
 /// Every fake account's password.
 pub const FAKE_PASSWORD: &str = "spoolframe";
+
+/// What the fake server asks a passkey to sign (P3-19).
+pub const FAKE_PASSKEY_CHALLENGE: [u8; 32] = [7; 32];
+
+/// The passkeys the fake server keeps, for every session of the device.
+#[derive(Default)]
+struct FakePasskeys {
+    keys: Vec<FakePasskey>,
+    /// Set by [`FakeClient::age_sign_ins`]: every sign-in is older than
+    /// the 10 minutes adding or removing a passkey allows.
+    stale: bool,
+    /// Who last signed in here with a passkey, as the SDK remembers it.
+    by_passkey: std::collections::HashSet<String>,
+}
+
+struct FakePasskey {
+    username: String,
+    credential_id: Vec<u8>,
+    name: String,
+    created_at: i64,
+    last_used_at: Option<i64>,
+    /// Made in an app, for APP_RP_ID; a web UI's otherwise.
+    app: bool,
+}
+
+impl FakePasskey {
+    /// The id the server names a passkey by. The real one is base64url;
+    /// any stable text does here.
+    fn id(&self) -> String {
+        self.credential_id
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    fn info(&self) -> PasskeyInfo {
+        PasskeyInfo {
+            id: self.id(),
+            name: self.name.clone(),
+            created_at: self.created_at,
+            last_used_at: self.last_used_at,
+            rp_id: if self.app {
+                APP_RP_ID.to_owned()
+            } else {
+                "media.example.org".to_owned()
+            },
+            app: self.app,
+            usable_here: self.app,
+        }
+    }
+}
+
+/// A passkey's name as the server takes it: 1 to 64 characters, trimmed.
+fn passkey_name(name: &str) -> Result<String, BackendError> {
+    let name = name.trim();
+    match name.chars().count() {
+        1..=64 => Ok(name.to_owned()),
+        _ => Err(BackendError::InvalidInput(
+            "a passkey's name is 1 to 64 characters".into(),
+        )),
+    }
+}
 
 /// Watch-state rules, the server's defaults (P1-14).
 /// A playback handle idle this long expires, as on the server (P1-08).
@@ -210,6 +276,9 @@ impl Catalog {
                 bit_depth: Some(16),
                 sample_rate: Some(44_100),
                 album_track_count: Some(9),
+                artist_name: Some("The Night Shift".into()),
+                album_title: Some("Low Tide".into()),
+                artwork: Vec::new(),
             }));
         }
         catalog.children.insert(album, tracks);
@@ -385,6 +454,7 @@ pub struct FakeSession {
     /// Tracks remembered per movie, or per show for its episodes.
     overrides: Mutex<HashMap<MediaId, TrackOverride>>,
     username: String,
+    passkeys: Arc<Mutex<FakePasskeys>>,
     pin: Mutex<FakePin>,
     /// Devices waiting to be signed in by code (P3-07), and wrong codes
     /// tried.
@@ -492,6 +562,7 @@ impl FakeSession {
         serving: Serving,
         gone: Arc<std::sync::atomic::AtomicBool>,
         active: Arc<Mutex<std::collections::HashSet<String>>>,
+        passkeys: Arc<Mutex<FakePasskeys>>,
     ) -> Self {
         // Alice has a PIN, asked for here, so the fake opens her locked.
         let pin = match username {
@@ -516,6 +587,7 @@ impl FakeSession {
             preferences: Mutex::new(TrackPreferences::default()),
             overrides: Mutex::new(HashMap::new()),
             username: username.to_owned(),
+            passkeys,
             pin: Mutex::new(pin),
             sign_ins: Mutex::new(SignIns::default()),
             active,
@@ -1428,6 +1500,109 @@ impl Session for FakeSession {
         })
     }
 
+    fn begin_passkey_registration(&self) -> BoxFuture<'_, Result<PasskeyCreation, BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            let passkeys = self.lock_passkeys();
+            if passkeys.stale {
+                return Err(BackendError::RecentSignInRequired);
+            }
+            Ok(PasskeyCreation {
+                challenge: FAKE_PASSKEY_CHALLENGE.to_vec(),
+                user_id: self.username.as_bytes().to_vec(),
+                user_name: format!("{} on Home Media", self.username),
+                display_name: format!("{} on Home Media", self.username),
+                exclude_credential_ids: passkeys
+                    .keys
+                    .iter()
+                    .filter(|k| k.app && k.username == self.username)
+                    .map(|k| k.credential_id.clone())
+                    .collect(),
+            })
+        })
+    }
+
+    fn finish_passkey_registration(
+        &self,
+        made: FinishPasskeyRegistration,
+    ) -> BoxFuture<'_, Result<(), BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            let name = passkey_name(&made.name)?;
+            let mut passkeys = self.lock_passkeys();
+            if passkeys.stale {
+                return Err(BackendError::RecentSignInRequired);
+            }
+            if made.client_data_json.is_empty() || made.attestation_object.is_empty() {
+                return Err(BackendError::WrongCredentials);
+            }
+            passkeys.keys.push(FakePasskey {
+                username: self.username.clone(),
+                credential_id: made.credential_id,
+                name,
+                created_at: 1_791_000_000,
+                last_used_at: None,
+                app: true,
+            });
+            Ok(())
+        })
+    }
+
+    fn passkeys(&self) -> BoxFuture<'_, Result<Vec<PasskeyInfo>, BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            Ok(self
+                .lock_passkeys()
+                .keys
+                .iter()
+                .filter(|k| k.username == self.username)
+                .map(FakePasskey::info)
+                .collect())
+        })
+    }
+
+    fn rename_passkey<'a>(
+        &'a self,
+        id: &'a str,
+        name: &'a str,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            let name = passkey_name(name)?;
+            let mut passkeys = self.lock_passkeys();
+            let key = passkeys
+                .keys
+                .iter_mut()
+                .find(|k| k.username == self.username && k.id() == id)
+                .ok_or_else(|| BackendError::NotFound(format!("passkey {id}")))?;
+            key.name = name;
+            Ok(())
+        })
+    }
+
+    fn remove_passkey<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            let mut passkeys = self.lock_passkeys();
+            if passkeys.stale {
+                return Err(BackendError::RecentSignInRequired);
+            }
+            let mine = |k: &FakePasskey| k.username == self.username;
+            let at = passkeys
+                .keys
+                .iter()
+                .position(|k| mine(k) && k.id() == id)
+                .ok_or_else(|| BackendError::NotFound(format!("passkey {id}")))?;
+            // "sso" has no password: their last passkey is their way in.
+            let theirs = passkeys.keys.iter().filter(|k| mine(k)).count();
+            if self.username == "sso" && theirs == 1 {
+                return Err(BackendError::LastSignInMethod);
+            }
+            passkeys.keys.remove(at);
+            Ok(())
+        })
+    }
+
     fn devices(&self) -> BoxFuture<'_, Result<Vec<DeviceInfo>, BackendError>> {
         Box::pin(async move {
             self.guard()?;
@@ -1533,6 +1708,10 @@ impl Session for FakeSession {
 }
 
 impl FakeSession {
+    fn lock_passkeys(&self) -> std::sync::MutexGuard<'_, FakePasskeys> {
+        self.passkeys.lock().expect("fake state is never poisoned")
+    }
+
     fn lock_overrides(&self) -> std::sync::MutexGuard<'_, HashMap<MediaId, TrackOverride>> {
         self.overrides.lock().expect("fake state is never poisoned")
     }
@@ -1558,6 +1737,7 @@ pub struct FakeClient {
     active: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Sign-ins this device asked a phone to approve (P3-05, P3-07).
     phone_sign_ins: Mutex<PhoneSignIns>,
+    passkeys: Arc<Mutex<FakePasskeys>>,
 }
 
 /// How the fake answers a sign-in a phone approves.
@@ -1671,6 +1851,19 @@ impl FakeClient {
             ],
             signed_in: Mutex::new(vec![profile("andrey", "Andrey"), profile("alice", "Alice")]),
             sessions: Mutex::new(HashMap::new()),
+            // Andrey made one in the web UI: listed, but no use in an app.
+            passkeys: Arc::new(Mutex::new(FakePasskeys {
+                keys: vec![FakePasskey {
+                    username: "andrey".into(),
+                    credential_id: vec![1, 2, 3, 4],
+                    name: "Firefox on nimble".into(),
+                    created_at: 1_790_000_000,
+                    last_used_at: Some(1_790_500_000),
+                    app: false,
+                }],
+                stale: false,
+                by_passkey: Default::default(),
+            })),
             failed_sign_ins: Mutex::new((0, None)),
             connections: Mutex::new(HashMap::new()),
             servers_changed: watch::Sender::new(()),
@@ -1690,6 +1883,15 @@ impl FakeClient {
                     .clone()
             })
             .unwrap_or_default()
+    }
+
+    /// Every sign-in on this device is now older than the 10 minutes
+    /// adding or removing a passkey allows.
+    pub fn age_sign_ins(&self) {
+        self.passkeys
+            .lock()
+            .expect("fake state is never poisoned")
+            .stale = true;
     }
 
     /// The server stops answering, as when it is shut down mid-play: every
@@ -1719,6 +1921,7 @@ impl FakeClient {
                     self.serving.clone(),
                     self.gone.clone(),
                     self.active.clone(),
+                    self.passkeys.clone(),
                 ))
             })
             .clone()
@@ -1857,6 +2060,11 @@ impl FakeClient {
     /// `username` signed in from this device, as a password or a phone's
     /// approval does.
     fn signed_in_as(&self, server: &ServerKey, username: &str, display_name: &str) -> Profile {
+        // A sign-in is fresh: adding and removing passkeys works again.
+        self.passkeys
+            .lock()
+            .expect("fake state is never poisoned")
+            .stale = false;
         let profile = Profile {
             server: server.clone(),
             username: (*username).into(),
@@ -2011,6 +2219,10 @@ impl Client for FakeClient {
         })
     }
 
+    fn resume(&self) -> BoxFuture<'_, ()> {
+        Box::pin(async {})
+    }
+
     fn connection_path(&self, _server: &ServerKey) -> ConnectionPath {
         ConnectionPath::Lan(([192, 168, 1, 20], 7431).into())
     }
@@ -2059,9 +2271,19 @@ impl Client for FakeClient {
                 .filter(|p| &p.server == server)
                 .map(|p| {
                     if self.fake_session(&p).pin_state().revoked {
+                        let by_passkey = self
+                            .passkeys
+                            .lock()
+                            .expect("fake state is never poisoned")
+                            .by_passkey
+                            .contains(&p.username);
                         Profile {
                             locked: false,
-                            sign_in: ProfileSignIn::Password,
+                            sign_in: if by_passkey {
+                                ProfileSignIn::Passkey
+                            } else {
+                                ProfileSignIn::Password
+                            },
                             ..p
                         }
                     } else {
@@ -2082,6 +2304,58 @@ impl Client for FakeClient {
         password: &'a str,
     ) -> BoxFuture<'a, Result<Profile, BackendError>> {
         Box::pin(async move { self.sign_in_now(server, username, password) })
+    }
+
+    fn begin_passkey_sign_in<'a>(
+        &'a self,
+        server: &'a ServerKey,
+        username: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<PasskeyRequest, BackendError>> {
+        Box::pin(async move {
+            self.pinned(server)?;
+            let passkeys = self.passkeys.lock().expect("fake state is never poisoned");
+            let allow = match username {
+                Some(username) => passkeys
+                    .keys
+                    .iter()
+                    .filter(|k| k.app && k.username == username)
+                    .map(|k| k.credential_id.clone())
+                    .collect(),
+                None => Vec::new(),
+            };
+            Ok(PasskeyRequest {
+                challenge: FAKE_PASSKEY_CHALLENGE.to_vec(),
+                allow_credential_ids: allow,
+            })
+        })
+    }
+
+    fn finish_passkey_sign_in<'a>(
+        &'a self,
+        server: &'a ServerKey,
+        signed: FinishPasskeySignIn,
+    ) -> BoxFuture<'a, Result<Profile, BackendError>> {
+        Box::pin(async move {
+            self.pinned(server)?;
+            let username = {
+                let mut passkeys = self.passkeys.lock().expect("fake state is never poisoned");
+                let key = passkeys
+                    .keys
+                    .iter_mut()
+                    .find(|k| k.app && k.credential_id == signed.credential_id)
+                    .ok_or(BackendError::WrongCredentials)?;
+                key.last_used_at = Some(1_791_000_000);
+                let username = key.username.clone();
+                passkeys.by_passkey.insert(username.clone());
+                username
+            };
+            let (_, username, display_name) = self
+                .accounts
+                .iter()
+                .find(|(s, u, _)| s == server && *u == username)
+                .ok_or(BackendError::WrongCredentials)?;
+            Ok(self.signed_in_as(server, username, display_name))
+        })
     }
 
     fn begin_device_sign_in<'a>(
@@ -3251,6 +3525,83 @@ mod tests {
         );
     }
 
+    fn made(credential_id: &[u8], name: &str) -> FinishPasskeyRegistration {
+        FinishPasskeyRegistration {
+            credential_id: credential_id.to_vec(),
+            attestation_object: vec![0xa0],
+            client_data_json: b"{}".to_vec(),
+            name: name.into(),
+        }
+    }
+
+    fn signed(credential_id: &[u8]) -> FinishPasskeySignIn {
+        FinishPasskeySignIn {
+            credential_id: credential_id.to_vec(),
+            authenticator_data: vec![0],
+            client_data_json: b"{}".to_vec(),
+            signature: vec![0],
+            user_handle: b"andrey".to_vec(),
+        }
+    }
+
+    #[test]
+    fn a_passkey_made_in_the_app_signs_its_user_in() {
+        let client = FakeClient::new(None);
+        let andrey = session_for(&client, "andrey");
+        ready(andrey.begin_passkey_registration()).unwrap();
+        ready(andrey.finish_passkey_registration(made(&[9, 9], "YubiKey 5C"))).unwrap();
+        let profile = ready(client.finish_passkey_sign_in(&home_media(), signed(&[9, 9]))).unwrap();
+        assert_eq!(profile.username, "andrey");
+    }
+
+    #[test]
+    fn a_web_ui_passkey_is_listed_but_does_not_sign_in_here() {
+        let client = FakeClient::new(None);
+        let andrey = session_for(&client, "andrey");
+        let listed = ready(andrey.passkeys()).unwrap();
+        assert_eq!(
+            (
+                listed.iter().map(|p| p.usable_here).collect::<Vec<_>>(),
+                ready(client.finish_passkey_sign_in(&home_media(), signed(&[1, 2, 3, 4])))
+                    .unwrap_err(),
+            ),
+            (vec![false], BackendError::WrongCredentials)
+        );
+    }
+
+    #[test]
+    fn adding_a_passkey_long_after_signing_in_asks_to_sign_in_again() {
+        let client = FakeClient::new(None);
+        let andrey = session_for(&client, "andrey");
+        client.age_sign_ins();
+        assert_eq!(
+            ready(andrey.begin_passkey_registration()).unwrap_err(),
+            BackendError::RecentSignInRequired
+        );
+    }
+
+    #[test]
+    fn a_passkeys_name_is_one_to_sixty_four_characters() {
+        let client = FakeClient::new(None);
+        let andrey = session_for(&client, "andrey");
+        assert!(matches!(
+            ready(andrey.finish_passkey_registration(made(&[5], "   "))),
+            Err(BackendError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn the_last_way_in_cannot_be_removed() {
+        let client = FakeClient::new(None);
+        let sso = session_for(&client, "sso");
+        ready(sso.finish_passkey_registration(made(&[6], "Phone"))).unwrap();
+        let id = ready(sso.passkeys()).unwrap()[0].id.clone();
+        assert_eq!(
+            ready(sso.remove_passkey(&id)).unwrap_err(),
+            BackendError::LastSignInMethod
+        );
+    }
+
     #[test]
     fn ten_wrong_pins_end_the_session_here() {
         let client = FakeClient::new(None);
@@ -3268,6 +3619,22 @@ mod tests {
             profile_of(&client, "alice").sign_in,
             ProfileSignIn::Password
         );
+    }
+
+    #[test]
+    fn an_ended_session_last_signed_in_by_passkey_is_offered_a_passkey() {
+        let client = FakeClient::new(None);
+        let alice = session_for(&client, "alice");
+        ready(alice.unlock(FAKE_PIN)).unwrap();
+        ready(alice.finish_passkey_registration(made(&[8], "Key"))).unwrap();
+        let mut signed = signed(&[8]);
+        signed.user_handle = b"alice".to_vec();
+        ready(client.finish_passkey_sign_in(&home_media(), signed)).unwrap();
+        let alice = session_for(&client, "alice");
+        for _ in 0..10 {
+            let _ = ready(alice.unlock("0000"));
+        }
+        assert_eq!(profile_of(&client, "alice").sign_in, ProfileSignIn::Passkey);
     }
 
     #[test]

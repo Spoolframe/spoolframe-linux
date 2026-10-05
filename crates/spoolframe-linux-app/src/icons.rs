@@ -67,6 +67,8 @@ pub const DELETE: &str = "lucide-delete-symbolic";
 // Signing in and setting up.
 pub const BROWSER: &str = "lucide-globe-symbolic";
 pub const PHONE: &str = "lucide-smartphone-symbolic";
+pub const PASSKEY: &str = "lucide-key-round-symbolic";
+pub const SECURITY_KEY: &str = "lucide-usb-symbolic";
 pub const EXPIRED: &str = "lucide-clock-symbolic";
 pub const WARNING: &str = "lucide-triangle-alert-symbolic";
 pub const SET_UP: &str = "lucide-settings-symbolic";
@@ -133,6 +135,8 @@ const ALL: &[&str] = &[
     DELETE,
     BROWSER,
     PHONE,
+    PASSKEY,
+    SECURITY_KEY,
     EXPIRED,
     WARNING,
     SET_UP,

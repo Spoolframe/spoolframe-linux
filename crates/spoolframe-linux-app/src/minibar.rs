@@ -347,26 +347,21 @@ impl MiniBar {
     /// album than the one before it (P1-23).
     fn show_cover(&self, item: &Item, playback: &Playback) {
         let album = playback.album();
-        let id = album.as_ref().map(|a| a.id.clone());
-        if *self.cover_album.borrow() == id && self.thumb.child().is_some() {
+        let (id, artwork) = crate::views::cover_of(item, album.as_ref());
+        if self.cover_album.borrow().as_ref() == Some(&id) && self.thumb.child().is_some() {
             return;
         }
-        let cover = crate::views::tile(
-            id.as_ref().unwrap_or(item.id()),
-            "",
-            "mini-cover",
-            (COVER, COVER),
-        );
-        if let (Some(art), Some(album)) = (self.art.borrow().as_ref(), &album) {
+        let cover = crate::views::tile(&id, "", "mini-cover", (COVER, COVER));
+        if let Some(art) = self.art.borrow().as_ref() {
             art.show(
                 &cover,
-                &album.artwork,
+                artwork,
                 &[ArtworkKind::Poster, ArtworkKind::Thumb],
                 ArtworkSize::Small,
             );
         }
         self.thumb.set_child(Some(&cover));
-        self.cover_album.replace(id);
+        self.cover_album.replace(Some(id));
     }
 
     fn update(&self, playback: &Playback, change: &Change) {
@@ -378,13 +373,17 @@ impl MiniBar {
                 let facts = crate::views::Facts::of(item);
                 self.title.set_label(&facts.title);
                 let detail = match (item, playback.album()) {
-                    (Item::Track(_), Some(album)) => Some(
-                        [album.artist_name.clone(), Some(album.title.clone())]
-                            .into_iter()
-                            .flatten()
-                            .collect::<Vec<_>>()
-                            .join(" · "),
-                    ),
+                    (Item::Track(_), album) => Some(
+                        [
+                            crate::views::track_artist(item, album.as_ref()),
+                            crate::views::track_album(item, album.as_ref()),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>()
+                        .join(" · "),
+                    )
+                    .filter(|d| !d.is_empty()),
                     // "1979 · Movie"; "Severance · S2 · E4".
                     (Item::Movie(_), _) => Some(
                         [facts.detail.clone(), Some("Movie".to_owned())]

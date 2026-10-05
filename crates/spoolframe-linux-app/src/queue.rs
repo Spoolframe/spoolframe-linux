@@ -394,6 +394,9 @@ mod tests {
             bit_depth: None,
             sample_rate: None,
             album_track_count: None,
+            artist_name: None,
+            album_title: None,
+            artwork: Vec::new(),
         })
     }
 

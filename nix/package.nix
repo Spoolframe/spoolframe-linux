@@ -15,6 +15,10 @@
   gtk4,
   libadwaita,
   libGL,
+  systemdLibs,
+  dbus,
+  openssl,
+  rustPlatform,
   gst_all_1,
   lib,
 }: let
@@ -44,9 +48,12 @@
       sourceRoot="."
     '';
     # glib: glib-compile-resources, which build.rs runs for the icons.
-    nativeBuildInputs = [pkg-config glib wrapGAppsHook4];
-    # libGL: egl.pc, for the video sink's GL path (see devenv.nix).
-    buildInputs = [gtk4 libadwaita libGL] ++ gstPlugins;
+    # bindgenHook: libclang for fido-hid-rs's bindings.
+    nativeBuildInputs = [pkg-config glib wrapGAppsHook4 rustPlatform.bindgenHook];
+    # libGL: egl.pc, for the video sink's GL path (see devenv.nix);
+    # Passkeys: systemdLibs (libudev) for security keys; dbus (BlueZ) and
+    # openssl (the tunnel's TLS) for the phone flow.
+    buildInputs = [gtk4 libadwaita libGL systemdLibs dbus openssl] ++ gstPlugins;
   };
 
   # Build dependencies separately for caching.
@@ -57,6 +64,15 @@ in
       inherit cargoArtifacts;
 
       cargoExtraArgs = "-p spoolframe-linux-app";
+      # The launcher and its icons: the app's id is casa.coldsteel.Spoolframe,
+      # which MPRIS names as its desktop entry too.
+      postInstall = ''
+        data=crates/spoolframe-linux-app/data
+        install -Dm644 $data/casa.coldsteel.Spoolframe.desktop \
+          $out/share/applications/casa.coldsteel.Spoolframe.desktop
+        mkdir -p $out/share/icons
+        cp -r $data/icons/hicolor $out/share/icons/
+      '';
       # The tests run in the dev shell's ci:test; running them here too would
       # build the workspace a second time in test mode.
       doCheck = false;
