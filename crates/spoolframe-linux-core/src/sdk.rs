@@ -23,10 +23,10 @@ use tokio::runtime::Handle;
 use tokio::sync::watch;
 
 use crate::backend::{
-    ArtworkSize, BackendError, BoxFuture, ChosenTracks, Chunk, Client, ConnectionState, DeviceInfo,
-    DeviceSignIn, DeviceSignInRequest, HomeScreen, PersonId, PinProof, PinState, PlaybackHandle,
-    PlaybackPlan, PlaybackStart, PlexLink, Previews, Profile, SearchRequest, SearchResults,
-    Selection, Server, ServerKey, Session,
+    ArtworkSize, BackendError, BoxFuture, ChosenTracks, Chunk, Client, ConnectionPath,
+    ConnectionState, DeviceInfo, DeviceSignIn, DeviceSignInRequest, HomeScreen, PersonId, PinProof,
+    PinState, PlaybackHandle, PlaybackPlan, PlaybackStart, PlexLink, Previews, Profile,
+    ProfileSignIn, SearchRequest, SearchResults, Selection, Server, ServerKey, Session,
 };
 use crate::storage::Storage;
 
@@ -75,6 +75,16 @@ pub fn connection_state(state: sdk::ConnectionState) -> ConnectionState {
     }
 }
 
+/// The SDK's connection path, in the UI's words.
+pub fn connection_path(path: sdk::ConnectionPath) -> ConnectionPath {
+    match path {
+        sdk::ConnectionPath::Lan { addr } => ConnectionPath::Lan(addr),
+        sdk::ConnectionPath::Direct { addr } => ConnectionPath::Direct(addr),
+        sdk::ConnectionPath::Relay => ConnectionPath::Relay,
+        sdk::ConnectionPath::Unknown => ConnectionPath::Unknown,
+    }
+}
+
 fn server(entry: sdk::ServerEntry) -> Server {
     Server {
         key: ServerKey(entry.endpoint_id),
@@ -96,6 +106,7 @@ fn profile(session: &sdk::Session) -> Profile {
         username: user.username.clone(),
         display_name: user.display_name.clone(),
         locked: user.locked,
+        sign_in: ProfileSignIn::Automatic,
     }
 }
 
@@ -301,12 +312,43 @@ impl Client for SdkClient {
         })
     }
 
+    fn connection_path(&self, key: &ServerKey) -> ConnectionPath {
+        // A malformed id has no connection either.
+        self.client
+            .connection_path(&key.0)
+            .map_or(ConnectionPath::Unknown, connection_path)
+    }
+
+    fn forget_profile<'a>(
+        &'a self,
+        key: &'a ServerKey,
+        username: &'a str,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            let (client, id, name) = (self.client.clone(), key.0.clone(), username.to_owned());
+            on_runtime(&self.handle, async move {
+                client.forget_profile(&id, &name).await
+            })
+            .await?;
+            self.sessions
+                .lock()
+                .expect("never poisoned")
+                .remove(&(key.clone(), username.to_owned()));
+            Ok(())
+        })
+    }
+
     fn sign_out<'a>(&'a self, key: &'a ServerKey) -> BoxFuture<'a, Result<(), BackendError>> {
         Box::pin(async move {
             let (client, id) = (self.client.clone(), key.0.clone());
             on_runtime(&self.handle, async move {
                 for session in client.profiles(&id).await? {
                     session.sign_out().await?;
+                }
+                // Those whose sessions had ended have no session to sign
+                // out; their names go too.
+                for saved in client.saved_profiles(&id).await? {
+                    client.forget_profile(&id, &saved.username).await?;
                 }
                 Ok::<_, sdk::SdkError>(())
             })
@@ -326,14 +368,33 @@ impl Client for SdkClient {
         Box::pin(async move {
             let client = self.client.clone();
             let id = key.0.clone();
-            let sessions =
-                on_runtime(&self.handle, async move { client.profiles(&id).await }).await?;
+            let (sessions, saved) = on_runtime(&self.handle, async move {
+                let sessions = client.profiles(&id).await?;
+                let saved = client.saved_profiles(&id).await?;
+                Ok::<_, sdk::SdkError>((sessions, saved))
+            })
+            .await?;
             // Sessions the SDK no longer has were ended; drop them here too.
             self.sessions
                 .lock()
                 .expect("never poisoned")
                 .retain(|(server, _), _| server != key);
-            Ok(sessions.iter().map(|s| self.remember(s)).collect())
+            let mut profiles: Vec<Profile> = sessions.iter().map(|s| self.remember(s)).collect();
+            // Ended sessions are kept by name, to sign in again.
+            for saved in saved {
+                if saved.sign_in == sdk::ProfileSignIn::Password
+                    && !profiles.iter().any(|p| p.username == saved.username)
+                {
+                    profiles.push(Profile {
+                        server: key.clone(),
+                        username: saved.username,
+                        display_name: saved.display_name,
+                        locked: false,
+                        sign_in: ProfileSignIn::Password,
+                    });
+                }
+            }
+            Ok(profiles)
         })
     }
 
@@ -631,6 +692,10 @@ impl Session for SdkSession {
 
     fn web_url(&self) -> Option<String> {
         self.session.web_url()
+    }
+
+    fn connection_path(&self) -> ConnectionPath {
+        connection_path(self.session.connection_path())
     }
 
     fn previews<'a>(&'a self, id: &'a MediaId) -> BoxFuture<'a, Result<Previews, BackendError>> {

@@ -12,8 +12,8 @@ use adw::prelude::*;
 use gtk::glib;
 use relm4::{Component, ComponentParts, ComponentSender};
 use spoolframe_linux_core::backend::{
-    BackendError, ChosenTracks, Client, ConnectionState, HomeScreen, Person, Profile, SearchScope,
-    Selection, Server, ServerKey, Session,
+    BackendError, ChosenTracks, Client, ConnectionState, HomeScreen, Person, Profile,
+    ProfileSignIn, SearchScope, Selection, Server, ServerKey, Session,
 };
 use spoolframe_linux_core::next_episode::next_episode;
 use spoolframe_linux_core::theme::Theme;
@@ -131,6 +131,8 @@ pub struct App {
     /// opens nothing more, and the page of an item clicked before it is
     /// dropped when it arrives, so only the last click opens a page.
     opening: Option<MediaId>,
+    /// The item playing, for pages that mark it (an album's track list).
+    now_playing: tokio::sync::watch::Sender<Option<MediaId>>,
 }
 
 /// The sidebar's choice.
@@ -157,6 +159,9 @@ pub struct AppWidgets {
     profile_server: gtk::Label,
     /// Says when the connection is not up.
     banner: adw::Banner,
+    library_heading: gtk::Label,
+    /// The root header's title, at its start.
+    root_title: gtk::Label,
     /// The root page's header bar: search puts its field there.
     root_header: adw::HeaderBar,
     sign_in: Option<start::SignIn>,
@@ -194,6 +199,10 @@ pub enum Msg {
     BackToProfiles,
     ForgotPin,
     OpenSignIn,
+    /// Sign in again as a profile whose session the server ended.
+    SignInAs(String),
+    /// Drop a profile kept on this device.
+    ForgetProfile(Profile),
     /// Ask a server that was not set up for its catalog again (P3-10).
     RetryCatalog,
     /// Sign in by approving on a phone (P3-05) or in the browser (P3-06).
@@ -276,6 +285,7 @@ pub enum Loaded {
     /// The user trusted a server's new identity (P1-13).
     Trusted(Result<Server, BackendError>),
     Profiles(Server, Result<Vec<Profile>, BackendError>),
+    ProfileForgotten(Server, Result<(), BackendError>),
     SignedIn(Result<Profile, BackendError>),
     Libraries(Result<Vec<Library>, BackendError>),
     Home(Result<HomeScreen, BackendError>),
@@ -435,10 +445,22 @@ impl Component for App {
             .tooltip_text("Switch profile")
             .css_classes(["flat", "sidebar-profile"])
             .build();
-        let profile_foot = adw::Bin::builder()
-            .child(&profile_button)
+        // Preferences, beside who is watching: the boards have no menu in
+        // the header.
+        let preferences_button = gtk::Button::builder()
+            .icon_name(crate::icons::SET_UP)
+            .tooltip_text("Preferences")
+            .action_name("win.preferences")
+            .valign(gtk::Align::Center)
+            .css_classes(["flat", "circular"])
+            .build();
+        profile_button.set_hexpand(true);
+        let profile_foot = gtk::Box::builder()
+            .spacing(4)
             .css_classes(["sidebar-foot"])
             .build();
+        profile_foot.append(&profile_button);
+        profile_foot.append(&preferences_button);
         {
             let sender = sender.clone();
             profile_button.connect_clicked(move |_| sender.input(Msg::SwitchProfile));
@@ -452,8 +474,9 @@ impl Component for App {
             .title_widget(&adw::Bin::new())
             .build();
         sidebar_header.pack_start(&brand);
-        let sidebar_toolbar = toolbar(
+        let sidebar_toolbar = views::toolbar(
             &sidebar_header,
+            &[],
             &gtk::ScrolledWindow::builder()
                 .child(&sidebar)
                 .vexpand(true)
@@ -473,16 +496,15 @@ impl Component for App {
             preferences.connect_activate(move |_, _| sender.input(Msg::OpenPreferences));
         }
         root.add_action(&preferences);
-        let menu = gtk::gio::Menu::new();
-        menu.append(Some("Preferences"), Some("win.preferences"));
-        let menu_button = gtk::MenuButton::builder()
-            .icon_name(crate::icons::MENU)
-            .tooltip_text("Main menu")
-            .menu_model(&menu)
-            .primary(true)
+        // The page's title at the start, as designed, not centred: a
+        // title widget that fills the header, its text at the left.
+        let root_title = gtk::Label::builder()
+            .xalign(0.0)
+            .hexpand(true)
+            .margin_start(16)
+            .css_classes(["title"])
             .build();
-        let header = adw::HeaderBar::new();
-        header.pack_end(&menu_button);
+        let header = adw::HeaderBar::builder().title_widget(&root_title).build();
         let content = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             // 32 between rows, less the room each row keeps for a lifted
@@ -499,11 +521,25 @@ impl Component for App {
             .child(&content)
             .vexpand(true)
             .build();
-        let root_toolbar = toolbar(&header, &scroller);
-        root_toolbar.add_top_bar(&banner);
+        // A library's name over its grid: the grid scrolls on its own (it
+        // loads as it goes), so the heading stays above it.
+        let library_heading = gtk::Label::builder()
+            .xalign(0.0)
+            .visible(false)
+            .css_classes(["title-2", "library-heading"])
+            .build();
+        let root_toolbar = views::toolbar(
+            &header,
+            &[banner.upcast_ref(), library_heading.upcast_ref()],
+            &scroller,
+        );
         let root_page = adw::NavigationPage::builder()
             .title("Home")
             .child(&root_toolbar)
+            .build();
+        root_page
+            .bind_property("title", &root_title, "label")
+            .sync_create()
             .build();
         let stack = adw::NavigationView::new();
         stack.add(&root_page);
@@ -581,13 +617,9 @@ impl Component for App {
                 Rc::new(move || window.close())
             },
         );
-        let library = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        split.set_vexpand(true);
-        library.append(&split);
-        library.append(&mini_bar.revealer);
         let library_page = adw::NavigationPage::builder()
             .title("Spoolframe")
-            .child(&library)
+            .child(&split)
             .build();
         // Space plays and pauses what plays, wherever the focus is (the
         // library, the player, Now Playing), except where Space types (a
@@ -615,10 +647,21 @@ impl Component for App {
             });
             keys
         };
-        let window_stack = adw::NavigationView::new();
+        let window_stack = adw::NavigationView::builder().vexpand(true).build();
         window_stack.add(&library_page);
         window_stack.add_controller(space_keys);
-        screens.add_named(&window_stack, Some("library"));
+        // Item pages cover the window, as designed, and the bar stays under
+        // them; only the full player and Now Playing hide it.
+        {
+            let bar = mini_bar.revealer.clone();
+            window_stack.connect_visible_page_notify(move |stack| {
+                bar.set_visible(!stack.visible_page().is_some_and(|p| is_player(&p)));
+            });
+        }
+        let shell = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        shell.append(&window_stack);
+        shell.append(&mini_bar.revealer);
+        screens.add_named(&shell, Some("library"));
         let toasts = adw::ToastOverlay::new();
         toasts.set_child(Some(&screens));
         root.set_content(Some(&toasts));
@@ -652,6 +695,7 @@ impl Component for App {
             library: None,
             opened_last_server: false,
             opening: None,
+            now_playing: tokio::sync::watch::Sender::new(None),
         };
         model.load_servers(&sender);
         // Discovery hears servers a moment after the client opens, so the
@@ -675,6 +719,8 @@ impl Component for App {
                 profile_name,
                 profile_server,
                 banner,
+                library_heading,
+                root_title,
                 root_header: header.clone(),
                 sign_in: None,
                 remote_sign_in: None,
@@ -774,6 +820,9 @@ impl Component for App {
                     Loaded::ServerAdded(client.add_address(&ServerKey(key), &address).await)
                 });
             }
+            Msg::ChooseProfile(profile) if profile.sign_in == ProfileSignIn::Password => {
+                sender.input(Msg::SignInAs(profile.username))
+            }
             Msg::ChooseProfile(profile) if profile.locked => {
                 self.ask_pin(profile, widgets, &sender)
             }
@@ -806,7 +855,20 @@ impl Component for App {
                 }
             }
             Msg::ForgotPin => sender.input(Msg::OpenSignIn),
-            Msg::OpenSignIn => {
+            Msg::ForgetProfile(profile) => {
+                let Some(server) = self.server.clone() else {
+                    return;
+                };
+                let client = self.client.clone();
+                sender.oneshot_command(async move {
+                    let forgotten = client
+                        .forget_profile(&profile.server, &profile.username)
+                        .await;
+                    Loaded::ProfileForgotten(server, forgotten)
+                });
+            }
+            Msg::OpenSignIn => sender.input(Msg::SignInAs(String::new())),
+            Msg::SignInAs(username) => {
                 let Some(server) = &self.server else { return };
                 let submit: Rc<dyn Fn(String, String)> = {
                     let sender = sender.clone();
@@ -817,6 +879,9 @@ impl Component for App {
                     Rc::new(move |via| sender.input(Msg::OpenRemoteSignIn(via)))
                 };
                 let dialog = start::SignIn::new(server, submit, elsewhere);
+                if !username.is_empty() {
+                    dialog.fill_username(&username);
+                }
                 dialog.dialog.present(Some(root));
                 widgets.sign_in = Some(dialog);
             }
@@ -923,10 +988,16 @@ impl Component for App {
                 widgets.content.append(&skeleton);
                 // A newer choice in the sidebar aborts this one.
                 let (scroller, content) = (widgets.scroller.clone(), widgets.content.clone());
+                let heading = widgets.library_heading.clone();
                 let cards = self.cards.clone();
                 self.root_load = Some(glib::spawn_future_local(async move {
+                    let title = library.title.clone();
                     match cache.grid(library, cards).await {
-                        Ok(grid) => scroller.set_child(Some(&grid)),
+                        Ok(grid) => {
+                            heading.set_label(&title);
+                            heading.set_visible(true);
+                            scroller.set_child(Some(&grid));
+                        }
                         Err(e) => {
                             clear(&content);
                             content.append(&error_status(&e));
@@ -992,12 +1063,16 @@ impl Component for App {
                 }
             }
             Msg::MinimizePlayer => {
-                widgets.window_stack.pop_to_page(&widgets.library_page);
+                close_player(widgets);
                 self.refresh_home(&sender);
             }
             Msg::ExpandPlayer => {
+                let showing_player = widgets
+                    .window_stack
+                    .visible_page()
+                    .is_some_and(|p| is_player(&p));
                 if let Some(playback) = &self.playback
-                    && widgets.window_stack.visible_page().as_ref() == Some(&widgets.library_page)
+                    && !showing_player
                 {
                     widgets
                         .window_stack
@@ -1229,6 +1304,8 @@ impl Component for App {
                 self.load_profiles(server, &sender);
             }
             Loaded::Trusted(Err(e)) => toast(widgets, &e),
+            Loaded::ProfileForgotten(server, Ok(())) => self.load_profiles(server, &sender),
+            Loaded::ProfileForgotten(_, Err(e)) => toast(widgets, &e),
             Loaded::Profiles(server, Ok(profiles)) => {
                 let choose: start::Choose<Profile> = {
                     let sender = sender.clone();
@@ -1242,8 +1319,18 @@ impl Component for App {
                     let sender = sender.clone();
                     Rc::new(move || sender.input(Msg::ShowServers))
                 };
+                let forget: start::Choose<Profile> = {
+                    let sender = sender.clone();
+                    Rc::new(move |p| sender.input(Msg::ForgetProfile(p)))
+                };
+                let path: Rc<dyn Fn() -> Option<&'static str>> = {
+                    let (client, key) = (self.client.clone(), server.key.clone());
+                    Rc::new(move || {
+                        spoolframe_linux_core::format::path_chip(client.connection_path(&key))
+                    })
+                };
                 widgets.profiles.set_child(Some(&start::profiles(
-                    &server, &profiles, &choose, &sign_in, &back,
+                    &server, &profiles, &choose, &forget, &sign_in, &back, path,
                 )));
                 widgets.screens.set_visible_child_name("profiles");
                 self.server = Some(server);
@@ -1442,7 +1529,15 @@ impl Component for App {
                 push(
                     widgets,
                     &album.title,
-                    &pages::album(&album, &artist, &tracks, play, enqueue, cards),
+                    &pages::album(
+                        &album,
+                        &artist,
+                        &tracks,
+                        play,
+                        enqueue,
+                        self.now_playing.subscribe(),
+                        cards,
+                    ),
                 );
             }
             Loaded::Album(album, Err(e)) => push_error(widgets, &album.title, &e),
@@ -1450,7 +1545,8 @@ impl Component for App {
             // again, if it is what is on screen.
             Loaded::WatchChanged(Ok(())) => {
                 let on_home = self.root == Root::Home
-                    && widgets.stack.visible_page().as_ref() == Some(&widgets.root_page);
+                    && widgets.stack.visible_page().as_ref() == Some(&widgets.root_page)
+                    && widgets.window_stack.visible_page().as_ref() == Some(&widgets.library_page);
                 if on_home {
                     self.load_home(&sender);
                 }
@@ -1461,7 +1557,7 @@ impl Component for App {
             Loaded::TracksForgotten(item, Ok(())) => {
                 toast_text(widgets, "Back to your default tracks");
                 // Reopen the page so its pickers show the server's choice.
-                widgets.stack.pop();
+                widgets.window_stack.pop();
                 self.open_item(*item, &sender);
             }
             Loaded::TracksForgotten(_, Err(e)) => toast(widgets, &e),
@@ -1482,7 +1578,7 @@ impl App {
         &self,
         tracks: Option<TrackPreferences>,
         sender: &ComponentSender<Self>,
-    ) -> adw::PreferencesDialog {
+    ) -> adw::Dialog {
         let set_theme: Rc<dyn Fn(Theme)> = {
             let sender = sender.clone();
             Rc::new(move |theme| sender.input(Msg::SetTheme(theme)))
@@ -1605,6 +1701,7 @@ impl App {
         self.saved_queue = SavedQueue::for_profile(&profile).map(Rc::new);
         self.restore_queue(widgets);
         widgets.stack.pop_to_page(&widgets.root_page);
+        widgets.window_stack.pop_to_page(&widgets.library_page);
         clear(&widgets.content);
         widgets.screens.set_visible_child_name("library");
         self.load_libraries(sender);
@@ -1640,8 +1737,13 @@ impl App {
         // a track that cannot play says so in a toast.
         let toasts = widgets.toasts.clone();
         let weak = Rc::downgrade(playback);
+        let now_playing = self.now_playing.clone();
+        now_playing.send_replace(playback.current().map(|i| i.id().clone()));
         playback.subscribe(move |change| {
             match change {
+                Change::Item(item) => {
+                    now_playing.send_replace(Some(item.id().clone()));
+                }
                 Change::Skipped(message) => toasts.add_toast(adw::Toast::new(message)),
                 Change::Failed(error) if weak.upgrade().is_some_and(|p| !p.is_video()) => {
                     toasts.add_toast(adw::Toast::new(&format!("Cannot play: {error}")));
@@ -1733,7 +1835,8 @@ impl App {
         }
         widgets.mini_bar.detach();
         widgets.mpris.detach();
-        widgets.window_stack.pop_to_page(&widgets.library_page);
+        self.now_playing.send_replace(None);
+        close_player(widgets);
     }
 
     /// Home again, if it shows: Continue watching moved with what played.
@@ -1762,11 +1865,29 @@ impl App {
             let sender = sender.clone();
             Rc::new(move |person| sender.input(Msg::OpenPerson(Box::new(person))))
         };
+        let shuffle: Rc<dyn Fn(Vec<Item>)> = {
+            let sender = sender.clone();
+            Rc::new(move |items: Vec<Item>| {
+                // From a random one, the rest shuffled by the queue, as an
+                // album's Shuffle does.
+                let index = glib::random_int_range(0, items.len().max(1) as i32) as usize;
+                sender.input(Msg::Play(Box::new(PlayRequest {
+                    items,
+                    index,
+                    from: None,
+                    selection: None,
+                    tracks: None,
+                    album: None,
+                    shuffle: true,
+                })));
+            })
+        };
         Some(SearchPage::new(search::Needs {
             session,
             cards: self.cards.clone(),
             play,
             open_person,
+            shuffle,
             server: server.name.clone(),
             profile: profile.display_name.clone(),
             recent: search::RecentSearches::for_profile(profile),
@@ -1983,6 +2104,9 @@ impl App {
                     year: None,
                     summary: None,
                     artwork: Vec::new(),
+                    content_rating: None,
+                    genres: Vec::new(),
+                    season_count: None,
                 };
                 let (show, seasons) = show_with_seasons(backend.as_ref(), show).await;
                 Loaded::Show(show, seasons, Some(season.id))
@@ -2153,13 +2277,6 @@ fn show_connection(widgets: &AppWidgets, server: Option<&Server>, state: Connect
     }
 }
 
-fn toolbar(header: &adw::HeaderBar, content: &impl IsA<gtk::Widget>) -> adw::ToolbarView {
-    let view = adw::ToolbarView::new();
-    view.add_top_bar(header);
-    view.set_content(Some(content));
-    view
-}
-
 fn sidebar_row(title: &str, icon: &str) -> gtk::Box {
     let row = gtk::Box::builder().spacing(12).build();
     row.append(&gtk::Image::from_icon_name(icon));
@@ -2184,6 +2301,7 @@ fn clear(content: &gtk::Box) {
 /// Puts the root page's ordinary content back in its scrolled area, in
 /// place of a library grid.
 fn show_content(widgets: &AppWidgets) {
+    widgets.library_heading.set_visible(false);
     if widgets.scroller.child().as_ref() != Some(widgets.content.upcast_ref()) {
         widgets.scroller.set_child(Some(&widgets.content));
     }
@@ -2228,11 +2346,35 @@ fn show_error(widgets: &AppWidgets, title: &str, error: &BackendError) {
 /// field there, gives way to another root. Done as the choice is made: a
 /// header changed while GTK maps or unmaps the page breaks its widget tree.
 fn plain_header(widgets: &AppWidgets) {
-    widgets.root_header.set_title_widget(None::<&gtk::Widget>);
+    widgets
+        .root_header
+        .set_title_widget(Some(&widgets.root_title));
 }
 
+/// An item page, over the whole window as designed: the sidebar is the
+/// library's, and the page's own header has Back.
 fn push(widgets: &AppWidgets, title: &str, body: &impl IsA<gtk::Widget>) {
-    widgets.stack.push(&pages::page(title, body));
+    widgets.window_stack.push(&pages::page(title, body));
+}
+
+/// The full player and Now Playing are tagged so: the bar hides under
+/// them, and minimizing closes only them.
+const PLAYER_TAG: &str = "player";
+
+fn is_player(page: &adw::NavigationPage) -> bool {
+    page.tag().as_deref() == Some(PLAYER_TAG)
+}
+
+/// Closes the full player or Now Playing, leaving whatever page was under
+/// it.
+fn close_player(widgets: &AppWidgets) {
+    while widgets
+        .window_stack
+        .visible_page()
+        .is_some_and(|p| is_player(&p))
+    {
+        widgets.window_stack.pop();
+    }
 }
 
 fn push_error(widgets: &AppWidgets, title: &str, error: &BackendError) {
@@ -2303,11 +2445,13 @@ fn player_page(
         Rc::new(move || sender.input(Msg::MinimizePlayer)) as Rc<dyn Fn()>
     };
     let actions = player::Actions { minimize };
-    if playback.is_video() {
+    let page = if playback.is_video() {
         player::page(playback, actions)
     } else {
         nowplaying::page(playback, actions, cards)
-    }
+    };
+    page.set_tag(Some(PLAYER_TAG));
+    page
 }
 
 /// Shows "Is this your server?" for `server`; the user's answer pins it.

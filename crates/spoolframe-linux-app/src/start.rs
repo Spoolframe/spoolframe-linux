@@ -4,7 +4,7 @@
 use std::rc::Rc;
 
 use adw::prelude::*;
-use spoolframe_linux_core::backend::{Profile, Server};
+use spoolframe_linux_core::backend::{Profile, ProfileSignIn, Server};
 
 use crate::remote_sign_in::Via;
 
@@ -374,12 +374,7 @@ pub fn fingerprint_check(
 /// "Server identity changed" (P1-13): a saved server answered with another
 /// key. Both codes, the full keys on request, and the choice: Cancel
 /// (nothing changes) or Trust New Identity (everyone signs in again).
-pub fn identity_changed(
-    name: &str,
-    saved: &str,
-    now: &str,
-    trust: Rc<dyn Fn()>,
-) -> adw::AlertDialog {
+pub fn identity_changed(name: &str, saved: &str, now: &str, trust: Rc<dyn Fn()>) -> adw::Dialog {
     let code =
         |key: &str| spoolframe_protocol::fingerprint::of_hex(key).unwrap_or_else(|| key.to_owned());
     let row = |label: &str, key: &str, class: &str| {
@@ -425,28 +420,85 @@ pub fn identity_changed(
             .css_classes(["dim-label", "caption"])
             .build(),
     );
-    let dialog = adw::AlertDialog::builder()
-        .content_width(460)
-        .heading("Server identity changed")
-        .body_use_markup(true)
-        .body(format!(
+    // An alert's shape, with the warning mark above the heading that an
+    // AlertDialog cannot carry: the codes, Cancel and Trust New Identity.
+    let icon = gtk::Image::builder()
+        .icon_name(crate::icons::WARNING)
+        .pixel_size(40)
+        .css_classes(["identity-warning"])
+        .build();
+    let heading = gtk::Label::builder()
+        .label("Server identity changed")
+        .css_classes(["title-3", "dialog-title"])
+        .build();
+    let body = gtk::Label::builder()
+        .use_markup(true)
+        .label(format!(
             "<b>{}</b> has a different key than the one saved on this computer. \
              This may mean the server was reinstalled, or that you're connecting \
              to a different server.",
             glib_escape(name)
         ))
-        .extra_child(&extra)
-        .default_response("cancel")
-        .close_response("cancel")
+        .wrap(true)
+        .justify(gtk::Justification::Center)
+        .css_classes(["dim-label"])
         .build();
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("trust", "Trust New Identity");
-    dialog.set_response_appearance("trust", adw::ResponseAppearance::Destructive);
-    dialog.connect_response(None, move |_, response| {
-        if response == "trust" {
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(14)
+        .margin_top(28)
+        .margin_bottom(22)
+        .margin_start(28)
+        .margin_end(28)
+        .build();
+    content.append(&icon);
+    content.append(&heading);
+    content.append(&body);
+    content.append(&extra);
+    let cancel = gtk::Button::builder()
+        .label("Cancel")
+        .hexpand(true)
+        .css_classes(["flat", "alert-response"])
+        .build();
+    let trust_button = gtk::Button::builder()
+        .label("Trust New Identity")
+        .hexpand(true)
+        .css_classes(["flat", "alert-response", "destructive"])
+        .build();
+    let responses = gtk::Box::builder()
+        .homogeneous(true)
+        .css_classes(["alert-responses"])
+        .build();
+    responses.append(&cancel);
+    responses.append(&gtk::Separator::new(gtk::Orientation::Vertical));
+    responses.append(&trust_button);
+    let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    column.append(&content);
+    column.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    column.append(&responses);
+    let dialog = adw::Dialog::builder()
+        .title("Server identity changed")
+        .content_width(460)
+        .child(&column)
+        .build();
+    {
+        let dialog = dialog.downgrade();
+        cancel.connect_clicked(move |_| {
+            if let Some(dialog) = dialog.upgrade() {
+                dialog.close();
+            }
+        });
+    }
+    {
+        let dialog = dialog.downgrade();
+        trust_button.connect_clicked(move |_| {
+            if let Some(dialog) = dialog.upgrade() {
+                dialog.close();
+            }
             trust();
-        }
-    });
+        });
+    }
+    dialog.set_focus(Some(&cancel));
     dialog
 }
 
@@ -552,8 +604,10 @@ pub fn profiles(
     server: &Server,
     profiles: &[Profile],
     choose: &Choose<Profile>,
+    forget: &Choose<Profile>,
     sign_in: &Rc<dyn Fn()>,
     back: &Rc<dyn Fn()>,
+    path: Rc<dyn Fn() -> Option<&'static str>>,
 ) -> gtk::Widget {
     // The server, and how it is reached beside it.
     let where_ = gtk::Box::builder().spacing(8).build();
@@ -563,13 +617,29 @@ pub fn profiles(
             .css_classes(["title"])
             .build(),
     );
-    where_.append(
-        &gtk::Label::builder()
-            .label("Direct · LAN")
-            .valign(gtk::Align::Center)
-            .css_classes(["status-chip"])
-            .build(),
-    );
+    let chip = gtk::Label::builder()
+        .valign(gtk::Align::Center)
+        .css_classes(["status-chip"])
+        .build();
+    let show_path = move |chip: &gtk::Label| {
+        let text = path();
+        chip.set_visible(text.is_some());
+        chip.set_label(text.unwrap_or_default());
+    };
+    show_path(&chip);
+    // The connection comes up, or moves, while the screen shows; asking
+    // dials nothing, so it is asked again each second until it goes.
+    {
+        let weak = chip.downgrade();
+        gtk::glib::timeout_add_seconds_local(1, move || match weak.upgrade() {
+            Some(chip) => {
+                show_path(&chip);
+                gtk::glib::ControlFlow::Continue
+            }
+            None => gtk::glib::ControlFlow::Break,
+        });
+    }
+    where_.append(&chip);
     let header = adw::HeaderBar::builder().title_widget(&where_).build();
     let back_button = gtk::Button::builder()
         .icon_name(crate::icons::BACK)
@@ -600,13 +670,26 @@ pub fn profiles(
             .halign(gtk::Align::Center)
             .css_classes(["dim-label", "profile-detail"])
             .build();
-        if profile.locked {
+        let password = profile.sign_in == ProfileSignIn::Password;
+        if password {
+            detail.append(&gtk::Label::new(Some("Password")));
+        } else if profile.locked {
             detail.append(&gtk::Image::from_icon_name(crate::icons::LOCK));
             detail.append(&gtk::Label::new(Some("PIN")));
         } else {
-            detail.append(&gtk::Label::new(Some("Signed in")));
+            detail.append(&gtk::Label::new(Some("Auto sign-in")));
         }
         let tile = profile_tile(&avatar, &profile.display_name, &detail);
+        // One whose session ended is only a name here: it can go.
+        if password {
+            let (profile, forget) = (profile.clone(), forget.clone());
+            let menu = crate::views::menu_popover(vec![vec![crate::views::MenuEntry::new(
+                "Forget on this device",
+                crate::icons::FORGET,
+                move || forget(profile.clone()),
+            )]]);
+            crate::views::context_menu(tile.upcast_ref(), &menu);
+        }
         let (profile, choose) = (profile.clone(), choose.clone());
         tile.connect_clicked(move |_| choose(profile.clone()));
         tiles.append(&tile);
@@ -687,6 +770,8 @@ fn profile_tile(
 /// without closing it.
 pub struct SignIn {
     pub dialog: adw::Dialog,
+    username: gtk::Entry,
+    password: gtk::PasswordEntry,
     error: gtk::Label,
     button: gtk::Button,
 }
@@ -759,9 +844,18 @@ impl SignIn {
         with_cancel(&dialog, &body);
         Self {
             dialog,
+            username,
+            password,
             error,
             button,
         }
+    }
+
+    /// Signing in again as someone whose session ended: their name is
+    /// kept, so only the password is asked.
+    pub fn fill_username(&self, name: &str) {
+        self.username.set_text(name);
+        self.dialog.set_property("focus-widget", &self.password);
     }
 
     /// While a sign-in is in flight, the button cannot be pressed again.

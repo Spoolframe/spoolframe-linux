@@ -43,6 +43,7 @@ impl Pipeline {
         let paintable = video.gtk.property::<gtk::gdk::Paintable>("paintable");
         let renderer = gst_play::PlayVideoOverlayVideoRenderer::with_sink(&video.outer);
         let play = gst_play::Play::new(Some(renderer));
+        style_subtitles(&play.pipeline());
         let mut config = play.config();
         config.set_position_update_interval(250);
         play.set_config(config)?;
@@ -232,6 +233,99 @@ impl Drop for Pipeline {
     }
 }
 
+/// The face text subtitles are drawn in: the app's own, not whatever
+/// fontconfig falls back to (a serif, here). The overlay scales the size
+/// with the picture.
+const SUBTITLE_FONT: &str = "Figtree SemiBold 18";
+
+/// Text subtitles in the app's face, and SRT's tags in the file's own
+/// text streams drawn as styling, not as letters (see [`srt_markup`]).
+///
+/// [`srt_markup`]: crate::srt_markup
+fn style_subtitles(pipeline: &gst::Element) {
+    pipeline.set_property("subtitle-font-desc", SUBTITLE_FONT);
+    let Some(bin) = pipeline.downcast_ref::<gst::Bin>() else {
+        return;
+    };
+    // playsink makes its subtitleoverlay when a text stream is linked.
+    bin.connect_deep_element_added(|_, _, element| {
+        let overlay = element
+            .factory()
+            .is_some_and(|f| f.name() == "subtitleoverlay");
+        if overlay && let Some(pad) = element.static_pad("subtitle_sink") {
+            mark_up_srt(&pad);
+        }
+    });
+}
+
+/// Text into the overlay with SRT's tags in it, as styling: plain `utf8`
+/// becomes Pango markup (its caps say so, and each cue is converted), and
+/// markup with escaped SRT tags in it is converted back (see
+/// [`crate::srt_markup`]). Other markup, an external SRT's through
+/// subparse among it, passes as it is.
+fn mark_up_srt(pad: &gst::Pad) {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    const OTHER: u8 = 0;
+    const PLAIN: u8 = 1;
+    const MARKUP: u8 = 2;
+    let text = std::sync::Arc::new(AtomicU8::new(OTHER));
+    pad.add_probe(
+        gst::PadProbeType::EVENT_DOWNSTREAM | gst::PadProbeType::BUFFER,
+        move |_, info| {
+            match &mut info.data {
+                Some(gst::PadProbeData::Event(event)) => {
+                    let gst::EventView::Caps(caps) = event.view() else {
+                        return gst::PadProbeReturn::Ok;
+                    };
+                    let format = caps
+                        .caps()
+                        .structure(0)
+                        .filter(|s| s.name() == "text/x-raw")
+                        .and_then(|s| s.get::<String>("format").ok());
+                    let kind = match format.as_deref() {
+                        Some("utf8") => PLAIN,
+                        Some("pango-markup") => MARKUP,
+                        _ => OTHER,
+                    };
+                    text.store(kind, Ordering::Relaxed);
+                    if kind == PLAIN {
+                        let mut markup = caps.caps_owned();
+                        markup.make_mut().set("format", "pango-markup");
+                        *event = gst::event::Caps::new(&markup);
+                    }
+                }
+                Some(gst::PadProbeData::Buffer(buffer)) => {
+                    let kind = text.load(Ordering::Relaxed);
+                    if kind == OTHER {
+                        return gst::PadProbeReturn::Ok;
+                    }
+                    let Ok(map) = buffer.map_readable() else {
+                        return gst::PadProbeReturn::Ok;
+                    };
+                    let cue = String::from_utf8_lossy(&map);
+                    let marked = match kind {
+                        PLAIN => Some(crate::srt_markup::to_pango(&cue)),
+                        _ => crate::srt_markup::repair_escaped(&cue),
+                    };
+                    drop(map);
+                    if let Some(marked) = marked {
+                        let mut out = gst::Buffer::from_mut_slice(marked.into_bytes());
+                        {
+                            let out = out.get_mut().expect("a new buffer is writable");
+                            out.set_pts(buffer.pts());
+                            out.set_dts(buffer.dts());
+                            out.set_duration(buffer.duration());
+                        }
+                        *buffer = out;
+                    }
+                }
+                _ => {}
+            }
+            gst::PadProbeReturn::Ok
+        },
+    );
+}
+
 /// gtk4paintablesink itself, and what GstPlay renders into (the same, or a
 /// glsinkbin around it); the diagnostics read both.
 #[derive(Clone)]
@@ -262,5 +356,115 @@ impl VideoSink {
             false => gtk.clone(),
         };
         Ok(Self { gtk, outer })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    /// A second of tiny raw video with one SRT cue muxed in as Matroska's
+    /// S_TEXT/UTF8, as a ripped file carries it.
+    fn file_with_a_tagged_cue(path: &Path) {
+        let mux = gst::parse::launch(&format!(
+            "videotestsrc num-buffers=10 ! video/x-raw,width=64,height=48,framerate=10/1 \
+             ! matroskamux name=mux ! filesink location={} \
+             appsrc name=text format=time caps=text/x-raw,format=utf8 ! mux.subtitle_%u",
+            path.display()
+        ))
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        // appsrc by its action signals: no gstreamer-app crate for a test.
+        let text = mux.by_name("text").unwrap();
+        mux.set_state(gst::State::Playing).unwrap();
+        let mut cue =
+            gst::Buffer::from_slice(b"<font color=\"white\">PB&J under the bridge</font>".to_vec());
+        {
+            let cue = cue.get_mut().unwrap();
+            cue.set_pts(gst::ClockTime::ZERO);
+            cue.set_duration(gst::ClockTime::from_mseconds(800));
+        }
+        let _ = text.emit_by_name::<gst::FlowReturn>("push-buffer", &[&cue]);
+        let _ = text.emit_by_name::<gst::FlowReturn>("end-of-stream", &[]);
+        wait_for_eos(&mux);
+    }
+
+    fn wait_for_eos(pipeline: &impl IsA<gst::Element>) {
+        let bus = pipeline.bus().unwrap();
+        let mut failed = None;
+        for message in bus.iter_timed(gst::ClockTime::from_seconds(20)) {
+            match message.view() {
+                gst::MessageView::Eos(_) => break,
+                gst::MessageView::Error(e) => {
+                    failed = Some(format!("{e:?}"));
+                    break;
+                }
+                _ => {}
+            }
+        }
+        // Down to NULL before any panic: a pipeline dropped while running
+        // takes the test process down with it.
+        pipeline.set_state(gst::State::Null).unwrap();
+        if let Some(failed) = failed {
+            panic!("{failed}");
+        }
+    }
+
+    #[test]
+    #[ignore = "needs GStreamer's base and good plugins; run on its own"]
+    fn a_cue_in_the_file_reaches_the_overlay_as_styling() {
+        gst::init().unwrap();
+        let dir = tempfile_dir();
+        let path = dir.join("cue.mkv");
+        file_with_a_tagged_cue(&path);
+        let playbin = gst::ElementFactory::make("playbin3")
+            .property("uri", format!("file://{}", path.display()))
+            .property(
+                "video-sink",
+                gst::ElementFactory::make("fakesink")
+                    .property("sync", false)
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+        style_subtitles(&playbin);
+        // What the overlay's text renderer is given.
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_ = seen.clone();
+        playbin
+            .downcast_ref::<gst::Bin>()
+            .unwrap()
+            .connect_deep_element_added(move |_, _, element| {
+                let renderer = element.factory().is_some_and(|f| f.name() == "textoverlay");
+                if let (true, Some(pad)) = (renderer, element.static_pad("text_sink")) {
+                    let seen = seen_.clone();
+                    pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                        if let Some(gst::PadProbeData::Buffer(buffer)) = &info.data {
+                            let map = buffer.map_readable().unwrap();
+                            seen.lock()
+                                .unwrap()
+                                .push(String::from_utf8_lossy(&map).into_owned());
+                        }
+                        gst::PadProbeReturn::Ok
+                    });
+                }
+            });
+        playbin.set_state(gst::State::Playing).unwrap();
+        wait_for_eos(&playbin);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            seen.lock().unwrap().first().map(String::as_str),
+            Some("<span foreground=\"white\">PB&amp;J under the bridge</span>")
+        );
+    }
+
+    fn tempfile_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("spoolframe-srt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 }

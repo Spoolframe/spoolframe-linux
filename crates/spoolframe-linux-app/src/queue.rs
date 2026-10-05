@@ -390,6 +390,10 @@ mod tests {
             disc: None,
             duration: None,
             playback: PlaybackState::default(),
+            codec: None,
+            bit_depth: None,
+            sample_rate: None,
+            album_track_count: None,
         })
     }
 
@@ -405,6 +409,7 @@ mod tests {
             title: title.into(),
             year: None,
             artwork: Vec::new(),
+            track_count: None,
         }
     }
 

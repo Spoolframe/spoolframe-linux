@@ -20,7 +20,7 @@ pub use spoolframe_protocol::{
 };
 pub use spoolframe_protocol::{
     PinProof, PinState, PlexLink, PlexSyncSummary, PreviewTile, Previews, SearchCounts,
-    SearchGroup, SearchRequest, SearchResults,
+    SearchGroup, SearchRequest, SearchResults, TopResult,
 };
 pub use spoolframe_types::Platform;
 use spoolframe_types::{
@@ -167,6 +167,18 @@ pub struct Profile {
     /// Its PIN is asked for on this device before anything of it shows
     /// (P2-08). As the server said when the profiles were listed.
     pub locked: bool,
+    pub sign_in: ProfileSignIn,
+}
+
+/// How choosing a profile signs it in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ProfileSignIn {
+    /// Its session is kept: it opens without asking (or with its PIN).
+    #[default]
+    Automatic,
+    /// The server ended its session: the user signs in again, and only
+    /// the profile's name is kept here.
+    Password,
 }
 
 /// A sign-in this device began and another approves (P3-05, P3-07): a
@@ -205,6 +217,18 @@ pub enum ConnectionState {
     Connected,
     Reconnecting { attempt: u32 },
     Closed,
+}
+
+/// How packets go to the server now, for the player's diagnostics. A
+/// hole punched through NAT and an open port look the same: `Direct` is
+/// any public address, `Lan` a private, link-local or loopback one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionPath {
+    Lan(std::net::SocketAddr),
+    Direct(std::net::SocketAddr),
+    Relay,
+    /// Not connected now, or no path chosen yet.
+    Unknown,
 }
 
 /// A started playback: what to read, and how much there is.
@@ -280,7 +304,20 @@ pub trait Client: Send + Sync {
     /// server stays saved.
     fn sign_out<'a>(&'a self, server: &'a ServerKey) -> BoxFuture<'a, Result<(), BackendError>>;
 
-    /// The users signed in on `server` from this device.
+    /// How this device reaches `server` now, before any profile is
+    /// chosen. Asks nothing and never dials.
+    fn connection_path(&self, server: &ServerKey) -> ConnectionPath;
+
+    /// Forgets a profile kept on this device for `server`: its session,
+    /// if any, and its name.
+    fn forget_profile<'a>(
+        &'a self,
+        server: &'a ServerKey,
+        username: &'a str,
+    ) -> BoxFuture<'a, Result<(), BackendError>>;
+
+    /// The users signed in on `server` from this device, and those whose
+    /// session the server ended (to sign in again).
     fn profiles<'a>(
         &'a self,
         server: &'a ServerKey,
@@ -330,6 +367,9 @@ pub trait Session: Send + Sync {
     /// Where a browser reaches the server's web UI, if it has a public
     /// address: for "open in the browser" links (P3-12's Plex account).
     fn web_url(&self) -> Option<String>;
+
+    /// How this device reaches the server now. Asks nothing.
+    fn connection_path(&self) -> ConnectionPath;
 
     /// The item's preview frames for scrubbing (P3-13). Asking also puts
     /// the item first in the server's queue to make them.

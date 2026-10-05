@@ -40,26 +40,93 @@ pub fn dialog(
     set_tracks: SetTracks,
     device: Device,
     signed: Option<crate::profile_page::Signed>,
-) -> adw::PreferencesDialog {
-    let dialog = adw::PreferencesDialog::builder()
+) -> adw::Dialog {
+    // The pages under the board's own tab strip, not libadwaita's
+    // switcher: four 120×52 tabs, icon over label, the picked one on the
+    // surface. Toasts (the profile page's answers) show over the pages.
+    let toasts = adw::ToastOverlay::new();
+    let mut pages = vec![
+        appearance(
+            theme,
+            set_theme,
+            device.show_diagnostics,
+            device.set_show_diagnostics.clone(),
+        ),
+        playback(tracks.map(|tracks| (tracks, set_tracks)), &device),
+        servers_page(servers),
+    ];
+    if let Some(signed) = signed {
+        pages.push(crate::profile_page::page(signed, &toasts));
+    }
+    let stack = gtk::Stack::builder()
+        .transition_type(gtk::StackTransitionType::Crossfade)
+        .vexpand(true)
+        .build();
+    let tabs = gtk::Box::builder()
+        .spacing(4)
+        .halign(gtk::Align::Center)
+        .css_classes(["pref-tabs"])
+        .build();
+    let mut first: Option<gtk::ToggleButton> = None;
+    for page in &pages {
+        stack.add_child(page);
+        let face = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(3)
+            .valign(gtk::Align::Center)
+            .build();
+        face.append(&gtk::Image::from_icon_name(
+            page.icon_name().as_deref().unwrap_or_default(),
+        ));
+        face.append(&gtk::Label::new(Some(&page.title())));
+        let tab = gtk::ToggleButton::builder()
+            .child(&face)
+            .width_request(120)
+            .hexpand(false)
+            .css_classes(["pref-tab"])
+            .build();
+        match &first {
+            Some(first) => tab.set_group(Some(first)),
+            None => {
+                tab.set_active(true);
+                first = Some(tab.clone());
+            }
+        }
+        let (stack, page) = (stack.clone(), page.clone());
+        tab.connect_toggled(move |tab| {
+            if tab.is_active() {
+                stack.set_visible_child(&page);
+            }
+        });
+        tabs.append(&tab);
+    }
+    toasts.set_child(Some(&stack));
+    // The strip's colour runs the dialog's width; the tabs sit centred.
+    let tab_bar = gtk::Box::builder()
+        .hexpand(true)
+        .css_classes(["pref-tabs-bar"])
+        .build();
+    tabs.set_hexpand(true);
+    tab_bar.append(&tabs);
+    let header = adw::HeaderBar::builder()
+        .show_start_title_buttons(false)
+        .title_widget(
+            &gtk::Label::builder()
+                .label("Preferences")
+                .xalign(0.0)
+                .hexpand(true)
+                .css_classes(["title", "pref-title"])
+                .build(),
+        )
+        .css_classes(["pref-header"])
+        .build();
+    let toolbar = crate::views::toolbar(&header, &[tab_bar.upcast_ref()], &toasts);
+    adw::Dialog::builder()
+        .title("Preferences")
         .content_width(720)
         .content_height(680)
-        .build();
-    dialog.add(&appearance(
-        theme,
-        set_theme,
-        device.show_diagnostics,
-        device.set_show_diagnostics.clone(),
-    ));
-    dialog.add(&playback(
-        tracks.map(|tracks| (tracks, set_tracks)),
-        &device,
-    ));
-    dialog.add(&servers_page(servers));
-    if let Some(signed) = signed {
-        dialog.add(&crate::profile_page::page(signed, &dialog));
-    }
-    dialog
+        .child(&toolbar)
+        .build()
 }
 
 /// What the Servers page needs: the client, to list and change saved
@@ -446,7 +513,10 @@ fn theme_hint(theme: Theme) -> String {
 /// of text and accent bars. "Follow system" is drawn in the colours in use.
 fn swatch(theme: Theme) -> gtk::ToggleButton {
     let preview = gtk::DrawingArea::builder()
+        .content_height(86)
         .height_request(86)
+        .vexpand(false)
+        .valign(gtk::Align::Start)
         .hexpand(true)
         .css_classes(["swatch-preview"])
         .build();
@@ -491,6 +561,7 @@ fn swatch(theme: Theme) -> gtk::ToggleButton {
     gtk::ToggleButton::builder()
         .child(&body)
         .tooltip_text(theme.name())
+        .valign(gtk::Align::Start)
         .css_classes(["flat", "swatch"])
         .build()
 }

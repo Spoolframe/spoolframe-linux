@@ -10,6 +10,20 @@ use gtk::prelude::*;
 use crate::icons;
 use crate::playback::{Change, Playback};
 
+/// The slider's position as the level the pipeline takes, and back.
+/// Loudness is heard roughly logarithmically, so a slider straight onto
+/// the linear level put all the quiet settings in its first tenth and
+/// everything above sounded loud. The slider is cubic instead, as
+/// GStreamer's own `StreamVolumeFormat::Cubic` and desktop mixers are:
+/// halfway is about half as loud.
+pub fn level_of(position: f64) -> f64 {
+    position.clamp(0.0, 1.0).powi(3)
+}
+
+pub fn position_of(level: f64) -> f64 {
+    level.clamp(0.0, 1.0).cbrt()
+}
+
 /// Which playback the control acts on: a fixed one, or the bar's current.
 pub type Target = Rc<dyn Fn() -> Option<Rc<Playback>>>;
 
@@ -53,7 +67,7 @@ impl Volume {
                     return;
                 }
                 if let Some(playback) = target() {
-                    playback.set_volume(scale.value());
+                    playback.set_volume(level_of(scale.value()));
                     // Turning it up says "I want to hear this".
                     if playback.is_muted() && scale.value() > 0.0 {
                         playback.set_muted(false);
@@ -86,7 +100,7 @@ impl Volume {
         match change {
             Change::Volume(volume) => {
                 self.syncing.set(true);
-                self.scale.set_value(*volume);
+                self.scale.set_value(position_of(*volume));
                 self.syncing.set(false);
             }
             Change::Muted(muted) => {
@@ -97,6 +111,23 @@ impl Volume {
                 self.scale.set_sensitive(!*muted);
             }
             _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn halfway_on_the_slider_is_an_eighth_of_the_level() {
+        assert!((level_of(0.5) - 0.125).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_slider_and_the_level_map_back_and_forth() {
+        for position in [0.0, 0.2, 0.5, 0.8, 1.0] {
+            assert!((position_of(level_of(position)) - position).abs() < 1e-9);
         }
     }
 }

@@ -45,6 +45,10 @@ pub struct MiniBar {
     length: gtk::Label,
     volume: Volume,
     tracks: gtk::MenuButton,
+    bar: gtk::CenterBox,
+    /// Video ends here; music has none on the board, and Queue in its place.
+    stop: gtk::Button,
+    queue: gtk::Button,
     /// The audio and subtitle stream counts the menu was built for.
     tracks_built: Cell<Option<(usize, usize)>>,
     current: Current,
@@ -106,6 +110,7 @@ impl MiniBar {
             let expand = expand.clone();
             open.connect_clicked(move |_| expand());
         }
+        let expand_for_queue = expand.clone();
 
         let back = round_button("Back 10 seconds", crate::icons::BACK_10, &["flat"]);
         let toggle = round_button("Pause", crate::icons::PAUSE, &["player-play"]);
@@ -176,6 +181,18 @@ impl MiniBar {
             .css_classes(["flat", "dim-label", "mini-button"])
             .build();
         stop_button.connect_clicked(move |_| stop());
+        // Music's queue is on Now Playing.
+        let queue_button = gtk::Button::builder()
+            .icon_name(crate::icons::PLAY_NEXT)
+            .tooltip_text("Queue")
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .css_classes(["flat", "dim-label", "mini-button"])
+            .build();
+        {
+            let expand = expand_for_queue.clone();
+            queue_button.connect_clicked(move |_| expand());
+        }
         // Video's audio and subtitles, built when its streams are known.
         let tracks = gtk::MenuButton::builder()
             .direction(gtk::ArrowType::Up)
@@ -190,8 +207,10 @@ impl MiniBar {
             .halign(gtk::Align::End)
             .valign(gtk::Align::Center)
             .build();
+        volume.row.add_css_class("dim-label");
         end.append(&volume.row);
         end.append(&tracks);
+        end.append(&queue_button);
         end.append(&expand_button);
         end.append(&stop_button);
 
@@ -228,6 +247,9 @@ impl MiniBar {
             length,
             volume,
             tracks,
+            bar,
+            stop: stop_button,
+            queue: queue_button,
             tracks_built: Cell::new(None),
             current,
             art: RefCell::new(None),
@@ -252,7 +274,21 @@ impl MiniBar {
                 .height_request(THUMB.1)
                 .css_classes(["mini-video"])
                 .build();
-            self.thumb.set_child(Some(&picture));
+            // The picture opens the player: a corner mark says so.
+            let badge = gtk::Image::builder()
+                .icon_name(crate::icons::FULLSCREEN)
+                .pixel_size(12)
+                .width_request(22)
+                .height_request(22)
+                .halign(gtk::Align::End)
+                .valign(gtk::Align::End)
+                .margin_end(6)
+                .margin_bottom(6)
+                .css_classes(["mini-expand-badge"])
+                .build();
+            let overlay = gtk::Overlay::builder().child(&picture).build();
+            overlay.add_overlay(&badge);
+            self.thumb.set_child(Some(&overlay));
         } else {
             // Music's cover is set on each track (see `show_cover`).
             self.thumb.set_child(None::<&gtk::Widget>);
@@ -263,6 +299,13 @@ impl MiniBar {
         // shuffle and repeat.
         self.video_transport.set_visible(video);
         self.tracks.set_visible(video);
+        self.stop.set_visible(video);
+        self.queue.set_visible(!video);
+        if video {
+            self.bar.remove_css_class("music");
+        } else {
+            self.bar.add_css_class("music");
+        }
         self.tracks.set_popover(None::<&gtk::Popover>);
         self.tracks_built.set(None);
         let music = (!video).then(|| Transport::new(playback, false));
@@ -337,6 +380,21 @@ impl MiniBar {
                 let detail = match (item, playback.album()) {
                     (Item::Track(_), Some(album)) => Some(
                         [album.artist_name.clone(), Some(album.title.clone())]
+                            .into_iter()
+                            .flatten()
+                            .collect::<Vec<_>>()
+                            .join(" · "),
+                    ),
+                    // "1979 · Movie"; "Severance · S2 · E4".
+                    (Item::Movie(_), _) => Some(
+                        [facts.detail.clone(), Some("Movie".to_owned())]
+                            .into_iter()
+                            .flatten()
+                            .collect::<Vec<_>>()
+                            .join(" · "),
+                    ),
+                    (Item::Episode(_), _) => Some(
+                        [facts.parent.clone(), facts.detail.clone()]
                             .into_iter()
                             .flatten()
                             .collect::<Vec<_>>()

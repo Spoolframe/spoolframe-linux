@@ -20,7 +20,7 @@ use gtk::glib;
 use serde::{Deserialize, Serialize};
 use spoolframe_linux_core::backend::{
     ArtworkSize, BackendError, Person, PersonRole, Profile, SearchCounts, SearchGroup, SearchKind,
-    SearchRequest, SearchResults, SearchScope, Session,
+    SearchRequest, SearchResults, SearchScope, Session, TopResult,
 };
 use spoolframe_linux_core::format;
 use spoolframe_linux_core::storage::DataStore;
@@ -57,6 +57,8 @@ pub struct Needs {
     pub play: Rc<dyn Fn(Item)>,
     /// Lists a person's items.
     pub open_person: Rc<dyn Fn(Person)>,
+    /// Plays items shuffled: a person's, from their top result.
+    pub shuffle: Rc<dyn Fn(Vec<Item>)>,
     /// The server's name, for "Nothing anywhere in … matches".
     pub server: String,
     /// The profile's display name and where its searches are kept.
@@ -76,6 +78,8 @@ pub struct SearchPage {
     back: gtk::Button,
     year: gtk::Button,
     year_label: gtk::Label,
+    /// Turns in the field while a search is out.
+    searching: gtk::Spinner,
     chips_row: gtk::Box,
     chips: Vec<(SearchScope, gtk::ToggleButton, gtk::Label)>,
     note: gtk::Label,
@@ -96,6 +100,12 @@ pub struct SearchPage {
 }
 
 struct State {
+    /// The year held as a token in the field: the query ends with it,
+    /// the field shows only the words before it.
+    year: Option<u16>,
+    /// The field's text being set by the page, not typed: replacing it
+    /// passes through an empty field, which is no reason to drop the year.
+    setting_text: bool,
     scope: SearchScope,
     /// See all: one group.
     kind: Option<SearchKind>,
@@ -119,6 +129,8 @@ impl Default for State {
             last: None,
             recent: Vec::new(),
             setting_chips: false,
+            year: None,
+            setting_text: false,
         }
     }
 }
@@ -155,9 +167,25 @@ impl SearchPage {
             .build();
         // In the header bar, as designed: All results, the field, the year.
         let head = gtk::Box::builder().spacing(10).build();
+        // The field's frame holds the entry and the year token, as the
+        // board draws it: the token sits inside the field.
+        let searching = gtk::Spinner::builder()
+            .width_request(16)
+            .height_request(16)
+            .visible(false)
+            .valign(gtk::Align::Center)
+            .build();
+        entry.set_hexpand(true);
+        let field = gtk::Box::builder()
+            .spacing(6)
+            .valign(gtk::Align::Center)
+            .css_classes(["search-field-box"])
+            .build();
+        field.append(&entry);
+        field.append(&searching);
+        field.append(&year);
         head.append(&back);
-        head.append(&entry);
-        head.append(&year);
+        head.append(&field);
 
         let chips_row = gtk::Box::builder().spacing(8).build();
         let mut chips = Vec::new();
@@ -324,6 +352,7 @@ impl SearchPage {
                 back,
                 year,
                 year_label,
+                searching,
                 chips_row,
                 chips,
                 note,
@@ -413,13 +442,34 @@ impl SearchPage {
     fn typed(self: &Rc<Self>, text: &str) {
         {
             let mut state = self.state.borrow_mut();
-            if state.query == text {
+            if state.setting_text {
                 return;
             }
-            state.query = text.to_owned();
+            // An empty field lets go of the year too.
+            if text.is_empty() {
+                state.year = None;
+            }
+            let query = match state.year {
+                Some(year) => format!("{text} {year}"),
+                None => text.to_owned(),
+            };
+            if state.query == query {
+                return;
+            }
+            state.query = query;
             state.kind = None;
         }
+        self.show_year();
         self.run();
+    }
+
+    /// The token shows while a year is held.
+    fn show_year(&self) {
+        let year = self.state.borrow().year;
+        if let Some(year) = year {
+            self.year_label.set_label(&year.to_string());
+        }
+        self.year.set_visible(year.is_some());
     }
 
     fn pick_scope(self: &Rc<Self>, scope: SearchScope) {
@@ -435,12 +485,15 @@ impl SearchPage {
 
     /// Searches every year: the query without its year.
     fn drop_year(self: &Rc<Self>) {
-        let year = self.state.borrow().last.as_ref().and_then(|r| r.year);
-        if let Some(year) = year {
-            let words = without_year(&self.state.borrow().query, year);
-            self.entry.set_text(&words);
-            self.entry.set_position(-1);
+        let words = self.entry.text().trim().to_owned();
+        {
+            let mut state = self.state.borrow_mut();
+            state.year = None;
+            state.query = words;
+            state.kind = None;
         }
+        self.show_year();
+        self.run();
     }
 
     /// Asks the server for the query as it stands; the earlier results
@@ -469,6 +522,8 @@ impl SearchPage {
             (request, state.kind.is_some())
         };
         self.show_see_all_head(seeing_all, None);
+        self.searching.set_visible(true);
+        self.searching.set_spinning(true);
         if self.body.visible_child_name().as_deref() == Some("results") {
             self.results.set_opacity(0.45);
         } else {
@@ -484,6 +539,8 @@ impl SearchPage {
             let Ok(answer) = asked.await else { return };
             let Some(page) = weak.upgrade() else { return };
             page.load.take();
+            page.searching.set_visible(false);
+            page.searching.set_spinning(false);
             match answer {
                 Ok(results) => page.show(results),
                 Err(e) => page.failed(&e),
@@ -506,14 +563,20 @@ impl SearchPage {
                 None => count.set_visible(false),
             }
         }
-        // The year as a token, while the query still ends with it.
-        match results.year.filter(|y| query.ends_with(&y.to_string())) {
-            Some(year) => {
-                self.year_label.set_label(&year.to_string());
-                self.year.set_visible(true);
-            }
-            None => self.year.set_visible(false),
+        // A year the server read off the end of the query becomes the
+        // token: the field keeps the words, the query keeps the year.
+        let held = self.state.borrow().year;
+        if held.is_none()
+            && let Some(year) = results.year.filter(|y| query.ends_with(&y.to_string()))
+        {
+            self.state.borrow_mut().year = Some(year);
+            let words = without_year(&query, year);
+            self.state.borrow_mut().setting_text = true;
+            self.entry.set_text(&words);
+            self.state.borrow_mut().setting_text = false;
+            self.entry.set_position(-1);
         }
+        self.show_year();
         let empty = results.top.is_none() && results.groups.iter().all(group_is_empty);
         if empty && kind.is_none() {
             self.show_none(scope, &query, &results.counts);
@@ -533,10 +596,10 @@ impl SearchPage {
     ) {
         clear(&self.results);
         if let Some(kind) = kind {
-            let count = results
-                .groups
-                .first()
-                .map_or(0, |g| g.items.len() + g.people.len());
+            let count = results.groups.first().map_or(0, |g| {
+                g.total
+                    .map_or(g.items.len() + g.people.len(), |t| t as usize)
+            });
             self.show_see_all_head(true, Some((kind, query, count, scope)));
         }
         if let Some(year) = results.year
@@ -545,8 +608,10 @@ impl SearchPage {
             self.results
                 .append(&self.year_note(year, &results.without_year));
         }
-        if let Some(top) = &results.top {
-            self.results.append(&self.top(top));
+        match &results.top {
+            Some(TopResult::Item(top)) => self.results.append(&self.top(top)),
+            Some(TopResult::Person(person)) => self.results.append(&self.top_person(person)),
+            None => {}
         }
         for group in &results.groups {
             self.results.append(&self.group(group, kind.is_some()));
@@ -639,6 +704,54 @@ impl SearchPage {
             });
             actions.append(&play);
         }
+        // A show offers its episode up next, once its seasons are in:
+        // "Resume S2 · E4", or "Play S1 · E1".
+        if let Item::Show(show) = item {
+            let play = gtk::Button::builder()
+                .visible(false)
+                .css_classes(["small-button", "suggested-action"])
+                .build();
+            actions.append(&play);
+            let (session, show_id) = (self.needs.session.clone(), show.id.clone());
+            let asked = relm4::spawn(async move {
+                let mut seasons = Vec::new();
+                for child in session.item(&show_id).await?.1 {
+                    if let Item::Season(season) = child {
+                        let episodes = session.item(&season.id).await?.1;
+                        seasons.push((season, episodes));
+                    }
+                }
+                Ok::<_, BackendError>(seasons)
+            });
+            let (weak, play_) = (Rc::downgrade(self), play.downgrade());
+            glib::spawn_future_local(async move {
+                let Ok(Ok(seasons)) = asked.await else { return };
+                let next = crate::pages::up_next(&seasons)
+                    .or_else(|| seasons.iter().flat_map(|(_, e)| e.first()).next())
+                    .cloned();
+                let (Some(next), Some(play)) = (next, play_.upgrade()) else {
+                    return;
+                };
+                let word = if Facts::of(&next).position().is_some() {
+                    "Resume"
+                } else {
+                    "Play"
+                };
+                play.set_child(Some(
+                    &adw::ButtonContent::builder()
+                        .icon_name(crate::icons::PLAY)
+                        .label(format!("{word} {}", crate::pages::episode_code(&next)))
+                        .build(),
+                ));
+                play.set_visible(true);
+                play.connect_clicked(move |_| {
+                    if let Some(page) = weak.upgrade() {
+                        page.remember();
+                        (page.needs.play)(next.clone());
+                    }
+                });
+            });
+        }
         let open = gtk::Button::builder()
             .label(open_label(item))
             .css_classes(["small-button"])
@@ -656,9 +769,96 @@ impl SearchPage {
         top.upcast()
     }
 
+    /// A person as the top result: their initials in a large circle, what
+    /// they did, and their items to shuffle or list.
+    fn top_person(self: &Rc<Self>, person: &Person) -> gtk::Widget {
+        let circle = gtk::Label::builder()
+            .label(initials(&person.name))
+            .width_request(TOP_PERSON)
+            .height_request(TOP_PERSON)
+            .valign(gtk::Align::Center)
+            .css_classes(["search-person", "search-top-person"])
+            .build();
+        let text = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(6)
+            .valign(gtk::Align::Center)
+            .build();
+        text.append(&caption("TOP RESULT · PERSON", &["search-kicker"]));
+        text.append(&caption(&person.name, &["search-top-title"]));
+        text.append(&caption(&person_detail(person), &["dim-label"]));
+        let actions = gtk::Box::builder().spacing(8).margin_top(6).build();
+        let shuffle = gtk::Button::builder()
+            .child(
+                &adw::ButtonContent::builder()
+                    .icon_name(crate::icons::SHUFFLE)
+                    .label("Shuffle their items")
+                    .build(),
+            )
+            .css_classes(["small-button", "suggested-action"])
+            .build();
+        {
+            let (weak, id) = (Rc::downgrade(self), person.id.clone());
+            shuffle.connect_clicked(move |button| {
+                let Some(page) = weak.upgrade() else { return };
+                page.remember();
+                button.set_sensitive(false);
+                let session = page.needs.session.clone();
+                let id = id.clone();
+                let asked =
+                    relm4::spawn(async move { session.person_items(&id, 0, PERSON_SHUFFLE).await });
+                let (play, button) = (page.needs.shuffle.clone(), button.downgrade());
+                glib::spawn_future_local(async move {
+                    if let Ok(Ok((items, _))) = asked.await {
+                        let items = playable(items);
+                        if !items.is_empty() {
+                            play(items);
+                        }
+                    }
+                    if let Some(button) = button.upgrade() {
+                        button.set_sensitive(true);
+                    }
+                });
+            });
+        }
+        actions.append(&shuffle);
+        let open = gtk::Button::builder()
+            .label("Show their items")
+            .css_classes(["small-button"])
+            .build();
+        {
+            let (weak, person) = (Rc::downgrade(self), person.clone());
+            open.connect_clicked(move |_| {
+                if let Some(page) = weak.upgrade() {
+                    page.remember();
+                    (page.needs.open_person)(person.clone());
+                }
+            });
+        }
+        actions.append(&open);
+        text.append(&actions);
+        let top = gtk::Box::builder()
+            .spacing(20)
+            .css_classes(["search-top"])
+            .build();
+        top.append(&circle);
+        top.append(&text);
+        top.upcast()
+    }
+
     /// A group: its name, a note, See all, and its items in the shape the
     /// design gives their kind.
     fn group(self: &Rc<Self>, group: &SearchGroup, seeing_all: bool) -> gtk::Widget {
+        // As many as the board shows of each kind; See all has the rest.
+        let everything = self.state.borrow().scope == SearchScope::All;
+        let limit = if seeing_all {
+            usize::MAX
+        } else {
+            kind_limit(group.kind, everything)
+        };
+        let items: Vec<Item> = group.items.iter().take(limit).cloned().collect();
+        let people: Vec<Person> = group.people.iter().take(limit).cloned().collect();
+        let cut = items.len() < group.items.len() || people.len() < group.people.len();
         let head = gtk::Box::builder().spacing(10).build();
         head.append(&caption(kind_label(group.kind), &["title-3"]));
         if group.hidden > 0 {
@@ -667,9 +867,9 @@ impl SearchPage {
                 &["dim-label", "small-text"],
             ));
         }
-        if group.more && !seeing_all {
+        if (group.more || cut) && !seeing_all {
             let see_all = gtk::Button::builder()
-                .label("See all")
+                .label(see_all_label(group.total))
                 .css_classes(["flat", "text-link", "see-all"])
                 .halign(gtk::Align::End)
                 .hexpand(true)
@@ -690,19 +890,19 @@ impl SearchPage {
         section.append(&head);
         let body: gtk::Widget = match group.kind {
             SearchKind::People => self.cards_of(
-                group.people.iter().map(|p| self.person_card(p)).collect(),
+                people.iter().map(|p| self.person_card(p)).collect(),
                 seeing_all,
             ),
             SearchKind::Shows | SearchKind::Movies | SearchKind::Artists | SearchKind::Albums => {
                 self.cards_of(
-                    group.items.iter().map(|i| self.small_card(i)).collect(),
+                    items.iter().map(|i| self.small_card(i)).collect(),
                     seeing_all,
                 )
             }
             // Rows in columns: three for episodes among everything, two
             // otherwise.
             SearchKind::Tracks | SearchKind::Episodes => self.rows_of(
-                &group.items,
+                &items,
                 if group.kind == SearchKind::Episodes && !seeing_all {
                     3
                 } else {
@@ -835,6 +1035,18 @@ impl SearchPage {
                         .css_classes(["dim-label", "monospace", "caption"])
                         .build(),
                 );
+            }
+            // An episode leads with its still, as on the board.
+            if let Item::Episode(episode) = item {
+                let still = views::tile(&episode.id, "", "thumb", (78, 44));
+                self.cards.art(
+                    &still,
+                    &episode.artwork,
+                    &[ArtworkKind::Thumb, ArtworkKind::Background],
+                    ArtworkSize::Small,
+                );
+                still.set_valign(gtk::Align::Center);
+                row.add_prefix(&still);
             }
             // An episode's menu goes to its show or season.
             if let Item::Episode(episode) = item {
@@ -1217,6 +1429,29 @@ fn open_label(item: &Item) -> &'static str {
 
 /// The top result's line: the year and length for a movie, the detail
 /// otherwise.
+/// The size of a person's circle as the top result, as the board draws it.
+const TOP_PERSON: i32 = 146;
+
+/// The most of a person's items shuffled from their top result.
+const PERSON_SHUFFLE: u32 = 200;
+
+/// "See all 23", or "See all" where the server cannot count them.
+fn see_all_label(total: Option<u32>) -> String {
+    match total {
+        Some(total) => format!("See all {total}"),
+        None => "See all".to_owned(),
+    }
+}
+
+/// What plays of a person's items: movies, episodes and tracks; a show
+/// or an album is a page, not something to shuffle in.
+fn playable(items: Vec<Item>) -> Vec<Item> {
+    items
+        .into_iter()
+        .filter(|i| matches!(i, Item::Movie(_) | Item::Episode(_) | Item::Track(_)))
+        .collect()
+}
+
 fn top_detail(item: &Item, facts: &Facts) -> Option<String> {
     match item {
         Item::Movie(_) => {
@@ -1287,6 +1522,18 @@ fn skeleton() -> gtk::Box {
     page.append(&block(120, 16));
     page.append(&posters);
     page
+}
+
+/// How many of a kind a group shows before See all, as the boards have
+/// it; episodes are quieter among everything.
+fn kind_limit(kind: SearchKind, everything: bool) -> usize {
+    match kind {
+        SearchKind::Shows | SearchKind::Movies => 6,
+        SearchKind::People | SearchKind::Artists | SearchKind::Albums => 5,
+        SearchKind::Tracks => 4,
+        SearchKind::Episodes if everything => 3,
+        SearchKind::Episodes => 6,
+    }
 }
 
 fn group_is_empty(group: &SearchGroup) -> bool {
@@ -1361,6 +1608,7 @@ mod tests {
             }),
             play: Rc::new(|_| {}),
             open_person: Rc::new(|_| {}),
+            shuffle: Rc::new(|_| {}),
             server: "Home Media".into(),
             profile: "Andrey".into(),
             recent: None,
@@ -1386,6 +1634,53 @@ mod tests {
         page.entry.set_text(text);
     }
 
+    #[test]
+    fn episodes_are_quieter_among_everything() {
+        assert_eq!(
+            (
+                kind_limit(SearchKind::Episodes, true),
+                kind_limit(SearchKind::Episodes, false),
+                kind_limit(SearchKind::Movies, true)
+            ),
+            (3, 6, 6)
+        );
+    }
+
+    #[test]
+    fn see_all_says_how_many_when_the_server_counts_them() {
+        assert_eq!(
+            (see_all_label(Some(23)), see_all_label(None)),
+            ("See all 23".to_owned(), "See all".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_persons_shows_are_not_shuffled_in() {
+        use spoolframe_types::{MediaId, MediaKind, Movie, Namespace, PlaybackState, Show};
+        let id = |kind, key| MediaId::new(Namespace::Plex, kind, key).unwrap();
+        let show = Item::Show(Show {
+            id: id(MediaKind::Show, "1"),
+            title: "Severance".into(),
+            year: None,
+            summary: None,
+            artwork: Vec::new(),
+            content_rating: None,
+            season_count: None,
+            genres: Vec::new(),
+        });
+        let movie = Item::Movie(Movie {
+            id: id(MediaKind::Movie, "2"),
+            title: "Arrival".into(),
+            year: None,
+            summary: None,
+            duration: None,
+            artwork: Vec::new(),
+            playback: PlaybackState::default(),
+            content_rating: None,
+        });
+        assert_eq!(playable(vec![show, movie.clone()]), vec![movie]);
+    }
+
     /// One test: GTK binds itself to the first thread that starts it.
     #[test]
     #[ignore = "needs a display; run on its own"]
@@ -1398,6 +1693,16 @@ mod tests {
         see_all_shows_one_group_under_its_own_head();
         a_search_is_remembered_and_shown_when_the_box_is_empty();
         recent_searches_show_again_without_stale_rows();
+        a_person_named_in_full_is_the_top_result();
+    }
+
+    fn a_person_named_in_full_is_the_top_result() {
+        let page = page();
+        type_in(&page, "denis villeneuve");
+        assert!(reaches(&page, "results"), "no results");
+        let top = page.results.first_child().unwrap();
+        let circle = top.first_child().unwrap();
+        assert!(circle.has_css_class("search-top-person"));
     }
 
     fn recent_searches_show_again_without_stale_rows() {

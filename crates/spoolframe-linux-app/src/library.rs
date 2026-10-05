@@ -213,7 +213,7 @@ fn grid(pages: &Rc<Pages>, cards: Rc<Cards>) -> gtk::GridView {
                 return;
             };
             let card = match &*cell.borrow::<Cell>() {
-                Some(media) => views::poster_card(media, &cards),
+                Some(media) => views::grid_card(media, &cards),
                 None => {
                     pages.want(item.position());
                     views::placeholder_card()

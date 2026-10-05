@@ -272,10 +272,22 @@ pub fn continue_card(item: &Item, cards: &Cards) -> gtk::Widget {
     card
 }
 
+/// A library grid's card: as a poster card, with only the title below, as
+/// LinuxHomeVideo has it.
+pub fn grid_card(item: &Item, cards: &Cards) -> gtk::Widget {
+    poster(item, cards, false)
+}
+
 /// A poster card: the title on the tile, a badge when watched, and the
-/// title and year below. 2:3 for films and shows, square for albums and
-/// artists.
+/// title and year below.
 pub fn poster_card(item: &Item, cards: &Cards) -> gtk::Widget {
+    poster(item, cards, true)
+}
+
+/// A poster card: the title on the tile, a badge when watched, and the
+/// title below, with the year when `detail`. 2:3 for films and shows, square for albums and
+/// artists.
+fn poster(item: &Item, cards: &Cards, detail: bool) -> gtk::Widget {
     let facts = Facts::of(item);
     let music = matches!(item, Item::Album(_) | Item::Artist(_) | Item::Track(_));
     let (shape, size) = if music {
@@ -305,9 +317,13 @@ pub fn poster_card(item: &Item, cards: &Cards) -> gtk::Widget {
     }
 
     let caption = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    caption.append(&caption_label(&facts.title, &["heading"]));
-    if let Some(detail) = &facts.detail {
-        caption.append(&caption_label(detail, &["dim-label", "caption"]));
+    if detail {
+        caption.append(&caption_label(&facts.title, &["heading"]));
+        if let Some(detail) = &facts.detail {
+            caption.append(&caption_label(detail, &["dim-label", "caption"]));
+        }
+    } else {
+        caption.append(&caption_label(&facts.title, &["card-caption"]));
     }
     let card = card(item, &tile, &caption, size.0, &cards.open);
     if music && let Some(enqueue) = &cards.enqueue {
@@ -434,6 +450,9 @@ pub fn show_of(episode: &Episode) -> Item {
         year: None,
         summary: None,
         artwork: Vec::new(),
+        content_rating: None,
+        genres: Vec::new(),
+        season_count: None,
     })
 }
 
@@ -493,6 +512,7 @@ pub fn album_of(track: &Track) -> Item {
         title: String::new(),
         year: None,
         artwork: Vec::new(),
+        track_count: None,
     })
 }
 
@@ -759,6 +779,30 @@ fn joined(parts: &[Option<String>]) -> String {
         .join(" · ")
 }
 
+/// A page under `header`, with `above` (a banner, a heading, tabs) between
+/// the two. Only the header is a top bar: libadwaita shrinks a header that
+/// shares the top bar and pads it by 3 px, which this sheet's own header
+/// colour shows as a dark band above it.
+pub fn toolbar(
+    header: &adw::HeaderBar,
+    above: &[&gtk::Widget],
+    content: &impl IsA<gtk::Widget>,
+) -> adw::ToolbarView {
+    let view = adw::ToolbarView::new();
+    view.add_top_bar(header);
+    if above.is_empty() {
+        view.set_content(Some(content));
+    } else {
+        let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        for widget in above {
+            column.append(*widget);
+        }
+        column.append(content);
+        view.set_content(Some(&column));
+    }
+    view
+}
+
 #[cfg(test)]
 mod tests {
     use spoolframe_types::{Episode, MediaId, MediaKind, Namespace, PlaybackState};
@@ -782,6 +826,7 @@ mod tests {
             duration: None,
             artwork: Vec::new(),
             playback: PlaybackState::default(),
+            content_rating: None,
         })
     }
 
@@ -804,5 +849,37 @@ mod tests {
             Facts::of(&item).detail.as_deref(),
             Some("12 Monkeys · S1 · E4")
         );
+    }
+
+    /// A banner and a heading over the page leave the header its full
+    /// height at the top edge, with no band above it.
+    #[test]
+    #[ignore = "needs a display; run on its own"]
+    fn a_header_with_bars_under_it_keeps_the_top_edge() {
+        gtk::init().unwrap();
+        adw::init().unwrap();
+        let header = adw::HeaderBar::new();
+        let banner = adw::Banner::new("Reconnecting");
+        banner.set_revealed(true);
+        let heading = gtk::Label::new(Some("Music"));
+        let view = toolbar(
+            &header,
+            &[banner.upcast_ref(), heading.upcast_ref()],
+            &gtk::ScrolledWindow::new(),
+        );
+        let window = gtk::Window::builder()
+            .child(&view)
+            .default_width(800)
+            .default_height(600)
+            .build();
+        window.present();
+        let context = gtk::glib::MainContext::default();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while std::time::Instant::now() < until {
+            context.iteration(false);
+        }
+        let bounds = header.compute_bounds(&view).unwrap();
+        window.close();
+        assert_eq!(bounds.y(), 0.0);
     }
 }

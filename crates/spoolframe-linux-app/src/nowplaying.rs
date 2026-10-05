@@ -151,7 +151,7 @@ pub fn page(playback: &Rc<Playback>, actions: Actions, cards: &Cards) -> adw::Na
             open(item);
         })
     };
-    let queue = Queue::new(playback, go_to);
+    let queue = Queue::new(playback, go_to, cards.art.clone());
     let body = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     body.append(&current);
     body.append(&queue.aside);
@@ -392,6 +392,11 @@ impl Transport {
         next.connect_clicked(move |_| run());
         let row = gtk::Box::builder()
             .spacing(if large { 18 } else { 10 })
+            .css_classes(if large {
+                vec!["transport", "large-transport"]
+            } else {
+                vec!["transport"]
+            })
             .build();
         for widget in [
             shuffle.upcast_ref::<gtk::Widget>(),
@@ -452,7 +457,10 @@ enum Row {
 /// queue, a context one jumps the album there and keeps the queue.
 struct Queue {
     aside: gtk::Box,
-    clear: gtk::Button,
+    /// "Playing from Low Tide", under Up next.
+    from: gtk::Label,
+    /// Draws the album covers on the rows.
+    art: Option<Rc<crate::artwork::Art>>,
     list: gtk::ListBox,
     rows: Rc<RefCell<Vec<Row>>>,
     playback: std::rc::Weak<Playback>,
@@ -461,35 +469,32 @@ struct Queue {
 }
 
 impl Queue {
-    fn new(playback: &Rc<Playback>, go_to: crate::views::Open) -> Self {
+    fn new(
+        playback: &Rc<Playback>,
+        go_to: crate::views::Open,
+        art: Option<Rc<crate::artwork::Art>>,
+    ) -> Self {
         let heading = gtk::Label::builder()
             .label("Up next")
             .xalign(0.0)
             .hexpand(true)
             .css_classes(["title-3"])
             .build();
-        let clear = gtk::Button::builder()
-            .label("Clear queue")
-            .valign(gtk::Align::Center)
-            .css_classes(["flat", "caption"])
+        let from = gtk::Label::builder()
+            .xalign(0.0)
+            .visible(false)
+            .css_classes(["dim-label", "caption"])
             .build();
-        {
-            let weak = Rc::downgrade(playback);
-            clear.connect_clicked(move |_| {
-                if let Some(playback) = weak.upgrade() {
-                    playback.clear_queue();
-                }
-            });
-        }
         let titles = gtk::Box::builder()
-            .spacing(8)
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(2)
             .margin_top(18)
-            .margin_bottom(10)
+            .margin_bottom(6)
             .margin_start(20)
             .margin_end(20)
             .build();
         titles.append(&heading);
-        titles.append(&clear);
+        titles.append(&from);
         let list = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::None)
             .activate_on_single_click(true)
@@ -524,7 +529,8 @@ impl Queue {
         aside.append(&scroller);
         Self {
             aside,
-            clear,
+            from,
+            art,
             list,
             rows,
             playback: Rc::downgrade(playback),
@@ -540,13 +546,18 @@ impl Queue {
         }
         let mut rows = Vec::new();
         let up_next = playback.up_next();
-        self.clear.set_visible(!up_next.queued.is_empty());
+        let album = playback.album();
+        if let Some(album) = &album {
+            self.from
+                .set_label(&format!("Playing from {}", album.title));
+        }
+        self.from.set_visible(album.is_some());
 
         if let Some(item) = playback.current() {
-            self.heading("Now playing", &mut rows);
-            let artist = artist_of(playback.album().as_ref());
+            self.heading("Now playing", false, &mut rows);
+            let artist = artist_of(album.as_ref());
             let row = self.append(
-                &queue_row(&number("▶"), &item, &artist, None),
+                &queue_row(&self.thumb(album.as_ref()), &item, &artist, None),
                 Row::Inert,
                 &mut rows,
             );
@@ -554,7 +565,7 @@ impl Queue {
         }
 
         if !up_next.queued.is_empty() {
-            self.heading("Next in queue", &mut rows);
+            self.heading("Next in queue", true, &mut rows);
             for (index, queued) in up_next.queued.iter().enumerate() {
                 let artist = artist_of(queued.album.as_ref());
                 let handle = gtk::Image::builder()
@@ -562,7 +573,12 @@ impl Queue {
                     .tooltip_text("Drag to reorder")
                     .css_classes(["dim-label"])
                     .build();
-                let content = queue_row(&handle, &queued.item, &artist, None);
+                let content = queue_row(
+                    &self.thumb(queued.album.as_ref()),
+                    &queued.item,
+                    &artist,
+                    Some(handle.upcast_ref()),
+                );
                 let row = self.append(&content, Row::Queued(queued.id), &mut rows);
                 self.reorderable(&row, queued.id, index);
                 // Right-click: play it now, or take it out of the queue.
@@ -590,10 +606,10 @@ impl Queue {
                 Some(album) => format!("Next from {}", album.title),
                 None => "Next".to_owned(),
             };
-            self.heading(&heading, &mut rows);
+            self.heading(&heading, false, &mut rows);
             let artist = artist_of(up_next.from.as_ref());
-            for (n, (pos, item)) in up_next.context.iter().enumerate() {
-                let content = queue_row(&number(&(n + 1).to_string()), item, &artist, None);
+            for (pos, item) in up_next.context.iter() {
+                let content = queue_row(&self.thumb(up_next.from.as_ref()), item, &artist, None);
                 let row = self.append(&content, Row::Context(*pos), &mut rows);
                 // Right-click: play it now, or queue it next.
                 let mut groups = Vec::new();
@@ -633,15 +649,55 @@ impl Queue {
         })
     }
 
-    fn heading(&self, text: &str, rows: &mut Vec<Row>) {
+    /// A section's heading; the queue's carries Clear, as designed.
+    fn heading(&self, text: &str, clear: bool, rows: &mut Vec<Row>) {
         let label = gtk::Label::builder()
             .label(text.to_uppercase())
             .xalign(0.0)
-            .margin_top(10)
+            .hexpand(true)
             .css_classes(["queue-heading", "dim-label"])
             .build();
-        let row = self.append(&label, Row::Inert, rows);
+        let line = gtk::Box::builder().spacing(8).margin_top(10).build();
+        line.append(&label);
+        if clear {
+            let button = gtk::Button::builder()
+                .child(
+                    &adw::ButtonContent::builder()
+                        .icon_name(crate::icons::CLEAR_RECENT)
+                        .label("Clear")
+                        .build(),
+                )
+                .valign(gtk::Align::Center)
+                .css_classes(["queue-clear"])
+                .build();
+            let weak = self.playback.clone();
+            button.connect_clicked(move |_| {
+                if let Some(playback) = weak.upgrade() {
+                    playback.clear_queue();
+                }
+            });
+            line.append(&button);
+        }
+        let row = self.append(&line, Row::Inert, rows);
         row.set_activatable(false);
+    }
+
+    /// A row's album cover, 40 px, in place of a number.
+    fn thumb(&self, album: Option<&spoolframe_types::Album>) -> gtk::Widget {
+        let Some(album) = album else {
+            return number("").upcast();
+        };
+        let tile = crate::views::tile(&album.id, "", "queue-thumb", (40, 40));
+        if let Some(art) = &self.art {
+            art.show(
+                &tile,
+                &album.artwork,
+                &[ArtworkKind::Poster, ArtworkKind::Thumb],
+                ArtworkSize::Small,
+            );
+        }
+        tile.set_valign(gtk::Align::Center);
+        tile.upcast()
     }
 
     fn append(
@@ -708,7 +764,7 @@ fn queue_row(
     mark: &impl IsA<gtk::Widget>,
     item: &Item,
     artist: &str,
-    end: Option<&gtk::Button>,
+    end: Option<&gtk::Widget>,
 ) -> gtk::Box {
     let facts = crate::views::Facts::of(item);
     let title = gtk::Label::builder()

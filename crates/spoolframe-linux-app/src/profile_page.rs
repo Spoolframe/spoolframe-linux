@@ -164,7 +164,7 @@ fn now() -> i64 {
 }
 
 /// The page, for `session`, showing toasts on `dialog`.
-pub fn page(signed: Signed, dialog: &adw::PreferencesDialog) -> adw::PreferencesPage {
+pub fn page(signed: Signed, dialog: &adw::ToastOverlay) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::builder()
         .title("Profile")
         .icon_name(crate::icons::PROFILE)
@@ -302,7 +302,8 @@ struct View {
     server_key: String,
     server_name: String,
     display_name: String,
-    dialog: glib::WeakRef<adw::PreferencesDialog>,
+    /// Preferences' toasts, and the parent its own dialogs show over.
+    dialog: glib::WeakRef<adw::ToastOverlay>,
     devices: adw::PreferencesGroup,
     rows: std::cell::RefCell<Vec<adw::SwitchRow>>,
     pin_row: adw::ActionRow,

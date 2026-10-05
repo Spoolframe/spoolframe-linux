@@ -49,7 +49,6 @@ pub const MUSIC: &str = "lucide-music-symbolic";
 pub const WATCHED: &str = "lucide-eye-symbolic";
 pub const CHECK: &str = "lucide-check-symbolic";
 pub const ADD: &str = "lucide-plus-symbolic";
-pub const MENU: &str = "lucide-menu-symbolic";
 pub const RIGHT: &str = "lucide-chevron-right-symbolic";
 pub const SERVER: &str = "lucide-server-symbolic";
 pub const ERROR: &str = "lucide-circle-alert-symbolic";
@@ -69,6 +68,7 @@ pub const DELETE: &str = "lucide-delete-symbolic";
 pub const BROWSER: &str = "lucide-globe-symbolic";
 pub const PHONE: &str = "lucide-smartphone-symbolic";
 pub const EXPIRED: &str = "lucide-clock-symbolic";
+pub const WARNING: &str = "lucide-triangle-alert-symbolic";
 pub const SET_UP: &str = "lucide-settings-symbolic";
 // Preferences' pages.
 pub const PLAYBACK_PAGE: &str = "lucide-monitor-play-symbolic";
@@ -118,7 +118,6 @@ const ALL: &[&str] = &[
     WATCHED,
     CHECK,
     ADD,
-    MENU,
     RIGHT,
     SERVER,
     ERROR,
@@ -135,6 +134,7 @@ const ALL: &[&str] = &[
     BROWSER,
     PHONE,
     EXPIRED,
+    WARNING,
     SET_UP,
     PLAYBACK_PAGE,
     PROFILE,

@@ -120,6 +120,9 @@ pub fn playable(
         for fact in &meta {
             row.append(&label(fact, &[]));
         }
+        if let Some(rating) = content_rating(item) {
+            row.append(&rating_badge(rating));
+        }
         info.append(&row);
     }
     if let Some(summary) = summary {
@@ -306,6 +309,17 @@ impl TrackPickers {
             picker(&row, "Subtitles", &names, selected)
         });
 
+        // A movie says what its file is, beside the pickers, as designed.
+        if !series && let Some(file) = format::file(tracks.container, tracks.video.as_ref()) {
+            let column = gtk::Box::new(gtk::Orientation::Vertical, 6);
+            column.append(&label("FILE", &["picker-label"]));
+            let text = label(&file, &["file-box"]);
+            text.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            text.set_max_width_chars(1);
+            text.set_tooltip_text(Some(&file));
+            column.append(&text);
+            row.append(&column);
+        }
         let column = gtk::Box::new(gtk::Orientation::Vertical, 8);
         column.append(&row);
         if let Some(chosen) = chosen {
@@ -539,7 +553,7 @@ pub struct ShowActions {
 
 /// The episode to watch next: the first one part-way through, else the
 /// first not watched.
-fn up_next(seasons: &[(Season, Vec<Item>)]) -> Option<&Item> {
+pub(crate) fn up_next(seasons: &[(Season, Vec<Item>)]) -> Option<&Item> {
     let episodes = || seasons.iter().flat_map(|(_, e)| e.iter());
     let watched = |item: &Item| matches!(item, Item::Episode(e) if e.playback.watched);
     episodes()
@@ -548,7 +562,7 @@ fn up_next(seasons: &[(Season, Vec<Item>)]) -> Option<&Item> {
 }
 
 /// "S2 · E4".
-fn episode_code(item: &Item) -> String {
+pub(crate) fn episode_code(item: &Item) -> String {
     match item {
         Item::Episode(e) => format!("S{} · E{}", e.season, e.episode),
         _ => String::new(),
@@ -613,13 +627,14 @@ pub fn show(
         meta.append(&label(&year.to_string(), &[]));
     }
     let real_seasons = seasons.iter().filter(|(s, _)| s.season > 0).count();
-    meta.append(&label(
-        &match real_seasons {
-            1 => "1 season".to_owned(),
-            n => format!("{n} seasons"),
-        },
-        &[],
-    ));
+    meta.append(&label(&format::seasons(real_seasons as u32), &[]));
+    if !show.genres.is_empty() {
+        let genres: Vec<&str> = show.genres.iter().take(2).map(String::as_str).collect();
+        meta.append(&label(&genres.join(", "), &[]));
+    }
+    if let Some(rating) = &show.content_rating {
+        meta.append(&rating_badge(rating));
+    }
     facts.append(&meta);
     if let Some(summary) = &show.summary {
         let text = label(summary, &["item-summary"]);
@@ -912,19 +927,10 @@ fn episode_list(
     list
 }
 
-/// An artist: their albums as a grid, and a "⋯" to queue them all.
+/// An artist: their albums as a grid.
 pub fn artist(artist: &Artist, albums: &[Item], cards: &Cards) -> gtk::Widget {
     let body = content();
-    let heading = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    heading.append(&label(&artist.name, &["title-1"]));
-    if let Some(enqueue) = &cards.enqueue {
-        let (item, enqueue) = (Item::Artist(artist.clone()), enqueue.clone());
-        let popover = views::menu_popover(vec![views::enqueue_entries(move |at| {
-            enqueue(item.clone(), at)
-        })]);
-        heading.append(&views::menu_button(&popover, "More"));
-    }
-    body.append(&heading);
+    body.append(&label(&artist.name, &["title-1"]));
     body.append(&views::grid(
         "Albums",
         albums.iter().map(|a| views::poster_card(a, cards)),
@@ -941,6 +947,7 @@ pub fn album(
     tracks: &[Item],
     play: PlayTracks,
     enqueue: EnqueueTracks,
+    playing: tokio::sync::watch::Receiver<Option<MediaId>>,
     cards: &Cards,
 ) -> gtk::Widget {
     let body = gtk::Box::builder()
@@ -985,10 +992,20 @@ pub fn album(
             _ => None,
         })
         .sum();
+    // The album's own count: the tracks listed can be fewer.
+    let count = album.track_count.unwrap_or(tracks.len() as u32);
+    let sound = tracks.iter().find_map(|t| match t {
+        Item::Track(t) => format::audio_format(t.codec, t.bit_depth, t.sample_rate),
+        _ => None,
+    });
     let meta: Vec<String> = [
         album.year.map(|y| y.to_string()),
-        Some(format!("{} tracks", tracks.len())),
+        Some(match count {
+            1 => "1 track".to_owned(),
+            n => format!("{n} tracks"),
+        }),
         Some(format::length(length)),
+        sound,
     ]
     .into_iter()
     .flatten()
@@ -1049,16 +1066,8 @@ pub fn album(
     }
     buttons.append(&play_all);
     buttons.append(&shuffle);
-    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     buttons.set_hexpand(true);
-    actions.append(&buttons);
-    {
-        let (enqueue, tracks) = (enqueue.clone(), tracks.to_vec());
-        let popover = views::menu_popover(vec![views::enqueue_entries(move |at| {
-            enqueue(tracks.clone(), at)
-        })]);
-        actions.append(&views::menu_button(&popover, "More"));
-    }
+    let actions = buttons;
     side.append(&actions);
     body.append(&side);
 
@@ -1068,6 +1077,8 @@ pub fn album(
         .valign(gtk::Align::Start)
         .css_classes(["track-list"])
         .build();
+    // Each track's row and number, to mark the one playing.
+    let mut marked: Vec<(MediaId, adw::ActionRow, gtk::Label, String)> = Vec::new();
     for (index, track) in tracks.iter().enumerate() {
         let Item::Track(t) = track else { continue };
         let row = adw::ActionRow::builder()
@@ -1075,11 +1086,11 @@ pub fn album(
             .activatable(true)
             .build();
         row.set_title(&t.title);
-        if let Some(number) = t.track {
-            let number = label(&number.to_string(), &["dim-label", "numeric", "small-text"]);
-            number.set_width_chars(2);
-            row.add_prefix(&number);
-        }
+        let shown = t.track.map(|n| n.to_string()).unwrap_or_default();
+        let number = label(&shown, &["dim-label", "numeric", "small-text"]);
+        number.set_width_chars(2);
+        row.add_prefix(&number);
+        marked.push((t.id.clone(), row.clone(), number, shown));
         if let Some(length) = t.duration {
             row.add_suffix(&label(
                 &format::timestamp(length),
@@ -1100,6 +1111,30 @@ pub fn album(
         row.connect_activated(move |_| play(tracks.clone(), index, false));
         list.append(&row);
     }
+    // The track playing is on the surface, its title in the accent and ▶
+    // for its number, as it changes, for as long as the page is open.
+    let weak = list.downgrade();
+    let mut playing = playing;
+    gtk::glib::spawn_future_local(async move {
+        loop {
+            if weak.upgrade().is_none() {
+                break;
+            }
+            let now = playing.borrow_and_update().clone();
+            for (id, row, number, shown) in &marked {
+                if now.as_ref() == Some(id) {
+                    row.add_css_class("playing");
+                    number.set_label("▶");
+                } else {
+                    row.remove_css_class("playing");
+                    number.set_label(shown);
+                }
+            }
+            if playing.changed().await.is_err() {
+                break;
+            }
+        }
+    });
     body.append(&list);
     body.upcast()
 }
@@ -1113,6 +1148,22 @@ fn content() -> gtk::Box {
         .margin_start(48)
         .margin_end(48)
         .build()
+}
+
+/// A movie's or an episode's rating, "R", "TV-MA".
+fn content_rating(item: &Item) -> Option<&str> {
+    match item {
+        Item::Movie(m) => m.content_rating.as_deref(),
+        Item::Episode(e) => e.content_rating.as_deref(),
+        _ => None,
+    }
+}
+
+/// A rating in a thin box, as the boards draw it.
+fn rating_badge(rating: &str) -> gtk::Label {
+    let badge = label(rating, &["rating-badge"]);
+    badge.set_valign(gtk::Align::Center);
+    badge
 }
 
 fn label(text: &str, classes: &[&str]) -> gtk::Label {
@@ -1160,6 +1211,7 @@ mod tests {
                 position: position.map(Duration::from_secs),
                 watched,
             },
+            content_rating: None,
         })
     }
 

@@ -102,6 +102,10 @@ mod tests {
             disc: None,
             duration: None,
             playback: PlaybackState::default(),
+            codec: None,
+            bit_depth: None,
+            sample_rate: None,
+            album_track_count: None,
         })
     }
 
@@ -111,6 +115,7 @@ mod tests {
             username: username.into(),
             display_name: username.into(),
             locked: false,
+            sign_in: Default::default(),
         }
     }
 

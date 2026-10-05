@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use spoolframe_client_sdk as sdk;
 use spoolframe_linux_core::backend::{
-    Client, ConnectionState, SearchRequest, SearchScope, ServerKey,
+    Client, ConnectionState, SearchRequest, SearchScope, ServerKey, TopResult,
 };
 use spoolframe_linux_core::reader::{MediaReader, Spawn};
 use spoolframe_linux_core::sdk::SdkClient;
@@ -218,7 +218,10 @@ fn the_app_backend_works_against_a_live_server() {
     let found = run(&runtime, session.search(&request)).unwrap();
     eprintln!(
         "search: top {:?}, {} groups",
-        found.top.as_ref().map(title),
+        found.top.as_ref().map(|top| match top {
+            TopResult::Item(item) => title(item),
+            TopResult::Person(person) => person.name.clone(),
+        }),
         found.groups.len()
     );
 

@@ -181,9 +181,220 @@ pub fn progress(length: Duration, position: Duration) -> f64 {
     (position.as_secs_f64() / length.as_secs_f64()).clamp(0.0, 1.0)
 }
 
+/// A file as stored, "MKV · HEVC 2160p HDR10", from the server's probe;
+/// `None` when it probed nothing. The picture's class goes by its width,
+/// so a 2.40:1 4K film (3840 by 1600) is 2160p.
+pub fn file(
+    container: Option<spoolframe_types::Container>,
+    video: Option<&spoolframe_types::VideoTrack>,
+) -> Option<String> {
+    use spoolframe_types::{Container, HdrFormat, VideoCodec};
+    let container = container.and_then(|c| match c {
+        Container::Matroska => Some("MKV"),
+        Container::Mp4 => Some("MP4"),
+        Container::MpegTs => Some("TS"),
+        Container::Avi => Some("AVI"),
+        Container::Flac => Some("FLAC"),
+        Container::Mp3 => Some("MP3"),
+        Container::Ogg => Some("OGG"),
+        Container::Unknown => None,
+    });
+    let picture = video.map(|v| {
+        let codec = match v.codec {
+            VideoCodec::H264 => "H.264",
+            VideoCodec::Hevc => "HEVC",
+            VideoCodec::Av1 => "AV1",
+            VideoCodec::Vp9 => "VP9",
+            VideoCodec::Vp8 => "VP8",
+            VideoCodec::Mpeg2 => "MPEG-2",
+            VideoCodec::Mpeg4 => "MPEG-4",
+            VideoCodec::Vc1 => "VC-1",
+            VideoCodec::Unknown => "",
+        };
+        let class = match v.width {
+            w if w >= 3200 => "2160p".to_owned(),
+            w if w >= 1800 => "1080p".to_owned(),
+            w if w >= 1200 => "720p".to_owned(),
+            _ => format!("{}p", v.height),
+        };
+        let hdr = v.hdr.map(|h| match h {
+            HdrFormat::Hdr10 => "HDR10",
+            HdrFormat::Hlg => "HLG",
+            HdrFormat::DolbyVision => "Dolby Vision",
+            HdrFormat::Unknown => "HDR",
+        });
+        [Some(codec), Some(class.as_str()), hdr]
+            .into_iter()
+            .flatten()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    });
+    let parts: Vec<String> = [container.map(str::to_owned), picture]
+        .into_iter()
+        .flatten()
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+/// Music's sound as an album shows it: "FLAC 24/96" for lossless with
+/// its depth and rate, the codec alone otherwise ("AAC").
+pub fn audio_format(
+    codec: Option<spoolframe_types::AudioCodec>,
+    bit_depth: Option<u32>,
+    sample_rate: Option<u32>,
+) -> Option<String> {
+    use spoolframe_types::AudioCodec;
+    let name = match codec? {
+        AudioCodec::Aac => "AAC",
+        AudioCodec::Ac3 => "AC-3",
+        AudioCodec::Eac3 => "E-AC-3",
+        AudioCodec::Dts => "DTS",
+        AudioCodec::TrueHd => "TrueHD",
+        AudioCodec::Flac => "FLAC",
+        AudioCodec::Alac => "ALAC",
+        AudioCodec::Opus => "Opus",
+        AudioCodec::Vorbis => "Vorbis",
+        AudioCodec::Mp3 => "MP3",
+        AudioCodec::Pcm => "PCM",
+        AudioCodec::Unknown => return None,
+    };
+    let lossless = matches!(
+        codec?,
+        AudioCodec::Flac | AudioCodec::Alac | AudioCodec::Pcm
+    );
+    Some(match (lossless, bit_depth, sample_rate) {
+        (true, Some(depth), Some(rate)) => {
+            let khz = rate as f64 / 1000.0;
+            let khz = if rate % 1000 == 0 {
+                format!("{}", rate / 1000)
+            } else {
+                format!("{khz:.1}")
+            };
+            format!("{name} {depth}/{khz}")
+        }
+        _ => name.to_owned(),
+    })
+}
+
+/// "1 season", "2 seasons".
+pub fn seasons(n: u32) -> String {
+    match n {
+        1 => "1 season".to_owned(),
+        n => format!("{n} seasons"),
+    }
+}
+
+/// How the device reaches a server, as the chip beside its name says it:
+/// "Direct · LAN", "Direct · internet", "Relay"; `None` while it is not
+/// connected.
+pub fn path_chip(path: crate::backend::ConnectionPath) -> Option<&'static str> {
+    use crate::backend::ConnectionPath;
+    match path {
+        ConnectionPath::Lan(_) => Some("Direct · LAN"),
+        ConnectionPath::Direct(_) => Some("Direct · internet"),
+        ConnectionPath::Relay => Some("Relay"),
+        ConnectionPath::Unknown => None,
+    }
+}
+
+/// How the device reaches the server, for diagnostics: "LAN ·
+/// 192.168.1.20:7431", "direct · 203.0.113.9:7431", "relay".
+pub fn connection_path(path: crate::backend::ConnectionPath) -> String {
+    use crate::backend::ConnectionPath;
+    match path {
+        ConnectionPath::Lan(addr) => format!("LAN · {addr}"),
+        ConnectionPath::Direct(addr) => format!("direct · {addr}"),
+        ConnectionPath::Relay => "relay".to_owned(),
+        ConnectionPath::Unknown => "—".to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_public_path_is_not_called_lan() {
+        use crate::backend::ConnectionPath;
+        assert_eq!(
+            path_chip(ConnectionPath::Direct(([203, 0, 113, 9], 7431).into())),
+            Some("Direct · internet")
+        );
+    }
+
+    #[test]
+    fn a_local_path_says_lan_and_where() {
+        use crate::backend::ConnectionPath;
+        assert_eq!(
+            connection_path(ConnectionPath::Lan(([10, 10, 0, 6], 7431).into())),
+            "LAN · 10.10.0.6:7431"
+        );
+    }
+
+    fn picture(
+        width: u32,
+        height: u32,
+        hdr: Option<spoolframe_types::HdrFormat>,
+    ) -> spoolframe_types::VideoTrack {
+        spoolframe_types::VideoTrack {
+            codec: spoolframe_types::VideoCodec::Hevc,
+            width,
+            height,
+            bit_depth: 10,
+            hdr,
+        }
+    }
+
+    #[test]
+    fn a_4k_hdr_file_reads_as_the_board_shows_it() {
+        assert_eq!(
+            file(
+                Some(spoolframe_types::Container::Matroska),
+                Some(&picture(
+                    3840,
+                    2160,
+                    Some(spoolframe_types::HdrFormat::Hdr10)
+                ))
+            )
+            .as_deref(),
+            Some("MKV · HEVC 2160p HDR10")
+        );
+    }
+
+    #[test]
+    fn a_wide_film_is_classed_by_its_width() {
+        assert_eq!(
+            file(None, Some(&picture(3840, 1600, None))).as_deref(),
+            Some("HEVC 2160p")
+        );
+    }
+
+    #[test]
+    fn nothing_probed_is_no_file_line() {
+        assert_eq!(file(None, None), None);
+    }
+
+    #[test]
+    fn lossless_music_shows_depth_and_rate() {
+        use spoolframe_types::AudioCodec;
+        assert_eq!(
+            (
+                audio_format(Some(AudioCodec::Flac), Some(24), Some(96_000)),
+                audio_format(Some(AudioCodec::Flac), Some(16), Some(44_100)),
+            ),
+            (Some("FLAC 24/96".into()), Some("FLAC 16/44.1".into()))
+        );
+    }
+
+    #[test]
+    fn lossy_music_shows_the_codec_alone() {
+        use spoolframe_types::AudioCodec;
+        assert_eq!(
+            audio_format(Some(AudioCodec::Aac), Some(16), Some(44_100)).as_deref(),
+            Some("AAC")
+        );
+    }
 
     fn mins(m: u64) -> Duration {
         Duration::from_secs(m * 60)

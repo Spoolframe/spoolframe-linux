@@ -664,6 +664,10 @@ mod tests {
             disc: None,
             duration: Some(Duration::from_secs(330)),
             playback: PlaybackState::default(),
+            codec: None,
+            bit_depth: None,
+            sample_rate: None,
+            album_track_count: None,
         });
         let album = Album {
             id: id(MediaKind::Album, "5"),
@@ -672,6 +676,7 @@ mod tests {
             title: "Mezzanine".into(),
             year: Some(1998),
             artwork: Vec::new(),
+            track_count: None,
         };
         (track, album)
     }
@@ -689,6 +694,7 @@ mod tests {
             duration: Some(Duration::from_secs(2900)),
             artwork: Vec::new(),
             playback: PlaybackState::default(),
+            content_rating: None,
         })
     }
 
@@ -701,6 +707,7 @@ mod tests {
             duration: Some(Duration::from_secs(7020)),
             artwork: Vec::new(),
             playback: PlaybackState::default(),
+            content_rating: None,
         })
     }
 

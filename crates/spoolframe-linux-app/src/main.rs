@@ -23,6 +23,7 @@ mod scrub;
 mod search;
 mod settings;
 mod source;
+mod srt_markup;
 mod start;
 mod theme;
 mod tracks;

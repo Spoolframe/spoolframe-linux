@@ -180,6 +180,12 @@ pub fn page(playback: &Rc<Playback>, actions: Actions) -> adw::NavigationPage {
             if view.diagnostics.panel.is_visible() {
                 view.diagnostics.show_subtitles(&playback);
                 view.diagnostics.show_video(playback.video_sink());
+                view.diagnostics
+                    .show_range(playback.video_sink(), playback.plan().as_ref());
+                view.diagnostics.set(
+                    "connection",
+                    &format::connection_path(playback.session().connection_path()),
+                );
             }
             glib::ControlFlow::Continue
         });
@@ -513,7 +519,7 @@ impl TopBar {
             .icon_name(crate::icons::BACK)
             .tooltip_text("Back (Esc) · keeps playing in the bar")
             .valign(gtk::Align::Center)
-            .css_classes(["circular", "flat"])
+            .css_classes(["circular", "flat", "player-back"])
             .build();
         back.connect_clicked(|button| {
             button.activate_action("navigation.pop", None).ok();
@@ -854,11 +860,13 @@ struct Diagnostics {
 }
 
 impl Diagnostics {
-    const ROWS: [&'static str; 12] = [
+    const ROWS: [&'static str; 14] = [
+        "connection",
         "path",
         "conversion",
         "why",
         "video",
+        "range",
         "decoder",
         "audio",
         "subtitles",
@@ -992,6 +1000,30 @@ impl Diagnostics {
         );
     }
 
+    /// Whether the picture is HDR as decoded, and whether anyone mapped it
+    /// to SDR: the server, or nobody (the client has no tone mapping).
+    fn show_range(&self, video: &VideoSink, plan: Option<&PlaybackPlan>) {
+        let colorimetry = video
+            .outer
+            .static_pad("sink")
+            .and_then(|pad| pad.current_caps())
+            .and_then(|caps| {
+                caps.structure(0)
+                    .and_then(|s| s.get::<String>("colorimetry").ok())
+            });
+        let tone_mapped = matches!(
+            plan,
+            Some(PlaybackPlan::Converted {
+                video: Some(ConvertedVideo::Encode { tone_map: true, .. }),
+                ..
+            })
+        );
+        self.set(
+            "range",
+            &dynamic_range(colorimetry.as_deref().and_then(hdr_of), tone_mapped),
+        );
+    }
+
     /// How the server plays the item (P2-06): directly, or what it copies
     /// and encodes, and why.
     fn show_plan(&self, plan: Option<&PlaybackPlan>) {
@@ -1068,6 +1100,42 @@ impl Diagnostics {
         if !decoders.is_empty() {
             self.set("decoder", &decoders.join(", "));
         }
+    }
+}
+
+/// An HDR transfer as decoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hdr {
+    Pq,
+    Hlg,
+}
+
+/// The HDR transfer in a caps colorimetry: GStreamer's name for the
+/// whole set ("bt2100-pq"), or "range:matrix:transfer:primaries" where
+/// it has none, the transfer 14 for SMPTE 2084 (PQ) and 15 for ARIB
+/// STD-B67 (HLG).
+fn hdr_of(colorimetry: &str) -> Option<Hdr> {
+    match colorimetry {
+        "bt2100-pq" => return Some(Hdr::Pq),
+        "bt2100-hlg" => return Some(Hdr::Hlg),
+        _ => {}
+    }
+    match colorimetry.split(':').nth(2)?.parse::<u32>().ok()? {
+        14 => Some(Hdr::Pq),
+        15 => Some(Hdr::Hlg),
+        _ => None,
+    }
+}
+
+/// The range row. Nothing here maps HDR to SDR, and the window is drawn
+/// as SDR, so an HDR picture the server sent as it is shows washed out:
+/// the row says so.
+fn dynamic_range(hdr: Option<Hdr>, tone_mapped: bool) -> String {
+    match (hdr, tone_mapped) {
+        (_, true) => "SDR · tone-mapped from HDR by the server".to_owned(),
+        (Some(Hdr::Pq), false) => "HDR10 (PQ) · shown as SDR, not tone-mapped".to_owned(),
+        (Some(Hdr::Hlg), false) => "HLG · shown as SDR, not tone-mapped".to_owned(),
+        (None, false) => "SDR".to_owned(),
     }
 }
 
@@ -1246,6 +1314,34 @@ pub fn mono(text: &str) -> gtk::Label {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pq_is_found_by_name_or_by_its_transfer() {
+        assert_eq!(
+            (
+                super::hdr_of("bt2100-pq"),
+                super::hdr_of("2:9:14:9"),
+                super::hdr_of("bt709"),
+            ),
+            (Some(super::Hdr::Pq), Some(super::Hdr::Pq), None)
+        );
+    }
+
+    #[test]
+    fn an_hdr_picture_nobody_mapped_says_so() {
+        assert_eq!(
+            super::dynamic_range(Some(super::Hdr::Pq), false),
+            "HDR10 (PQ) · shown as SDR, not tone-mapped"
+        );
+    }
+
+    #[test]
+    fn the_servers_tone_mapping_is_named() {
+        assert_eq!(
+            super::dynamic_range(None, true),
+            "SDR · tone-mapped from HDR by the server"
+        );
+    }
+
     use spoolframe_protocol::{ConvertedSubtitle, PlannedAudio};
     use spoolframe_types::{AudioCodec, Container, Delivery, SubtitleFormat, VideoCodec};
 

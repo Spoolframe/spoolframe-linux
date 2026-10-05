@@ -19,18 +19,19 @@ use spoolframe_protocol::{
 use spoolframe_types::language::same_language;
 use spoolframe_types::{
     Album, Artist, ArtworkId, AudioCodec, AudioRole, AudioTrack, Container, Delivery, Episode,
-    Item, Library, LibraryId, LibraryKind, MediaId, MediaKind, MediaTracks, Movie, Namespace,
-    PlaybackState, SdhPreference, Season, Show, SubtitleFormat, SubtitleMode, SubtitleRole,
-    SubtitleTrack, Track, TrackPreferences, VideoCodec,
+    HdrFormat, Item, Library, LibraryId, LibraryKind, MediaId, MediaKind, MediaTracks, Movie,
+    Namespace, PlaybackState, SdhPreference, Season, Show, SubtitleFormat, SubtitleMode,
+    SubtitleRole, SubtitleTrack, Track, TrackPreferences, VideoCodec, VideoTrack,
 };
 use tokio::sync::watch;
 
 use crate::backend::{
-    ArtworkSize, BackendError, BoxFuture, ChosenTracks, Chunk, Client, ConnectionState, DeviceInfo,
-    DeviceSignIn, DeviceSignInRequest, HomeScreen, MAX_READ, Marker, Person, PersonId, PersonRole,
-    PinProof, PinState, Platform, PlaybackHandle, PlaybackPlan, PlaybackStart, PlexLink, Previews,
-    Profile, SearchCounts, SearchGroup, SearchKind, SearchRequest, SearchResults, SearchScope,
-    Selection, Server, ServerKey, Session, TrackReason,
+    ArtworkSize, BackendError, BoxFuture, ChosenTracks, Chunk, Client, ConnectionPath,
+    ConnectionState, DeviceInfo, DeviceSignIn, DeviceSignInRequest, HomeScreen, MAX_READ, Marker,
+    Person, PersonId, PersonRole, PinProof, PinState, Platform, PlaybackHandle, PlaybackPlan,
+    PlaybackStart, PlexLink, Previews, Profile, ProfileSignIn, SearchCounts, SearchGroup,
+    SearchKind, SearchRequest, SearchResults, SearchScope, Selection, Server, ServerKey, Session,
+    TopResult, TrackReason,
 };
 
 /// Every fake account's password.
@@ -71,6 +72,7 @@ fn movie(key: &str, title: &str, year: u16, length: u64) -> Item {
         duration: mins(length),
         artwork: Vec::new(),
         playback: PlaybackState::default(),
+        content_rating: Some("PG-13".into()),
     })
 }
 
@@ -175,6 +177,7 @@ impl Catalog {
             title: "Low Tide".into(),
             year: Some(2021),
             artwork: Vec::new(),
+            track_count: Some(9),
         }));
         catalog.children.insert(artist.clone(), vec![album.clone()]);
         let mut tracks = Vec::new();
@@ -203,6 +206,10 @@ impl Catalog {
                 disc: Some(1),
                 duration: Some(Duration::from_secs(secs)),
                 playback: PlaybackState::default(),
+                codec: Some(AudioCodec::Flac),
+                bit_depth: Some(16),
+                sample_rate: Some(44_100),
+                album_track_count: Some(9),
             }));
         }
         catalog.children.insert(album, tracks);
@@ -241,6 +248,9 @@ impl Catalog {
             year: Some(year),
             summary: None,
             artwork: Vec::new(),
+            content_rating: Some("TV-MA".into()),
+            season_count: Some(0),
+            genres: vec!["Drama".into(), "Science Fiction".into()],
         }));
         self.season(&show, title, &(base + 1).to_string(), season, episodes);
         show
@@ -286,9 +296,13 @@ impl Catalog {
                 duration: mins(50),
                 artwork: Vec::new(),
                 playback: PlaybackState::default(),
+                content_rating: Some("TV-MA".into()),
             }));
         }
         self.children.insert(season_id, ids);
+        if let Some(Item::Show(show)) = self.items.get_mut(show) {
+            show.season_count = Some(show.season_count.unwrap_or(0) + 1);
+        }
     }
 
     fn get(&self, id: &MediaId) -> Result<&Item, BackendError> {
@@ -650,11 +664,21 @@ impl FakeSession {
         match item {
             Item::Track(_) => MediaTracks {
                 duration: length_of(item),
+                container: Some(Container::Flac),
+                video: None,
                 audio: vec![audio(None, 2, true, AudioRole::Main)],
                 subtitles: Vec::new(),
             },
             _ => MediaTracks {
                 duration: length_of(item),
+                container: Some(Container::Matroska),
+                video: Some(VideoTrack {
+                    codec: VideoCodec::Hevc,
+                    width: 3840,
+                    height: 2160,
+                    bit_depth: 10,
+                    hdr: Some(HdrFormat::Hdr10),
+                }),
                 audio: vec![
                     audio(None, 6, true, AudioRole::Main),
                     audio(Some("Commentary"), 2, false, AudioRole::Commentary),
@@ -1047,7 +1071,10 @@ impl Session for FakeSession {
             let stated = |items: &[Item]| {
                 self.items_with_state(&items.iter().map(|i| i.id().clone()).collect::<Vec<_>>())
             };
-            results.top = results.top.and_then(|top| stated(&[top]).pop());
+            results.top = match results.top {
+                Some(TopResult::Item(top)) => stated(&[top]).pop().map(TopResult::Item),
+                person => person,
+            };
             for group in &mut results.groups {
                 group.items = stated(&group.items);
             }
@@ -1271,6 +1298,10 @@ impl Session for FakeSession {
         self.serving
             .web
             .then(|| "https://media.example.org".to_owned())
+    }
+
+    fn connection_path(&self) -> ConnectionPath {
+        ConnectionPath::Lan(([192, 168, 1, 20], 7431).into())
     }
 
     fn previews<'a>(&'a self, id: &'a MediaId) -> BoxFuture<'a, Result<Previews, BackendError>> {
@@ -1666,6 +1697,7 @@ impl FakeClient {
             username: username.into(),
             display_name: username.into(),
             locked: false,
+            sign_in: Default::default(),
         }
     }
 
@@ -1677,6 +1709,7 @@ impl FakeClient {
             username: username.into(),
             display_name: display_name.into(),
             locked: false,
+            sign_in: Default::default(),
         };
         FakeClient {
             catalog: Arc::new(Catalog::new()),
@@ -1919,6 +1952,7 @@ impl FakeClient {
             username: (*username).into(),
             display_name: (*display_name).into(),
             locked: false,
+            sign_in: Default::default(),
         };
         let mut signed_in = self.signed_in.lock().expect("fake state is never poisoned");
         if !signed_in.contains(&profile) {
@@ -2064,6 +2098,25 @@ impl Client for FakeClient {
         })
     }
 
+    fn connection_path(&self, _server: &ServerKey) -> ConnectionPath {
+        ConnectionPath::Lan(([192, 168, 1, 20], 7431).into())
+    }
+
+    fn forget_profile<'a>(
+        &'a self,
+        server: &'a ServerKey,
+        username: &'a str,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            self.pinned(server)?;
+            self.signed_in
+                .lock()
+                .expect("fake state is never poisoned")
+                .retain(|p| !(&p.server == server && p.username == username));
+            Ok(())
+        })
+    }
+
     fn sign_out<'a>(&'a self, server: &'a ServerKey) -> BoxFuture<'a, Result<(), BackendError>> {
         Box::pin(async move {
             self.pinned(server)?;
@@ -2086,13 +2139,24 @@ impl Client for FakeClient {
                 .lock()
                 .expect("fake state is never poisoned")
                 .clone();
+            // A revoked session is kept by name, as the SDK keeps it, to
+            // sign in again with a password.
             Ok(signed_in
                 .into_iter()
                 .filter(|p| &p.server == server)
-                .filter(|p| !self.fake_session(p).pin_state().revoked)
-                .map(|p| Profile {
-                    locked: self.fake_session(&p).would_lock(),
-                    ..p
+                .map(|p| {
+                    if self.fake_session(&p).pin_state().revoked {
+                        Profile {
+                            locked: false,
+                            sign_in: ProfileSignIn::Password,
+                            ..p
+                        }
+                    } else {
+                        Profile {
+                            locked: self.fake_session(&p).would_lock(),
+                            ..p
+                        }
+                    }
                 })
                 .collect())
         })
@@ -2242,11 +2306,36 @@ mod search {
             .map(|k| (*k, hits(*k, year)))
             .collect();
 
+        // As the server picks: a person only on a strictly better name
+        // match than the best item; ties go to the item.
         let top = match request.kind {
             Some(_) => None,
-            None => pick_top(&found, &text),
+            None => {
+                let item = pick_top(&found, &text);
+                let person = people()
+                    .into_iter()
+                    .min_by_key(|p| name_rank(&p.name, &text));
+                match (item, person) {
+                    (Some(item), Some(person))
+                        if name_rank(&person.name, &text) < name_rank(title(&item), &text) =>
+                    {
+                        Some(TopResult::Person(person))
+                    }
+                    (Some(item), _) => Some(TopResult::Item(item)),
+                    (None, Some(person)) => Some(TopResult::Person(person)),
+                    (None, None) => None,
+                }
+            }
         };
-        if let Some(top) = &top {
+        let top_item = match &top {
+            Some(TopResult::Item(item)) => Some(item.clone()),
+            _ => None,
+        };
+        let top_person = match &top {
+            Some(TopResult::Person(person)) => Some(person.id.clone()),
+            _ => None,
+        };
+        if let Some(top) = &top_item {
             for (_, items) in &mut found {
                 items.retain(|i| i.id() != top.id());
             }
@@ -2261,7 +2350,7 @@ mod search {
                 .filter(|(k, _)| *k == SearchKind::Shows)
                 .flat_map(|(_, items)| items.iter().map(|i| i.id().clone()))
                 .collect();
-            if let Some(Item::Show(show)) = &top {
+            if let Some(Item::Show(show)) = &top_item {
                 shows.insert(show.id.clone());
             }
             for (kind, items) in &mut found {
@@ -2278,14 +2367,19 @@ mod search {
         for kind in &kinds {
             let one_kind = request.kind.is_some();
             if *kind == SearchKind::People {
-                let people = people();
+                let mut people = people();
+                // The top match counts in the total, as the server's does.
+                let total = people.len() as u32;
+                people.retain(|p| Some(&p.id) != top_person.as_ref());
                 if people.is_empty() && !one_kind {
                     continue;
                 }
+                let more = people.len() > limit;
                 groups.push(SearchGroup {
                     kind: *kind,
                     items: Vec::new(),
-                    more: people.len() > limit,
+                    total: (!more).then_some(total),
+                    more,
                     people: people.into_iter().take(limit).collect(),
                     hidden: 0,
                 });
@@ -2309,8 +2403,12 @@ mod search {
             } else {
                 limit
             };
+            // As the server counts: the top match and the hidden episodes
+            // too.
+            let top_here = top_item.as_ref().is_some_and(|t| kind_of(t) == Some(*kind));
             groups.push(SearchGroup {
                 kind: *kind,
+                total: Some(items.len() as u32 + hidden + u32::from(top_here)),
                 more: items.len() > shown,
                 items: items.into_iter().take(shown).collect(),
                 people: Vec::new(),
@@ -2343,7 +2441,7 @@ mod search {
                 let with: HashSet<MediaId> = found
                     .iter()
                     .flat_map(|(_, i)| i.iter().map(|i| i.id().clone()))
-                    .chain(top.iter().map(|t| t.id().clone()))
+                    .chain(top_item.iter().map(|t| t.id().clone()))
                     .collect();
                 kinds
                     .iter()
@@ -2395,6 +2493,18 @@ mod search {
             || title
                 .split(|c: char| !c.is_alphanumeric())
                 .any(|word| word.starts_with(text))
+    }
+
+    /// How well a name matches: the whole of it, its start, or within.
+    fn name_rank(name: &str, text: &str) -> u8 {
+        let name = name.to_lowercase();
+        if name == text {
+            0
+        } else if name.starts_with(text) {
+            1
+        } else {
+            2
+        }
     }
 
     fn pick_top(found: &[(SearchKind, Vec<Item>)], text: &str) -> Option<Item> {
@@ -2662,12 +2772,30 @@ mod tests {
     }
 
     #[test]
+    fn a_person_named_in_full_is_the_top_match_and_leaves_people() {
+        let results = search("denis villeneuve", SearchScope::All, None);
+        assert_eq!(
+            (
+                results
+                    .top
+                    .as_ref()
+                    .map(|t| matches!(t, TopResult::Person(_))),
+                group(&results, SearchKind::People).map(|g| g.people.len()),
+            ),
+            (Some(true), None)
+        );
+    }
+
+    #[test]
     fn the_top_match_is_not_repeated_in_its_group() {
         // "Low Tide" is an album and its title track; the album wins.
         let results = search("LOW TIDE", SearchScope::All, None);
         assert_eq!(
             (
-                results.top.as_ref().map(|t| matches!(t, Item::Album(_))),
+                results
+                    .top
+                    .as_ref()
+                    .map(|t| matches!(t, TopResult::Item(Item::Album(_)))),
                 group(&results, SearchKind::Albums).map(|g| g.items.len()),
                 group(&results, SearchKind::Tracks).map(|g| titles(&g.items)),
             ),
@@ -2712,7 +2840,8 @@ mod tests {
 
     #[test]
     fn people_are_found_and_their_items_listed() {
-        let results = search("villeneuve", SearchScope::All, None);
+        // Listed under People: in All, the only match is the top result.
+        let results = search("villeneuve", SearchScope::All, Some(SearchKind::People));
         let person = &group(&results, SearchKind::People).unwrap().people[0];
         let (items, total) = ready(andrey().person_items(&person.id, 0, 10)).unwrap();
         assert_eq!(
@@ -3147,6 +3276,7 @@ mod tests {
             username: "andrey".into(),
             display_name: "Andrey".into(),
             locked: false,
+            sign_in: Default::default(),
         };
         let session = client.session(&profile).unwrap();
         let start =
@@ -3202,6 +3332,19 @@ mod tests {
             ready(alice.unlock("0000")).unwrap_err(),
             BackendError::SignInRequired
         );
+        // Kept by name, as the SDK keeps an ended session, to sign in
+        // again with a password.
+        assert_eq!(
+            profile_of(&client, "alice").sign_in,
+            ProfileSignIn::Password
+        );
+    }
+
+    #[test]
+    fn a_forgotten_profile_is_no_longer_listed() {
+        let client = FakeClient::new(None);
+        session_for(&client, "alice");
+        ready(client.forget_profile(&home_media(), "alice")).unwrap();
         assert!(!usernames(&ready(client.profiles(&home_media())).unwrap()).contains(&"alice"));
     }
 
