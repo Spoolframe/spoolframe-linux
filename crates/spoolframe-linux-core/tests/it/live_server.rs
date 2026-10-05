@@ -243,10 +243,15 @@ fn the_app_backend_works_against_a_live_server() {
         handle.spawn(future);
     });
     let reader = MediaReader::new(
-        session.clone(),
-        item.id().clone(),
-        selection,
-        start,
+        runtime.block_on(async {
+            spoolframe_client_sdk::ManagedPlayback::adopt(
+                spoolframe_linux_core::playback::backend(session.clone()),
+                item.id().clone(),
+                Some(selection),
+                Default::default(),
+                start,
+            )
+        }),
         spawn,
         None,
     );

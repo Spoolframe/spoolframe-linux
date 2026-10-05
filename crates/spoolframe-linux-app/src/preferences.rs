@@ -730,6 +730,8 @@ impl PlaybackRows {
 pub struct Device {
     pub bitrate: Option<u64>,
     pub set_bitrate: SetBitrate,
+    pub show_hdr: bool,
+    pub set_show_hdr: SetSkipIntros,
     pub skip_intros: bool,
     pub set_skip_intros: SetSkipIntros,
     pub show_diagnostics: bool,
@@ -756,7 +758,19 @@ fn playback(
         .title("Playback")
         .icon_name(crate::icons::PLAYBACK_PAGE)
         .build();
-    page.add(&streaming(device.bitrate, device.set_bitrate.clone()));
+    let streaming = streaming(device.bitrate, device.set_bitrate.clone());
+    let hdr = adw::SwitchRow::builder()
+        .title("Show HDR")
+        .subtitle(
+            "Off: the server converts HDR films to SDR, even for an HDR monitor. \
+             Applies when Spoolframe next starts.",
+        )
+        .active(device.show_hdr)
+        .build();
+    let set_show_hdr = device.set_show_hdr.clone();
+    hdr.connect_active_notify(move |row| set_show_hdr(row.is_active()));
+    streaming.add(&hdr);
+    page.add(&streaming);
     page.add(&markers);
     if let Some((preferences, set_tracks)) = tracks {
         let (audio, subtitles) = track_groups(preferences, set_tracks);

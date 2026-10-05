@@ -123,8 +123,10 @@ fn open_sdk(runtime: &tokio::runtime::Runtime) -> Result<SdkClient> {
     let data = DataStore::default_dir()
         .context("no data directory (no home directory?), so there is nowhere to keep data")?;
     let storage = runtime.block_on(Storage::open(DataStore::new(data)))?;
-    let mut capabilities = capabilities::capabilities();
-    capabilities.max_bitrate = settings::Settings::load().max_bitrate();
+    let settings = settings::Settings::load();
+    let mut capabilities =
+        capabilities::with_hdr(capabilities::capabilities(), settings.show_hdr());
+    capabilities.max_bitrate = settings.max_bitrate();
     tracing::debug!(?capabilities, "decoders found");
     let device = sdk::Device {
         platform: sdk::types::Platform::Linux,

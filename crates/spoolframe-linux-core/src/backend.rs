@@ -231,37 +231,8 @@ pub enum ConnectionPath {
     Unknown,
 }
 
-/// A started playback: what to read, and how much there is.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlaybackStart {
-    pub handle: PlaybackHandle,
-    pub plan: PlaybackPlan,
-    /// The size of the file the handle reads, in bytes; 0 for a converted
-    /// playback, whose output grows as it is encoded (see [`Chunk`]).
-    pub size: u64,
-    /// The tracks the server chose and why, when none were asked for.
-    pub chosen: Option<ChosenTracks>,
-    /// A converted playback's encode: 0 at the start, one more after each
-    /// [`Session::seek_playback`].
-    pub epoch: u32,
-    /// The item's intro and credits (P2-10), sorted by start; empty when
-    /// the server knows none.
-    pub markers: Vec<Marker>,
-}
-
-/// Part of a converted playback's output (P2-04).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Chunk {
-    pub bytes: Vec<u8>,
-    /// Bytes encoded so far: the whole output once `complete`.
-    pub size: u64,
-    /// The encode has finished: no more bytes will come.
-    pub complete: bool,
-    pub epoch: u32,
-}
-
-/// The longest read the server serves at once (P1-08).
-pub const MAX_READ: u64 = 16 * 1024 * 1024;
+pub use spoolframe_client_sdk::{Chunk, Playback as PlaybackStart};
+pub use spoolframe_protocol::MAX_READ;
 
 /// This device: the servers it knows, and the users signed in on them.
 pub trait Client: Send + Sync {
@@ -364,6 +335,9 @@ pub trait Client: Send + Sync {
 /// One signed-in user's view of a server: the catalog, their watch state
 /// and playback.
 pub trait Session: Send + Sync {
+    /// Explicit foreground selection; background calls never select a profile.
+    fn activate(&self) -> BoxFuture<'_, Result<(), BackendError>>;
+
     /// Where a browser reaches the server's web UI, if it has a public
     /// address: for "open in the browser" links (P3-12's Plex account).
     fn web_url(&self) -> Option<String>;
@@ -487,7 +461,7 @@ pub trait Session: Send + Sync {
 
     fn update_progress<'a>(
         &'a self,
-        id: &'a MediaId,
+        handle: &'a PlaybackHandle,
         position: Duration,
     ) -> BoxFuture<'a, Result<(), BackendError>>;
 

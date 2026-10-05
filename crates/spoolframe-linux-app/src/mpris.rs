@@ -10,7 +10,7 @@
 //! poll of the server's futures happens inside Relm4's runtime; the
 //! server's own handlers still run on the main loop, next to GTK.
 
-use std::cell::{Cell, OnceCell, RefCell};
+use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -113,9 +113,17 @@ impl State {
 
 pub struct Mpris {
     state: Rc<State>,
-    server: Rc<OnceCell<LocalServer<Player>>>,
-    /// Relm4's runtime, entered for each poll of the server's futures.
-    runtime: Rc<OnceCell<tokio::runtime::Handle>>,
+    /// What to tell the bus, in the order it happened. One task sends it
+    /// all, one at a time: a task per signal let a Paused sent at a track
+    /// change land after the Playing that followed it, and desktops that
+    /// only follow the signals kept showing Paused.
+    outbox: tokio::sync::mpsc::UnboundedSender<Outgoing>,
+}
+
+/// A signal for the bus.
+enum Outgoing {
+    Changed(Vec<Property>),
+    Signal(Signal),
 }
 
 impl Mpris {
@@ -136,12 +144,11 @@ impl Mpris {
             quit,
             stop,
         });
+        let (outbox, sent) = tokio::sync::mpsc::unbounded_channel();
         let this = Rc::new(Self {
             state: state.clone(),
-            server: Rc::new(OnceCell::new()),
-            runtime: Rc::new(OnceCell::new()),
+            outbox,
         });
-        let (server, runtime) = (this.server.clone(), this.runtime.clone());
         glib::spawn_future_local(async move {
             let handle = match relm4::spawn(async { tokio::runtime::Handle::current() }).await {
                 Ok(handle) => handle,
@@ -155,8 +162,22 @@ impl Mpris {
             };
             tracing::debug!(bus_name = %made.bus_name(), "MPRIS registered");
             glib::spawn_future_local(InRuntime::new(&handle, made.run()));
-            let _ = runtime.set(handle);
-            let _ = server.set(made);
+            // Whatever was told before the bus name was up goes first.
+            drain(sent, |outgoing| {
+                let (made, handle) = (&made, &handle);
+                async move {
+                    let sent = match outgoing {
+                        Outgoing::Changed(properties) => {
+                            InRuntime::new(handle, made.properties_changed(properties)).await
+                        }
+                        Outgoing::Signal(signal) => InRuntime::new(handle, made.emit(signal)).await,
+                    };
+                    if let Err(e) = sent {
+                        tracing::debug!(error = %e, "MPRIS signal");
+                    }
+                }
+            })
+            .await;
         });
         this
     }
@@ -291,29 +312,26 @@ impl Mpris {
         });
     }
 
-    /// Emits PropertiesChanged, once the server is up.
+    /// Emits PropertiesChanged, after everything told before it. Without
+    /// a bus there is no one to tell, and it is dropped.
     fn changed(&self, properties: Vec<Property>) {
-        let (server, runtime) = (self.server.clone(), self.runtime.clone());
-        glib::spawn_future_local(async move {
-            let (Some(server), Some(runtime)) = (server.get(), runtime.get()) else {
-                return;
-            };
-            if let Err(e) = InRuntime::new(runtime, server.properties_changed(properties)).await {
-                tracing::debug!(error = %e, "MPRIS PropertiesChanged");
-            }
-        });
+        let _ = self.outbox.send(Outgoing::Changed(properties));
     }
 
     fn emit(&self, signal: Signal) {
-        let (server, runtime) = (self.server.clone(), self.runtime.clone());
-        glib::spawn_future_local(async move {
-            let (Some(server), Some(runtime)) = (server.get(), runtime.get()) else {
-                return;
-            };
-            if let Err(e) = InRuntime::new(runtime, server.emit(signal)).await {
-                tracing::debug!(error = %e, "MPRIS signal");
-            }
-        });
+        let _ = self.outbox.send(Outgoing::Signal(signal));
+    }
+}
+
+/// Sends what `queue` holds, each send finished before the next begins,
+/// until every sender is gone.
+async fn drain<T, F, Fut>(mut queue: tokio::sync::mpsc::UnboundedReceiver<T>, mut send: F)
+where
+    F: FnMut(T) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    while let Some(item) = queue.recv().await {
+        send(item).await;
     }
 }
 
@@ -649,6 +667,48 @@ mod tests {
     use spoolframe_types::{Episode, MediaId, MediaKind, Movie, Namespace, PlaybackState, Track};
 
     use super::*;
+
+    /// Ready after `0` more polls: a send the bus is slow to take.
+    struct Slow(u32);
+
+    impl Future for Slow {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if self.0 == 0 {
+                return Poll::Ready(());
+            }
+            self.0 -= 1;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+
+    #[test]
+    fn a_slow_paused_still_reaches_the_bus_before_the_playing_after_it() {
+        let (outbox, queue) = tokio::sync::mpsc::unbounded_channel();
+        outbox.send(PlaybackStatus::Paused).unwrap();
+        outbox.send(PlaybackStatus::Playing).unwrap();
+        drop(outbox);
+        let bus = Rc::new(RefCell::new(Vec::new()));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(drain(queue, |status| {
+            let bus = bus.clone();
+            async move {
+                // Paused takes longer to send than Playing.
+                Slow(if status == PlaybackStatus::Paused {
+                    10
+                } else {
+                    0
+                })
+                .await;
+                bus.borrow_mut().push(status);
+            }
+        }));
+        assert_eq!(bus.borrow().last(), Some(&PlaybackStatus::Playing));
+    }
 
     fn id(kind: MediaKind, key: &str) -> MediaId {
         MediaId::new(Namespace::Plex, kind, key).unwrap()

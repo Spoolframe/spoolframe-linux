@@ -99,6 +99,8 @@ pub struct App {
     unlocking: Option<Profile>,
     /// A PIN or a sign-in is with the server: another is not sent.
     unlock_in_flight: bool,
+    profile_scope: spoolframe_client_sdk::ProfileScope,
+    shutdown_calls: Vec<tokio::task::JoinHandle<()>>,
     sign_in_in_flight: bool,
     /// What the root page shows (or is about to).
     root: Root,
@@ -238,6 +240,7 @@ pub enum Msg {
     SetMaxBitrate(Option<u64>),
     /// Skip intros without asking (P2-10).
     SetSkipIntros(bool),
+    SetShowHdr(bool),
     SetShowDiagnostics(bool),
     /// Leave the full player and keep playing in the bar.
     MinimizePlayer,
@@ -268,6 +271,18 @@ const PERSON_ITEMS: u32 = 200;
 
 /// A season with its episodes.
 type SeasonEpisodes = (Season, Vec<Item>);
+
+#[derive(Debug)]
+pub struct Completion {
+    token: spoolframe_client_sdk::ProfileToken,
+    loaded: Loaded,
+}
+
+impl Completion {
+    fn accept(self) -> Option<Loaded> {
+        self.token.accept(self.loaded)
+    }
+}
 
 #[derive(Debug)]
 pub enum Loaded {
@@ -316,6 +331,7 @@ pub enum Loaded {
     Preferences(Result<TrackPreferences, BackendError>),
     /// What the server said to the PIN typed for a locked profile.
     Unlocked(Box<Profile>, Result<(), BackendError>),
+    Activated(u64, Box<Profile>, Result<(), BackendError>),
 }
 
 impl Loaded {
@@ -347,7 +363,9 @@ impl Loaded {
     /// The error of an answer that comes from the profile's session.
     fn session_error(&self) -> Option<&BackendError> {
         match self {
-            Loaded::Libraries(Err(e))
+            Loaded::Activated(_, _, Err(e))
+            | Loaded::Playable(_, _, Err(e), _, _)
+            | Loaded::Libraries(Err(e))
             | Loaded::Home(Err(e))
             | Loaded::Person(_, Err(e))
             | Loaded::Show(_, Err(e), _)
@@ -368,7 +386,7 @@ impl Component for App {
     type Init = Init;
     type Input = Msg;
     type Output = ();
-    type CommandOutput = Loaded;
+    type CommandOutput = Completion;
     type Root = adw::ApplicationWindow;
     type Widgets = AppWidgets;
 
@@ -674,6 +692,8 @@ impl Component for App {
             profile: None,
             unlocking: None,
             unlock_in_flight: false,
+            profile_scope: spoolframe_client_sdk::ProfileScope::default(),
+            shutdown_calls: Vec::new(),
             sign_in_in_flight: false,
             root: Root::Home,
             root_load: None,
@@ -754,6 +774,7 @@ impl Component for App {
                 self.load_home(&sender);
             }
             Msg::ShowServers => {
+                self.invalidate_session();
                 widgets.screens.set_visible_child_name("servers");
                 self.load_servers(&sender);
             }
@@ -771,7 +792,7 @@ impl Component for App {
                 let Some(session) = self.session.clone() else {
                     return;
                 };
-                sender.oneshot_command(async move {
+                self.command(&sender, async move {
                     let done = if hide {
                         session.hide_from_continue(item.id()).await
                     } else {
@@ -782,20 +803,20 @@ impl Component for App {
             }
             Msg::CheckServer(server, verifying) => {
                 let client = self.client.clone();
-                sender.oneshot_command(async move {
+                self.command(&sender, async move {
                     let checked = client.connect(&server.key).await;
                     Loaded::Checked(server, verifying, checked)
                 });
             }
             Msg::PinServer(server, verified, verifying) => {
                 let client = self.client.clone();
-                sender.oneshot_command(async move {
+                self.command(&sender, async move {
                     Loaded::Pinned(verifying, client.pin(&server.key, verified).await)
                 });
             }
             Msg::TrustIdentity(saved, now) => {
                 let client = self.client.clone();
-                sender.oneshot_command(async move {
+                self.command(&sender, async move {
                     Loaded::Trusted(client.trust_new_identity(&saved, &now).await)
                 });
             }
@@ -816,7 +837,7 @@ impl Component for App {
                     dialog.set_busy(true);
                 }
                 let client = self.client.clone();
-                sender.oneshot_command(async move {
+                self.command(&sender, async move {
                     Loaded::ServerAdded(client.add_address(&ServerKey(key), &address).await)
                 });
             }
@@ -840,13 +861,23 @@ impl Component for App {
                     Ok(session) => session,
                     Err(e) => return toast(widgets, &e),
                 };
+                self.stop_playback(widgets);
+                let pending = std::mem::take(&mut self.shutdown_calls);
                 self.unlock_in_flight = true;
-                sender.oneshot_command(async move {
-                    let unlocked = session.unlock(&pin).await;
+                self.command(&sender, async move {
+                    for call in pending {
+                        let _ = call.await;
+                    }
+                    let unlocked = async {
+                        session.activate().await?;
+                        session.unlock(&pin).await
+                    }
+                    .await;
                     Loaded::Unlocked(Box::new(profile), unlocked)
                 });
             }
             Msg::BackToProfiles => {
+                self.invalidate_session();
                 self.unlocking = None;
                 widgets.pin_pad = None;
                 match self.server.clone() {
@@ -860,7 +891,7 @@ impl Component for App {
                     return;
                 };
                 let client = self.client.clone();
-                sender.oneshot_command(async move {
+                self.command(&sender, async move {
                     let forgotten = client
                         .forget_profile(&profile.server, &profile.username)
                         .await;
@@ -887,12 +918,16 @@ impl Component for App {
             }
             Msg::OpenRemoteSignIn(via) => {
                 let Some(server) = &self.server else { return };
+                let token = self.profile_scope.token();
                 let ends = remote_sign_in::Ends {
                     // An approval ends as a password sign-in does.
                     done: {
                         let sender = sender.clone();
                         Rc::new(move |profile| {
-                            sender.command_sender().emit(Loaded::SignedIn(Ok(profile)))
+                            sender.command_sender().emit(Completion {
+                                token: token.clone(),
+                                loaded: Loaded::SignedIn(Ok(profile)),
+                            })
                         })
                     },
                     no_web: {
@@ -929,11 +964,12 @@ impl Component for App {
                     dialog.set_busy(true);
                 }
                 let client = self.client.clone();
-                sender.oneshot_command(async move {
+                self.command(&sender, async move {
                     Loaded::SignedIn(client.sign_in(&server.key, &username, &password).await)
                 });
             }
             Msg::SwitchProfile => {
+                self.invalidate_session();
                 if let Some(server) = self.server.clone() {
                     self.load_profiles(server, &sender);
                 }
@@ -1009,7 +1045,7 @@ impl Component for App {
                 let Some(session) = self.session.clone() else {
                     return;
                 };
-                sender.oneshot_command(async move {
+                self.command(&sender, async move {
                     let items = session.person_items(&person.id, 0, PERSON_ITEMS).await;
                     Loaded::Person(person, items)
                 });
@@ -1087,7 +1123,7 @@ impl Component for App {
                 let Some(session) = self.session.clone() else {
                     return;
                 };
-                sender.oneshot_command(async move {
+                self.command(&sender, async move {
                     Loaded::Enqueued(at, tracks_of(session.as_ref(), *item).await)
                 });
             }
@@ -1098,7 +1134,7 @@ impl Component for App {
                 let Some(session) = self.session.clone() else {
                     return;
                 };
-                sender.oneshot_command(async move {
+                self.command(&sender, async move {
                     let done = if watched {
                         session.mark_watched(&id).await
                     } else {
@@ -1112,7 +1148,7 @@ impl Component for App {
                 let Some(session) = self.session.clone() else {
                     return;
                 };
-                sender.oneshot_command(async move {
+                self.command(&sender, async move {
                     Loaded::Saved(session.set_track_override(&id, selection).await)
                 });
             }
@@ -1120,7 +1156,7 @@ impl Component for App {
                 let Some(session) = self.session.clone() else {
                     return;
                 };
-                sender.oneshot_command(async move {
+                self.command(&sender, async move {
                     let done = session.clear_track_override(item.id()).await;
                     Loaded::TracksForgotten(item, done)
                 });
@@ -1129,14 +1165,14 @@ impl Component for App {
                 let Some(session) = self.session.clone() else {
                     return;
                 };
-                sender.oneshot_command(async move {
+                self.command(&sender, async move {
                     Loaded::Saved(session.set_track_preferences(&preferences).await)
                 });
             }
             Msg::OpenPreferences => match self.session.clone() {
                 // The Playback page shows the user's preferences, from the
                 // server.
-                Some(session) => sender.oneshot_command(async move {
+                Some(session) => self.command(&sender, async move {
                     Loaded::Preferences(session.track_preferences().await)
                 }),
                 None => self.preferences_dialog(None, &sender).present(Some(root)),
@@ -1152,6 +1188,18 @@ impl Component for App {
                 }
             }
             Msg::SetShowDiagnostics(on) => self.settings.set_show_diagnostics(on),
+            Msg::SetShowHdr(on) => {
+                // Part of the device's capabilities, told as it connects.
+                self.settings.set_show_hdr(on);
+                toast_text(
+                    widgets,
+                    if on {
+                        "HDR on · applies when Spoolframe next starts"
+                    } else {
+                        "HDR off · applies when Spoolframe next starts"
+                    },
+                );
+            }
             Msg::SetMaxBitrate(limit) => {
                 // The server learns it with the device's capabilities, at
                 // the next start.
@@ -1174,6 +1222,9 @@ impl Component for App {
         sender: ComponentSender<Self>,
         root: &Self::Root,
     ) {
+        let Some(loaded) = loaded.accept() else {
+            return;
+        };
         // A page for an item no longer the one being opened is dropped:
         // a later click asked for another.
         if let Some(id) = loaded.opened() {
@@ -1181,6 +1232,11 @@ impl Component for App {
                 return;
             }
             self.opening = None;
+        }
+        if let Loaded::Activated(generation, ..) = &loaded
+            && *generation != self.profile_scope.generation()
+        {
+            return;
         }
         // The answer is in: the next try may go.
         match &loaded {
@@ -1287,6 +1343,15 @@ impl Component for App {
                 }
             }
             Loaded::Hidden(_, _, Err(e)) => toast(widgets, &e),
+            Loaded::Activated(generation, profile, result) => {
+                if generation != self.profile_scope.generation() {
+                    return;
+                }
+                match result {
+                    Ok(()) => self.enter_active(*profile, widgets, &sender),
+                    Err(e) => toast(widgets, &e),
+                }
+            }
             Loaded::Unlocked(profile, Ok(())) => {
                 self.unlocking = None;
                 widgets.pin_pad = None;
@@ -1612,6 +1677,10 @@ impl App {
             let sender = sender.clone();
             Rc::new(move |on| sender.input(Msg::SetSkipIntros(on)))
         };
+        let set_show_hdr: preferences::SetSkipIntros = {
+            let sender = sender.clone();
+            Rc::new(move |on| sender.input(Msg::SetShowHdr(on)))
+        };
         let set_show_diagnostics: preferences::SetSkipIntros = {
             let sender = sender.clone();
             Rc::new(move |on| sender.input(Msg::SetShowDiagnostics(on)))
@@ -1625,6 +1694,8 @@ impl App {
             preferences::Device {
                 bitrate: self.settings.max_bitrate(),
                 set_bitrate,
+                show_hdr: self.settings.show_hdr(),
+                set_show_hdr,
                 skip_intros: self.settings.skip_intros(),
                 set_skip_intros,
                 show_diagnostics: self.settings.show_diagnostics(),
@@ -1636,12 +1707,15 @@ impl App {
 
     fn load_servers(&self, sender: &ComponentSender<Self>) {
         let client = self.client.clone();
-        sender.oneshot_command(async move { Loaded::Servers(client.servers().await) });
+        self.command(
+            sender,
+            async move { Loaded::Servers(client.servers().await) },
+        );
     }
 
     fn load_profiles(&self, server: Server, sender: &ComponentSender<Self>) {
         let client = self.client.clone();
-        sender.oneshot_command(async move {
+        self.command(sender, async move {
             let profiles = client.profiles(&server.key).await;
             Loaded::Profiles(server, profiles)
         });
@@ -1650,6 +1724,28 @@ impl App {
     /// Opens the library as `profile`: its own session on the same
     /// connection, a fresh sidebar and Home.
     fn enter(
+        &mut self,
+        profile: Profile,
+        widgets: &mut AppWidgets,
+        sender: &ComponentSender<Self>,
+    ) {
+        self.stop_playback(widgets);
+        let pending = std::mem::take(&mut self.shutdown_calls);
+        let session = match self.client.session(&profile) {
+            Ok(session) => session,
+            Err(e) => return toast(widgets, &e),
+        };
+        self.invalidate_session();
+        let generation = self.profile_scope.generation();
+        self.command(sender, async move {
+            for call in pending {
+                let _ = call.await;
+            }
+            Loaded::Activated(generation, Box::new(profile), session.activate().await)
+        });
+    }
+
+    fn enter_active(
         &mut self,
         profile: Profile,
         widgets: &mut AppWidgets,
@@ -1831,7 +1927,8 @@ impl App {
     fn stop_playback(&mut self, widgets: &mut AppWidgets) {
         if let Some(playback) = self.playback.take() {
             self.queued = playback.carry();
-            playback.stop();
+            self.shutdown_calls.retain(|call| !call.is_finished());
+            self.shutdown_calls.extend(playback.stop_waitable());
         }
         widgets.mini_bar.detach();
         widgets.mpris.detach();
@@ -1918,6 +2015,8 @@ impl App {
         widgets: &mut AppWidgets,
         sender: &ComponentSender<Self>,
     ) {
+        self.invalidate_session();
+        self.unlock_in_flight = false;
         let server_name = self.server.as_ref().map_or("", |s| s.name.as_str());
         let unlock: Rc<dyn Fn(String)> = {
             let sender = sender.clone();
@@ -1987,7 +2086,7 @@ impl App {
     /// The session is gone: back to "Who's watching", where the profile
     /// can be signed in again.
     fn signed_out(&mut self, widgets: &mut AppWidgets, sender: &ComponentSender<Self>) {
-        self.session = None;
+        self.invalidate_session();
         // A player still open would keep playing behind "Who's watching".
         self.stop_playback(widgets);
         self.queued.clear();
@@ -1999,11 +2098,38 @@ impl App {
         }
     }
 
+    fn invalidate_session(&mut self) {
+        self.profile_scope.invalidate();
+        self.session = None;
+        self.opening = None;
+        self.unlock_in_flight = false;
+        self.sign_in_in_flight = false;
+        if let Some(load) = self.root_load.take() {
+            load.abort();
+        }
+    }
+
+    fn command(
+        &self,
+        sender: &ComponentSender<Self>,
+        load: impl std::future::Future<Output = Loaded> + Send + 'static,
+    ) {
+        let token = self.profile_scope.token();
+        sender.oneshot_command(async move {
+            Completion {
+                token,
+                loaded: load.await,
+            }
+        });
+    }
+
     fn load_libraries(&self, sender: &ComponentSender<Self>) {
         let Some(session) = self.session.clone() else {
             return;
         };
-        sender.oneshot_command(async move { Loaded::Libraries(session.libraries().await) });
+        self.command(sender, async move {
+            Loaded::Libraries(session.libraries().await)
+        });
     }
 
     /// Home, if it is the sidebar's choice: asked for by Undo from
@@ -2037,10 +2163,11 @@ impl App {
         if let Some(old) = self.root_load.take() {
             old.abort();
         }
+        let token = self.profile_scope.token();
         let (task, sender) = (relm4::spawn(load), sender.clone());
         self.root_load = Some(glib::spawn_future_local(async move {
             if let Ok(loaded) = task.await {
-                sender.command_sender().emit(loaded);
+                sender.command_sender().emit(Completion { token, loaded });
             }
         }));
     }
@@ -2060,7 +2187,7 @@ impl App {
         match item {
             Item::Movie(ref m) => {
                 let id = m.id.clone();
-                sender.oneshot_command(async move {
+                self.command(sender, async move {
                     // The card's copy may be from before the last
                     // playback: Resume would start from where it was then.
                     let (item, tracks, chosen) = tokio::join!(
@@ -2073,7 +2200,7 @@ impl App {
             }
             Item::Episode(ref e) => {
                 let (id, show, episode) = (e.id.clone(), e.show_id.clone(), e.clone());
-                sender.oneshot_command(async move {
+                self.command(sender, async move {
                     let (item, show, tracks, chosen, next) = tokio::join!(
                         fresh(backend.as_ref(), item),
                         backend.item(&show),
@@ -2092,12 +2219,12 @@ impl App {
                     Loaded::Playable(item, context, tracks, chosen, next)
                 });
             }
-            Item::Show(show) => sender.oneshot_command(async move {
+            Item::Show(show) => self.command(sender, async move {
                 let (show, seasons) = show_with_seasons(backend.as_ref(), show).await;
                 Loaded::Show(show, seasons, None)
             }),
             // A season opens its show's page, on that season's tab.
-            Item::Season(season) => sender.oneshot_command(async move {
+            Item::Season(season) => self.command(sender, async move {
                 let show = Show {
                     id: season.show_id.clone(),
                     title: season.show_title.clone().unwrap_or_default(),
@@ -2113,14 +2240,14 @@ impl App {
             }),
             // The artist and the album as the server has them: one opened
             // from a track's menu carries only its ID.
-            Item::Artist(artist) => sender.oneshot_command(async move {
+            Item::Artist(artist) => self.command(sender, async move {
                 match backend.item(&artist.id).await {
                     Ok((Item::Artist(full), albums)) => Loaded::Artist(full, Ok(albums)),
                     Ok((_, albums)) => Loaded::Artist(artist, Ok(albums)),
                     Err(e) => Loaded::Artist(artist, Err(e)),
                 }
             }),
-            Item::Album(album) => sender.oneshot_command(async move {
+            Item::Album(album) => self.command(sender, async move {
                 let (album, tracks) = match backend.item(&album.id).await {
                     Ok((Item::Album(full), tracks)) => (full, Ok(tracks)),
                     Ok((_, tracks)) => (album, Ok(tracks)),
@@ -2515,6 +2642,54 @@ mod tests {
             sentence("the media file could not be read."),
             "The media file could not be read."
         );
+    }
+
+    #[test]
+    fn stale_profile_replies_drop_successes_and_authentication_errors() {
+        let scope = spoolframe_client_sdk::ProfileScope::default();
+        let old = scope.token();
+        scope.invalidate();
+        for loaded in [
+            Loaded::Enqueued(Enqueue::Next, Ok(Vec::new())),
+            Loaded::Libraries(Err(BackendError::SignInRequired)),
+            Loaded::Home(Err(BackendError::ProfileLocked)),
+        ] {
+            assert!(
+                Completion {
+                    token: old.clone(),
+                    loaded
+                }
+                .accept()
+                .is_none()
+            );
+        }
+        assert!(
+            Completion {
+                token: scope.token(),
+                loaded: Loaded::Home(Err(BackendError::ProfileLocked))
+            }
+            .accept()
+            .unwrap()
+            .profile_locked()
+        );
+    }
+
+    #[test]
+    fn playable_pages_route_authentication_failures() {
+        let item = Item::Movie(spoolframe_types::Movie {
+            id: "plex:movie:1".parse().unwrap(),
+            title: "Movie".into(),
+            year: None,
+            summary: None,
+            content_rating: None,
+            duration: None,
+            artwork: Vec::new(),
+            playback: Default::default(),
+        });
+        for error in [BackendError::SignInRequired, BackendError::ProfileLocked] {
+            let loaded = Loaded::Playable(item.clone(), None, Err(error.clone()), None, None);
+            assert_eq!(loaded.session_error(), Some(&error));
+        }
     }
 
     #[test]

@@ -107,6 +107,15 @@ pub fn capabilities() -> ClientCapabilities {
     caps
 }
 
+/// `caps` as the user set HDR: shown as HDR (no limit: the frames carry
+/// their colour state to GTK, and the compositor maps them per monitor),
+/// or none of it, so the server tone-maps every HDR film to SDR.
+pub fn with_hdr(mut caps: ClientCapabilities, show: bool) -> ClientCapabilities {
+    let limits = caps.max_video.get_or_insert_with(Default::default);
+    limits.hdr = (!show).then(std::collections::BTreeSet::new);
+    caps
+}
+
 fn elements(kind: gst::ElementFactoryType) -> Vec<gst::ElementFactory> {
     gst::ElementFactory::factories_with_type(kind, gst::Rank::MARGINAL)
         .into_iter()
@@ -149,6 +158,20 @@ fn supported<T: Ord + Copy>(
 
 #[cfg(test)]
 mod tests {
+    use super::with_hdr;
+
+    #[test]
+    fn hdr_off_asks_the_server_to_tone_map_everything() {
+        let caps = with_hdr(Default::default(), false);
+        assert_eq!(caps.max_video.and_then(|v| v.hdr), Some(Default::default()));
+    }
+
+    #[test]
+    fn hdr_on_sets_no_limit() {
+        let caps = with_hdr(Default::default(), true);
+        assert_eq!(caps.max_video.and_then(|v| v.hdr), None);
+    }
+
     use super::*;
     use spoolframe_linux_core::testing::TestDir;
 

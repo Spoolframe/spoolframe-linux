@@ -97,6 +97,8 @@ pub fn row(title: &str, cards: impl IntoIterator<Item = gtk::Widget>) -> gtk::Bo
     let (back, forward) = scroll_buttons(&scroller);
 
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    // In line with the cards, which sit inside the row's side room.
+    header.set_margin_start(LIFT_SIDE);
     header.append(&heading(title));
     header.append(&back);
     header.append(&forward);
@@ -114,11 +116,17 @@ pub fn row(title: &str, cards: impl IntoIterator<Item = gtk::Widget>) -> gtk::Bo
 /// shadow.
 pub const LIFT_ABOVE: i32 = 8;
 pub const LIFT_BELOW: i32 = 20;
+/// A lifted card grows 2% about its centre, 3 px a side on the widest:
+/// with no room at the row's ends the first card lost its left edge, and
+/// with it the first letter of its caption.
+pub const LIFT_SIDE: i32 = 4;
 
 /// Room inside a scrolled row for its cards to lift and cast a shadow.
 pub fn lift_room(cards: &impl IsA<gtk::Widget>) {
     cards.set_margin_top(LIFT_ABOVE);
     cards.set_margin_bottom(LIFT_BELOW);
+    cards.set_margin_start(LIFT_SIDE);
+    cards.set_margin_end(LIFT_SIDE);
 }
 
 /// ‹ and › for a row that scrolls sideways: shown only while it
@@ -250,20 +258,36 @@ pub fn continue_card(item: &Item, cards: &Cards) -> gtk::Widget {
         tile.add_overlay(&strip);
     }
 
-    let caption = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let title = caption_label(&facts.caption(), &["card-caption"]);
-    title.set_hexpand(true);
-    caption.append(&title);
-    if let (Some(length), Some(position)) = (facts.length, facts.position()) {
-        caption.append(
-            &gtk::Label::builder()
+    // The show, then which episode: once the artwork is in, the tile's
+    // own title is hidden and the still alone does not say which show.
+    let below = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    let first = caption_label(&facts.caption(), &["card-caption"]);
+    let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let left = facts
+        .length
+        .zip(facts.position())
+        .map(|(length, position)| {
+            gtk::Label::builder()
                 .label(format::remaining(length, position))
                 .css_classes(["dim-label", "small-text"])
-                .build(),
-        );
+                .build()
+        });
+    match facts.episode_line() {
+        Some(episode) => {
+            below.append(&first);
+            let episode = caption_label(episode, &["dim-label", "small-text"]);
+            episode.set_hexpand(true);
+            line.append(&episode);
+        }
+        None => {
+            first.set_hexpand(true);
+            line.append(&first);
+        }
     }
-    let below = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    below.append(&caption);
+    if let Some(left) = &left {
+        line.append(left);
+    }
+    below.append(&line);
     let card = card(item, &tile, &below, LANDSCAPE.0, &cards.open);
     card.add_css_class("continue-card");
     if let (Some(set_watched), Some(hide)) = (&cards.set_watched, &cards.hide) {
@@ -759,6 +783,13 @@ impl<'a> Facts<'a> {
             .and_then(|p| p.position)
     }
 
+    /// Which episode, "S2 · E4 · Woe's Hollow", for the line under an
+    /// episode's show; `None` when the caption already says it (no show
+    /// name) or the item is no episode.
+    pub fn episode_line(&self) -> Option<&str> {
+        self.parent.as_ref().and(self.episode.as_deref())
+    }
+
     /// What a landscape card says first: the show for an episode (its
     /// episode label goes under it), otherwise the title.
     pub fn caption(&self) -> String {
@@ -834,6 +865,18 @@ mod tests {
     fn an_episode_card_leads_with_its_show() {
         let item = episode(Some("12 Monkeys"));
         assert_eq!(Facts::of(&item).caption(), "12 Monkeys");
+    }
+
+    #[test]
+    fn under_its_show_an_episode_says_which_one_it_is() {
+        let item = episode(Some("12 Monkeys"));
+        assert_eq!(Facts::of(&item).episode_line(), Some("S1 · E4 · Seven"));
+    }
+
+    #[test]
+    fn an_episode_without_a_show_name_says_it_once() {
+        let item = episode(None);
+        assert_eq!(Facts::of(&item).episode_line(), None);
     }
 
     #[test]

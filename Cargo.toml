@@ -6,7 +6,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["Andrey Cherkashin <andoriyu@gmail.com>"]
 # GPL, not the server's AGPL nor the protocol crates' MIT/Apache: the client
@@ -36,7 +36,8 @@ spoolframe-types = { path = "../spoolframe/crates/spoolframe-types" }
 # artwork sizes), which the SDK returns too. Same arrangement as above.
 spoolframe-protocol = { path = "../spoolframe/crates/spoolframe-protocol" }
 # The client side of the protocol: Iroh transport, saved servers, sessions.
-spoolframe-client-sdk = { path = "../spoolframe/crates/spoolframe-client-sdk" }
+spoolframe-client-sdk = { path = "../spoolframe/crates/spoolframe-client-sdk", features = ["media-readers"] }
+spoolframe-policy = { path = "../spoolframe/crates/spoolframe-policy" }
 # The SDK's Storage trait is an async-trait one.
 async-trait = "0.1"
 
@@ -60,7 +61,7 @@ gst-base = { package = "gstreamer-base", version = "0.25" }
 # dmabuf: decoded frames reach GTK in GPU memory; wayland/x11egl give
 # the sink a GL context. Without them every frame is copied out of the
 # decoder and converted on the CPU, which 4K cannot keep up with.
-gst-plugin-gtk4 = { version = "0.15", features = ["gtk_v4_14", "dmabuf", "wayland", "x11egl"] }
+gst-plugin-gtk4 = { version = "0.15", features = ["gtk_v4_20", "dmabuf", "wayland", "x11egl"] }
 # QR codes for a phone to scan (P3-05's sign-in with your phone); the
 # encoder only, the app draws the modules itself.
 qrcode = { version = "0.14", default-features = false }

@@ -7,6 +7,7 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+spoolframe-policy = { workspace = true, optional = true }
 spoolframe-types = { workspace = true }
 spoolframe-protocol = { workspace = true }
 spoolframe-client-sdk = { workspace = true }
@@ -22,8 +23,9 @@ spoolframe-test-dir = { workspace = true, optional = true }
 
 [features]
 # TestDir and the fake server, for the app's tests too.
-testing = ["dep:spoolframe-test-dir"]
+testing = ["dep:spoolframe-test-dir", "dep:spoolframe-policy"]
 
 [dev-dependencies]
+spoolframe-policy = { workspace = true }
 spoolframe-test-dir = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }

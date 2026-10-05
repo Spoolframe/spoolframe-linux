@@ -893,7 +893,7 @@ fn web_profile_link(session: &dyn Session) -> Option<gtk::Button> {
 
 /// A PIN as the server takes it: 4 to 8 digits.
 fn pin_ok(pin: &str) -> bool {
-    (4..=8).contains(&pin.len()) && pin.chars().all(|c| c.is_ascii_digit())
+    spoolframe_types::pin::pin_digits(pin).is_some()
 }
 
 /// The PIN typed large and spaced, digits only.

@@ -55,12 +55,7 @@ pub fn backend_error(error: sdk::SdkError) -> BackendError {
         E::SignInDenied => BackendError::SignInDenied,
         E::SignInExpired => BackendError::SignInExpired,
         E::PlaybackFailed(why) => BackendError::Other(format!("the conversion failed: {why}")),
-        // The server's own "unavailable" (Plex or a media mount down)
-        // arrives as a server error with its message.
-        E::Server(message) => match message.strip_prefix("unavailable: ") {
-            Some(why) => BackendError::Unavailable(why.to_owned()),
-            None => BackendError::Other(format!("server: {message}")),
-        },
+        E::Unavailable(message) => BackendError::Unavailable(message),
         other => BackendError::Other(other.to_string()),
     }
 }
@@ -465,6 +460,7 @@ impl Client for SdkClient {
             .cloned()
             .ok_or(BackendError::SignInRequired)?;
         Ok(Arc::new(SdkSession {
+            client: self.client.clone(),
             session,
             handle: self.handle.clone(),
             sessions: self.sessions.clone(),
@@ -502,6 +498,7 @@ impl Client for SdkClient {
 }
 
 pub struct SdkSession {
+    client: sdk::Client,
     session: sdk::Session,
     handle: Handle,
     sessions: Sessions,
@@ -529,6 +526,11 @@ impl SdkSession {
 }
 
 impl Session for SdkSession {
+    fn activate(&self) -> BoxFuture<'_, Result<(), BackendError>> {
+        let client = self.client.clone();
+        Box::pin(self.call(move |s| async move { client.activate_profile(&s).await.map(|_| ()) }))
+    }
+
     fn home(&self) -> BoxFuture<'_, Result<HomeScreen, BackendError>> {
         Box::pin(self.call(|s| async move { s.home().await }))
     }
@@ -612,15 +614,7 @@ impl Session for SdkSession {
                 start,
                 ..Default::default()
             };
-            let playback = s.start_playback_with(&id, selection, options).await?;
-            Ok(PlaybackStart {
-                handle: playback.handle,
-                plan: playback.plan,
-                size: playback.size,
-                chosen: playback.chosen,
-                epoch: playback.epoch,
-                markers: playback.markers,
-            })
+            s.start_playback_with(&id, selection, options).await
         }))
     }
 
@@ -632,15 +626,9 @@ impl Session for SdkSession {
         length: u64,
     ) -> BoxFuture<'a, Result<Chunk, BackendError>> {
         let handle = handle.clone();
-        Box::pin(self.call(move |s| async move {
-            let chunk = s.read_chunk(&handle, epoch, offset, length).await?;
-            Ok(Chunk {
-                bytes: chunk.bytes,
-                size: chunk.size,
-                complete: chunk.complete,
-                epoch: chunk.epoch,
-            })
-        }))
+        Box::pin(
+            self.call(move |s| async move { s.read_chunk(&handle, epoch, offset, length).await }),
+        )
     }
 
     fn seek_playback<'a>(
@@ -705,11 +693,11 @@ impl Session for SdkSession {
 
     fn update_progress<'a>(
         &'a self,
-        id: &'a MediaId,
+        handle: &'a PlaybackHandle,
         position: Duration,
     ) -> BoxFuture<'a, Result<(), BackendError>> {
-        let id = id.clone();
-        Box::pin(self.call(move |s| async move { s.update_progress(&id, position).await }))
+        let handle = handle.clone();
+        Box::pin(self.call(move |s| async move { s.update_progress(&handle, position).await }))
     }
 
     fn mark_watched<'a>(&'a self, id: &'a MediaId) -> BoxFuture<'a, Result<(), BackendError>> {
@@ -883,7 +871,7 @@ mod tests {
     #[test]
     fn the_servers_unavailable_becomes_unavailable() {
         assert_eq!(
-            backend_error(sdk::SdkError::Server("unavailable: Plex is down".into())),
+            backend_error(sdk::SdkError::Unavailable("Plex is down".into())),
             BackendError::Unavailable("Plex is down".into())
         );
     }

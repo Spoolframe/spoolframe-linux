@@ -26,16 +26,33 @@ pub fn ready<T>(future: impl Future<Output = T>) -> T {
 /// Runs each future on a thread of its own, polling until it is done.
 pub fn thread_spawn() -> Spawn {
     Arc::new(|future| {
-        std::thread::spawn(move || {
-            let mut future = future;
-            while pin!(&mut future)
-                .poll(&mut Context::from_waker(Waker::noop()))
-                .is_pending()
-            {
-                std::thread::yield_now();
-            }
-        });
+        runtime().spawn(future);
     })
+}
+fn runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+    })
+}
+pub fn managed(
+    session: Arc<dyn crate::backend::Session>,
+    item: spoolframe_types::MediaId,
+    selection: crate::backend::Selection,
+    start: crate::backend::PlaybackStart,
+) -> spoolframe_client_sdk::ManagedPlayback {
+    let _enter = runtime().enter();
+    spoolframe_client_sdk::ManagedPlayback::adopt(
+        crate::playback::backend(session),
+        item,
+        Some(selection),
+        Default::default(),
+        start,
+    )
 }
 
 /// `bytes` in a file named `media` in a directory of its own.

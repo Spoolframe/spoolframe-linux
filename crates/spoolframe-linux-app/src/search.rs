@@ -859,7 +859,13 @@ impl SearchPage {
         let items: Vec<Item> = group.items.iter().take(limit).cloned().collect();
         let people: Vec<Person> = group.people.iter().take(limit).cloned().collect();
         let cut = items.len() < group.items.len() || people.len() < group.people.len();
-        let head = gtk::Box::builder().spacing(10).build();
+        // In line with cards in a row, which sit inside its side room.
+        let in_row =
+            !seeing_all && !matches!(group.kind, SearchKind::Tracks | SearchKind::Episodes);
+        let head = gtk::Box::builder()
+            .spacing(10)
+            .margin_start(if in_row { views::LIFT_SIDE } else { 0 })
+            .build();
         head.append(&caption(kind_label(group.kind), &["title-3"]));
         if group.hidden > 0 {
             head.append(&caption(

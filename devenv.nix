@@ -24,6 +24,7 @@ in {
   # or newer.
   packages =
     [
+      pkgs.cargo-deny
       pkgs.pkg-config
       pkgs.gtk4
       pkgs.libadwaita
@@ -37,6 +38,12 @@ in {
   # only through this list.
   env.GST_PLUGIN_SYSTEM_PATH_1_0 =
     lib.makeSearchPathOutput "lib" "lib/gstreamer-1.0" gstPlugins;
+
+  tasks."spoolframe-linux:licenses" = {
+    description = "Check the Linux client license boundary";
+    exec = "cargo deny --locked check licenses";
+  };
+  tasks."ci:static".after = ["spoolframe-linux:licenses"];
 
   enterShell = ''
     echo "spoolframe-linux dev environment"

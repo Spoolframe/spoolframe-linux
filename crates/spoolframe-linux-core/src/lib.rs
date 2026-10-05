@@ -20,3 +20,5 @@ pub mod storage;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 pub mod theme;
+
+pub mod playback;

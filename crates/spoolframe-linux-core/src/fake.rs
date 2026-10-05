@@ -12,16 +12,19 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use spoolframe_policy::{
+    tracks::{self, TrackOverride},
+    watch::{WatchRules, credits_to_end},
+};
 use spoolframe_protocol::{
     AudioAction, ConvertedAudio, ConvertedSubtitle, ConvertedVideo, PlannedAudio, PlannedSubtitle,
     SubtitleAction, SubtitleDelivery,
 };
-use spoolframe_types::language::same_language;
 use spoolframe_types::{
     Album, Artist, ArtworkId, AudioCodec, AudioRole, AudioTrack, Container, Delivery, Episode,
     HdrFormat, Item, Library, LibraryId, LibraryKind, MediaId, MediaKind, MediaTracks, Movie,
-    Namespace, PlaybackState, SdhPreference, Season, Show, SubtitleFormat, SubtitleMode,
-    SubtitleRole, SubtitleTrack, Track, TrackPreferences, VideoCodec, VideoTrack,
+    Namespace, PlaybackState, Season, Show, SubtitleFormat, SubtitleRole, SubtitleTrack, Track,
+    TrackPreferences, VideoCodec, VideoTrack,
 };
 use tokio::sync::watch;
 
@@ -31,16 +34,13 @@ use crate::backend::{
     Person, PersonId, PersonRole, PinProof, PinState, Platform, PlaybackHandle, PlaybackPlan,
     PlaybackStart, PlexLink, Previews, Profile, ProfileSignIn, SearchCounts, SearchGroup,
     SearchKind, SearchRequest, SearchResults, SearchScope, Selection, Server, ServerKey, Session,
-    TopResult, TrackReason,
+    TopResult,
 };
 
 /// Every fake account's password.
 pub const FAKE_PASSWORD: &str = "spoolframe";
 
 /// Watch-state rules, the server's defaults (P1-14).
-const STARTED_AFTER: Duration = Duration::from_secs(60);
-const WATCHED_FRACTION: f64 = 0.9;
-const WATCHED_WHEN_LEFT: Duration = Duration::from_secs(5 * 60);
 /// A playback handle idle this long expires, as on the server (P1-08).
 const HANDLE_IDLE: Duration = Duration::from_secs(5 * 60);
 /// Failed sign-ins before the fake rate-limits, and for how long.
@@ -344,21 +344,16 @@ impl WatchState {
         self.states.insert(id.clone(), state);
     }
 
-    fn progress(&mut self, id: &MediaId, length: Option<Duration>, position: Duration) {
-        if position < STARTED_AFTER {
-            return;
-        }
-        let watched = length.is_some_and(|length| {
-            position.as_secs_f64() >= length.as_secs_f64() * WATCHED_FRACTION
-                || length.saturating_sub(position) < WATCHED_WHEN_LEFT
-        });
-        self.set(
-            id,
-            PlaybackState {
-                position: (!watched).then_some(position),
-                watched,
-            },
-        );
+    fn progress(
+        &mut self,
+        id: &MediaId,
+        length: Option<Duration>,
+        position: Duration,
+        markers: &[Marker],
+    ) {
+        let rules = WatchRules::default();
+        let watched = rules.is_watched(position, length, credits_to_end(markers));
+        self.set(id, rules.playback_state(Some(position), watched));
     }
 }
 
@@ -388,7 +383,7 @@ pub struct FakeSession {
     next_handle: AtomicU64,
     preferences: Mutex<TrackPreferences>,
     /// Tracks remembered per movie, or per show for its episodes.
-    overrides: Mutex<HashMap<MediaId, Selection>>,
+    overrides: Mutex<HashMap<MediaId, TrackOverride>>,
     username: String,
     pin: Mutex<FakePin>,
     /// Devices waiting to be signed in by code (P3-07), and wrong codes
@@ -396,7 +391,7 @@ pub struct FakeSession {
     sign_ins: Mutex<SignIns>,
     /// Which profile used the device's connection last: switching to
     /// another and back locks a profile again (P2-08).
-    active: Arc<Mutex<Option<String>>>,
+    active: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 /// Device sign-ins waiting for this user's approval (P3-07).
@@ -496,7 +491,7 @@ impl FakeSession {
         username: &str,
         serving: Serving,
         gone: Arc<std::sync::atomic::AtomicBool>,
-        active: Arc<Mutex<Option<String>>>,
+        active: Arc<Mutex<std::collections::HashSet<String>>>,
     ) -> Self {
         // Alice has a PIN, asked for here, so the fake opens her locked.
         let pin = match username {
@@ -708,121 +703,18 @@ impl FakeSession {
     }
 
     /// The tracks the server would pick: the remembered ones, else the
-    /// user's preferences, simplified from P1-20's chooser.
-    fn choose(&self, item: &Item, tracks: &MediaTracks) -> ChosenTracks {
-        if let Some(selection) = self
-            .overrides
-            .lock()
-            .expect("fake state is never poisoned")
-            .get(&Self::override_key(item))
-        {
-            return ChosenTracks {
-                selection: *selection,
-                audio: TrackReason::Override,
-                subtitle: TrackReason::Override,
-            };
-        }
+    /// user's preferences, using the production policy.
+    fn choose(&self, item: &Item, media: &MediaTracks) -> ChosenTracks {
         let preferences = self
             .preferences
             .lock()
-            .expect("fake state is never poisoned")
-            .clone();
-
-        // Audio: the first track in a preferred language whose role is not
-        // avoided; else the file's default.
-        let allowed: Vec<usize> = (0..tracks.audio.len())
-            .filter(|i| !preferences.audio.avoid.contains(&tracks.audio[*i].role))
-            .collect();
-        let allowed = if allowed.is_empty() {
-            (0..tracks.audio.len()).collect()
-        } else {
-            allowed
-        };
-        let default = allowed
-            .iter()
-            .copied()
-            .find(|i| tracks.audio[*i].default)
-            .or(allowed.first().copied());
-        let by_language = preferences.audio.languages.iter().find_map(|wanted| {
-            allowed.iter().copied().find(|i| {
-                tracks.audio[*i]
-                    .language
-                    .as_deref()
-                    .is_some_and(|l| same_language(l, wanted))
-            })
-        });
-        let (audio, audio_reason) = match (by_language, default) {
-            (Some(i), _) => (Some(i), TrackReason::Preferences),
-            (None, Some(i)) => (Some(i), TrackReason::FileDefault),
-            (None, None) => (None, TrackReason::NoTracks),
-        };
-        let audio_language = audio.and_then(|i| tracks.audio[i].language.clone());
-
-        // Subtitles, by mode.
-        let in_audio_language = |t: &SubtitleTrack| match (&t.language, &audio_language) {
-            (Some(a), Some(b)) => same_language(a, b),
-            _ => false,
-        };
-        let languages = if preferences.subtitles.languages.is_empty() {
-            audio_language.iter().cloned().collect()
-        } else {
-            preferences.subtitles.languages.clone()
-        };
-        let (subtitle, subtitle_reason) = if tracks.subtitles.is_empty() {
-            (None, TrackReason::NoTracks)
-        } else {
-            match preferences.subtitles.mode {
-                SubtitleMode::Off => (None, TrackReason::NotWanted),
-                SubtitleMode::ForcedOnly => {
-                    match tracks
-                        .subtitles
-                        .iter()
-                        .position(|t| t.forced && in_audio_language(t))
-                    {
-                        Some(i) => (Some(i), TrackReason::Preferences),
-                        None => (None, TrackReason::NoneMatched),
-                    }
-                }
-                SubtitleMode::ForeignOnly
-                    if audio_language
-                        .as_deref()
-                        .is_some_and(|a| languages.iter().any(|l| same_language(l, a))) =>
-                {
-                    (None, TrackReason::NotWanted)
-                }
-                SubtitleMode::Always | SubtitleMode::ForeignOnly => {
-                    let fits = |t: &SubtitleTrack, lang: &str, sdh: bool| {
-                        t.language
-                            .as_deref()
-                            .is_some_and(|l| same_language(l, lang))
-                            && matches!(t.role, SubtitleRole::Full | SubtitleRole::Sdh)
-                            && (t.role == SubtitleRole::Sdh) == sdh
-                    };
-                    let order: &[bool] = match preferences.subtitles.sdh {
-                        SdhPreference::Prefer => &[true, false],
-                        SdhPreference::Accept => &[false, true],
-                        SdhPreference::Avoid => &[false],
-                    };
-                    let found = languages.iter().find_map(|lang| {
-                        order.iter().find_map(|sdh| {
-                            tracks.subtitles.iter().position(|t| fits(t, lang, *sdh))
-                        })
-                    });
-                    match found {
-                        Some(i) => (Some(i), TrackReason::Preferences),
-                        None => (None, TrackReason::NoneMatched),
-                    }
-                }
-            }
-        };
-        ChosenTracks {
-            selection: Selection {
-                audio: audio.map(|i| i as u32),
-                subtitle: subtitle.map(|i| i as u32),
-            },
-            audio: audio_reason,
-            subtitle: subtitle_reason,
-        }
+            .expect("fake state is never poisoned");
+        let overrides = self.lock_overrides();
+        tracks::choose(
+            media,
+            &preferences,
+            overrides.get(&Self::override_key(item)),
+        )
     }
 
     fn pin_state(&self) -> std::sync::MutexGuard<'_, FakePin> {
@@ -865,8 +757,7 @@ impl FakeSession {
     fn would_lock(&self) -> bool {
         let pin = self.pin_state();
         let active = self.active.lock().expect("fake state is never poisoned");
-        pin.required.contains(THIS_DEVICE)
-            && (pin.locked || active.as_deref() != Some(&self.username))
+        pin.required.contains(THIS_DEVICE) && (pin.locked || !active.contains(&self.username))
     }
 
     /// What every call but unlocking goes through, as on the server: a
@@ -886,14 +777,13 @@ impl FakeSession {
         if pin.revoked {
             return Err(BackendError::SignInRequired);
         }
-        let mut active = self.active.lock().expect("fake state is never poisoned");
-        if pin.required.contains(THIS_DEVICE) && active.as_deref() != Some(&self.username) {
+        let active = self.active.lock().expect("fake state is never poisoned");
+        if pin.required.contains(THIS_DEVICE) && !active.contains(&self.username) {
             pin.locked = true;
         }
         if pin.locked {
             return Err(BackendError::ProfileLocked);
         }
-        *active = Some(self.username.clone());
         Ok(())
     }
 
@@ -1004,6 +894,19 @@ impl FakeSession {
 }
 
 impl Session for FakeSession {
+    fn activate(&self) -> BoxFuture<'_, Result<(), BackendError>> {
+        Box::pin(async move {
+            if self.pin_state().revoked {
+                return Err(BackendError::SignInRequired);
+            }
+            self.active
+                .lock()
+                .expect("fake state is never poisoned")
+                .retain(|name| name == &self.username);
+            Ok(())
+        })
+    }
+
     fn home(&self) -> BoxFuture<'_, Result<HomeScreen, BackendError>> {
         Box::pin(async move {
             self.catalog()?;
@@ -1332,10 +1235,12 @@ impl Session for FakeSession {
 
     fn update_progress<'a>(
         &'a self,
-        id: &'a MediaId,
+        handle: &'a PlaybackHandle,
         position: Duration,
     ) -> BoxFuture<'a, Result<(), BackendError>> {
         Box::pin(async move {
+            let (id, _) = self.playback(handle)?;
+            let id = &id;
             let item = self.catalog.get(id)?;
             self.reports
                 .lock()
@@ -1343,7 +1248,8 @@ impl Session for FakeSession {
                 .push((id.clone(), position));
             // Music has no watch state in Phase 1 (P1-14).
             if matches!(item, Item::Movie(_) | Item::Episode(_)) {
-                self.watch().progress(id, length_of(item), position);
+                self.watch()
+                    .progress(id, length_of(item), position, &self.serving.markers);
                 self.unhide(id);
             }
             Ok(())
@@ -1426,7 +1332,9 @@ impl Session for FakeSession {
     ) -> BoxFuture<'a, Result<(), BackendError>> {
         Box::pin(async move {
             let key = Self::override_key(self.catalog.get(id)?);
-            self.lock_overrides().insert(key, selection);
+            let tracks = self.tracks_of(self.catalog.get(id)?);
+            self.lock_overrides()
+                .insert(key, TrackOverride::from_selection(&tracks, selection));
             Ok(())
         })
     }
@@ -1458,8 +1366,10 @@ impl Session for FakeSession {
             }
             pin.wrong = 0;
             pin.locked = false;
-            *self.active.lock().expect("fake state is never poisoned") =
-                Some(self.username.clone());
+            self.active
+                .lock()
+                .expect("fake state is never poisoned")
+                .insert(self.username.clone());
             Ok(())
         })
     }
@@ -1483,7 +1393,7 @@ impl Session for FakeSession {
     ) -> BoxFuture<'a, Result<(), BackendError>> {
         Box::pin(async move {
             self.guard()?;
-            if !(4..=8).contains(&new.len()) || !new.bytes().all(|b| b.is_ascii_digit()) {
+            if spoolframe_types::pin::pin_digits(new).is_none() {
                 return Err(BackendError::InvalidInput("a PIN is 4 to 8 digits".into()));
             }
             let has_pin = self.pin_state().pin.is_some();
@@ -1623,7 +1533,7 @@ impl Session for FakeSession {
 }
 
 impl FakeSession {
-    fn lock_overrides(&self) -> std::sync::MutexGuard<'_, HashMap<MediaId, Selection>> {
+    fn lock_overrides(&self) -> std::sync::MutexGuard<'_, HashMap<MediaId, TrackOverride>> {
         self.overrides.lock().expect("fake state is never poisoned")
     }
 }
@@ -1645,7 +1555,7 @@ pub struct FakeClient {
     servers_changed: watch::Sender<()>,
     gone: Arc<std::sync::atomic::AtomicBool>,
     /// The profile that used the connection last (P2-08).
-    active: Arc<Mutex<Option<String>>>,
+    active: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Sign-ins this device asked a phone to approve (P3-05, P3-07).
     phone_sign_ins: Mutex<PhoneSignIns>,
 }
@@ -1967,7 +1877,10 @@ impl FakeClient {
         pin.wrong = 0;
         pin.locked = false;
         drop(pin);
-        *self.active.lock().expect("fake state is never poisoned") = Some(profile.username.clone());
+        self.active
+            .lock()
+            .expect("fake state is never poisoned")
+            .insert(profile.username.clone());
         profile
     }
 
@@ -2582,6 +2495,11 @@ mod search {
 }
 
 #[cfg(test)]
+use crate::backend::TrackReason;
+#[cfg(test)]
+use spoolframe_types::{SdhPreference, SubtitleMode};
+
+#[cfg(test)]
 mod tests {
 
     use super::*;
@@ -2666,9 +2584,12 @@ mod tests {
 
     #[test]
     fn progress_under_a_minute_does_not_start_an_item() {
-        let session = andrey();
+        let (_dir, path) = file_with("progress", b"stand-in");
+        let client = FakeClient::new(Some(path));
+        let session = session_for(&client, "andrey");
         let heat = media(MediaKind::Movie, "3");
-        ready(session.update_progress(&heat, Duration::from_secs(30))).unwrap();
+        let playback = ready(session.start_playback(&heat, None, None)).unwrap();
+        ready(session.update_progress(&playback.handle, Duration::from_secs(30))).unwrap();
         let home = ready(session.home()).unwrap();
         assert!(!titles(&home.continue_watching).contains(&"Heat"));
     }
@@ -2684,28 +2605,37 @@ mod tests {
 
     #[test]
     fn progress_brings_a_hidden_item_back() {
-        let session = andrey();
+        let (_dir, path) = file_with("progress", b"stand-in");
+        let client = FakeClient::new(Some(path));
+        let session = session_for(&client, "andrey");
         let first = ready(session.home()).unwrap().continue_watching[0].clone();
         ready(session.hide_from_continue(first.id())).unwrap();
-        ready(session.update_progress(first.id(), Duration::from_secs(120))).unwrap();
+        let playback = ready(session.start_playback(first.id(), None, None)).unwrap();
+        ready(session.update_progress(&playback.handle, Duration::from_secs(120))).unwrap();
         let home = ready(session.home()).unwrap();
         assert!(home.continue_watching.iter().any(|i| i.id() == first.id()));
     }
 
     #[test]
     fn progress_puts_an_item_first_in_continue_watching() {
-        let session = andrey();
+        let (_dir, path) = file_with("progress", b"stand-in");
+        let client = FakeClient::new(Some(path));
+        let session = session_for(&client, "andrey");
         let heat = media(MediaKind::Movie, "3");
-        ready(session.update_progress(&heat, Duration::from_secs(600))).unwrap();
+        let playback = ready(session.start_playback(&heat, None, None)).unwrap();
+        ready(session.update_progress(&playback.handle, Duration::from_secs(600))).unwrap();
         let home = ready(session.home()).unwrap();
         assert_eq!(title(&home.continue_watching[0]), "Heat");
     }
 
     #[test]
-    fn progress_past_ninety_percent_marks_the_item_watched() {
-        let session = andrey();
+    fn progress_past_ninety_five_percent_marks_the_item_watched() {
+        let (_dir, path) = file_with("progress", b"stand-in");
+        let client = FakeClient::new(Some(path));
+        let session = session_for(&client, "andrey");
         let alien = media(MediaKind::Movie, "1");
-        ready(session.update_progress(&alien, Duration::from_secs(106 * 60))).unwrap();
+        let playback = ready(session.start_playback(&alien, None, None)).unwrap();
+        ready(session.update_progress(&playback.handle, Duration::from_secs(112 * 60))).unwrap();
         let (item, _) = ready(session.item(&alien)).unwrap();
         let Item::Movie(m) = item else { panic!() };
         assert!(m.playback.watched && m.playback.position.is_none());
@@ -3353,7 +3283,10 @@ mod tests {
         let client = FakeClient::new(None);
         let alice = session_for(&client, "alice");
         ready(alice.unlock(FAKE_PIN)).unwrap();
-        ready(session_for(&client, "andrey").libraries()).unwrap();
+        let other = session_for(&client, "andrey");
+        ready(other.libraries()).unwrap();
+        assert!(!profile_of(&client, "alice").locked);
+        ready(other.activate()).unwrap();
         assert!(profile_of(&client, "alice").locked);
     }
 

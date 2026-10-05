@@ -15,6 +15,7 @@ const CONNECTION: &str = "connection";
 const SERVER: &str = "server";
 const STREAMING: &str = "streaming";
 const MAX_BITRATE: &str = "max-bitrate";
+const SHOW_HDR: &str = "show-hdr";
 const PLAYBACK: &str = "playback";
 const SKIP_INTROS: &str = "skip-intros";
 const DIAGNOSTICS: &str = "show-diagnostics";
@@ -80,6 +81,18 @@ impl Settings {
             .uint64(STREAMING, MAX_BITRATE)
             .ok()
             .filter(|b| *b > 0)
+    }
+
+    /// Whether HDR films come as HDR, for GTK and the compositor to show on
+    /// each monitor; on by default. Off, the server tone-maps them to SDR.
+    /// Read once at start-up, like the bitrate limit.
+    pub fn show_hdr(&self) -> bool {
+        self.file.boolean(STREAMING, SHOW_HDR).unwrap_or(true)
+    }
+
+    pub fn set_show_hdr(&mut self, on: bool) {
+        self.file.set_boolean(STREAMING, SHOW_HDR, on);
+        self.save();
     }
 
     pub fn set_max_bitrate(&mut self, bitrate: Option<u64>) {

@@ -1127,14 +1127,14 @@ fn hdr_of(colorimetry: &str) -> Option<Hdr> {
     }
 }
 
-/// The range row. Nothing here maps HDR to SDR, and the window is drawn
-/// as SDR, so an HDR picture the server sent as it is shows washed out:
-/// the row says so.
+/// The range row. An HDR picture's frames carry their colour state to
+/// GTK, which hands them on to the compositor as HDR (or converts them for
+/// an SDR window); the server tone-maps only when HDR is off.
 fn dynamic_range(hdr: Option<Hdr>, tone_mapped: bool) -> String {
     match (hdr, tone_mapped) {
         (_, true) => "SDR · tone-mapped from HDR by the server".to_owned(),
-        (Some(Hdr::Pq), false) => "HDR10 (PQ) · shown as SDR, not tone-mapped".to_owned(),
-        (Some(Hdr::Hlg), false) => "HLG · shown as SDR, not tone-mapped".to_owned(),
+        (Some(Hdr::Pq), false) => "HDR10 (PQ) · to the compositor as HDR".to_owned(),
+        (Some(Hdr::Hlg), false) => "HLG · to the compositor as HDR".to_owned(),
         (None, false) => "SDR".to_owned(),
     }
 }
@@ -1327,10 +1327,10 @@ mod tests {
     }
 
     #[test]
-    fn an_hdr_picture_nobody_mapped_says_so() {
+    fn an_hdr_picture_goes_to_the_compositor_as_hdr() {
         assert_eq!(
             super::dynamic_range(Some(super::Hdr::Pq), false),
-            "HDR10 (PQ) · shown as SDR, not tone-mapped"
+            "HDR10 (PQ) · to the compositor as HDR"
         );
     }
 

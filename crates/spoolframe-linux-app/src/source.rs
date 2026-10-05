@@ -23,7 +23,7 @@ use spoolframe_linux_core::reader::{ByteSource, ReadError};
 const SCHEME: &str = "spoolframe";
 
 /// Published readers, by the number in their URI.
-static READERS: LazyLock<Mutex<HashMap<u64, Arc<dyn ByteSource>>>> =
+static READERS: LazyLock<Mutex<HashMap<u64, Arc<Retirable>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
@@ -31,7 +31,7 @@ static NEXT: AtomicU64 = AtomicU64::new(1);
 /// dropped; an element already reading keeps its own reference.
 pub struct Published {
     id: u64,
-    reader: Arc<dyn ByteSource>,
+    reader: Arc<Retirable>,
 }
 
 impl Published {
@@ -45,6 +45,10 @@ impl Published {
     }
 
     fn publish(reader: Arc<dyn ByteSource>) -> Self {
+        let reader = Arc::new(Retirable {
+            source: reader,
+            retired: Mutex::new(false),
+        });
         let id = NEXT.fetch_add(1, Ordering::Relaxed);
         readers().insert(id, reader.clone());
         Self { id, reader }
@@ -55,8 +59,52 @@ impl Published {
         &*self.reader
     }
 
+    pub fn retire(&self) {
+        let mut retired = self.reader.retired.lock().unwrap();
+        *retired = true;
+        self.reader.source.set_flushing(true);
+    }
+
+    pub fn retired(&self) -> bool {
+        *self.reader.retired.lock().unwrap()
+    }
+
     pub fn uri(&self) -> String {
         format!("{SCHEME}://media/{}", self.id)
+    }
+}
+
+struct Retirable {
+    source: Arc<dyn ByteSource>,
+    retired: Mutex<bool>,
+}
+
+impl ByteSource for Retirable {
+    fn read_reporting(
+        &self,
+        offset: u64,
+        length: u64,
+        buffering: &mut dyn FnMut(u8),
+    ) -> Result<Vec<u8>, ReadError> {
+        if *self.retired.lock().unwrap() {
+            return Err(ReadError::Flushing);
+        }
+        let result = self.source.read_reporting(offset, length, buffering);
+        if *self.retired.lock().unwrap() {
+            Err(ReadError::Flushing)
+        } else {
+            result
+        }
+    }
+    fn set_flushing(&self, flushing: bool) {
+        let retired = self.retired.lock().unwrap();
+        self.source.set_flushing(flushing || *retired);
+    }
+    fn size(&self) -> Option<u64> {
+        self.source.size()
+    }
+    fn status(&self) -> spoolframe_linux_core::reader::Status {
+        self.source.status()
     }
 }
 
@@ -66,7 +114,7 @@ impl Drop for Published {
     }
 }
 
-fn readers() -> std::sync::MutexGuard<'static, HashMap<u64, Arc<dyn ByteSource>>> {
+fn readers() -> std::sync::MutexGuard<'static, HashMap<u64, Arc<Retirable>>> {
     READERS.lock().expect("the reader table is never poisoned")
 }
 
@@ -92,11 +140,11 @@ mod imp {
     #[derive(Default)]
     pub struct SpoolframeSrc {
         uri: Mutex<Option<String>>,
-        reader: Mutex<Option<Arc<dyn ByteSource>>>,
+        reader: Mutex<Option<Arc<Retirable>>>,
     }
 
     impl SpoolframeSrc {
-        fn reader(&self) -> Option<Arc<dyn ByteSource>> {
+        fn reader(&self) -> Option<Arc<Retirable>> {
             self.reader.lock().expect("never poisoned").clone()
         }
     }
@@ -305,13 +353,24 @@ mod tests {
         let item = MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap();
         let start = ready(session.start_playback(&item, None, None)).unwrap();
         Published::new(MediaReader::new(
-            session,
-            item,
-            Selection::default(),
-            start,
+            spoolframe_linux_core::testing::managed(session, item, Selection::default(), start),
             thread_spawn(),
             None,
         ))
+    }
+
+    #[test]
+    fn a_retired_reader_cannot_be_unflushed() {
+        let dir = TestDir::new_blocking("spoolframe-retired-reader");
+        let path = dir.join("media");
+        std::fs::write(&path, [0_u8; 100]).unwrap();
+        let published = published(path);
+        published.retire();
+        published.reader().set_flushing(false);
+        assert!(matches!(
+            published.reader().read_reporting(0, 10, &mut |_| {}),
+            Err(ReadError::Flushing)
+        ));
     }
 
     #[test]
@@ -390,9 +449,7 @@ mod tests {
         let item = MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap();
         let start = ready(session.start_playback(&item, None, None)).unwrap();
         let published = Published::new(ProgressiveReader::new(
-            session,
-            start.handle,
-            start.epoch,
+            spoolframe_linux_core::testing::managed(session, item, Selection::default(), start),
             thread_spawn(),
             None,
         ));
@@ -478,10 +535,7 @@ mod tests {
             handle.spawn(future);
         });
         let published = Published::new(MediaReader::new(
-            session,
-            item.id().clone(),
-            selection,
-            start,
+            spoolframe_linux_core::testing::managed(session, item.id().clone(), selection, start),
             spawn,
             None,
         ));

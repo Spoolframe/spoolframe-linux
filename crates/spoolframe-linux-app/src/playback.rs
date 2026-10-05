@@ -18,14 +18,17 @@ use std::time::{Duration, Instant};
 
 use gtk::glib;
 use gtk::glib::thread_guard::ThreadGuard;
+use spoolframe_client_sdk::PlaybackOptions;
 use spoolframe_linux_core::backend::{
-    BackendError, Marker, PlaybackHandle, PlaybackPlan, PlaybackStart, Selection, Session,
+    BackendError, Marker, PlaybackHandle, PlaybackPlan, Selection, Session,
 };
 use spoolframe_linux_core::markers;
 pub use spoolframe_linux_core::markers::Offer;
 use spoolframe_linux_core::next_episode::next_episode;
+use spoolframe_linux_core::playback::{self as managed, ManagedPlayback};
 use spoolframe_linux_core::progressive::ProgressiveReader;
 use spoolframe_linux_core::reader::{self, ByteSource, MediaReader, Spawn};
+use spoolframe_linux_core::sdk::backend_error;
 use spoolframe_protocol::{ConvertedVideo, PlannedSubtitle, SubtitleAction, SubtitleDelivery};
 use spoolframe_types::Delivery;
 use spoolframe_types::{Album, Item, MediaTracks, SubtitleFormat};
@@ -216,6 +219,7 @@ pub struct Playback {
     length: Cell<Duration>,
     stopped: Cell<bool>,
     listeners: RefCell<Vec<Listener>>,
+    progress_tail: RefCell<Option<tokio::sync::oneshot::Receiver<()>>>,
 }
 
 /// What belongs to the item playing now, and lives exactly as long as it
@@ -238,7 +242,7 @@ struct Current {
     /// newer.
     restarts: Cell<u64>,
     /// The playback the server opened, for its subtitle.
-    handle: RefCell<Option<PlaybackHandle>>,
+    managed: RefCell<Option<ManagedPlayback>>,
     /// How the server plays the item, for the diagnostics.
     plan: RefCell<Option<PlaybackPlan>>,
     track_list: RefCell<Option<MediaTracks>>,
@@ -279,7 +283,6 @@ enum Stage {
     /// a new encode at `to`, and the old encode's positions are ignored.
     /// Seeks while scrubbing gather into the one not yet sent.
     Restarting {
-        conv: Conversion,
         to: Duration,
         sent: bool,
     },
@@ -290,16 +293,7 @@ enum Stage {
 #[derive(Clone)]
 enum Mode {
     Direct,
-    Converted(Conversion),
-}
-
-/// A converted playback's encode (P2-06): a seek restarts it, and moving
-/// on ends it.
-#[derive(Clone)]
-struct Conversion {
-    handle: PlaybackHandle,
-    epoch: u32,
-    bitrate: Option<u64>,
+    Converted,
 }
 
 impl Current {
@@ -312,7 +306,7 @@ impl Current {
             pictured: Cell::new(false),
             stage: RefCell::new(Stage::Asking),
             restarts: Cell::new(0),
-            handle: RefCell::new(None),
+            managed: RefCell::new(None),
             plan: RefCell::new(None),
             track_list: RefCell::new(tracks),
             pending: Cell::new(None),
@@ -325,23 +319,16 @@ impl Current {
         }
     }
 
-    /// The encode, while the item plays converted.
-    fn conversion(&self) -> Option<Conversion> {
-        match &*self.stage.borrow() {
-            Stage::Open {
-                mode: Mode::Converted(conv),
-                ..
-            }
-            | Stage::Restarting { conv, .. } => Some(conv.clone()),
-            _ => None,
-        }
-    }
-
     fn is_converted(&self) -> bool {
-        self.conversion().is_some()
+        matches!(
+            &*self.stage.borrow(),
+            Stage::Open {
+                mode: Mode::Converted,
+                ..
+            } | Stage::Restarting { .. }
+        )
     }
 
-    /// Open and not waiting to resume: a seek now lands.
     fn settled(&self) -> bool {
         matches!(&*self.stage.borrow(), Stage::Open { resume: None, .. })
     }
@@ -424,6 +411,7 @@ impl Playback {
             length: Cell::new(Duration::ZERO),
             stopped: Cell::new(false),
             listeners: RefCell::new(Vec::new()),
+            progress_tail: RefCell::new(None),
         });
         connect(playback.pipeline.adapter(), &playback);
         {
@@ -724,28 +712,24 @@ impl Playback {
     fn restart(self: &Rc<Self>, current: &Rc<Current>, to: Duration) {
         {
             let mut stage = current.stage.borrow_mut();
-            let conv = match &mut *stage {
+            let start_restart = match &mut *stage {
                 Stage::Restarting {
                     to: unsent,
                     sent: false,
                     ..
                 } => {
                     *unsent = to;
-                    None
+                    false
                 }
-                Stage::Restarting { conv, .. }
+                Stage::Restarting { .. }
                 | Stage::Open {
-                    mode: Mode::Converted(conv),
+                    mode: Mode::Converted,
                     ..
-                } => Some(conv.clone()),
+                } => true,
                 _ => return,
             };
-            if let Some(conv) = conv {
-                *stage = Stage::Restarting {
-                    conv,
-                    to,
-                    sent: false,
-                };
+            if start_restart {
+                *stage = Stage::Restarting { to, sent: false };
                 drop(stage);
                 let restart = current.restarts.get() + 1;
                 current.restarts.set(restart);
@@ -768,15 +752,19 @@ impl Playback {
         if !self.is_current(current) || current.restarts.get() != restart {
             return;
         }
-        let (handle, to) = match &mut *current.stage.borrow_mut() {
-            Stage::Restarting { conv, to, sent } if !*sent => {
+        let to = match &mut *current.stage.borrow_mut() {
+            Stage::Restarting { to, sent, .. } if !*sent => {
                 *sent = true;
-                (conv.handle.clone(), *to)
+                *to
             }
             _ => return,
         };
-        let session = self.session.clone();
-        let sought = relm4::spawn(async move { session.seek_playback(&handle, to).await });
+        let managed = current.managed.borrow().clone().expect("started playback");
+        let stopped = self.pipeline.stop_and_wait();
+        let sought = relm4::spawn(async move {
+            let _ = stopped.await;
+            managed.seek(to).await.map_err(backend_error)
+        });
         let (weak, current) = (Rc::downgrade(self), Rc::downgrade(current));
         glib::spawn_future_local(async move {
             let answer = sought.await;
@@ -800,42 +788,43 @@ impl Playback {
         current: Weak<Current>,
         restart: u64,
         to: Duration,
-        answer: Answer<u32>,
+        answer: Answer<spoolframe_client_sdk::Playback>,
     ) {
         let Some(current) = current.upgrade().filter(|c| self.is_current(c)) else {
             return;
         };
-        let conv = match &*current.stage.borrow() {
-            Stage::Restarting {
-                conv, sent: true, ..
-            } if current.restarts.get() == restart => conv.clone(),
-            _ => return,
-        };
-        let epoch = match answer {
-            Ok(Ok(epoch)) => epoch,
-            // The handle idled out (the app was away): a new playback of
-            // the same item, whose encode begins where the user sought.
-            Ok(Err(BackendError::PlaybackExpired)) => return self.ask(&current, Some(to)),
+        if !matches!(
+            &*current.stage.borrow(),
+            Stage::Restarting { sent: true, .. }
+        ) || current.restarts.get() != restart
+        {
+            return;
+        }
+        let next = match answer {
+            Ok(Ok(next)) => next,
             Ok(Err(e)) => return self.failed(&e.to_string()),
             Err(e) => return self.failed(&format!("seeking failed: {e}")),
         };
-        let conv = Conversion { epoch, ..conv };
-        let reader = ProgressiveReader::new(
-            self.session.clone(),
-            conv.handle.clone(),
-            epoch,
-            spawn(),
-            conv.bitrate,
-        );
+        current.plan.replace(Some(next.plan.clone()));
+        let managed = current.managed.borrow().clone().expect("started playback");
+        let (mode, resume, reader) =
+            match playback_reader(managed, Some(to), current.catalog_length) {
+                Ok(parts) => parts,
+                Err(error) => return self.failed(&error),
+            };
         let subtitle = current.subtitle_file.borrow().clone();
-        self.pipeline.load(Box::new(reader), subtitle.as_deref());
-        current.stage.replace(Stage::Open {
-            mode: Mode::Converted(conv),
-            resume: None,
-        });
+        self.pipeline.load(reader, subtitle.as_deref());
+        current.stage.replace(Stage::Open { mode, resume });
         current.media_info.replace(None);
         // The new encode has the same streams; they are picked again.
-        current.pending.set(Some(Selection::default()));
+        let selected = match next.plan {
+            PlaybackPlan::Direct { .. } => current
+                .requested
+                .or(next.chosen.map(|c| c.selection))
+                .unwrap_or_default(),
+            _ => Selection::default(),
+        };
+        current.pending.set(Some(selected));
         if self.autoplay.get() && !self.held.get() {
             self.pipeline.play_now();
         } else {
@@ -846,24 +835,24 @@ impl Playback {
     /// Reads a byte of the converted output, which the server counts as
     /// use: its handle stays alive while the reader has no reason to read.
     fn keep_conversion_alive(&self) {
-        let Some(conv) = self.now().and_then(|c| c.conversion()) else {
+        let Some(current) = self.now().filter(|c| c.is_converted()) else {
             return;
         };
-        let session = self.session.clone();
+        let Some(managed) = current.managed.borrow().clone() else {
+            return;
+        };
         relm4::spawn(async move {
-            if let Err(e) = session.read_chunk(&conv.handle, conv.epoch, 0, 1).await {
+            if let Err(e) = managed.read_chunk(&managed.snapshot(), 0, 1).await {
                 tracing::debug!(error = %e, "keeping the conversion alive");
             }
         });
     }
 
-    /// Ends `current`'s encode on the server: it would otherwise run on
-    /// until its handle idles out.
-    fn end_conversion(&self, current: &Current) -> Option<tokio::task::JoinHandle<()>> {
-        let conv = current.conversion()?;
-        let session = self.session.clone();
-        Some(relm4::spawn(async move {
-            if let Err(e) = session.stop_playback(&conv.handle).await {
+    /// Ends the playback after its queued progress reports finish.
+    fn end_handle(&self, current: &Current) -> Option<tokio::task::JoinHandle<()>> {
+        let managed = current.managed.borrow().clone()?;
+        Some(self.ordered_call(async move {
+            if let Err(e) = managed.close().await {
                 tracing::debug!(error = %e, "stopping the conversion");
             }
         }))
@@ -968,17 +957,18 @@ impl Playback {
 
     /// [`Playback::stop`], giving back the last calls to the server, to
     /// wait for when the app quits.
-    fn stop_waitable(&self) -> Vec<tokio::task::JoinHandle<()>> {
+    pub(crate) fn stop_waitable(&self) -> Vec<tokio::task::JoinHandle<()>> {
         if self.stopped.replace(true) {
             return Vec::new();
         }
+        let report = self.report_progress();
         // The item goes: answers still on their way find nothing.
         let current = self.current.take();
         // Down to NULL now, not whenever the last reference goes (see
         // `shutdown`), and off the main thread (see `crate::pipeline`).
         [
-            self.report_progress(),
-            current.and_then(|c| self.end_conversion(&c)),
+            report,
+            current.and_then(|c| self.end_handle(&c)),
             Some(self.pipeline.dismantle()),
         ]
         .into_iter()
@@ -1008,7 +998,7 @@ impl Playback {
         self.autoplay.set(true);
         self.held.set(false);
         if let Some(last) = self.current.take() {
-            self.end_conversion(&last);
+            self.end_handle(&last);
         }
         // The next load takes the last item's subtitle away, while
         // stopped (see `Pipeline::load`).
@@ -1057,7 +1047,11 @@ impl Playback {
             current.item.id().clone(),
             current.requested,
         );
+        let pending = self.progress_tail.borrow_mut().take();
         let started = relm4::spawn(async move {
+            if let Some(pending) = pending {
+                let _ = pending.await;
+            }
             // The track list maps the chosen tracks onto the file's
             // streams; it does not wait on the start.
             let tracks = async {
@@ -1066,7 +1060,17 @@ impl Playback {
                     false => None,
                 }
             };
-            tokio::join!(session.start_playback(&id, requested, from), tracks)
+            let opening = ManagedPlayback::open(
+                managed::backend(session.clone()),
+                id.clone(),
+                requested,
+                PlaybackOptions {
+                    start: from,
+                    ..Default::default()
+                },
+            );
+            let (playback, tracks) = tokio::join!(opening, tracks);
+            (playback.map_err(backend_error), tracks)
         });
         let (weak, current) = (Rc::downgrade(self), Rc::downgrade(current));
         glib::spawn_future_local(async move {
@@ -1087,28 +1091,18 @@ impl Playback {
             .upgrade()
             .filter(|c| self.is_current(c) && matches!(&*c.stage.borrow(), Stage::Asking));
         let Some(current) = current else {
-            // Left before the server answered (stopped, or moved on): a
-            // converted start's encode is ended, or it would run until
-            // its handle idles out.
-            if let Ok((Ok(start), _)) = &answer
-                && matches!(start.plan, PlaybackPlan::Converted { .. })
-            {
-                let (session, handle) = (self.session.clone(), start.handle.clone());
-                relm4::spawn(async move {
-                    let _ = session.stop_playback(&handle).await;
-                });
-            }
             return;
         };
         tracing::debug!(ms = current.since_asked(), "the server answered");
         let item = &current.item;
-        let (mut start, tracks) = match answer {
+        let (managed, tracks) = match answer {
             Ok((Ok(start), tracks)) => (start, tracks),
             Ok((Err(e), _)) => return self.could_not_start(item, &e.to_string()),
             Err(e) => {
                 return self.could_not_start(item, &format!("starting playback failed: {e}"));
             }
         };
+        let mut start = managed.snapshot();
         if tracks.is_some() {
             current.track_list.replace(tracks);
         }
@@ -1125,67 +1119,11 @@ impl Playback {
         self.follow_episode(&current);
         let external = subtitle_comes_as_file(&start.plan);
         let handle = start.handle.clone();
-        current.handle.replace(Some(handle.clone()));
-        let (mode, resume, reader): (Mode, Option<Duration>, Box<dyn ByteSource>) =
-            match &start.plan {
-                PlaybackPlan::Converted {
-                    delivery: Delivery::Progressive,
-                    video,
-                    ..
-                } => {
-                    let bitrate = match video {
-                        Some(ConvertedVideo::Encode { max_bitrate, .. }) => *max_bitrate,
-                        _ => None,
-                    };
-                    let conv = Conversion {
-                        handle: handle.clone(),
-                        epoch: start.epoch,
-                        bitrate,
-                    };
-                    let reader = ProgressiveReader::new(
-                        self.session.clone(),
-                        handle.clone(),
-                        start.epoch,
-                        spawn(),
-                        bitrate,
-                    );
-                    // The encode began at the resume point: nothing to seek,
-                    // and its output is already in the film's time.
-                    (Mode::Converted(conv), None, Box::new(reader))
-                }
-                PlaybackPlan::Converted { delivery, .. } => {
-                    return self.failed(&format!(
-                        "the server planned {delivery:?} delivery, which this player does not take"
-                    ));
-                }
-                // Not played as direct play: an empty "file" made the reader's
-                // rate 0 (see MediaReader's bitrate).
-                PlaybackPlan::Unsupported { reasons } => {
-                    return self.failed(&format!("cannot play: {}", reasons.join("; ")));
-                }
-                PlaybackPlan::Unknown => {
-                    return self
-                        .failed("the server planned playback this version cannot take; update it");
-                }
-                PlaybackPlan::Direct { .. } => {
-                    let (size, length) = (start.size, current.catalog_length);
-                    let reader = MediaReader::new(
-                        self.session.clone(),
-                        item.id().clone(),
-                        selection,
-                        start,
-                        spawn(),
-                        length,
-                    );
-                    // Resuming: start reading ahead from about where the
-                    // resume point is in the file while the demuxer reads the
-                    // header, so the seek finds its data on the way or here.
-                    if let (Some(at), Some(length)) = (from, length) {
-                        reader.expect(reader::guess_offset(size, length, at));
-                    }
-                    (Mode::Direct, from, Box::new(reader))
-                }
-            };
+        current.managed.replace(Some(managed.clone()));
+        let (mode, resume, reader) = match playback_reader(managed, from, current.catalog_length) {
+            Ok(parts) => parts,
+            Err(error) => return self.failed(&error),
+        };
         // A subtitle already here (the same item started again after its
         // handle idled out) goes with the file.
         let subtitle = current.subtitle_file.borrow().clone();
@@ -1193,7 +1131,7 @@ impl Playback {
         // A converted encode begins at `from`: that is where playback is
         // until its positions arrive (a restart for a late subtitle goes
         // from here, not from 0).
-        if let (Mode::Converted(_), Some(at)) = (&mode, from) {
+        if let (Mode::Converted, Some(at)) = (&mode, from) {
             self.position.set(at);
         }
         current.stage.replace(Stage::Open { mode, resume });
@@ -1359,16 +1297,38 @@ impl Playback {
     /// Tells the server the current item is at `position`; nothing for
     /// music.
     fn send_progress(&self, position: Duration) -> Option<tokio::task::JoinHandle<()>> {
-        let item = self.current()?;
+        let current = self.now()?;
+        let item = &current.item;
+        let managed = current.managed.borrow().clone()?;
         if !matches!(item, Item::Movie(_) | Item::Episode(_)) {
             return None;
         }
-        let (session, id) = (self.session.clone(), item.id().clone());
-        Some(relm4::spawn(async move {
-            if let Err(e) = session.update_progress(&id, position).await {
+        Some(self.ordered_call(async move {
+            if let Err(e) = managed.report_position(position) {
+                tracing::warn!(error = %e, "progress not queued");
+                return;
+            }
+            if let Err(e) = managed.flush().await {
                 tracing::warn!(error = %e, "progress not saved");
             }
         }))
+    }
+
+    /// Preserve event order and finish progress before closing its playback handle.
+    fn ordered_call(
+        &self,
+        call: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> tokio::task::JoinHandle<()> {
+        let previous = self.progress_tail.borrow_mut().take();
+        let (done, next) = tokio::sync::oneshot::channel();
+        self.progress_tail.replace(Some(next));
+        relm4::spawn(async move {
+            if let Some(previous) = previous {
+                let _ = previous.await;
+            }
+            call.await;
+            let _ = done.send(());
+        })
     }
 
     fn buffering(&self, percent: i32) {
@@ -1662,7 +1622,7 @@ type Answer<T> = Result<Result<T, BackendError>, tokio::task::JoinError>;
 
 /// The answer to starting an item, with its track list when asked for.
 type Started =
-    Result<(Result<PlaybackStart, BackendError>, Option<MediaTracks>), tokio::task::JoinError>;
+    Result<(Result<ManagedPlayback, BackendError>, Option<MediaTracks>), tokio::task::JoinError>;
 
 /// What happens to a playback from outside its own calls: GstPlay's
 /// signals and the server's answers. One entry point, [`Playback::on`];
@@ -1677,7 +1637,7 @@ enum Event {
     Ended,
     Volume(f64),
     Muted(bool),
-    Error(String),
+    Error(String, String),
     Started {
         current: Weak<Current>,
         from: Option<Duration>,
@@ -1687,7 +1647,7 @@ enum Event {
         current: Weak<Current>,
         restart: u64,
         to: Duration,
-        answer: Answer<u32>,
+        answer: Answer<spoolframe_client_sdk::Playback>,
     },
     Subtitle {
         current: Weak<Current>,
@@ -1712,7 +1672,11 @@ impl Playback {
             Event::Ended => self.ended(),
             Event::Volume(volume) => self.emit(&Change::Volume(volume)),
             Event::Muted(muted) => self.emit(&Change::Muted(muted)),
-            Event::Error(e) => self.failed(&e),
+            Event::Error(uri, e) => {
+                if self.pipeline.accepts_error(&uri) {
+                    self.failed(&e);
+                }
+            }
             Event::Started {
                 current,
                 from,
@@ -1768,8 +1732,67 @@ fn connect(adapter: &gst_play::PlaySignalAdapter, playback: &Rc<Playback>) {
     adapter.connect_volume_changed(move |_, volume| on(&g, Event::Volume(volume)));
     let g = guard();
     adapter.connect_mute_changed(move |_, muted| on(&g, Event::Muted(muted)));
-    let g = guard();
-    adapter.connect_error(move |_, e, _| on(&g, Event::Error(e.to_string())));
+    let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
+    playback
+        .pipeline
+        .message_bus()
+        .set_sync_handler(move |_, message| {
+            if let Ok(gst_play::PlayMessage::Error(error)) = gst_play::PlayMessage::parse(message) {
+                let _ = send.send((error.uri().to_string(), error.error().to_string()));
+            }
+            gst::BusSyncReply::Pass
+        });
+    let weak = Rc::downgrade(playback);
+    glib::spawn_future_local(async move {
+        while let Some((uri, error)) = receive.recv().await {
+            let Some(playback) = weak.upgrade() else {
+                break;
+            };
+            playback.on(Event::Error(uri, error));
+        }
+    });
+}
+
+type ReaderParts = (Mode, Option<Duration>, Box<dyn ByteSource>);
+fn playback_reader(
+    playback: ManagedPlayback,
+    from: Option<Duration>,
+    length: Option<Duration>,
+) -> Result<ReaderParts, String> {
+    let start = playback.snapshot();
+    match &start.plan {
+        PlaybackPlan::Converted {
+            delivery: Delivery::Progressive,
+            video,
+            ..
+        } => {
+            let bitrate = match video {
+                Some(ConvertedVideo::Encode { max_bitrate, .. }) => *max_bitrate,
+                _ => None,
+            };
+            Ok((
+                Mode::Converted,
+                None,
+                Box::new(ProgressiveReader::new(playback, spawn(), bitrate)),
+            ))
+        }
+        PlaybackPlan::Direct { .. } => {
+            let reader = MediaReader::new(playback, spawn(), length);
+            if let (Some(at), Some(length)) = (from, length) {
+                reader.expect(reader::guess_offset(start.size, length, at));
+            }
+            Ok((Mode::Direct, from, Box::new(reader)))
+        }
+        PlaybackPlan::Converted { delivery, .. } => Err(format!(
+            "the server planned {delivery:?} delivery, which this player does not take"
+        )),
+        PlaybackPlan::Unsupported { reasons } => {
+            Err(format!("cannot play: {}", reasons.join("; ")))
+        }
+        PlaybackPlan::Unknown => {
+            Err("the server planned playback this version cannot take; update it".into())
+        }
+    }
 }
 
 /// Fetches run on Relm4's tokio runtime, where the SDK's networking lives.
@@ -1876,6 +1899,7 @@ mod tests {
     fn playback_on_the_fake_server() {
         gtk::init().unwrap();
         init().unwrap();
+        dropping_a_start_cleans_up_its_server_handle();
         a_playback_plays_and_tells_a_late_view_where_it_is();
         a_server_that_goes_away_fails_the_playback();
         pausing_saves_where_playback_got_to();
@@ -2010,6 +2034,25 @@ mod tests {
     /// A converted playback (P2-06) plays, a seek restarts the encode and
     /// playback goes on in it, with one encode open on the server, and
     /// stopping ends it.
+    fn dropping_a_start_cleans_up_its_server_handle() {
+        let dir = TestDir::new_blocking("spoolframe-abandoned-start");
+        let path = dir.join("clip.mkv");
+        clip(&path);
+        let client = FakeClient::new(Some(path)).converting(64 * 1024);
+        let profile = FakeClient::profile("andrey");
+        let playback = start_first_movie(&client, &profile, None);
+        drop(playback);
+        // Do not dispatch the main loop until the server has admitted the start.
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while client.open_playbacks(&profile) == 0 && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(client.open_playbacks(&profile), 1);
+        assert!(run_until(Duration::from_secs(5), || client
+            .open_playbacks(&profile)
+            == 0));
+    }
+
     fn a_converted_playback_restarts_its_encode_on_a_seek() {
         let dir = TestDir::new_blocking("spoolframe-convert");
         let path = dir.join("clip.mkv");
@@ -2036,8 +2079,16 @@ mod tests {
             playback.plan(),
             Some(PlaybackPlan::Converted { .. })
         ));
+        let old_uri = playback.pipeline.playback_uri().unwrap();
         let restarts = playback.restarts();
         playback.seek(Duration::from_secs(3));
+        let current = playback.now().unwrap();
+        playback.send_restart(&current, current.restarts.get());
+        playback.on(Event::Error(
+            old_uri.clone(),
+            "old epoch read failed".into(),
+        ));
+        assert!(matches!(&*current.stage.borrow(), Stage::Restarting { .. }));
         // The fake's encode starts again from the file's start (it has no
         // -copyts), so the position drops back; playback must go on.
         assert!(
@@ -2049,6 +2100,11 @@ mod tests {
             playback.is_playing(),
             played.get()
         );
+        playback.on(Event::Error(old_uri, "late old-reader error".into()));
+        assert!(!matches!(
+            &*playback.now().unwrap().stage.borrow(),
+            Stage::Failed
+        ));
         assert_eq!(client.open_playbacks(&profile), 1);
         playback.stop();
         run_until(Duration::from_secs(2), || {

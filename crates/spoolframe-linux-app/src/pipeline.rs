@@ -26,6 +26,7 @@ use crate::tracks;
 pub struct Pipeline {
     /// `None` only once dropped: [`Drop`] moves it to a worker.
     play: Option<gst_play::Play>,
+    state: tokio::sync::watch::Receiver<gst_play::PlayState>,
     /// Dropped before GstPlay on the main thread: its handlers are bound
     /// to it, and the messages it holds hold GstPlay.
     adapter: Option<gst_play::PlaySignalAdapter>,
@@ -35,6 +36,7 @@ pub struct Pipeline {
     published: RefCell<Option<Published>>,
     /// The external subtitle GstPlay was given last.
     subtitle: RefCell<Option<PathBuf>>,
+    loading_subtitle: std::sync::Arc<std::sync::Mutex<Option<Option<String>>>>,
 }
 
 impl Pipeline {
@@ -44,17 +46,36 @@ impl Pipeline {
         let renderer = gst_play::PlayVideoOverlayVideoRenderer::with_sink(&video.outer);
         let play = gst_play::Play::new(Some(renderer));
         style_subtitles(&play.pipeline());
+        // GstPlay's subtitle setter restores the previous position, including
+        // for a non-seekable replacement stream. Set playbin's startup subtitle
+        // when its source is created, after GstPlay has reset the old URI.
+        let loading_subtitle = std::sync::Arc::new(std::sync::Mutex::new(None::<Option<String>>));
+        let pending = loading_subtitle.clone();
+        play.pipeline()
+            .connect("source-setup", false, move |values| {
+                if let Some(subtitle) = pending.lock().unwrap().take() {
+                    let playbin = values[0].get::<gst::Element>().unwrap();
+                    playbin.set_property("suburi", subtitle.as_deref());
+                }
+                None
+            });
         let mut config = play.config();
         config.set_position_update_interval(250);
         play.set_config(config)?;
         let adapter = gst_play::PlaySignalAdapter::new(&play);
+        let (state_send, state) = tokio::sync::watch::channel(gst_play::PlayState::Stopped);
+        adapter.connect_state_changed(move |_, state| {
+            let _ = state_send.send(state);
+        });
         Ok(Self {
             play: Some(play),
+            state,
             adapter: Some(adapter),
             video,
             paintable,
             published: RefCell::new(None),
             subtitle: RefCell::new(None),
+            loading_subtitle,
         })
     }
 
@@ -93,16 +114,18 @@ impl Pipeline {
     /// mid-play stalled it. One already given is given again, as a new
     /// URI may not keep it.
     pub fn load(&self, reader: Box<dyn ByteSource>, subtitle: Option<&Path>) {
+        self.quiesce();
         let play = self.play();
-        play.stop();
         let published = Published::boxed(reader);
+        let uri = subtitle
+            .map(|path| gtk::prelude::FileExt::uri(&gtk::gio::File::for_path(path)).to_string());
+        *self.loading_subtitle.lock().unwrap() = Some(uri);
+        self.subtitle.replace(subtitle.map(Path::to_path_buf));
+        if subtitle.is_some() {
+            play.set_subtitle_track_enabled(true);
+        }
         play.set_uri(Some(&published.uri()));
         self.published.replace(Some(published));
-        match subtitle {
-            Some(path) => self.give_subtitle(Some(path)),
-            None if self.subtitle.borrow().is_some() => self.give_subtitle(None),
-            None => {}
-        }
     }
 
     /// Hands GstPlay an external subtitle mid-play, on, or takes it away.
@@ -125,7 +148,42 @@ impl Pipeline {
 
     /// Stops, keeping the pipeline for the next item.
     pub fn stop(&self) {
+        self.quiesce();
+    }
+
+    pub fn quiesce(&self) {
+        if let Some(published) = self.published.borrow().as_ref() {
+            published.retire();
+        }
         self.play().stop();
+    }
+
+    // Retire reads immediately, then wait without blocking GTK for GstPlay
+    // to finish stopping before the server changes the stream's epoch.
+    pub fn stop_and_wait(&self) -> impl std::future::Future<Output = ()> + Send + use<> {
+        let mut state = self.state.clone();
+        self.quiesce();
+        async move {
+            let _ = state
+                .wait_for(|state| *state == gst_play::PlayState::Stopped)
+                .await;
+        }
+    }
+
+    pub fn message_bus(&self) -> gst::Bus {
+        self.play().message_bus()
+    }
+
+    #[cfg(test)]
+    pub fn playback_uri(&self) -> Option<String> {
+        self.published.borrow().as_ref().map(Published::uri)
+    }
+
+    pub fn accepts_error(&self, uri: &str) -> bool {
+        self.published
+            .borrow()
+            .as_ref()
+            .is_some_and(|p| !p.retired() && p.uri() == uri)
     }
 
     pub fn play_now(&self) {

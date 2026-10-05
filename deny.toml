@@ -1,0 +1,17 @@
+# The client is GPL; AGPL dependencies are deliberately excluded.
+[graph]
+all-features = true
+exclude-dev = true
+
+[licenses]
+confidence-threshold = 0.95
+allow = [
+  "MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause", "BSD-3-Clause", "ISC",
+  "Unicode-3.0", "Zlib", "CC0-1.0", "Unlicense", "BSL-1.0",
+  "CDLA-Permissive-2.0", "LGPL-2.1-or-later", "MPL-2.0",
+]
+exceptions = [
+  { crate = "spoolframe-policy", allow = ["GPL-3.0-or-later"] },
+  { crate = "spoolframe-linux-core", allow = ["GPL-3.0-or-later"] },
+  { crate = "spoolframe-linux-app", allow = ["GPL-3.0-or-later"] },
+]
