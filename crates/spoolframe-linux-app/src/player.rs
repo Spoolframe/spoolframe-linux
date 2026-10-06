@@ -281,7 +281,12 @@ impl View {
             Change::Volume(_) | Change::Muted(_) => self.controls.volume.show(change),
             Change::Offer(offer) => self.show_offer(*offer),
             Change::IntroSkipped => self.undo.show(),
-            Change::Modes { .. } | Change::Queue | Change::Skipped(_) => {}
+            // The app closes the player on Stopped.
+            Change::Modes { .. }
+            | Change::Queue
+            | Change::Skipped(_)
+            | Change::Stopped
+            | Change::SignedOut => {}
         }
     }
 

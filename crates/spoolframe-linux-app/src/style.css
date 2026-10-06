@@ -1,6 +1,6 @@
 /* The app's own styling. Colours come only from libadwaita's variables,
    never a literal, so that "Follow system", the user's gtk.css and every
-   Catppuccin theme restyle these widgets too. tests/it/stylesheet.rs checks
+   Catppuccin theme restyle these widgets too. src/stylesheet.rs checks
    this.
 
    This sheet loads one step above the user's gtk.css (see theme.rs). A

@@ -278,6 +278,8 @@ impl View {
             Change::Starting
             | Change::Buffering(_)
             | Change::Failed(_)
+            | Change::Stopped
+            | Change::SignedOut
             | Change::Skipped(_)
             | Change::Offer(_)
             | Change::IntroSkipped => {}

@@ -476,6 +476,7 @@ impl Default for SignIns {
             device_name: Some("Living Room Apple TV".into()),
             client_name: "spoolframe-tvos".into(),
             requested_at: unix_now() - 30,
+            platform: Platform::Tvos,
         };
         Self {
             pending: [(FAKE_SIGN_IN_CODE.to_owned(), request)].into(),
@@ -539,6 +540,11 @@ struct Serving {
     web: bool,
     /// How the server answers for preview frames (P3-13).
     previews: PreviewsAnswer,
+    /// The admin stops every playback (P3-15): reads are refused.
+    stopped: bool,
+    /// Sessions end under their playbacks (a password changed elsewhere):
+    /// reads ask to sign in again.
+    signed_out: bool,
 }
 
 /// How the fake answers for an item's preview frames.
@@ -1227,6 +1233,12 @@ impl Session for FakeSession {
             if self.gone.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(BackendError::Unreachable("Home Media".into()));
             }
+            if self.serving.stopped {
+                return Err(BackendError::PlaybackStopped);
+            }
+            if self.serving.signed_out {
+                return Err(BackendError::SignInRequired);
+            }
             self.playback(handle)?;
             self.file_bytes(offset, length)
         })
@@ -1500,6 +1512,61 @@ impl Session for FakeSession {
         })
     }
 
+    fn confirm_password<'a>(
+        &'a self,
+        password: &'a str,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            if self.username == "sso" {
+                return Err(BackendError::NoPassword);
+            }
+            if password != FAKE_PASSWORD {
+                return Err(BackendError::WrongCredentials);
+            }
+            self.lock_passkeys().stale = false;
+            Ok(())
+        })
+    }
+
+    fn begin_confirm_passkey(&self) -> BoxFuture<'_, Result<PasskeyRequest, BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            let allow: Vec<Vec<u8>> = self
+                .lock_passkeys()
+                .keys
+                .iter()
+                .filter(|k| k.app && k.username == self.username)
+                .map(|k| k.credential_id.clone())
+                .collect();
+            if allow.is_empty() {
+                return Err(BackendError::NotFound("app passkey".into()));
+            }
+            Ok(PasskeyRequest {
+                challenge: FAKE_PASSKEY_CHALLENGE.to_vec(),
+                allow_credential_ids: allow,
+            })
+        })
+    }
+
+    fn finish_confirm_passkey(
+        &self,
+        signed: FinishPasskeySignIn,
+    ) -> BoxFuture<'_, Result<(), BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            let mut passkeys = self.lock_passkeys();
+            let theirs = passkeys.keys.iter().any(|k| {
+                k.app && k.username == self.username && k.credential_id == signed.credential_id
+            });
+            if !theirs {
+                return Err(BackendError::WrongCredentials);
+            }
+            passkeys.stale = false;
+            Ok(())
+        })
+    }
+
     fn begin_passkey_registration(&self) -> BoxFuture<'_, Result<PasskeyCreation, BackendError>> {
         Box::pin(async move {
             self.guard()?;
@@ -1637,6 +1704,11 @@ impl Session for FakeSession {
             if pin.pin.is_none() {
                 return Err(BackendError::InvalidInput("set a PIN first".into()));
             }
+            // No longer asking for it needs a recent sign-in, as on the
+            // server.
+            if !required && self.lock_passkeys().stale {
+                return Err(BackendError::RecentSignInRequired);
+            }
             let device = device.unwrap_or(THIS_DEVICE).to_owned();
             if required {
                 pin.required.insert(device);
@@ -1662,6 +1734,7 @@ impl Session for FakeSession {
                     device_name: Some("This computer".into()),
                     client_name: "spoolframe-linux".into(),
                     requested_at: unix_now(),
+                    platform: Platform::Linux,
                 });
             }
             match sign_ins.pending.get(code) {
@@ -1684,6 +1757,9 @@ impl Session for FakeSession {
                 return Err(BackendError::InvalidInput(
                     "this device cannot approve its own sign-in".into(),
                 ));
+            }
+            if self.lock_passkeys().stale {
+                return Err(BackendError::RecentSignInRequired);
             }
             let mut sign_ins = self.sign_ins.lock().expect("fake state is never poisoned");
             sign_ins
@@ -1737,6 +1813,8 @@ pub struct FakeClient {
     active: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Sign-ins this device asked a phone to approve (P3-05, P3-07).
     phone_sign_ins: Mutex<PhoneSignIns>,
+    /// Bumped by [`FakeClient::sign_out_elsewhere`].
+    sign_outs: watch::Sender<u64>,
     passkeys: Arc<Mutex<FakePasskeys>>,
 }
 
@@ -1812,6 +1890,8 @@ impl FakeClient {
                 not_set_up: false,
                 web: true,
                 previews: PreviewsAnswer::None,
+                stopped: false,
+                signed_out: false,
             },
             gone: Arc::default(),
             active: Arc::default(),
@@ -1866,6 +1946,7 @@ impl FakeClient {
             })),
             failed_sign_ins: Mutex::new((0, None)),
             connections: Mutex::new(HashMap::new()),
+            sign_outs: watch::Sender::new(0),
             servers_changed: watch::Sender::new(()),
         }
     }
@@ -1883,6 +1964,20 @@ impl FakeClient {
                     .clone()
             })
             .unwrap_or_default()
+    }
+
+    /// The server signs this device out, as when its password changes on
+    /// another device: every profile's session ends, and the watch fires.
+    pub fn sign_out_elsewhere(&self) {
+        for profile in self
+            .signed_in
+            .lock()
+            .expect("fake state is never poisoned")
+            .iter()
+        {
+            self.fake_session(profile).pin_state().revoked = true;
+        }
+        self.sign_outs.send_modify(|n| *n += 1);
     }
 
     /// Every sign-in on this device is now older than the 10 minutes
@@ -1925,6 +2020,20 @@ impl FakeClient {
                 ))
             })
             .clone()
+    }
+
+    /// Every playback's session ends under it, as when the password
+    /// changes on another device: its reads ask to sign in again.
+    pub fn with_sessions_ending(mut self) -> Self {
+        self.serving.signed_out = true;
+        self
+    }
+
+    /// The server's admin stops every playback (P3-15): its reads are
+    /// refused with PlaybackStopped.
+    pub fn with_playbacks_stopped(mut self) -> Self {
+        self.serving.stopped = true;
+        self
     }
 
     /// Reads answer at most `limit` bytes, like a server that sends less
@@ -2313,19 +2422,12 @@ impl Client for FakeClient {
     ) -> BoxFuture<'a, Result<PasskeyRequest, BackendError>> {
         Box::pin(async move {
             self.pinned(server)?;
-            let passkeys = self.passkeys.lock().expect("fake state is never poisoned");
-            let allow = match username {
-                Some(username) => passkeys
-                    .keys
-                    .iter()
-                    .filter(|k| k.app && k.username == username)
-                    .map(|k| k.credential_id.clone())
-                    .collect(),
-                None => Vec::new(),
-            };
+            // The server lists no passkeys, with a username or without
+            // (PX-10): the key offers whichever it holds for this server.
+            let _ = username;
             Ok(PasskeyRequest {
                 challenge: FAKE_PASSKEY_CHALLENGE.to_vec(),
-                allow_credential_ids: allow,
+                allow_credential_ids: Vec::new(),
             })
         })
     }
@@ -2413,6 +2515,10 @@ impl Client for FakeClient {
         Ok(self.fake_session(profile))
     }
 
+    fn signed_out(&self, _server: &ServerKey) -> watch::Receiver<u64> {
+        self.sign_outs.subscribe()
+    }
+
     fn connection(&self, server: &ServerKey) -> watch::Receiver<ConnectionState> {
         let state = if self.reach(server).is_ok() {
             ConnectionState::Connected
@@ -2472,14 +2578,18 @@ mod search {
                 .cloned()
                 .collect()
         };
+        // Inside a library, as the server does since P3-18: the people in
+        // one of its items.
         let people = || -> Vec<Person> {
-            if within.is_some() {
-                return Vec::new();
-            }
             catalog
                 .people
                 .iter()
                 .filter(|(p, _)| matches(&text, &p.name))
+                .filter(|(_, items)| {
+                    within
+                        .as_ref()
+                        .is_none_or(|w| items.iter().any(|i| w.contains(i)))
+                })
                 .map(|(p, _)| p.clone())
                 .collect()
         };
@@ -3064,7 +3174,7 @@ mod tests {
     }
 
     #[test]
-    fn a_library_search_finds_only_its_items_and_no_people() {
+    fn a_library_search_finds_only_its_items() {
         let request = SearchRequest {
             query: "low".into(),
             limit: 10,
@@ -3074,6 +3184,32 @@ mod tests {
         };
         let results = ready(andrey().search(&request)).unwrap();
         assert!(results.top.is_none() && results.groups.is_empty());
+    }
+
+    #[test]
+    fn a_library_search_finds_the_people_in_its_items() {
+        let in_library = |key: &str, name: &str| SearchRequest {
+            query: "villeneuve".into(),
+            limit: 10,
+            scope: SearchScope::All,
+            kind: Some(SearchKind::People),
+            library: Some(library(key, name, LibraryKind::Movies).id),
+        };
+        let people = |request: &SearchRequest| {
+            ready(andrey().search(request))
+                .unwrap()
+                .groups
+                .iter()
+                .map(|g| g.people.len())
+                .sum::<usize>()
+        };
+        assert_eq!(
+            (
+                people(&in_library("1", "Movies")),
+                people(&in_library("3", "Music"))
+            ),
+            (1, 0)
+        );
     }
 
     #[test]
@@ -3635,6 +3771,45 @@ mod tests {
             let _ = ready(alice.unlock("0000"));
         }
         assert_eq!(profile_of(&client, "alice").sign_in, ProfileSignIn::Passkey);
+    }
+
+    #[test]
+    fn confirming_with_the_password_lets_an_old_sign_in_add_a_passkey() {
+        let client = FakeClient::new(None);
+        let andrey = session_for(&client, "andrey");
+        client.age_sign_ins();
+        assert_eq!(
+            ready(andrey.begin_passkey_registration()).unwrap_err(),
+            BackendError::RecentSignInRequired
+        );
+        ready(andrey.confirm_password(FAKE_PASSWORD)).unwrap();
+        assert!(ready(andrey.begin_passkey_registration()).is_ok());
+    }
+
+    #[test]
+    fn a_user_without_an_app_passkey_cannot_confirm_with_one() {
+        let client = FakeClient::new(None);
+        // Andrey's only passkey is the web UI's.
+        assert_eq!(
+            ready(session_for(&client, "andrey").begin_confirm_passkey()).unwrap_err(),
+            BackendError::NotFound("app passkey".into())
+        );
+    }
+
+    #[test]
+    fn signed_out_elsewhere_the_watch_fires_and_profiles_ask_again() {
+        let client = FakeClient::new(None);
+        session_for(&client, "andrey");
+        let mut sign_outs = client.signed_out(&home_media());
+        client.sign_out_elsewhere();
+        assert_eq!(
+            (
+                sign_outs.has_changed().unwrap(),
+                profile_of(&client, "andrey").sign_in
+            ),
+            (true, ProfileSignIn::Password)
+        );
+        sign_outs.mark_unchanged();
     }
 
     #[test]

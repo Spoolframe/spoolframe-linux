@@ -108,6 +108,12 @@ pub enum Change<'a> {
     /// The intro was skipped by itself; [`Playback::undo_intro_skip`]
     /// goes back.
     IntroSkipped,
+    /// The server's admin stopped this playback (P3-15): nothing plays it
+    /// again; the player closes.
+    Stopped,
+    /// The session ended under it (signed out elsewhere, or the password
+    /// changed): back to "Who's watching".
+    SignedOut,
 }
 
 /// What plays after the current item, for "Up next".
@@ -1638,6 +1644,10 @@ enum Event {
     Volume(f64),
     Muted(bool),
     Error(String, String),
+    /// A read was refused because the admin stopped the playback.
+    Stopped(String),
+    /// A read was refused because the session ended.
+    SignedOut(String),
     Started {
         current: Weak<Current>,
         from: Option<Duration>,
@@ -1675,6 +1685,18 @@ impl Playback {
             Event::Error(uri, e) => {
                 if self.pipeline.accepts_error(&uri) {
                     self.failed(&e);
+                }
+            }
+            Event::Stopped(uri) => {
+                if self.pipeline.accepts_error(&uri) {
+                    tracing::info!("the server's admin stopped the playback");
+                    self.emit(&Change::Stopped);
+                }
+            }
+            Event::SignedOut(uri) => {
+                if self.pipeline.accepts_error(&uri) {
+                    tracing::info!("the session ended under the playback");
+                    self.emit(&Change::SignedOut);
                 }
             }
             Event::Started {
@@ -1738,17 +1760,22 @@ fn connect(adapter: &gst_play::PlaySignalAdapter, playback: &Rc<Playback>) {
         .message_bus()
         .set_sync_handler(move |_, message| {
             if let Ok(gst_play::PlayMessage::Error(error)) = gst_play::PlayMessage::parse(message) {
-                let _ = send.send((error.uri().to_string(), error.error().to_string()));
+                let marked = error.details().map(|d| d.name().to_string());
+                let _ = send.send((error.uri().to_string(), error.error().to_string(), marked));
             }
             gst::BusSyncReply::Pass
         });
     let weak = Rc::downgrade(playback);
     glib::spawn_future_local(async move {
-        while let Some((uri, error)) = receive.recv().await {
+        while let Some((uri, error, marked)) = receive.recv().await {
             let Some(playback) = weak.upgrade() else {
                 break;
             };
-            playback.on(Event::Error(uri, error));
+            playback.on(match marked.as_deref() {
+                Some(crate::source::STOPPED) => Event::Stopped(uri),
+                Some(crate::source::SIGNED_OUT) => Event::SignedOut(uri),
+                _ => Event::Error(uri, error),
+            });
         }
     });
 }
@@ -1902,6 +1929,8 @@ mod tests {
         dropping_a_start_cleans_up_its_server_handle();
         a_playback_plays_and_tells_a_late_view_where_it_is();
         a_server_that_goes_away_fails_the_playback();
+        a_playback_the_admin_stopped_says_so();
+        a_session_ended_under_a_playback_says_so();
         pausing_saves_where_playback_got_to();
         resuming_plays_from_where_it_stopped();
         a_restored_queue_waits_paused_where_it_was();
@@ -2319,6 +2348,84 @@ mod tests {
     /// The server goes away before the file is read: the playback says it
     /// failed (the player shows the error) instead of waiting forever, and
     /// shutting down afterwards releases it.
+    fn a_playback_the_admin_stopped_says_so() {
+        let dir = TestDir::new_blocking("spoolframe-stopped");
+        let path = dir.join("clip.mkv");
+        clip(&path);
+        let client = FakeClient::new(Some(path)).with_playbacks_stopped();
+        let profile = FakeClient::profile("andrey");
+        let session = client.session(&profile).unwrap();
+        let item = first_movie(&session);
+        let playback = Playback::start(Playlist {
+            session,
+            items: vec![item],
+            index: 0,
+            queued: Vec::new(),
+            from: None,
+            selection: None,
+            tracks: None,
+            album: None,
+        })
+        .unwrap();
+        let (stopped, failed) = (Rc::new(Cell::new(false)), Rc::new(Cell::new(false)));
+        {
+            let (stopped, failed) = (stopped.clone(), failed.clone());
+            playback.subscribe(move |change| {
+                match change {
+                    Change::Stopped => stopped.set(true),
+                    Change::Failed(_) => failed.set(true),
+                    _ => {}
+                }
+                true
+            });
+        }
+        assert!(
+            run_until(Duration::from_secs(20), || stopped.get() || failed.get()),
+            "neither stopped nor failed"
+        );
+        assert!(stopped.get() && !failed.get());
+        playback.stop();
+    }
+
+    fn a_session_ended_under_a_playback_says_so() {
+        let dir = TestDir::new_blocking("spoolframe-signed-out");
+        let path = dir.join("clip.mkv");
+        clip(&path);
+        let client = FakeClient::new(Some(path)).with_sessions_ending();
+        let profile = FakeClient::profile("andrey");
+        let session = client.session(&profile).unwrap();
+        let item = first_movie(&session);
+        let playback = Playback::start(Playlist {
+            session,
+            items: vec![item],
+            index: 0,
+            queued: Vec::new(),
+            from: None,
+            selection: None,
+            tracks: None,
+            album: None,
+        })
+        .unwrap();
+        let (stopped, failed) = (Rc::new(Cell::new(false)), Rc::new(Cell::new(false)));
+        {
+            let (stopped, failed) = (stopped.clone(), failed.clone());
+            playback.subscribe(move |change| {
+                match change {
+                    Change::SignedOut => stopped.set(true),
+                    Change::Failed(_) => failed.set(true),
+                    _ => {}
+                }
+                true
+            });
+        }
+        assert!(
+            run_until(Duration::from_secs(20), || stopped.get() || failed.get()),
+            "neither stopped nor failed"
+        );
+        assert!(stopped.get() && !failed.get());
+        playback.stop();
+    }
+
     fn a_server_that_goes_away_fails_the_playback() {
         let dir = TestDir::new_blocking("spoolframe-gone");
         let path = dir.join("clip.mkv");

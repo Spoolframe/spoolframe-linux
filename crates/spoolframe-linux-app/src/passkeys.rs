@@ -15,17 +15,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use adw::prelude::*;
 use gtk::glib;
 use spoolframe_linux_core::backend::{
-    BackendError, Client, FinishPasskeyRegistration, PasskeyInfo, Profile, Server, Session,
+    BackendError, FinishPasskeyRegistration, PasskeyInfo, Server, Session,
 };
 
-use crate::passkey_dialog::{self, Ceremony, Done, KeyPage, PasskeySignIn};
+use crate::passkey_dialog::{self, Ceremony, Done, KeyPage};
 use spoolframe_linux_core::passkey::Via;
 
 /// What the group needs: who, where, and how to sign in again.
 pub struct Needs {
-    pub client: Arc<dyn Client>,
     pub server: Server,
-    pub profile: Profile,
     pub session: Arc<dyn Session>,
 }
 
@@ -101,9 +99,7 @@ pub fn group(needs: Needs, toasts: &adw::ToastOverlay) -> adw::PreferencesGroup 
         .header_suffix(&add)
         .build();
     let view = Rc::new(View {
-        client: needs.client,
         server: needs.server,
-        profile: needs.profile,
         session: RefCell::new(needs.session),
         toasts: toasts.downgrade(),
         group: group.clone(),
@@ -125,9 +121,7 @@ pub fn group(needs: Needs, toasts: &adw::ToastOverlay) -> adw::PreferencesGroup 
 }
 
 struct View {
-    client: Arc<dyn Client>,
     server: Server,
-    profile: Profile,
     /// Replaced when "Confirm it's you" signs in again.
     session: RefCell<Arc<dyn Session>>,
     toasts: glib::WeakRef<adw::ToastOverlay>,
@@ -392,164 +386,21 @@ impl View {
         );
     }
 
-    /// "Confirm it's you": signs in again, then makes the call again on
-    /// the new session.
+    /// "Confirm it's you" on this session, then the call again.
     fn confirm(self: &Rc<Self>, title: &str, again: Again) {
         let Some(parent) = self.parent() else { return };
-        let dialog = adw::Dialog::builder()
-            .title(title)
-            .content_width(380)
-            .build();
-        let password = gtk::PasswordEntry::builder()
-            .show_peek_icon(true)
-            .css_classes(["field"])
-            .build();
-        let error = gtk::Label::builder()
-            .visible(false)
-            .wrap(true)
-            .max_width_chars(1)
-            .css_classes(["error"])
-            .build();
-        let go = gtk::Button::builder()
-            .label("Continue")
-            .css_classes(["action", "suggested-action"])
-            .build();
-        let with_passkey = gtk::Button::builder()
-            .label("Use a passkey instead")
-            .halign(gtk::Align::Center)
-            .css_classes(["flat", "text-link"])
-            .build();
-        let body = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .spacing(14)
-            .margin_top(24)
-            .margin_bottom(26)
-            .margin_start(26)
-            .margin_end(26)
-            .build();
-        body.append(
-            &gtk::Label::builder()
-                .label("Confirm it’s you")
-                .css_classes(["title-3"])
-                .build(),
-        );
-        body.append(
-            &gtk::Label::builder()
-                .label("You signed in over 10 minutes ago.")
-                .css_classes(["dim-label", "small-text"])
-                .build(),
-        );
-        let field = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .spacing(6)
-            .build();
-        field.append(
-            &gtk::Label::builder()
-                .label("Password")
-                .xalign(0.0)
-                .css_classes(["field-label"])
-                .build(),
-        );
-        field.append(&password);
-        body.append(&field);
-        body.append(&error);
-        body.append(&go);
-        body.append(&with_passkey);
-        crate::start::with_cancel(&dialog, &body);
-        let signed_in: Rc<dyn Fn(Profile)> = {
-            let (weak, dialog, again) = (Rc::downgrade(self), dialog.downgrade(), again.clone());
-            Rc::new(move |profile| {
-                let Some(view) = weak.upgrade() else { return };
-                if let Some(dialog) = dialog.upgrade() {
-                    dialog.close();
+        let weak = Rc::downgrade(self);
+        crate::confirm::ask(
+            &parent,
+            self.session.borrow().clone(),
+            &self.server.name,
+            title,
+            Rc::new(move || {
+                if let Some(view) = weak.upgrade() {
+                    again(&view);
                 }
-                match view.client.session(&profile) {
-                    Ok(session) => {
-                        view.session.replace(session);
-                        again(&view);
-                    }
-                    Err(e) => view.toast(&e.to_string()),
-                }
-            })
-        };
-        {
-            let (weak, password_, error, signed_in) = (
-                Rc::downgrade(self),
-                password.clone(),
-                error.clone(),
-                signed_in.clone(),
-            );
-            go.connect_clicked(move |go| {
-                let Some(view) = weak.upgrade() else { return };
-                go.set_sensitive(false);
-                let (client, key, username, secret) = (
-                    view.client.clone(),
-                    view.server.key.clone(),
-                    view.profile.username.clone(),
-                    password_.text().to_string(),
-                );
-                let call =
-                    relm4::spawn(async move { client.sign_in(&key, &username, &secret).await });
-                let (go, error, signed_in) = (go.clone(), error.clone(), signed_in.clone());
-                glib::spawn_future_local(async move {
-                    let answer = call.await;
-                    go.set_sensitive(true);
-                    match answer {
-                        Ok(Ok(profile)) => signed_in(profile),
-                        Ok(Err(BackendError::WrongCredentials)) => {
-                            error.set_label("That password isn’t right.");
-                            error.set_visible(true);
-                        }
-                        Ok(Err(e)) => {
-                            error.set_label(&e.to_string());
-                            error.set_visible(true);
-                        }
-                        Err(e) => {
-                            error.set_label(&e.to_string());
-                            error.set_visible(true);
-                        }
-                    }
-                });
-            });
-            let go_ = go.clone();
-            password.connect_activate(move |_| go_.emit_clicked());
-        }
-        {
-            let (weak, signed_in, parent_) =
-                (Rc::downgrade(self), signed_in.clone(), parent.clone());
-            with_passkey.connect_clicked(move |_| {
-                let Some(view) = weak.upgrade() else { return };
-                // The passkey dialog closes itself once signed in: the slot
-                // holds it for its own ending.
-                let slot: Rc<RefCell<Option<glib::WeakRef<adw::Dialog>>>> = Rc::default();
-                let screen = PasskeySignIn::new(
-                    view.client.clone(),
-                    &view.server,
-                    Some(view.profile.username.clone()),
-                    passkey_dialog::Ends {
-                        done: {
-                            let (signed_in, slot) = (signed_in.clone(), slot.clone());
-                            Rc::new(move |profile| {
-                                if let Some(dialog) =
-                                    slot.borrow().as_ref().and_then(|d| d.upgrade())
-                                {
-                                    dialog.close();
-                                }
-                                signed_in(profile);
-                            })
-                        },
-                    },
-                );
-                slot.replace(Some(screen.dialog.downgrade()));
-                screen.dialog.present(Some(&parent_));
-                // The dialog holds its screen while it shows.
-                let held = screen.clone();
-                screen.dialog.connect_closed(move |_| {
-                    let _ = &held;
-                });
-            });
-        }
-        dialog.present(Some(&parent));
+            }),
+        );
     }
 
     /// Add a passkey…: which kind, the key, then its name.
@@ -929,6 +780,7 @@ mod tests {
     }
 
     fn a_web_ui_passkey_is_listed() {
+        use spoolframe_linux_core::backend::Client;
         use spoolframe_linux_core::fake::FakeClient;
         let client: Arc<dyn Client> = Arc::new(FakeClient::new(None));
         let profile = FakeClient::profile("andrey");
@@ -945,15 +797,7 @@ mod tests {
             last_connected_at: None,
         };
         let toasts = adw::ToastOverlay::new();
-        let group = group(
-            Needs {
-                client,
-                server,
-                profile,
-                session,
-            },
-            &toasts,
-        );
+        let group = group(Needs { server, session }, &toasts);
         let titles = || {
             let mut titles = Vec::new();
             let mut child = group.first_child();

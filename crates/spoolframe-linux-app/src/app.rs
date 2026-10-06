@@ -115,6 +115,9 @@ pub struct App {
     cards: Rc<Cards>,
     /// Follows the connection to the server in use; replaced on switching.
     connection_watch: Option<glib::JoinHandle<()>>,
+    /// The server signing this device out (PX-10): back to "Who's
+    /// watching" at once.
+    sign_out_watch: Option<glib::JoinHandle<()>>,
     /// What plays, shown full or in the bar; dropping it stops it.
     playback: Option<Rc<Playback>>,
     /// The play queue (P1-23) while no playback holds it: kept from the
@@ -247,6 +250,9 @@ pub enum Msg {
     /// Skip intros without asking (P2-10).
     SetSkipIntros(bool),
     SetShowHdr(bool),
+    /// The session ended under the screen (signed out elsewhere, or its
+    /// password changed): back to "Who's watching".
+    SessionEnded,
     SetShowDiagnostics(bool),
     /// Leave the full player and keep playing in the bar.
     MinimizePlayer,
@@ -721,6 +727,7 @@ impl Component for App {
                 enqueue: None,
             }),
             connection_watch: None,
+            sign_out_watch: None,
             playback: None,
             queued: Vec::new(),
             saved_queue: None,
@@ -1122,7 +1129,7 @@ impl Component for App {
                         if shuffle {
                             playback.toggle_shuffle();
                         }
-                        self.attach_playback(&playback, widgets);
+                        self.attach_playback(&playback, widgets, &sender);
                         // Video opens the player; music keeps the page it
                         // was started from, playing in the bar.
                         if playback.is_video() {
@@ -1230,6 +1237,7 @@ impl Component for App {
                 }
             }
             Msg::SetShowDiagnostics(on) => self.settings.set_show_diagnostics(on),
+            Msg::SessionEnded => self.signed_out(widgets, &sender),
             Msg::SetShowHdr(on) => {
                 // Part of the device's capabilities, told as it connects.
                 self.settings.set_show_hdr(on);
@@ -1857,7 +1865,7 @@ impl App {
         // The queue was the last profile's; this one's comes back paused.
         self.queued.clear();
         self.saved_queue = SavedQueue::for_profile(&profile).map(Rc::new);
-        self.restore_queue(widgets);
+        self.restore_queue(widgets, sender);
         widgets.stack.pop_to_page(&widgets.root_page);
         widgets.window_stack.pop_to_page(&widgets.library_page);
         clear(&widgets.content);
@@ -1872,6 +1880,17 @@ impl App {
         if let Some(watch) = self.connection_watch.take() {
             watch.abort();
         }
+        if let Some(watch) = self.sign_out_watch.take() {
+            watch.abort();
+        }
+        let mut sign_outs = self.client.signed_out(server);
+        sign_outs.mark_unchanged();
+        let ended = sender.clone();
+        self.sign_out_watch = Some(glib::spawn_future_local(async move {
+            while sign_outs.changed().await.is_ok() {
+                ended.input(Msg::SessionEnded);
+            }
+        }));
         let mut states = self.client.connection(server);
         let sender = sender.clone();
         self.connection_watch = Some(glib::spawn_future_local(async move {
@@ -1887,13 +1906,19 @@ impl App {
 
     /// Shows `playback` in the bar and to the desktop, and saves its queue
     /// as it changes.
-    fn attach_playback(&self, playback: &Rc<Playback>, widgets: &AppWidgets) {
+    fn attach_playback(
+        &self,
+        playback: &Rc<Playback>,
+        widgets: &AppWidgets,
+        sender: &ComponentSender<Self>,
+    ) {
         playback.set_skip_intros(self.settings.skip_intros());
         // A queued item that cannot play is passed over with a word, not
         // a stop (P1-23).
         // Music has no page that shows an error (the video player does):
         // a track that cannot play says so in a toast.
         let toasts = widgets.toasts.clone();
+        let stop = sender.clone();
         let weak = Rc::downgrade(playback);
         let now_playing = self.now_playing.clone();
         now_playing.send_replace(playback.current().map(|i| i.id().clone()));
@@ -1903,6 +1928,14 @@ impl App {
                     now_playing.send_replace(Some(item.id().clone()));
                 }
                 Change::Skipped(message) => toasts.add_toast(adw::Toast::new(message)),
+                // Nothing plays it again: the player and the bar close.
+                Change::SignedOut => stop.input(Msg::SessionEnded),
+                Change::Stopped => {
+                    toasts.add_toast(adw::Toast::new(
+                        "Playback was stopped by the server's admin",
+                    ));
+                    stop.input(Msg::StopPlayback);
+                }
                 Change::Failed(error) if weak.upgrade().is_some_and(|p| !p.is_video()) => {
                     toasts.add_toast(adw::Toast::new(&format!("Cannot play: {error}")));
                 }
@@ -1919,7 +1952,7 @@ impl App {
 
     /// Brings back the profile's queue from the last run, paused in the
     /// bar.
-    fn restore_queue(&mut self, widgets: &AppWidgets) {
+    fn restore_queue(&mut self, widgets: &AppWidgets, sender: &ComponentSender<Self>) {
         let (Some(session), Some(saved)) = (self.session.clone(), self.saved_queue.clone()) else {
             return;
         };
@@ -1931,7 +1964,7 @@ impl App {
         }
         match Playback::restore(session, queue, at) {
             Ok(playback) => {
-                self.attach_playback(&playback, widgets);
+                self.attach_playback(&playback, widgets, sender);
                 self.playback = Some(playback);
             }
             Err(e) => tracing::warn!(error = %e, "cannot restore the queue"),
@@ -2046,6 +2079,10 @@ impl App {
             cards: self.cards.clone(),
             play,
             open_person,
+            signed_out: {
+                let sender = sender.clone();
+                Rc::new(move || sender.input(Msg::SessionEnded))
+            },
             shuffle,
             server: server.name.clone(),
             profile: profile.display_name.clone(),
@@ -2062,9 +2099,7 @@ impl App {
         );
         Some(crate::profile_page::Signed {
             session,
-            client: self.client.clone(),
             server: server.clone(),
-            profile: profile.clone(),
             server_key: server.key.0.clone(),
             server_name: server.name.clone(),
             display_name: profile.display_name.clone(),
@@ -2155,7 +2190,12 @@ impl App {
         // A player still open would keep playing behind "Who's watching".
         self.stop_playback(widgets);
         self.queued.clear();
-        toast(widgets, &BackendError::SignInRequired);
+        // Signed out elsewhere, a password changed, a session revoked:
+        // it is no fault here, so it reads as news, not an error.
+        toast_text(
+            widgets,
+            "You were signed out on this device. Sign in again.",
+        );
         if let Some(server) = self.server.clone() {
             self.load_profiles(server, sender);
         } else {

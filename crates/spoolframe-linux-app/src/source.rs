@@ -20,6 +20,15 @@ use gst_base::prelude::*;
 use gst_base::subclass::prelude::*;
 use spoolframe_linux_core::reader::{ByteSource, ReadError};
 
+/// The details of the error a read posts when the server's admin stopped
+/// the playback (P3-15). GstPlay passes an element's error on in its own
+/// error domain, so the code alone does not survive; the details do.
+pub const STOPPED: &str = "spoolframe-playback-stopped";
+
+/// The same, when the session is gone (signed out elsewhere, or its
+/// password changed): the app goes back to "Who's watching".
+pub const SIGNED_OUT: &str = "spoolframe-signed-out";
+
 const SCHEME: &str = "spoolframe";
 
 /// Published readers, by the number in their URI.
@@ -253,6 +262,26 @@ mod imp {
             let bytes = match reader.read_reporting(offset, length.into(), &mut buffering) {
                 Ok(bytes) => bytes,
                 Err(ReadError::Flushing) => return Err(gst::FlowError::Flushing),
+                // An admin stopped it (P3-15): its own code, so the player
+                // closes instead of offering it again.
+                Err(ReadError::Backend(spoolframe_client_sdk::SdkError::PlaybackStopped)) => {
+                    gst::element_imp_error!(
+                        self,
+                        gst::ResourceError::NotAuthorized,
+                        ["the playback was stopped on the server"],
+                        details: gst::Structure::new_empty(STOPPED)
+                    );
+                    return Err(gst::FlowError::Error);
+                }
+                Err(ReadError::Backend(spoolframe_client_sdk::SdkError::SignInRequired)) => {
+                    gst::element_imp_error!(
+                        self,
+                        gst::ResourceError::NotAuthorized,
+                        ["the session ended; sign in again"],
+                        details: gst::Structure::new_empty(SIGNED_OUT)
+                    );
+                    return Err(gst::FlowError::Error);
+                }
                 Err(ReadError::Backend(e)) => {
                     gst::element_imp_error!(self, gst::ResourceError::Read, ["{e}"]);
                     return Err(gst::FlowError::Error);

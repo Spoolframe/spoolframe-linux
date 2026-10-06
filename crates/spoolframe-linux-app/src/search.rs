@@ -59,6 +59,8 @@ pub struct Needs {
     pub open_person: Rc<dyn Fn(Person)>,
     /// Plays items shuffled: a person's, from their top result.
     pub shuffle: Rc<dyn Fn(Vec<Item>)>,
+    /// The session ended (signed out elsewhere, or its password changed).
+    pub signed_out: Rc<dyn Fn()>,
     /// The server's name, for "Nothing anywhere in … matches".
     pub server: String,
     /// The profile's display name and where its searches are kept.
@@ -543,6 +545,8 @@ impl SearchPage {
             page.searching.set_spinning(false);
             match answer {
                 Ok(results) => page.show(results),
+                // Not a failed search: the app goes back to "Who's watching".
+                Err(BackendError::SignInRequired) => (page.needs.signed_out)(),
                 Err(e) => page.failed(&e),
             }
         })));
@@ -1627,6 +1631,7 @@ mod tests {
             play: Rc::new(|_| {}),
             open_person: Rc::new(|_| {}),
             shuffle: Rc::new(|_| {}),
+            signed_out: Rc::new(|| {}),
             server: "Home Media".into(),
             profile: "Andrey".into(),
             recent: None,

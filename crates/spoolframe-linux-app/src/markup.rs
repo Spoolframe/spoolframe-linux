@@ -4,14 +4,14 @@
 //! as it is set. Rows take their text after they are built.
 
 const SOURCES: &[(&str, &str)] = &[
-    ("app.rs", include_str!("../../src/app.rs")),
-    ("pages.rs", include_str!("../../src/pages.rs")),
-    ("preferences.rs", include_str!("../../src/preferences.rs")),
-    ("profile_page.rs", include_str!("../../src/profile_page.rs")),
-    ("search.rs", include_str!("../../src/search.rs")),
-    ("start.rs", include_str!("../../src/start.rs")),
-    ("views.rs", include_str!("../../src/views.rs")),
-    ("nowplaying.rs", include_str!("../../src/nowplaying.rs")),
+    ("app.rs", include_str!("app.rs")),
+    ("pages.rs", include_str!("pages.rs")),
+    ("preferences.rs", include_str!("preferences.rs")),
+    ("profile_page.rs", include_str!("profile_page.rs")),
+    ("search.rs", include_str!("search.rs")),
+    ("start.rs", include_str!("start.rs")),
+    ("views.rs", include_str!("views.rs")),
+    ("nowplaying.rs", include_str!("nowplaying.rs")),
 ];
 
 /// Rows and toasts whose builder sets a title or subtitle that is not a

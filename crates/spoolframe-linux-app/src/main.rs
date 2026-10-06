@@ -1,10 +1,14 @@
 mod app;
 mod artwork;
 mod capabilities;
+mod confirm;
 mod fonts;
 mod icons;
 mod library;
 mod logo;
+// Checks over the sources: unit tests, kept beside the code they scan.
+#[cfg(test)]
+mod markup;
 mod minibar;
 mod mpris;
 mod nowplaying;
@@ -27,6 +31,8 @@ mod settings;
 mod source;
 mod srt_markup;
 mod start;
+#[cfg(test)]
+mod stylesheet;
 mod theme;
 mod tracks;
 mod transport;

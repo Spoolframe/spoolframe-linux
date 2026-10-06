@@ -39,6 +39,7 @@ pub fn backend_error(error: sdk::SdkError) -> BackendError {
     match error {
         E::Unreachable(what) => BackendError::Unreachable(what),
         E::TimedOut(what) => BackendError::TimedOut(what),
+        E::PlaybackStopped => BackendError::PlaybackStopped,
         E::InvalidCredentials => BackendError::WrongCredentials,
         E::NoPassword => BackendError::NoPassword,
         E::RateLimited { retry_after } => BackendError::RateLimited(retry_after),
@@ -61,6 +62,7 @@ pub fn backend_error(error: sdk::SdkError) -> BackendError {
         E::PlaybackFailed(why) => BackendError::Other(format!("the conversion failed: {why}")),
         E::Unavailable(message) => BackendError::Unavailable(message),
         E::RecentSignInRequired => BackendError::RecentSignInRequired,
+        E::ServerFull => BackendError::ServerFull,
         E::LastSignInMethod => BackendError::LastSignInMethod,
         other => BackendError::Other(other.to_string()),
     }
@@ -189,6 +191,7 @@ pub struct SdkClient {
     handle: Handle,
     sessions: Sessions,
     states: Mutex<HashMap<ServerKey, watch::Sender<ConnectionState>>>,
+    sign_outs: Mutex<HashMap<ServerKey, watch::Sender<u64>>>,
     servers_changed: watch::Sender<()>,
 }
 
@@ -208,6 +211,7 @@ impl SdkClient {
             handle,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             states: Mutex::new(HashMap::new()),
+            sign_outs: Mutex::new(HashMap::new()),
             servers_changed,
         }
     }
@@ -524,6 +528,28 @@ impl Client for SdkClient {
         }))
     }
 
+    fn signed_out(&self, key: &ServerKey) -> watch::Receiver<u64> {
+        let mut sign_outs = self.sign_outs.lock().expect("never poisoned");
+        if let Some(sender) = sign_outs.get(key) {
+            return sender.subscribe();
+        }
+        let sender = watch::Sender::new(0);
+        let receiver = sender.subscribe();
+        match self.client.signed_out(&key.0) {
+            Ok(mut watch) => {
+                let forward = sender.clone();
+                self.handle.spawn(async move {
+                    while watch.next().await.is_some() {
+                        forward.send_modify(|n| *n += 1);
+                    }
+                });
+            }
+            Err(e) => tracing::warn!(error = %e, "cannot watch for sign-outs"),
+        }
+        sign_outs.insert(key.clone(), sender);
+        receiver
+    }
+
     fn connection(&self, key: &ServerKey) -> watch::Receiver<ConnectionState> {
         let mut states = self.states.lock().expect("never poisoned");
         if let Some(sender) = states.get(key) {
@@ -834,6 +860,25 @@ impl Session for SdkSession {
 
     fn plex_link(&self) -> BoxFuture<'_, Result<Option<PlexLink>, BackendError>> {
         Box::pin(self.call(|s| async move { s.plex_link().await }))
+    }
+
+    fn confirm_password<'a>(
+        &'a self,
+        password: &'a str,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        let password = password.to_owned();
+        Box::pin(self.call(move |s| async move { s.confirm_password(&password).await }))
+    }
+
+    fn begin_confirm_passkey(&self) -> BoxFuture<'_, Result<PasskeyRequest, BackendError>> {
+        Box::pin(self.call(|s| async move { s.begin_confirm_passkey().await }))
+    }
+
+    fn finish_confirm_passkey(
+        &self,
+        signed: FinishPasskeySignIn,
+    ) -> BoxFuture<'_, Result<(), BackendError>> {
+        Box::pin(self.call(move |s| async move { s.finish_confirm_passkey(signed).await }))
     }
 
     fn begin_passkey_registration(&self) -> BoxFuture<'_, Result<PasskeyCreation, BackendError>> {

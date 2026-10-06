@@ -34,10 +34,8 @@ pub fn last_used(seen: i64, now: i64) -> String {
 /// The signed-in profile the page is for.
 pub struct Signed {
     pub session: Arc<dyn Session>,
-    /// For the passkeys, whose "Confirm it's you" signs in again.
-    pub client: Arc<dyn spoolframe_linux_core::backend::Client>,
+    /// For the passkeys' dialogs, which name it.
     pub server: spoolframe_linux_core::backend::Server,
-    pub profile: spoolframe_linux_core::backend::Profile,
     /// The server's key, hex: a pasted link must name this server.
     pub server_key: String,
     pub server_name: String,
@@ -185,9 +183,7 @@ pub fn page(signed: Signed, dialog: &adw::ToastOverlay) -> adw::PreferencesPage 
         .build();
     let passkeys = crate::passkeys::group(
         crate::passkeys::Needs {
-            client: signed.client,
             server: signed.server,
-            profile: signed.profile,
             session: signed.session.clone(),
         },
         dialog,
@@ -362,6 +358,19 @@ impl View {
         });
     }
 
+    /// "Confirm it's you" on this session, then `again`.
+    fn confirm(&self, title: &str, again: Rc<dyn Fn()>) {
+        if let Some(parent) = self.dialog.upgrade() {
+            crate::confirm::ask(
+                &parent,
+                self.session.clone(),
+                &self.server_name,
+                title,
+                again,
+            );
+        }
+    }
+
     /// Lists the devices again, each with its switch.
     fn load(self: &Rc<Self>) {
         self.run(
@@ -432,11 +441,26 @@ impl View {
     /// Asks for the PIN on `device` (this one for `None`), or stops
     /// asking. A refusal puts the switch back to what the server has.
     fn require(self: &Rc<Self>, device: Option<String>, on: bool) {
+        let again = device.clone();
         self.run(
             move |s| Box::pin(async move { s.set_pin_required(device.as_deref(), on).await }),
             move |this, result| match result {
                 Ok(()) if on => this.toast("Your PIN will be asked for there"),
                 Ok(()) => this.toast("Your PIN will not be asked for there"),
+                // No longer asking needs a recent sign-in (P3-18): the
+                // switch goes back until it is confirmed, then again.
+                Err(BackendError::RecentSignInRequired) => {
+                    this.load();
+                    let weak = Rc::downgrade(this);
+                    this.confirm(
+                        "Stop asking for the PIN",
+                        Rc::new(move || {
+                            if let Some(this) = weak.upgrade() {
+                                this.require(again.clone(), on);
+                            }
+                        }),
+                    );
+                }
                 Err(e) => {
                     this.toast(&refusal(&e));
                     this.load();
@@ -1097,13 +1121,14 @@ impl View {
             .device_name
             .clone()
             .unwrap_or_else(|| "A device".to_owned());
+        // Which app asks, as the server says it: "Apple TV app".
+        let platform = request.platform.label();
         let body = step_body(
-            crate::icons::PHONE,
+            device_icon(Some(request.platform)),
             "Sign in this device?",
             &format!(
-                "It asked {}, from {}.",
+                "It asked {}, from the {platform}.",
                 asked(request.requested_at, now()),
-                request.client_name
             ),
         );
         let facts = gtk::ListBox::builder()
@@ -1111,7 +1136,7 @@ impl View {
             .css_classes(["boxed-list"])
             .build();
         for (label, value, mono) in [
-            ("Device", device.clone(), false),
+            ("Device", format!("{device} · {platform}"), false),
             ("Signs in as", self.display_name.clone(), false),
             ("Code", device_sign_in::display(&code), true),
         ] {
@@ -1157,8 +1182,10 @@ impl View {
                 done.clone(),
                 dialog.clone(),
             );
-            button.connect_clicked(move |_| {
+            button.connect_clicked(move |button| {
                 let Some(this) = this.upgrade() else { return };
+                // Pressed again once "Confirm it's you" is done.
+                let again = button.downgrade();
                 let (code, device, stack, done, dialog) = (
                     code.clone(),
                     device.clone(),
@@ -1187,6 +1214,14 @@ impl View {
                             }
                             this.toast(&format!("{device} was not signed in"));
                         }
+                        Err(BackendError::RecentSignInRequired) => this.confirm(
+                            "Sign in a device",
+                            Rc::new(move || {
+                                if let Some(button) = again.upgrade() {
+                                    button.emit_clicked();
+                                }
+                            }),
+                        ),
                         Err(e) => this.toast(&approval_refusal(&e)),
                     },
                 );

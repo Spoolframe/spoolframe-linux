@@ -266,6 +266,8 @@ impl Mpris {
             | Change::MediaInfo(_)
             | Change::Buffering(_)
             | Change::Failed(_)
+            | Change::Stopped
+            | Change::SignedOut
             | Change::Skipped(_)
             | Change::Offer(_)
             | Change::IntroSkipped => {}

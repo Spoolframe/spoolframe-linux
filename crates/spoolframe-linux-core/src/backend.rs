@@ -51,9 +51,15 @@ pub enum BackendError {
     /// still have gone through, so re-read before offering it again.
     #[error("{0} did not answer in time")]
     TimedOut(String),
+    /// The server's admin stopped this playback (P3-15); nothing plays it
+    /// again.
+    #[error("playback was stopped by the server's admin")]
+    PlaybackStopped,
     #[error("the username or password is wrong")]
     WrongCredentials,
-    #[error("too many failed sign-ins; try again in {} s", .0.as_secs().max(1))]
+    /// Too many failed sign-ins, or (PX-10) too many changes in a row from
+    /// this user or device: wait, then try again.
+    #[error("too many tries; try again in {} s", .0.as_secs().max(1))]
     RateLimited(Duration),
     /// The session is gone (signed out elsewhere, expired, user disabled):
     /// the user has to sign in again.
@@ -76,6 +82,10 @@ pub enum BackendError {
     /// The server is converting as many files as it may (P2-03).
     #[error("the server is busy converting other files; try again shortly")]
     Busy,
+    /// The server takes no more connections from devices not yet signed
+    /// in (PX-10): try again later, by hand.
+    #[error("the server is busy; try again later")]
+    ServerFull,
     /// A seek restarted a converted playback's encode (P2-04): read
     /// `epoch` from offset 0.
     #[error("the playback restarted (epoch {epoch})")]
@@ -368,6 +378,11 @@ pub trait Client: Send + Sync {
     /// The state of the connection to `server`, as it changes.
     fn connection(&self, server: &ServerKey) -> watch::Receiver<ConnectionState>;
 
+    /// Changes each time `server` signs this device out (its last session
+    /// ended, a password changed elsewhere, PX-10): the stored sessions
+    /// are gone by then, so the app goes back to "Who's watching".
+    fn signed_out(&self, server: &ServerKey) -> watch::Receiver<u64>;
+
     /// Changes when [`Client::servers`] would answer differently: a server
     /// heard, changed or gone on the LAN, an address added, a pin saved or
     /// forgotten. Discovery takes a moment after opening, so the first
@@ -628,6 +643,25 @@ pub trait Session: Send + Sync {
 
     /// Refuses it: the device is told so.
     fn deny_device_sign_in<'a>(&'a self, code: &'a str) -> BoxFuture<'a, Result<(), BackendError>>;
+
+    /// "Confirm it's you" with the password: refreshes this session's
+    /// sign-in time, for the actions that need one in the last 10 minutes
+    /// (approving a device, adding or removing a passkey, no longer
+    /// requiring the PIN). A wrong one is [`BackendError::WrongCredentials`]
+    /// (then [`BackendError::RateLimited`]); an account without a password
+    /// is [`BackendError::NoPassword`]. The PIN does not confirm it.
+    fn confirm_password<'a>(&'a self, password: &'a str)
+    -> BoxFuture<'a, Result<(), BackendError>>;
+
+    /// Begins confirming with one of this user's app passkeys: what the
+    /// key or phone signs. A user with none is [`BackendError::NotFound`].
+    fn begin_confirm_passkey(&self) -> BoxFuture<'_, Result<PasskeyRequest, BackendError>>;
+
+    /// Finishes it with what the passkey signed.
+    fn finish_confirm_passkey(
+        &self,
+        signed: FinishPasskeySignIn,
+    ) -> BoxFuture<'_, Result<(), BackendError>>;
 }
 
 #[cfg(test)]
