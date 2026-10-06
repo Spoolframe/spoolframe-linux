@@ -133,6 +133,12 @@ pub struct App {
     /// heard only on a later listing; it is opened once, not on every
     /// change after.
     opened_last_server: bool,
+    /// The first listing of profiles this run is yet to come: the one that
+    /// opens at start is opened from it, past Who's watching (P4-02).
+    starting: bool,
+    /// A remembered profile the server would not resume: Who's watching
+    /// says it needs a sign-in, once.
+    needs_sign_in: Option<Profile>,
     /// The item whose page is loading: a second click on it while it loads
     /// opens nothing more, and the page of an item clicked before it is
     /// dropped when it arrives, so only the last click opens a page.
@@ -212,16 +218,21 @@ pub enum Msg {
     SignInAs(String),
     /// Drop a profile kept on this device.
     ForgetProfile(Profile),
+    /// "Sign out Alice?" for a profile on Who's watching, or the one
+    /// watching when None (P4-02).
+    AskSignOut(Option<Profile>),
+    /// Signs a profile out here, which forgets this computer for it.
+    SignOutProfile(Profile),
     /// Ask a server that was not set up for its catalog again (P3-10).
     RetryCatalog,
     /// Sign in by approving on a phone (P3-05) or in the browser (P3-06).
-    OpenRemoteSignIn(Via),
+    OpenRemoteSignIn(Via, bool),
     /// Sign in with a passkey (P3-19), narrowed to a typed username.
-    OpenPasskeySignIn(Option<String>),
+    OpenPasskeySignIn(Option<String>, bool),
     /// The browser sign-in has no page to open: the server has no web
     /// address.
     BrowserSignInUnavailable,
-    SubmitSignIn(String, Secret),
+    SubmitSignIn(String, Secret, bool),
     /// Back to "Who's watching" from the library.
     SwitchProfile,
     /// A sidebar row was activated: see the `ROW_*` constants.
@@ -253,6 +264,9 @@ pub enum Msg {
     /// The session ended under the screen (signed out elsewhere, or its
     /// password changed): back to "Who's watching".
     SessionEnded,
+    /// Preferences › Profile stopped remembering this computer, which
+    /// ended the session here (P4-01).
+    StoppedRemembering,
     SetShowDiagnostics(bool),
     /// Leave the full player and keep playing in the bar.
     MinimizePlayer,
@@ -313,6 +327,11 @@ pub enum Loaded {
     Trusted(Result<Server, BackendError>),
     Profiles(Server, Result<Vec<Profile>, BackendError>),
     ProfileForgotten(Server, Result<(), BackendError>),
+    /// A profile signed out, from Who's watching or the sidebar (P4-02).
+    ProfileSignedOut(Server, Result<(), BackendError>),
+    /// A remembered profile opened without a password, or why not; its
+    /// username, to sign in again.
+    Resumed(Box<Profile>, Result<Profile, BackendError>),
     SignedIn(Result<Profile, BackendError>),
     Libraries(Result<Vec<Library>, BackendError>),
     Home(Result<HomeScreen, BackendError>),
@@ -472,7 +491,7 @@ impl Component for App {
         profile_body.append(&gtk::Image::from_icon_name(crate::icons::DOWN));
         let profile_button = gtk::Button::builder()
             .child(&profile_body)
-            .tooltip_text("Switch profile")
+            .tooltip_text("Account")
             .css_classes(["flat", "sidebar-profile"])
             .build();
         // Preferences, beside who is watching: the boards have no menu in
@@ -491,9 +510,33 @@ impl Component for App {
             .build();
         profile_foot.append(&profile_button);
         profile_foot.append(&preferences_button);
+        // The account menu, as the LinuxTrustStates board has it.
         {
-            let sender = sender.clone();
-            profile_button.connect_clicked(move |_| sender.input(Msg::SwitchProfile));
+            let (switch, sign_out) = (sender.clone(), sender.clone());
+            let menu = crate::views::menu_popover(vec![
+                vec![
+                    crate::views::MenuEntry::new("Switch profile", crate::icons::DOWN, move || {
+                        switch.input(Msg::SwitchProfile)
+                    }),
+                    crate::views::MenuEntry::new("Preferences", crate::icons::SET_UP, {
+                        let button = profile_button.downgrade();
+                        move || {
+                            if let Some(button) = button.upgrade() {
+                                let _ = button.activate_action("win.preferences", None);
+                            }
+                        }
+                    }),
+                ],
+                vec![crate::views::MenuEntry {
+                    destructive: true,
+                    ..crate::views::MenuEntry::new("Sign out", crate::icons::SIGN_OUT, move || {
+                        sign_out.input(Msg::AskSignOut(None))
+                    })
+                }],
+            ]);
+            menu.set_parent(&profile_button);
+            menu.set_position(gtk::PositionType::Top);
+            profile_button.connect_clicked(move |_| menu.popup());
         }
         // The mark and the wordmark head the sidebar.
         let brand = gtk::Box::builder().spacing(10).build();
@@ -734,6 +777,8 @@ impl Component for App {
             library_cache: None,
             library: None,
             opened_last_server: false,
+            starting: true,
+            needs_sign_in: None,
             opening: None,
             now_playing: tokio::sync::watch::Sender::new(None),
         };
@@ -868,7 +913,18 @@ impl Component for App {
             }
             // Last in with a passkey: offered one again.
             Msg::ChooseProfile(profile) if profile.sign_in == ProfileSignIn::Passkey => {
-                sender.input(Msg::OpenPasskeySignIn(Some(profile.username)))
+                sender.input(Msg::OpenPasskeySignIn(Some(profile.username), false))
+            }
+            // Remembered: opened without a password (P4-01).
+            Msg::ChooseProfile(profile) if profile.sign_in == ProfileSignIn::Resume => {
+                let Some(trust) = profile.trust.clone() else {
+                    return sender.input(Msg::SignInAs(profile.username));
+                };
+                let client = self.client.clone();
+                self.command(&sender, async move {
+                    let resumed = client.resume_profile(&profile.server, &trust.user_id).await;
+                    Loaded::Resumed(Box::new(profile), resumed)
+                });
             }
             Msg::ChooseProfile(profile) if profile.locked => {
                 self.ask_pin(profile, widgets, &sender)
@@ -924,20 +980,67 @@ impl Component for App {
                     Loaded::ProfileForgotten(server, forgotten)
                 });
             }
+            Msg::AskSignOut(profile) => {
+                let Some(profile) = profile.or_else(|| self.profile.clone()) else {
+                    return;
+                };
+                let name = profile.display_name.clone();
+                let sign_out: Rc<dyn Fn()> = {
+                    let sender = sender.clone();
+                    Rc::new(move || sender.input(Msg::SignOutProfile(profile.clone())))
+                };
+                start::sign_out_confirm(&name, sign_out).present(Some(root));
+            }
+            Msg::SignOutProfile(profile) => {
+                let Some(server) = self.server.clone() else {
+                    return;
+                };
+                // The one watching leaves the library first.
+                let watching = self
+                    .profile
+                    .as_ref()
+                    .is_some_and(|p| p.server == profile.server && p.username == profile.username);
+                if watching {
+                    self.stop_playback(widgets);
+                    self.invalidate_session();
+                }
+                let client = self.client.clone();
+                self.command(&sender, async move {
+                    let signed_out = async {
+                        // A remembered profile has no session here until it
+                        // is resumed; resuming is what signing out ends.
+                        let profile = match (&profile.trust, profile.sign_in) {
+                            (Some(trust), ProfileSignIn::Resume) => {
+                                client
+                                    .resume_profile(&profile.server, &trust.user_id)
+                                    .await?
+                            }
+                            _ => profile,
+                        };
+                        client.session(&profile)?.sign_out().await
+                    }
+                    .await;
+                    Loaded::ProfileSignedOut(server, signed_out)
+                });
+            }
             Msg::OpenSignIn => sender.input(Msg::SignInAs(String::new())),
             Msg::SignInAs(username) => {
                 let Some(server) = &self.server else { return };
-                let submit: Rc<dyn Fn(String, String)> = {
+                let submit: Rc<dyn Fn(String, String, bool)> = {
                     let sender = sender.clone();
-                    Rc::new(move |u, p| sender.input(Msg::SubmitSignIn(u, Secret(p))))
+                    Rc::new(move |u, p, remember| {
+                        sender.input(Msg::SubmitSignIn(u, Secret(p), remember))
+                    })
                 };
-                let elsewhere: Rc<dyn Fn(Via)> = {
+                let elsewhere: Rc<dyn Fn(Via, bool)> = {
                     let sender = sender.clone();
-                    Rc::new(move |via| sender.input(Msg::OpenRemoteSignIn(via)))
+                    Rc::new(move |via, remember| sender.input(Msg::OpenRemoteSignIn(via, remember)))
                 };
-                let passkey: Rc<dyn Fn(Option<String>)> = {
+                let passkey: Rc<dyn Fn(Option<String>, bool)> = {
                     let sender = sender.clone();
-                    Rc::new(move |username| sender.input(Msg::OpenPasskeySignIn(username)))
+                    Rc::new(move |username, remember| {
+                        sender.input(Msg::OpenPasskeySignIn(username, remember))
+                    })
                 };
                 let dialog = start::SignIn::new(server, submit, elsewhere, passkey);
                 if !username.is_empty() {
@@ -946,7 +1049,7 @@ impl Component for App {
                 dialog.dialog.present(Some(root));
                 widgets.sign_in = Some(dialog);
             }
-            Msg::OpenRemoteSignIn(via) => {
+            Msg::OpenRemoteSignIn(via, remember) => {
                 let Some(server) = &self.server else { return };
                 let token = self.profile_scope.token();
                 let ends = remote_sign_in::Ends {
@@ -969,11 +1072,11 @@ impl Component for App {
                         Rc::new(move |url| open_in_browser(url, window.upgrade().as_ref()))
                     },
                 };
-                let screen = RemoteSignIn::new(self.client.clone(), server, via, ends);
+                let screen = RemoteSignIn::new(self.client.clone(), server, via, remember, ends);
                 screen.dialog.present(Some(root));
                 widgets.remote_sign_in = Some(screen);
             }
-            Msg::OpenPasskeySignIn(username) => {
+            Msg::OpenPasskeySignIn(username, remember) => {
                 let Some(server) = &self.server else { return };
                 let token = self.profile_scope.token();
                 let ends = passkey_dialog::Ends {
@@ -988,7 +1091,8 @@ impl Component for App {
                         })
                     },
                 };
-                let screen = PasskeySignIn::new(self.client.clone(), server, username, ends);
+                let screen =
+                    PasskeySignIn::new(self.client.clone(), server, username, remember, ends);
                 screen.dialog.present(Some(root));
                 widgets.passkey_sign_in = Some(screen);
             }
@@ -1000,7 +1104,7 @@ impl Component for App {
                     );
                 }
             }
-            Msg::SubmitSignIn(username, Secret(password)) => {
+            Msg::SubmitSignIn(username, Secret(password), remember) => {
                 // Enter in the password field still sends while one is out.
                 if self.sign_in_in_flight {
                     return;
@@ -1014,7 +1118,11 @@ impl Component for App {
                 }
                 let client = self.client.clone();
                 self.command(&sender, async move {
-                    Loaded::SignedIn(client.sign_in(&server.key, &username, &password).await)
+                    Loaded::SignedIn(
+                        client
+                            .sign_in(&server.key, &username, &password, remember)
+                            .await,
+                    )
                 });
             }
             Msg::SwitchProfile => {
@@ -1238,6 +1346,18 @@ impl Component for App {
             }
             Msg::SetShowDiagnostics(on) => self.settings.set_show_diagnostics(on),
             Msg::SessionEnded => self.signed_out(widgets, &sender),
+            Msg::StoppedRemembering => {
+                self.invalidate_session();
+                self.stop_playback(widgets);
+                self.queued.clear();
+                toast_text(
+                    widgets,
+                    "This computer no longer remembers you. Sign in again to watch.",
+                );
+                if let Some(server) = self.server.clone() {
+                    self.load_profiles(server, &sender);
+                }
+            }
             Msg::SetShowHdr(on) => {
                 // Part of the device's capabilities, told as it connects.
                 self.settings.set_show_hdr(on);
@@ -1421,6 +1541,26 @@ impl Component for App {
             Loaded::Trusted(Err(e)) => toast(widgets, &e),
             Loaded::ProfileForgotten(server, Ok(())) => self.load_profiles(server, &sender),
             Loaded::ProfileForgotten(_, Err(e)) => toast(widgets, &e),
+            Loaded::ProfileSignedOut(server, signed_out) => {
+                if let Err(e) = signed_out {
+                    toast(widgets, &e);
+                }
+                self.load_profiles(server, &sender);
+            }
+            Loaded::Resumed(_, Ok(profile)) if profile.locked => {
+                self.ask_pin(profile, widgets, &sender)
+            }
+            Loaded::Resumed(_, Ok(profile)) => self.enter(profile, widgets, &sender),
+            // Trust lapsed, was removed, or the account was disabled: the
+            // server does not say which, so one message for all, and the
+            // profile leaves the picker as the list is asked again.
+            Loaded::Resumed(profile, Err(BackendError::SignInRequired)) => {
+                self.needs_sign_in = Some(*profile);
+                if let Some(server) = self.server.clone() {
+                    self.load_profiles(server, &sender);
+                }
+            }
+            Loaded::Resumed(_, Err(e)) => toast(widgets, &e),
             Loaded::Profiles(server, Ok(profiles)) => {
                 let choose: start::Choose<Profile> = {
                     let sender = sender.clone();
@@ -1438,19 +1578,45 @@ impl Component for App {
                     let sender = sender.clone();
                     Rc::new(move |p| sender.input(Msg::ForgetProfile(p)))
                 };
+                let sign_out: start::Choose<Profile> = {
+                    let sender = sender.clone();
+                    Rc::new(move |p| sender.input(Msg::AskSignOut(Some(p))))
+                };
+                let sign_in_as: start::Choose<Profile> = {
+                    let sender = sender.clone();
+                    Rc::new(move |p| sender.input(Msg::SignInAs(p.username)))
+                };
                 let path: Rc<dyn Fn() -> Option<&'static str>> = {
                     let (client, key) = (self.client.clone(), server.key.clone());
                     Rc::new(move || {
                         spoolframe_linux_core::format::path_chip(client.connection_path(&key))
                     })
                 };
+                let needs_sign_in = self.needs_sign_in.take();
                 widgets.profiles.set_child(Some(&start::profiles(
-                    &server, &profiles, &choose, &forget, &sign_in, &back, path,
+                    &server,
+                    &profiles,
+                    &start::ProfileActions {
+                        choose,
+                        forget,
+                        sign_out,
+                        sign_in_as,
+                    },
+                    needs_sign_in.as_ref(),
+                    &sign_in,
+                    &back,
+                    path,
                 )));
                 widgets.screens.set_visible_child_name("profiles");
                 self.server = Some(server);
-                // Nobody signed in here yet: go straight to signing in.
-                if profiles.is_empty() {
+                let opens_at_start = std::mem::take(&mut self.starting)
+                    .then(|| start::opens_at_start(&profiles))
+                    .flatten();
+                if let Some(profile) = opens_at_start {
+                    // Past Who's watching; Switch profile still leads to it.
+                    sender.input(Msg::ChooseProfile(profile.clone()));
+                } else if profiles.is_empty() && needs_sign_in.is_none() {
+                    // Nobody signed in here yet: go straight to signing in.
                     sender.input(Msg::OpenSignIn);
                 }
             }
@@ -1771,7 +1937,7 @@ impl App {
                 show_diagnostics: self.settings.show_diagnostics(),
                 set_show_diagnostics,
             },
-            self.signed(),
+            self.signed(sender),
         )
     }
 
@@ -2091,7 +2257,7 @@ impl App {
     }
 
     /// The profile in use, for Preferences → Profile.
-    fn signed(&self) -> Option<crate::profile_page::Signed> {
+    fn signed(&self, sender: &ComponentSender<Self>) -> Option<crate::profile_page::Signed> {
         let (session, server, profile) = (
             self.session.clone()?,
             self.server.as_ref()?,
@@ -2104,6 +2270,10 @@ impl App {
             server_name: server.name.clone(),
             display_name: profile.display_name.clone(),
             username: profile.username.clone(),
+            left: {
+                let sender = sender.clone();
+                Rc::new(move || sender.input(Msg::StoppedRemembering))
+            },
         })
     }
 

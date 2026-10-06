@@ -10,6 +10,8 @@
 //!
 //! It keeps the device's key in memory, so it leaves nothing in the
 //! keyring, and it reads media but changes no watch state or preferences.
+//! The trust test makes its throwaway device trusted for the user and
+//! signs it out at the end, which removes that trust again.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -117,10 +119,9 @@ fn the_server_list_changes_when_the_lan_server_is_heard() {
     eprintln!("discovery: {listed} servers listed after a change");
 }
 
-#[test]
-#[ignore = "needs a running Spoolframe server; see the module docs"]
-fn the_app_backend_works_against_a_live_server() {
-    let runtime = tokio::runtime::Runtime::new().unwrap();
+/// A new device, with its key in memory, for the server in the
+/// environment.
+fn new_device(runtime: &tokio::runtime::Runtime) -> (SdkClient, ServerKey) {
     let device = sdk::Device {
         platform: sdk::types::Platform::Linux,
         name: "spoolframe-linux live test".into(),
@@ -134,8 +135,129 @@ fn the_app_backend_works_against_a_live_server() {
             device,
         ))
         .unwrap();
-    let client = SdkClient::new(client, runtime.handle().clone());
-    let key = ServerKey(env("SPOOLFRAME_TEST_KEY"));
+    (
+        SdkClient::new(client, runtime.handle().clone()),
+        ServerKey(env("SPOOLFRAME_TEST_KEY")),
+    )
+}
+
+/// P4-01 as the app uses it: a sign-in that asks to be remembered, the
+/// remembered profile resumed without a password, opening at start, and
+/// signing out forgetting the device.
+#[test]
+#[ignore = "needs a running Spoolframe server; see the module docs"]
+fn a_remembered_profile_resumes_and_signing_out_forgets_it() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (client, key) = new_device(&runtime);
+    run(
+        &runtime,
+        client.add_address(&key, &env("SPOOLFRAME_TEST_ADDR")),
+    )
+    .unwrap();
+    run(&runtime, client.pin(&key, false)).unwrap();
+    let user = env("SPOOLFRAME_TEST_USER");
+    let profile = run(
+        &runtime,
+        client.sign_in(&key, &user, &env("SPOOLFRAME_TEST_PASSWORD"), true),
+    )
+    .unwrap();
+
+    let remembered = run(&runtime, client.trusted_profiles(&key)).unwrap();
+    let mine = remembered
+        .iter()
+        .find(|t| t.username == user)
+        .unwrap_or_else(|| panic!("remembering was asked, but: {remembered:?}"))
+        .clone();
+    eprintln!(
+        "remembered: {} (opens at start: {})",
+        mine.username, mine.auto_login
+    );
+    let listed = run(&runtime, client.profiles(&key)).unwrap();
+    assert!(
+        listed
+            .iter()
+            .any(|p| p.username == user && p.trust.is_some()),
+        "Who's watching does not show it remembered: {listed:?}"
+    );
+
+    // Just signed in, so turning auto-login on needs no confirming.
+    let session = client.session(&profile).unwrap();
+    run(&runtime, session.set_device_trust(None, true, true)).unwrap();
+    let devices = run(&runtime, session.devices()).unwrap();
+    let here = devices.iter().find(|d| d.this_device).unwrap();
+    assert!(here.trusted && here.auto_login, "this device: {here:?}");
+    eprintln!("this device: trusted, opens at start");
+
+    let resumed = run(&runtime, client.resume_profile(&key, &mine.user_id)).unwrap();
+    let libraries = run(&runtime, client.session(&resumed).unwrap().libraries()).unwrap();
+    eprintln!("resumed without a password: {} libraries", libraries.len());
+
+    run(&runtime, client.session(&resumed).unwrap().sign_out()).unwrap();
+    let remembered = run(&runtime, client.trusted_profiles(&key)).unwrap();
+    assert!(
+        remembered.iter().all(|t| t.username != user),
+        "signing out did not forget the device: {remembered:?}"
+    );
+    assert!(
+        run(&runtime, client.resume_profile(&key, &mine.user_id)).is_err(),
+        "a signed-out profile still resumes"
+    );
+    eprintln!("signed out: forgotten, and no longer resumes");
+}
+
+/// A device that asks to be remembered, approved by a signed-in one that
+/// unticks the box: it is signed in just this once (P4-01, P4-02).
+#[test]
+#[ignore = "needs a running Spoolframe server; see the module docs"]
+fn the_approver_decides_whether_a_device_is_remembered() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let user = env("SPOOLFRAME_TEST_USER");
+    let (approver, key) = new_device(&runtime);
+    let (asking, _) = new_device(&runtime);
+    for client in [&approver, &asking] {
+        run(
+            &runtime,
+            client.add_address(&key, &env("SPOOLFRAME_TEST_ADDR")),
+        )
+        .unwrap();
+        run(&runtime, client.pin(&key, false)).unwrap();
+    }
+    let profile = run(
+        &runtime,
+        approver.sign_in(&key, &user, &env("SPOOLFRAME_TEST_PASSWORD"), false),
+    )
+    .unwrap();
+    let session = approver.session(&profile).unwrap();
+
+    let begun = run(&runtime, asking.begin_device_sign_in(&key, true)).unwrap();
+    let code = begun.display_code.replace('-', "");
+    let request = run(&runtime, session.lookup_device_sign_in(&code)).unwrap();
+    assert!(
+        request.remember,
+        "the request lost its remember: {request:?}"
+    );
+    run(&runtime, session.approve_device_sign_in(&code, false)).unwrap();
+    let (signed_in, remembered) = run(&runtime, asking.await_device_sign_in(&begun)).unwrap();
+    assert_eq!(signed_in.username, user);
+    assert_eq!(remembered, Some(false), "the approver unticked the box");
+    assert!(
+        run(&runtime, asking.trusted_profiles(&key))
+            .unwrap()
+            .iter()
+            .all(|t| t.username != user),
+        "a device signed in just this once is remembered"
+    );
+    eprintln!("approved, not remembered: {}", signed_in.username);
+    for (client, profile) in [(&asking, &signed_in), (&approver, &profile)] {
+        run(&runtime, client.session(profile).unwrap().sign_out()).unwrap();
+    }
+}
+
+#[test]
+#[ignore = "needs a running Spoolframe server; see the module docs"]
+fn the_app_backend_works_against_a_live_server() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (client, key) = new_device(&runtime);
 
     // Add by key and address, as "Add a server by its key…" does.
     let server = run(
@@ -155,6 +277,7 @@ fn the_app_backend_works_against_a_live_server() {
             &key,
             &env("SPOOLFRAME_TEST_USER"),
             &env("SPOOLFRAME_TEST_PASSWORD"),
+            false,
         ),
     )
     .unwrap();

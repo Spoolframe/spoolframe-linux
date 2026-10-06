@@ -119,6 +119,7 @@ mod tests {
             display_name: username.into(),
             locked: false,
             sign_in: Default::default(),
+            trust: None,
         }
     }
 

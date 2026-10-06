@@ -598,13 +598,47 @@ fn glib_escape(text: &str) -> String {
     gtk::glib::markup_escape_text(text).to_string()
 }
 
-/// "Who's watching?": the users signed in on this device, and a way to sign
-/// in another. Switching between them keeps the connection (§15).
+/// What a profile's tile says under its name, and its icon.
+pub fn profile_caption(profile: &Profile) -> (Option<&'static str>, &'static str) {
+    match (&profile.trust, profile.sign_in) {
+        (Some(trust), _) if trust.auto_login => (Some(crate::icons::PLAY), "Opens at start"),
+        (_, ProfileSignIn::Password) => (None, "Password"),
+        (_, ProfileSignIn::Passkey) => (Some(crate::icons::PASSKEY), "Passkey"),
+        (Some(trust), _) if trust.pin_required || profile.locked => {
+            (Some(crate::icons::LOCK), "Remembered · PIN")
+        }
+        (Some(trust), _) if trust.by_passkey => (None, "Remembered · passkey"),
+        (Some(_), _) => (None, "Remembered"),
+        (None, _) if profile.locked => (Some(crate::icons::LOCK), "PIN"),
+        (None, _) => (None, "Signed in"),
+    }
+}
+
+/// What a profile's tile does: open it, and its menu's forget and sign out.
+pub struct ProfileActions {
+    pub choose: Choose<Profile>,
+    pub forget: Choose<Profile>,
+    pub sign_out: Choose<Profile>,
+    /// The password form, for a profile that needs a sign-in again.
+    pub sign_in_as: Choose<Profile>,
+}
+
+/// The profile that opens when Spoolframe starts, if any (P4-01: one per
+/// device at most).
+pub fn opens_at_start(profiles: &[Profile]) -> Option<&Profile> {
+    profiles
+        .iter()
+        .find(|p| p.trust.as_ref().is_some_and(|t| t.auto_login))
+}
+
+/// "Who's watching?": the users signed in on this device, the ones it
+/// remembers (P4-01), and a way to sign in another. Switching between them
+/// keeps the connection (§15).
 pub fn profiles(
     server: &Server,
     profiles: &[Profile],
-    choose: &Choose<Profile>,
-    forget: &Choose<Profile>,
+    actions: &ProfileActions,
+    needs_sign_in: Option<&Profile>,
     sign_in: &Rc<dyn Fn()>,
     back: &Rc<dyn Fn()>,
     path: Rc<dyn Fn() -> Option<&'static str>>,
@@ -670,30 +704,43 @@ pub fn profiles(
             .halign(gtk::Align::Center)
             .css_classes(["dim-label", "profile-detail"])
             .build();
-        let ended = profile.sign_in != ProfileSignIn::Automatic;
-        if profile.sign_in == ProfileSignIn::Passkey {
-            detail.append(&gtk::Image::from_icon_name(crate::icons::PASSKEY));
-            detail.append(&gtk::Label::new(Some("Passkey")));
-        } else if ended {
-            detail.append(&gtk::Label::new(Some("Password")));
-        } else if profile.locked {
-            detail.append(&gtk::Image::from_icon_name(crate::icons::LOCK));
-            detail.append(&gtk::Label::new(Some("PIN")));
-        } else {
-            detail.append(&gtk::Label::new(Some("Auto sign-in")));
+        let (icon, caption) = profile_caption(profile);
+        if let Some(icon) = icon {
+            detail.append(&gtk::Image::from_icon_name(icon));
         }
+        detail.append(&gtk::Label::new(Some(caption)));
         let tile = profile_tile(&avatar, &profile.display_name, &detail);
-        // One whose session ended is only a name here: it can go.
-        if ended {
-            let (profile, forget) = (profile.clone(), forget.clone());
-            let menu = crate::views::menu_popover(vec![vec![crate::views::MenuEntry::new(
+        let ended = matches!(
+            profile.sign_in,
+            ProfileSignIn::Password | ProfileSignIn::Passkey
+        );
+        // One whose session ended is only a name here: it can go. One
+        // signed in or remembered signs out, which forgets this computer
+        // for it too.
+        let menu = if ended {
+            let (profile, forget) = (profile.clone(), actions.forget.clone());
+            vec![vec![crate::views::MenuEntry::new(
                 "Forget on this device",
                 crate::icons::FORGET,
                 move || forget(profile.clone()),
-            )]]);
-            crate::views::context_menu(tile.upcast_ref(), &menu);
-        }
-        let (profile, choose) = (profile.clone(), choose.clone());
+            )]]
+        } else {
+            let (opened, choose) = (profile.clone(), actions.choose.clone());
+            let (leaving, sign_out) = (profile.clone(), actions.sign_out.clone());
+            vec![vec![
+                crate::views::MenuEntry::new("Open", crate::icons::PLAY, move || {
+                    choose(opened.clone())
+                }),
+                crate::views::MenuEntry {
+                    destructive: true,
+                    ..crate::views::MenuEntry::new("Sign out", crate::icons::SIGN_OUT, move || {
+                        sign_out(leaving.clone())
+                    })
+                },
+            ]]
+        };
+        crate::views::context_menu(tile.upcast_ref(), &crate::views::menu_popover(menu));
+        let (profile, choose) = (profile.clone(), actions.choose.clone());
         tile.connect_clicked(move |_| choose(profile.clone()));
         tiles.append(&tile);
     }
@@ -732,14 +779,69 @@ pub fn profiles(
     heading.add_css_class("profiles-title");
     column.append(&heading);
     column.append(&tiles);
+    if let Some(profile) = needs_sign_in {
+        column.append(&needs_sign_in_card(profile, &actions.sign_in_as));
+    }
     let note = dim(
-        "Switching profile keeps the same connection. Each profile has its own \
-         session on this device.",
+        "Profiles signed in here, and the ones this computer remembers. Right-click one \
+         to sign out, which also forgets this computer for it.",
     );
     note.set_halign(gtk::Align::Center);
     note.set_max_width_chars(70);
     column.append(&note);
     page(&header, &column)
+}
+
+/// "Alice needs to sign in again on this computer.", and Sign in: a
+/// remembered profile the server would not resume (LinuxTrustStates 1).
+fn needs_sign_in_card(profile: &Profile, sign_in_as: &Choose<Profile>) -> gtk::Box {
+    let card = gtk::Box::builder()
+        .spacing(16)
+        .halign(gtk::Align::Center)
+        .css_classes(["card", "needs-sign-in"])
+        .build();
+    card.append(
+        &gtk::Image::builder()
+            .icon_name(crate::icons::LOCK)
+            .css_classes(["warning"])
+            .build(),
+    );
+    card.append(
+        &gtk::Label::builder()
+            .label(format!(
+                "{} needs to sign in again on this computer.",
+                profile.display_name
+            ))
+            .wrap(true)
+            .xalign(0.0)
+            .build(),
+    );
+    let button = gtk::Button::builder()
+        .label("Sign in")
+        .valign(gtk::Align::Center)
+        .css_classes(["action", "compact", "suggested-action"])
+        .build();
+    let (profile, sign_in_as) = (profile.clone(), sign_in_as.clone());
+    button.connect_clicked(move |_| sign_in_as(profile.clone()));
+    card.append(&button);
+    card
+}
+
+/// "Sign out Alice?", as the LinuxTrustStates board has it; `sign_out`
+/// runs on Sign out.
+pub fn sign_out_confirm(name: &str, sign_out: Rc<dyn Fn()>) -> adw::AlertDialog {
+    let dialog = adw::AlertDialog::new(
+        Some(&format!("Sign out {name}?")),
+        Some(&format!(
+            "This also forgets this computer: next time, {name} signs in with a password or \
+             passkey."
+        )),
+    );
+    dialog.add_responses(&[("cancel", "Cancel"), ("sign-out", "Sign out")]);
+    dialog.set_response_appearance("sign-out", adw::ResponseAppearance::Destructive);
+    dialog.set_close_response("cancel");
+    dialog.connect_response(Some("sign-out"), move |_, _| sign_out());
+    dialog
 }
 
 /// The avatars' fills, in turn, as on the boards: the accent, mauve, peach.
@@ -781,12 +883,13 @@ pub struct SignIn {
 
 impl SignIn {
     /// `passkey` opens Sign in with a passkey, with the username typed,
-    /// if any.
+    /// if any. Each way in is handed whether to remember this device
+    /// (P4-02).
     pub fn new(
         server: &Server,
-        submit: Rc<dyn Fn(String, String)>,
-        elsewhere: Rc<dyn Fn(Via)>,
-        passkey: Rc<dyn Fn(Option<String>)>,
+        submit: Rc<dyn Fn(String, String, bool)>,
+        elsewhere: Rc<dyn Fn(Via, bool)>,
+        passkey: Rc<dyn Fn(Option<String>, bool)>,
     ) -> Self {
         let username = gtk::Entry::builder().css_classes(["field"]).build();
         let password = gtk::PasswordEntry::builder()
@@ -806,9 +909,19 @@ impl SignIn {
             .css_classes(["error"])
             .build();
         let button = action("Sign in", None, &["suggested-action"]);
+        // Above every way in, and off unless ticked: a shared computer
+        // should not keep a profile open by default.
+        let remember = remember_box();
         let send = {
-            let (username, password) = (username.clone(), password.clone());
-            move || submit(username.text().to_string(), password.text().to_string())
+            let (username, password, remember) =
+                (username.clone(), password.clone(), remember.clone());
+            move || {
+                submit(
+                    username.text().to_string(),
+                    password.text().to_string(),
+                    remember.is_active(),
+                )
+            }
         };
         let send_ = send.clone();
         button.connect_clicked(move |_| send_());
@@ -825,6 +938,7 @@ impl SignIn {
         body.append(&field("Username", &username));
         body.append(&field("Password", &password));
         body.append(&error);
+        body.append(&remember_row(&remember));
         body.append(&button);
         // A passkey on a security key or a phone signs in here (P3-19); a
         // sign-in provider cannot, and the web sign-in does it for the app,
@@ -836,10 +950,10 @@ impl SignIn {
             &["secondary"],
         );
         {
-            let username = username.clone();
+            let (username, remember) = (username.clone(), remember.clone());
             with_passkey.connect_clicked(move |_| {
                 let typed = username.text().trim().to_owned();
-                passkey((!typed.is_empty()).then_some(typed));
+                passkey((!typed.is_empty()).then_some(typed), remember.is_active());
             });
         }
         body.append(&with_passkey);
@@ -854,8 +968,8 @@ impl SignIn {
             ),
         ] {
             let button = action(label, Some(icon), &["secondary"]);
-            let elsewhere = elsewhere.clone();
-            button.connect_clicked(move |_| elsewhere(via));
+            let (elsewhere, remember) = (elsewhere.clone(), remember.clone());
+            button.connect_clicked(move |_| elsewhere(via, remember.is_active()));
             body.append(&button);
         }
 
@@ -894,6 +1008,34 @@ impl SignIn {
         self.error.set_label(reason);
         self.error.set_visible(true);
     }
+}
+
+/// "Remember this device", unticked (P4-02).
+pub fn remember_box() -> gtk::CheckButton {
+    gtk::CheckButton::builder()
+        .label("Remember this device")
+        .css_classes(["remember-device"])
+        .build()
+}
+
+/// The box with its helper line under it.
+pub fn remember_row(remember: &gtk::CheckButton) -> gtk::Box {
+    let row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .build();
+    row.append(remember);
+    row.append(
+        &gtk::Label::builder()
+            .label("You can open your profile here without a password, until you sign out.")
+            .xalign(0.0)
+            .wrap(true)
+            .max_width_chars(1)
+            .margin_start(28)
+            .css_classes(["dim-label", "caption"])
+            .build(),
+    );
+    row
 }
 
 /// A label over its field, as the boards lay out a form.
@@ -1187,9 +1329,98 @@ mod not_set_up_tests {
 
 #[cfg(test)]
 mod tests {
-    use spoolframe_linux_core::backend::ServerKey;
+    use spoolframe_linux_core::backend::{ServerKey, Trust};
 
     use super::*;
+
+    fn remembered(sign_in: ProfileSignIn, trust: Trust) -> Profile {
+        Profile {
+            server: ServerKey("home".into()),
+            username: "alice".into(),
+            display_name: "Alice".into(),
+            locked: false,
+            sign_in,
+            trust: Some(trust),
+        }
+    }
+
+    fn trust() -> Trust {
+        Trust {
+            user_id: "u-alice".into(),
+            pin_required: false,
+            auto_login: false,
+            by_passkey: false,
+        }
+    }
+
+    #[test]
+    fn only_the_auto_login_profile_opens_at_start() {
+        let signed_in = Profile {
+            username: "steve".into(),
+            trust: None,
+            ..remembered(ProfileSignIn::Automatic, trust())
+        };
+        let opens = remembered(
+            ProfileSignIn::Resume,
+            Trust {
+                auto_login: true,
+                ..trust()
+            },
+        );
+        let profiles = [signed_in, opens];
+        assert_eq!(
+            opens_at_start(&profiles).map(|p| p.username.as_str()),
+            Some("alice")
+        );
+    }
+
+    #[test]
+    fn the_profile_that_opens_at_start_says_so() {
+        let profile = remembered(
+            ProfileSignIn::Automatic,
+            Trust {
+                auto_login: true,
+                ..trust()
+            },
+        );
+        assert_eq!(profile_caption(&profile).1, "Opens at start");
+    }
+
+    #[test]
+    fn a_remembered_profile_with_a_pin_shows_the_lock() {
+        let profile = remembered(
+            ProfileSignIn::Resume,
+            Trust {
+                pin_required: true,
+                ..trust()
+            },
+        );
+        assert_eq!(
+            profile_caption(&profile),
+            (Some(crate::icons::LOCK), "Remembered · PIN")
+        );
+    }
+
+    #[test]
+    fn a_remembered_profile_last_in_by_passkey_says_passkey() {
+        let profile = remembered(
+            ProfileSignIn::Resume,
+            Trust {
+                by_passkey: true,
+                ..trust()
+            },
+        );
+        assert_eq!(profile_caption(&profile).1, "Remembered · passkey");
+    }
+
+    #[test]
+    fn a_profile_signed_in_but_not_remembered_says_signed_in() {
+        let profile = Profile {
+            trust: None,
+            ..remembered(ProfileSignIn::Automatic, trust())
+        };
+        assert_eq!(profile_caption(&profile).1, "Signed in");
+    }
 
     fn nimble(address: &str) -> Server {
         Server {

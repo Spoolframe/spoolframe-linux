@@ -688,6 +688,11 @@ statuspage.destructive-icon image.icon {
   opacity: 1;
 }
 
+statuspage.success-icon image.icon {
+  color: var(--success-color);
+  opacity: 1;
+}
+
 statuspage.not-set-up .title {
   font-size: 30px;
   font-weight: 700;
@@ -1084,6 +1089,10 @@ button.row-button.destructive-tint {
   font-size: 11px;
   font-weight: 600;
 }
+
+/* A device's trust in Preferences › Profile (P4-02). */
+.status-chip.trusted { color: var(--accent-color); }
+.status-chip.untrusted { color: alpha(var(--window-fg-color), 0.55); }
 
 /* The PIN pad (P2-08): round keys on the surface, and a dot per digit,
    filled once typed. */
@@ -1542,4 +1551,10 @@ popover.scrub-preview > contents {
 
 .scrub-frame {
   border-radius: 6px;
+}
+
+/* A remembered profile the server would not resume (LinuxTrustStates). */
+.needs-sign-in {
+  padding: 14px 18px;
+  border-radius: 12px;
 }

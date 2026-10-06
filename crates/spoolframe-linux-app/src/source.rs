@@ -539,6 +539,7 @@ mod tests {
                 &key,
                 &env("SPOOLFRAME_TEST_USER"),
                 &env("SPOOLFRAME_TEST_PASSWORD"),
+                false,
             ))
             .unwrap();
         let session = client.session(&profile).unwrap();

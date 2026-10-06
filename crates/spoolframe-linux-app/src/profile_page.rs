@@ -1,7 +1,9 @@
 //! Preferences → Profile: the user's PIN, whether it is asked for on this
 //! device, and the same switch for each of their devices, so a TV with an
 //! awkward keyboard is set from here (P2-08); and approving another
-//! device's sign-in by the code it shows (P3-07).
+//! device's sign-in by the code it shows (P3-07). This computer: whether
+//! it remembers the profile and opens it at start, and which devices are
+//! trusted, another one forgotten from here (P4-02).
 //!
 //! The page talks to the session itself and shows what the server said as
 //! toasts on the dialog. Being signed in is all any of it takes: the
@@ -41,6 +43,9 @@ pub struct Signed {
     pub server_name: String,
     pub display_name: String,
     pub username: String,
+    /// This computer stopped remembering the profile, which ends its
+    /// session here: the app goes back to Who's watching.
+    pub left: Rc<dyn Fn()>,
 }
 
 /// The web UI's profile page, where a Plex account is linked.
@@ -169,6 +174,19 @@ fn device_icon(platform: Option<Platform>) -> &'static str {
     }
 }
 
+/// A device's trust, as the pill beside it says.
+fn trust_pill(trusted: bool) -> &'static str {
+    if trusted { "Trusted" } else { "Not trusted" }
+}
+
+/// What turning on Open at start says, before it is (LinuxTrustStates 5).
+fn auto_login_body(name: &str) -> String {
+    format!(
+        "Spoolframe opens {name}’s profile when it starts, without Who’s watching. {name}’s PIN \
+         is turned off on this computer, and any other profile stops opening here at start."
+    )
+}
+
 fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -195,9 +213,31 @@ pub fn page(signed: Signed, dialog: &adw::ToastOverlay) -> adw::PreferencesPage 
         display_name: signed.display_name,
         dialog: dialog.downgrade(),
         devices: adw::PreferencesGroup::builder()
-            .title("Asked for on")
-            .description("Your devices that are signed in to this profile.")
+            .title("Devices")
+            .description(
+                "PIN: asked for when your profile opens there. Trusted: it can reopen your \
+                 profile without a password. You can forget a device here; trusting one is \
+                 done in the web app.",
+            )
             .build(),
+        remember_row: adw::SwitchRow::builder()
+            .title("Remember this device")
+            .subtitle(
+                "Reopen your profile here without a password, until you sign out. Forgotten \
+                 after 180 days unused.",
+            )
+            .build(),
+        auto_row: adw::SwitchRow::builder()
+            .title("Open this profile when Spoolframe starts")
+            .subtitle(
+                "Skips Who’s watching. Turns off your PIN on this computer, and stops any other \
+                 profile opening here at start.",
+            )
+            .sensitive(false)
+            .build(),
+        here: std::cell::Cell::new(Here::default()),
+        syncing: std::cell::Cell::new(false),
+        left: signed.left,
         rows: std::cell::RefCell::new(Vec::new()),
         pin_row: adw::ActionRow::builder().title("PIN").subtitle("…").build(),
         set_button: gtk::Button::builder()
@@ -274,6 +314,26 @@ pub fn page(signed: Signed, dialog: &adw::ToastOverlay) -> adw::PreferencesPage 
     view.pin_row.add_suffix(&view.remove_button);
     pin.add(&view.pin_row);
     page.add(&pin);
+    let this_computer = adw::PreferencesGroup::builder()
+        .title("This computer")
+        .build();
+    this_computer.add(&view.remember_row);
+    this_computer.add(&view.auto_row);
+    {
+        let weak = Rc::downgrade(&view);
+        view.remember_row.connect_active_notify(move |row| {
+            if let Some(view) = weak.upgrade().filter(|v| !v.syncing.get()) {
+                view.remember(row.is_active());
+            }
+        });
+        let weak = Rc::downgrade(&view);
+        view.auto_row.connect_active_notify(move |row| {
+            if let Some(view) = weak.upgrade().filter(|v| !v.syncing.get()) {
+                view.open_at_start(row.is_active());
+            }
+        });
+    }
+    page.add(&this_computer);
     page.add(&view.devices);
     let others = adw::PreferencesGroup::builder()
         .title("Sign in another device")
@@ -325,13 +385,28 @@ struct View {
     /// Preferences' toasts, and the parent its own dialogs show over.
     dialog: glib::WeakRef<adw::ToastOverlay>,
     devices: adw::PreferencesGroup,
-    rows: std::cell::RefCell<Vec<adw::SwitchRow>>,
+    rows: std::cell::RefCell<Vec<adw::ActionRow>>,
+    remember_row: adw::SwitchRow,
+    auto_row: adw::SwitchRow,
+    /// This computer as the server last listed it.
+    here: std::cell::Cell<Here>,
+    /// Set while the switches are put to what the server said, so that is
+    /// not taken for the user turning them.
+    syncing: std::cell::Cell<bool>,
+    left: Rc<dyn Fn()>,
     pin_row: adw::ActionRow,
     set_button: gtk::Button,
     remove_button: gtk::Button,
     /// Whether the user has a PIN, as the server last said.
     has_pin: std::cell::Cell<bool>,
     plex_row: adw::ActionRow,
+}
+
+/// This computer's trust for the profile, from the device list.
+#[derive(Debug, Clone, Copy, Default)]
+struct Here {
+    trusted: bool,
+    auto_login: bool,
 }
 
 impl View {
@@ -414,28 +489,279 @@ impl View {
         for row in self.rows.borrow_mut().drain(..) {
             self.devices.remove(&row);
         }
+        let here = devices
+            .iter()
+            .find(|d| d.this_device)
+            .map_or_else(Here::default, |d| Here {
+                trusted: d.trusted,
+                auto_login: d.auto_login,
+            });
+        self.here.set(here);
+        self.syncing.set(true);
+        self.remember_row.set_active(here.trusted);
+        self.auto_row.set_active(here.auto_login);
+        // Opening at start needs this computer remembered.
+        self.auto_row.set_sensitive(here.trusted);
+        self.syncing.set(false);
         let now = now();
         let mut rows = Vec::new();
         for device in devices {
-            let (title, subtitle) = device_line(&device, now);
-            let row = adw::SwitchRow::builder()
-                .use_markup(false)
-                .active(device.pin_required)
-                .build();
-            row.set_title(&title);
-            row.set_subtitle(&subtitle);
-            row.add_prefix(&gtk::Image::from_icon_name(device_icon(device.platform)));
-            let this = Rc::downgrade(self);
-            let id = (!device.this_device).then(|| device.endpoint_id.clone());
-            row.connect_active_notify(move |row| {
-                if let Some(this) = this.upgrade() {
-                    this.require(id.clone(), row.is_active());
-                }
-            });
+            let row = self.device_row(&device, now);
             self.devices.add(&row);
             rows.push(row);
         }
         self.rows.replace(rows);
+    }
+
+    /// A device: what it is, its PIN switch, whether it is trusted, and
+    /// Forget for another device that is.
+    fn device_row(self: &Rc<Self>, device: &DeviceInfo, now: i64) -> adw::ActionRow {
+        let (title, subtitle) = device_line(device, now);
+        let row = adw::ActionRow::builder().use_markup(false).build();
+        row.set_title(&title);
+        row.set_subtitle(&subtitle);
+        row.add_prefix(&gtk::Image::from_icon_name(device_icon(device.platform)));
+        row.add_suffix(
+            &gtk::Label::builder()
+                .label("PIN")
+                .css_classes(["dim-label", "caption"])
+                .build(),
+        );
+        let pin = gtk::Switch::builder()
+            .active(device.pin_required)
+            .valign(gtk::Align::Center)
+            .build();
+        {
+            let this = Rc::downgrade(self);
+            let id = (!device.this_device).then(|| device.endpoint_id.clone());
+            pin.connect_active_notify(move |pin| {
+                if let Some(this) = this.upgrade() {
+                    this.pin_switched(id.clone(), pin.is_active());
+                }
+            });
+        }
+        row.add_suffix(&pin);
+        row.add_suffix(
+            &gtk::Label::builder()
+                .label(trust_pill(device.trusted))
+                .valign(gtk::Align::Center)
+                .css_classes(if device.trusted {
+                    vec!["status-chip", "trusted"]
+                } else {
+                    vec!["status-chip", "untrusted"]
+                })
+                .build(),
+        );
+        if device.trusted && !device.this_device {
+            let forget = gtk::Button::builder()
+                .label("Forget")
+                .valign(gtk::Align::Center)
+                .css_classes(["row-button", "destructive-tint"])
+                .build();
+            let (this, id, name) = (Rc::downgrade(self), device.endpoint_id.clone(), title);
+            forget.connect_clicked(move |_| {
+                if let Some(this) = this.upgrade() {
+                    this.ask_forget(id.clone(), name.clone());
+                }
+            });
+            row.add_suffix(&forget);
+        }
+        row
+    }
+
+    /// A question over Preferences: `yes` on `action`, `no` on Cancel.
+    fn ask(
+        &self,
+        heading: &str,
+        body: &str,
+        action: &str,
+        destructive: bool,
+        yes: Rc<dyn Fn()>,
+        no: Rc<dyn Fn()>,
+    ) {
+        let Some(parent) = self.dialog.upgrade() else {
+            return no();
+        };
+        let dialog = adw::AlertDialog::new(Some(heading), Some(body));
+        dialog.add_responses(&[("cancel", "Cancel"), ("yes", action)]);
+        dialog.set_response_appearance(
+            "yes",
+            if destructive {
+                adw::ResponseAppearance::Destructive
+            } else {
+                adw::ResponseAppearance::Suggested
+            },
+        );
+        dialog.set_close_response("cancel");
+        dialog.connect_response(
+            None,
+            move |_, response| {
+                if response == "yes" { yes() } else { no() }
+            },
+        );
+        dialog.present(Some(&parent));
+    }
+
+    /// Puts the switches back to what the server has.
+    fn undo(self: &Rc<Self>) -> Rc<dyn Fn()> {
+        let weak = Rc::downgrade(self);
+        Rc::new(move || {
+            if let Some(this) = weak.upgrade() {
+                this.load();
+            }
+        })
+    }
+
+    /// The PIN switch on a device. Turned on here while the profile opens
+    /// at start, it says that stops first (LinuxTrustStates 6).
+    fn pin_switched(self: &Rc<Self>, device: Option<String>, on: bool) {
+        if !(on && device.is_none() && self.here.get().auto_login) {
+            return self.require(device, on);
+        }
+        let weak = Rc::downgrade(self);
+        self.ask(
+            "Ask for the PIN here?",
+            &format!(
+                "{} stops opening at start: Spoolframe shows Who’s watching and asks for the PIN.",
+                self.display_name
+            ),
+            "Turn PIN on",
+            false,
+            Rc::new(move || {
+                if let Some(this) = weak.upgrade() {
+                    this.require(None, true);
+                }
+            }),
+            self.undo(),
+        );
+    }
+
+    /// Remember this device. On needs a recent sign-in; off ends the
+    /// session here, so it asks first (LinuxTrustStates 8).
+    fn remember(self: &Rc<Self>, on: bool) {
+        if on {
+            return self.set_trust(true, false);
+        }
+        let weak = Rc::downgrade(self);
+        self.ask(
+            "Stop remembering this computer?",
+            "You’re signed out here now, and next time you need your password or a passkey.",
+            "Stop remembering",
+            true,
+            Rc::new(move || {
+                if let Some(this) = weak.upgrade() {
+                    this.set_trust(false, false);
+                }
+            }),
+            self.undo(),
+        );
+    }
+
+    /// Open this profile when Spoolframe starts: on says what it turns off
+    /// first (LinuxTrustStates 5).
+    fn open_at_start(self: &Rc<Self>, on: bool) {
+        if !on {
+            return self.set_trust(true, false);
+        }
+        let weak = Rc::downgrade(self);
+        self.ask(
+            &format!("Open {} at start?", self.display_name),
+            &auto_login_body(&self.display_name),
+            "Turn on",
+            false,
+            Rc::new(move || {
+                if let Some(this) = weak.upgrade() {
+                    this.set_trust(true, true);
+                }
+            }),
+            self.undo(),
+        );
+    }
+
+    /// Sets this computer's trust and auto-login; a refusal for want of a
+    /// recent sign-in confirms it is them, then sets it again.
+    fn set_trust(self: &Rc<Self>, trusted: bool, auto_login: bool) {
+        self.run(
+            move |s| Box::pin(async move { s.set_device_trust(None, trusted, auto_login).await }),
+            move |this, result| match result {
+                // Not remembered, the session here is over.
+                Ok(()) if !trusted => {
+                    if let Some(dialog) = this
+                        .dialog
+                        .upgrade()
+                        .and_then(|d| d.ancestor(adw::Dialog::static_type()))
+                        .and_downcast::<adw::Dialog>()
+                    {
+                        dialog.close();
+                    }
+                    (this.left)();
+                }
+                Ok(()) => this.load(),
+                Err(BackendError::RecentSignInRequired) => {
+                    this.load();
+                    let weak = Rc::downgrade(this);
+                    this.confirm(
+                        "Remember this device",
+                        Rc::new(move || {
+                            if let Some(this) = weak.upgrade() {
+                                this.set_trust(trusted, auto_login);
+                            }
+                        }),
+                    );
+                }
+                Err(e) => {
+                    this.toast(&refusal(&e));
+                    this.load();
+                }
+            },
+        );
+    }
+
+    /// Forget another device (LinuxTrustStates 7): it is signed out of the
+    /// profile; trusting it again is the web app's.
+    fn ask_forget(self: &Rc<Self>, id: String, name: String) {
+        let weak = Rc::downgrade(self);
+        self.ask(
+            &format!("Forget {name}?"),
+            &format!(
+                "It’s signed out of {}’s profile now, and needs a sign-in next time. Trusting it \
+                 again is done in the web app.",
+                self.display_name
+            ),
+            "Forget",
+            true,
+            Rc::new(move || {
+                if let Some(this) = weak.upgrade() {
+                    this.forget(id.clone(), name.clone());
+                }
+            }),
+            Rc::new(|| {}),
+        );
+    }
+
+    fn forget(self: &Rc<Self>, id: String, name: String) {
+        let (again_id, again_name) = (id.clone(), name.clone());
+        self.run(
+            move |s| Box::pin(async move { s.set_device_trust(Some(&id), false, false).await }),
+            move |this, result| match result {
+                Ok(()) => {
+                    this.toast(&format!("{name} was forgotten"));
+                    this.load();
+                }
+                Err(BackendError::RecentSignInRequired) => {
+                    let weak = Rc::downgrade(this);
+                    this.confirm(
+                        "Forget a device",
+                        Rc::new(move || {
+                            if let Some(this) = weak.upgrade() {
+                                this.forget(again_id.clone(), again_name.clone());
+                            }
+                        }),
+                    );
+                }
+                Err(e) => this.toast(&refusal(&e)),
+            },
+        );
     }
 
     /// Asks for the PIN on `device` (this one for `None`), or stops
@@ -1154,6 +1480,31 @@ impl View {
             facts.append(&row);
         }
         body.append(&facts);
+        // It asked to be remembered (P4-02): ticked, and the approver may
+        // untick it. A device that did not ask has no box.
+        let remember = gtk::CheckButton::builder()
+            .label("This device will be remembered")
+            .active(request.remember)
+            .css_classes(["remember-device"])
+            .build();
+        if request.remember {
+            let row = gtk::Box::builder()
+                .orientation(gtk::Orientation::Vertical)
+                .spacing(2)
+                .build();
+            row.append(&remember);
+            row.append(
+                &gtk::Label::builder()
+                    .label("It asked to be. Untick to sign it in just this once.")
+                    .xalign(0.0)
+                    .wrap(true)
+                    .max_width_chars(1)
+                    .margin_start(28)
+                    .css_classes(["dim-label", "caption"])
+                    .build(),
+            );
+            body.append(&row);
+        }
         let warning = gtk::Label::builder()
             .label("Only continue if you started this on a device in front of you.")
             .wrap(true)
@@ -1174,18 +1525,21 @@ impl View {
         body.append(&not_me);
         page.append(&body);
         for (button, approve) in [(&sign_in, true), (&not_me, false)] {
-            let (this, code, device, stack, done, dialog) = (
+            let (this, code, device, stack, done, dialog, remember) = (
                 Rc::downgrade(self),
                 code.clone(),
                 device.clone(),
                 stack.clone(),
                 done.clone(),
                 dialog.clone(),
+                remember.clone(),
             );
             button.connect_clicked(move |button| {
                 let Some(this) = this.upgrade() else { return };
                 // Pressed again once "Confirm it's you" is done.
                 let again = button.downgrade();
+                // Unshown, it stays unticked.
+                let remembered = remember.is_active();
                 let (code, device, stack, done, dialog) = (
                     code.clone(),
                     device.clone(),
@@ -1197,7 +1551,7 @@ impl View {
                     move |s| {
                         Box::pin(async move {
                             if approve {
-                                s.approve_device_sign_in(&code).await
+                                s.approve_device_sign_in(&code, remembered).await
                             } else {
                                 s.deny_device_sign_in(&code).await
                             }
@@ -1205,7 +1559,7 @@ impl View {
                     },
                     move |this, result| match result {
                         Ok(()) if approve => {
-                            fill_done(&done, &device, &dialog);
+                            fill_done(&done, &device, remembered, &dialog);
                             stack.set_visible_child_name("done");
                         }
                         Ok(()) => {
@@ -1230,15 +1584,24 @@ impl View {
     }
 }
 
+/// What step 3 says under its heading.
+fn done_line(remembered: bool) -> &'static str {
+    if remembered {
+        "It’s remembered until it signs out. It shows up under Devices in your profile."
+    } else {
+        "It shows up under Devices in your profile on the web."
+    }
+}
+
 /// Step 3: "Apple TV is signed in", and Done.
-fn fill_done(page: &gtk::Box, device: &str, dialog: &glib::WeakRef<adw::Dialog>) {
+fn fill_done(page: &gtk::Box, device: &str, remembered: bool, dialog: &glib::WeakRef<adw::Dialog>) {
     while let Some(child) = page.first_child() {
         page.remove(&child);
     }
     let body = step_body(
         crate::icons::CHECK,
         &format!("{device} is signed in"),
-        "It shows up under Devices in your profile on the web.",
+        done_line(remembered),
     );
     let done = gtk::Button::builder()
         .label("Done")
@@ -1303,6 +1666,114 @@ mod tests {
             approval_refusal(&BackendError::TimedOut("Home Media".into()))
                 .contains("may be signed in already")
         );
+    }
+
+    fn run_until(limit: std::time::Duration, done: impl Fn() -> bool) -> bool {
+        let context = glib::MainContext::default();
+        let deadline = std::time::Instant::now() + limit;
+        while std::time::Instant::now() < deadline {
+            if done() {
+                return true;
+            }
+            context.iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        done()
+    }
+
+    /// Every widget of type `T` under `widget`.
+    fn all<T: IsA<gtk::Widget>>(widget: &gtk::Widget) -> Vec<T> {
+        let mut found = Vec::new();
+        if let Some(it) = widget.downcast_ref::<T>() {
+            found.push(it.clone());
+        }
+        let mut child = widget.first_child();
+        while let Some(c) = child {
+            found.extend(all::<T>(&c));
+            child = c.next_sibling();
+        }
+        found
+    }
+
+    /// One test: GTK binds itself to the first thread that starts it.
+    #[test]
+    #[ignore = "needs a display; run on its own"]
+    fn profile_page_on_the_fake_server() {
+        gtk::init().unwrap();
+        adw::init().unwrap();
+        remembering_this_computer_lets_it_open_at_start();
+    }
+
+    fn remembering_this_computer_lets_it_open_at_start() {
+        use spoolframe_linux_core::backend::{Client, Server};
+        use spoolframe_linux_core::fake::FakeClient;
+        use spoolframe_linux_core::testing::ready;
+        let fake = Arc::new(FakeClient::new(None));
+        let client: Arc<dyn Client> = fake.clone();
+        let profile = FakeClient::profile("andrey");
+        let server = Server {
+            key: profile.server.clone(),
+            name: "Home Media".into(),
+            addresses: Vec::new(),
+            pinned: true,
+            fingerprint: String::new(),
+            verified: true,
+            on_network: true,
+            verified_at: None,
+            last_connected_at: None,
+        };
+        let toasts = adw::ToastOverlay::new();
+        let page = page(
+            Signed {
+                session: client.session(&profile).unwrap(),
+                server_key: server.key.0.clone(),
+                server_name: server.name.clone(),
+                server,
+                display_name: "Andrey".into(),
+                username: "andrey".into(),
+                left: Rc::new(|| {}),
+            },
+            &toasts,
+        );
+        let switch = |title: &str| {
+            all::<adw::SwitchRow>(page.upcast_ref())
+                .into_iter()
+                .find(|r| r.title() == title)
+                .unwrap()
+        };
+        let remember = switch("Remember this device");
+        let at_start = switch("Open this profile when Spoolframe starts");
+        assert!(!remember.is_active() && !at_start.is_sensitive());
+        remember.set_active(true);
+        assert!(
+            run_until(std::time::Duration::from_secs(5), || ready(
+                client.trusted_profiles(&profile.server)
+            )
+            .unwrap()
+            .iter()
+            .any(|t| t.username == "andrey")),
+            "the switch did not make this computer remember the profile"
+        );
+        assert!(
+            run_until(std::time::Duration::from_secs(5), || at_start
+                .is_sensitive()),
+            "Open at start stayed off-limits once remembered"
+        );
+    }
+
+    #[test]
+    fn a_device_not_trusted_says_so() {
+        assert_eq!(trust_pill(false), "Not trusted");
+    }
+
+    #[test]
+    fn opening_at_start_says_the_pin_goes_off_here() {
+        assert!(auto_login_body("Alice").contains("Alice’s PIN is turned off on this computer"));
+    }
+
+    #[test]
+    fn a_remembered_device_is_said_to_stay_until_it_signs_out() {
+        assert!(done_line(true).contains("until it signs out"));
     }
 
     #[test]
@@ -1413,6 +1884,8 @@ mod tests {
             last_seen_at: 0,
             pin_required: false,
             this_device: true,
+            trusted: false,
+            auto_login: false,
         };
         assert_eq!(
             device_line(&device, 0),

@@ -30,6 +30,7 @@ use crate::backend::{
 };
 use crate::backend::{
     FinishPasskeyRegistration, FinishPasskeySignIn, PasskeyCreation, PasskeyInfo, PasskeyRequest,
+    Trust, TrustedProfile,
 };
 use crate::storage::Storage;
 
@@ -110,7 +111,47 @@ fn profile(session: &sdk::Session) -> Profile {
         display_name: user.display_name.clone(),
         locked: user.locked,
         sign_in: ProfileSignIn::Automatic,
+        trust: None,
     }
+}
+
+/// `profiles` with the remembered ones of `trusted` (P4-01) folded in by
+/// username: one with a session keeps opening with it; one without opens
+/// by resuming; one only remembered is added.
+pub fn with_trust(
+    mut profiles: Vec<Profile>,
+    trusted: Vec<TrustedProfile>,
+    server: &ServerKey,
+) -> Vec<Profile> {
+    for remembered in trusted {
+        let mut trust = Trust {
+            user_id: remembered.user_id,
+            pin_required: remembered.pin_required,
+            auto_login: remembered.auto_login,
+            by_passkey: false,
+        };
+        match profiles
+            .iter_mut()
+            .find(|p| p.username == remembered.username)
+        {
+            Some(profile) => {
+                trust.by_passkey = profile.sign_in == ProfileSignIn::Passkey;
+                if profile.sign_in != ProfileSignIn::Automatic {
+                    profile.sign_in = ProfileSignIn::Resume;
+                }
+                profile.trust = Some(trust);
+            }
+            None => profiles.push(Profile {
+                server: server.clone(),
+                username: remembered.username,
+                display_name: remembered.display_name,
+                locked: false,
+                sign_in: ProfileSignIn::Resume,
+                trust: Some(trust),
+            }),
+        }
+    }
+    profiles
 }
 
 /// The app's storage as the SDK's: four pass-throughs.
@@ -384,10 +425,16 @@ impl Client for SdkClient {
         Box::pin(async move {
             let client = self.client.clone();
             let id = key.0.clone();
-            let (sessions, saved) = on_runtime(&self.handle, async move {
+            let (sessions, saved, trusted) = on_runtime(&self.handle, async move {
                 let sessions = client.profiles(&id).await?;
                 let saved = client.saved_profiles(&id).await?;
-                Ok::<_, sdk::SdkError>((sessions, saved))
+                // Asked of the server; without an answer the picker still
+                // shows what the device keeps.
+                let trusted = client.trusted_profiles(&id).await.unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "cannot list the remembered profiles");
+                    Vec::new()
+                });
+                Ok::<_, sdk::SdkError>((sessions, saved, trusted))
             })
             .await?;
             // Sessions the SDK no longer has were ended; drop them here too.
@@ -413,10 +460,11 @@ impl Client for SdkClient {
                         display_name: saved.display_name,
                         locked: false,
                         sign_in,
+                        trust: None,
                     });
                 }
             }
-            Ok(profiles)
+            Ok(with_trust(profiles, trusted, key))
         })
     }
 
@@ -425,13 +473,43 @@ impl Client for SdkClient {
         key: &'a ServerKey,
         username: &'a str,
         password: &'a str,
+        remember: bool,
     ) -> BoxFuture<'a, Result<Profile, BackendError>> {
         Box::pin(async move {
             let client = self.client.clone();
             let (id, username, password) =
                 (key.0.clone(), username.to_owned(), password.to_owned());
             let session = on_runtime(&self.handle, async move {
-                client.sign_in(&id, &username, &password).await
+                client.sign_in(&id, &username, &password, remember).await
+            })
+            .await?;
+            Ok(self.remember(&session))
+        })
+    }
+
+    fn trusted_profiles<'a>(
+        &'a self,
+        key: &'a ServerKey,
+    ) -> BoxFuture<'a, Result<Vec<TrustedProfile>, BackendError>> {
+        Box::pin(async move {
+            let (client, id) = (self.client.clone(), key.0.clone());
+            on_runtime(
+                &self.handle,
+                async move { client.trusted_profiles(&id).await },
+            )
+            .await
+        })
+    }
+
+    fn resume_profile<'a>(
+        &'a self,
+        key: &'a ServerKey,
+        user_id: &'a str,
+    ) -> BoxFuture<'a, Result<Profile, BackendError>> {
+        Box::pin(async move {
+            let (client, id, user) = (self.client.clone(), key.0.clone(), user_id.to_owned());
+            let session = on_runtime(&self.handle, async move {
+                client.resume_profile(&id, &user).await
             })
             .await?;
             Ok(self.remember(&session))
@@ -460,11 +538,12 @@ impl Client for SdkClient {
         &'a self,
         key: &'a ServerKey,
         signed: FinishPasskeySignIn,
+        remember: bool,
     ) -> BoxFuture<'a, Result<Profile, BackendError>> {
         Box::pin(async move {
             let (client, id) = (self.client.clone(), key.0.clone());
             let session = on_runtime(&self.handle, async move {
-                client.finish_passkey_sign_in(&id, signed).await
+                client.finish_passkey_sign_in(&id, signed, remember).await
             })
             .await?;
             Ok(self.remember(&session))
@@ -474,15 +553,17 @@ impl Client for SdkClient {
     fn begin_device_sign_in<'a>(
         &'a self,
         key: &'a ServerKey,
+        remember: bool,
     ) -> BoxFuture<'a, Result<DeviceSignIn, BackendError>> {
         Box::pin(async move {
             let (client, id) = (self.client.clone(), key.0.clone());
             let begun = on_runtime(&self.handle, async move {
-                client.begin_device_sign_in(&id).await
+                client.begin_device_sign_in(&id, remember).await
             })
             .await?;
             Ok(DeviceSignIn {
                 server: key.clone(),
+                remember: begun.remember,
                 display_code: begun.display_code.clone(),
                 web_url: begun.web_url.clone(),
                 expires_in: begun.expires_in,
@@ -494,7 +575,7 @@ impl Client for SdkClient {
     fn await_device_sign_in<'a>(
         &'a self,
         sign_in: &'a DeviceSignIn,
-    ) -> BoxFuture<'a, Result<Profile, BackendError>> {
+    ) -> BoxFuture<'a, Result<(Profile, Option<bool>), BackendError>> {
         Box::pin(async move {
             let begun = sign_in
                 .request
@@ -506,7 +587,8 @@ impl Client for SdkClient {
                 client.await_device_sign_in(&begun).await
             })
             .await?;
-            Ok(self.remember(&session))
+            let remembered = session.remembered();
+            Ok((self.remember(&session), remembered))
         })
     }
 
@@ -937,9 +1019,27 @@ impl Session for SdkSession {
     fn approve_device_sign_in<'a>(
         &'a self,
         code: &'a str,
+        remember: bool,
     ) -> BoxFuture<'a, Result<(), BackendError>> {
         let code = code.to_owned();
-        Box::pin(self.call(move |s| async move { s.approve_device_sign_in(&code).await }))
+        Box::pin(self.call(move |s| async move { s.approve_device_sign_in(&code, remember).await }))
+    }
+
+    fn set_device_trust<'a>(
+        &'a self,
+        device: Option<&'a str>,
+        trusted: bool,
+        auto_login: bool,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        let device = device.map(str::to_owned);
+        Box::pin(self.call(move |s| async move {
+            s.set_device_trust(device.as_deref(), trusted, auto_login)
+                .await
+        }))
+    }
+
+    fn sign_out(&self) -> BoxFuture<'_, Result<(), BackendError>> {
+        Box::pin(self.call(|s| async move { s.sign_out().await }))
     }
 
     fn deny_device_sign_in<'a>(&'a self, code: &'a str) -> BoxFuture<'a, Result<(), BackendError>> {
@@ -951,6 +1051,28 @@ impl Session for SdkSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_remembered_profile_last_in_by_passkey_still_says_passkey() {
+        let server = ServerKey("home".into());
+        let saved = Profile {
+            server: server.clone(),
+            username: "sam".into(),
+            display_name: "Sam".into(),
+            locked: false,
+            sign_in: ProfileSignIn::Passkey,
+            trust: None,
+        };
+        let remembered = TrustedProfile {
+            user_id: "u-sam".into(),
+            username: "sam".into(),
+            display_name: "Sam".into(),
+            pin_required: false,
+            auto_login: false,
+        };
+        let merged = with_trust(vec![saved], vec![remembered], &server);
+        assert!(merged[0].trust.as_ref().is_some_and(|t| t.by_passkey));
+    }
 
     #[test]
     fn previews_not_ready_or_none_keep_their_meaning() {

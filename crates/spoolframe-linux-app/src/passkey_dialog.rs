@@ -637,15 +637,18 @@ pub struct PasskeySignIn {
     header_title: adw::WindowTitle,
     back: gtk::Button,
     key: Rc<KeyPage>,
+    remember: gtk::CheckButton,
 }
 
 impl PasskeySignIn {
     /// `username`, when typed in the sign-in form, narrows the passkeys
-    /// to that user's.
+    /// to that user's. `remember` is the sign-in form's box, shown again
+    /// here (P4-02).
     pub fn new(
         client: Arc<dyn Client>,
         server: &Server,
         username: Option<String>,
+        remember: bool,
         ends: Ends,
     ) -> Rc<Self> {
         let dialog = adw::Dialog::builder()
@@ -691,7 +694,9 @@ impl PasskeySignIn {
             header_title,
             back,
             key,
+            remember: crate::start::remember_box(),
         });
+        screen.remember.set_active(remember);
         screen
             .stack
             .add_named(&screen.choose_page(use_password), Some("choose"));
@@ -768,6 +773,7 @@ impl PasskeySignIn {
         }
         options.append(&phone);
         page.append(&options);
+        page.append(&crate::start::remember_row(&self.remember));
         page.append(
             &gtk::Label::builder()
                 .label(
@@ -845,9 +851,15 @@ impl PasskeySignIn {
 
     /// Hands the server what the key signed.
     fn finish(self: &Rc<Self>, signed: FinishPasskeySignIn) {
-        let (client, key) = (self.client.clone(), self.server.key.clone());
+        let (client, key, remember) = (
+            self.client.clone(),
+            self.server.key.clone(),
+            self.remember.is_active(),
+        );
         let finished =
-            relm4::spawn(async move { client.finish_passkey_sign_in(&key, signed).await });
+            relm4::spawn(
+                async move { client.finish_passkey_sign_in(&key, signed, remember).await },
+            );
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
             let finished = finished.await;
@@ -985,11 +997,16 @@ mod tests {
             client,
             &server,
             None,
+            true,
             Ends {
                 done: Rc::new(|_| {}),
             },
         );
         assert_eq!(screen.stack.visible_child_name().as_deref(), Some("choose"));
+        assert!(
+            screen.remember.is_active(),
+            "the sign-in form's Remember this device was not carried over"
+        );
     }
 
     /// The fake's first server, without a runtime: its list is ready.

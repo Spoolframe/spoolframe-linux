@@ -14,6 +14,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+pub use spoolframe_protocol::TrustedProfile;
 pub use spoolframe_protocol::{
     APP_ORIGIN, APP_RP_ID, FinishPasskeyRegistration, FinishPasskeySignIn, PasskeyCreation,
     PasskeyInfo, PasskeyRequest,
@@ -194,6 +195,23 @@ pub struct Profile {
     /// (P2-08). As the server said when the profiles were listed.
     pub locked: bool,
     pub sign_in: ProfileSignIn,
+    /// This device is trusted for the user (P4-01): the profile opens
+    /// without a password, with [`Client::resume_profile`].
+    pub trust: Option<Trust>,
+}
+
+/// A profile remembered on this device (P4-01).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Trust {
+    /// What [`Client::resume_profile`] takes.
+    pub user_id: String,
+    /// The PIN is asked for here when it opens (P2-08).
+    pub pin_required: bool,
+    /// It opens when Spoolframe starts; one profile per device at most.
+    pub auto_login: bool,
+    /// Its last sign-in here was a passkey, as this device saved it: Who's
+    /// watching says so.
+    pub by_passkey: bool,
 }
 
 /// How choosing a profile signs it in.
@@ -208,6 +226,9 @@ pub enum ProfileSignIn {
     /// As `Password`, for someone whose last sign-in here was a passkey:
     /// they are offered a passkey again.
     Passkey,
+    /// No session, but the device is trusted for them (P4-01): it opens
+    /// with [`Client::resume_profile`], without a password.
+    Resume,
 }
 
 /// A sign-in this device began and another approves (P3-05, P3-07): a
@@ -218,6 +239,8 @@ pub struct DeviceSignIn {
     pub server: ServerKey,
     /// The code as shown, large: `BCDF-GHJK`.
     pub display_code: String,
+    /// This device asked to be remembered; the approver decides (P4-01).
+    pub remember: bool,
     /// The server's web page that approves this code, for a QR code any
     /// phone's camera opens; `None` when the server has no public web
     /// address, and only a Spoolframe app can approve.
@@ -330,11 +353,30 @@ pub trait Client: Send + Sync {
     ) -> BoxFuture<'a, Result<Vec<Profile>, BackendError>>;
 
     /// Signs a user in on `server` with a password (§22), adding a profile.
+    /// `remember` asks to trust this device for the user (P4-01).
     fn sign_in<'a>(
         &'a self,
         server: &'a ServerKey,
         username: &'a str,
         password: &'a str,
+        remember: bool,
+    ) -> BoxFuture<'a, Result<Profile, BackendError>>;
+
+    /// The profiles remembered on this device for `server` (P4-01), asked
+    /// before any sign-in.
+    fn trusted_profiles<'a>(
+        &'a self,
+        server: &'a ServerKey,
+    ) -> BoxFuture<'a, Result<Vec<TrustedProfile>, BackendError>>;
+
+    /// Opens a remembered profile without a password (P4-01): a session,
+    /// locked if the PIN is required here. One the device is no longer
+    /// trusted for is [`BackendError::SignInRequired`], whatever the
+    /// reason. Not a recent sign-in: sensitive actions still confirm.
+    fn resume_profile<'a>(
+        &'a self,
+        server: &'a ServerKey,
+        user_id: &'a str,
     ) -> BoxFuture<'a, Result<Profile, BackendError>>;
 
     /// Begins a sign-in another device approves (P3-05, P3-07): what to
@@ -343,16 +385,19 @@ pub trait Client: Send + Sync {
     fn begin_device_sign_in<'a>(
         &'a self,
         server: &'a ServerKey,
+        remember: bool,
     ) -> BoxFuture<'a, Result<DeviceSignIn, BackendError>>;
 
     /// Waits until `sign_in` is approved, adding its profile as a password
     /// sign-in does; [`BackendError::SignInDenied`] or
     /// [`BackendError::SignInExpired`] otherwise. Drop the future to stop
     /// waiting.
+    /// With the profile comes whether the approver let this device be
+    /// remembered (P4-01).
     fn await_device_sign_in<'a>(
         &'a self,
         sign_in: &'a DeviceSignIn,
-    ) -> BoxFuture<'a, Result<Profile, BackendError>>;
+    ) -> BoxFuture<'a, Result<(Profile, Option<bool>), BackendError>>;
 
     /// Begins a passkey sign-in on `server` (P3-19): what the passkey
     /// signs, for [`APP_RP_ID`]. With `username`, only that user's
@@ -370,6 +415,7 @@ pub trait Client: Send + Sync {
         &'a self,
         server: &'a ServerKey,
         signed: FinishPasskeySignIn,
+        remember: bool,
     ) -> BoxFuture<'a, Result<Profile, BackendError>>;
 
     /// The session behind a profile.
@@ -636,10 +682,30 @@ pub trait Session: Send + Sync {
 
     /// Signs that device in as this user. Approving the device that shows
     /// the code is [`BackendError::InvalidInput`].
+    /// `remember` keeps the device's own request to be remembered; it is
+    /// remembered only if it asked and this says yes (P4-01).
     fn approve_device_sign_in<'a>(
         &'a self,
         code: &'a str,
+        remember: bool,
     ) -> BoxFuture<'a, Result<(), BackendError>>;
+
+    /// Trusts a device for this user, or stops (P4-01); `None` is this
+    /// one. Turning trust or auto-login on is for this device only, and
+    /// needs a recent sign-in; so does turning trust off for another.
+    /// Turning it off here ends this session (the profile stays saved).
+    /// Auto-login without trust is [`BackendError::InvalidInput`]; turning
+    /// it on turns the PIN off here.
+    fn set_device_trust<'a>(
+        &'a self,
+        device: Option<&'a str>,
+        trusted: bool,
+        auto_login: bool,
+    ) -> BoxFuture<'a, Result<(), BackendError>>;
+
+    /// Signs this profile out here: the session ends and the device is no
+    /// longer trusted for it (P4-01); the next time is a full sign-in.
+    fn sign_out(&self) -> BoxFuture<'_, Result<(), BackendError>>;
 
     /// Refuses it: the device is told so.
     fn deny_device_sign_in<'a>(&'a self, code: &'a str) -> BoxFuture<'a, Result<(), BackendError>>;

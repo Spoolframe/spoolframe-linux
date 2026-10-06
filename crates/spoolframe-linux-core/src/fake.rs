@@ -38,7 +38,7 @@ use crate::backend::{
     Person, PersonId, PersonRole, PinProof, PinState, Platform, PlaybackHandle, PlaybackPlan,
     PlaybackStart, PlexLink, Previews, Profile, ProfileSignIn, SearchCounts, SearchGroup,
     SearchKind, SearchRequest, SearchResults, SearchScope, Selection, Server, ServerKey, Session,
-    TopResult,
+    TopResult, TrustedProfile,
 };
 
 /// Every fake account's password.
@@ -47,9 +47,18 @@ pub const FAKE_PASSWORD: &str = "spoolframe";
 /// What the fake server asks a passkey to sign (P3-19).
 pub const FAKE_PASSKEY_CHALLENGE: [u8; 32] = [7; 32];
 
-/// The passkeys the fake server keeps, for every session of the device.
+/// What the fake server keeps about this device's sign-ins, for every
+/// session of it: passkeys (P3-19) and trust (P4-01).
 #[derive(Default)]
-struct FakePasskeys {
+struct FakeAuth {
+    /// The users this device is trusted for, by username, with whether
+    /// theirs is the auto-login profile (one at most).
+    trusted: HashMap<String, bool>,
+    /// Whether the living-room TV is still trusted (it is to begin with).
+    tv_untrusted: bool,
+    /// Signed out here (P4-01): gone from "Who's watching" until they sign
+    /// in again.
+    signed_out: std::collections::HashSet<String>,
     keys: Vec<FakePasskey>,
     /// Set by [`FakeClient::age_sign_ins`]: every sign-in is older than
     /// the 10 minutes adding or removing a passkey allows.
@@ -454,7 +463,7 @@ pub struct FakeSession {
     /// Tracks remembered per movie, or per show for its episodes.
     overrides: Mutex<HashMap<MediaId, TrackOverride>>,
     username: String,
-    passkeys: Arc<Mutex<FakePasskeys>>,
+    passkeys: Arc<Mutex<FakeAuth>>,
     pin: Mutex<FakePin>,
     /// Devices waiting to be signed in by code (P3-07), and wrong codes
     /// tried.
@@ -468,6 +477,8 @@ pub struct FakeSession {
 struct SignIns {
     pending: HashMap<String, DeviceSignInRequest>,
     wrong: u32,
+    /// Codes approved, and whether the device was remembered (P4-01).
+    approved: Vec<(String, bool)>,
 }
 
 impl Default for SignIns {
@@ -477,10 +488,13 @@ impl Default for SignIns {
             client_name: "spoolframe-tvos".into(),
             requested_at: unix_now() - 30,
             platform: Platform::Tvos,
+            // It asks to be remembered, so the approver's box shows ticked.
+            remember: true,
         };
         Self {
             pending: [(FAKE_SIGN_IN_CODE.to_owned(), request)].into(),
             wrong: 0,
+            approved: Vec::new(),
         }
     }
 }
@@ -568,7 +582,7 @@ impl FakeSession {
         serving: Serving,
         gone: Arc<std::sync::atomic::AtomicBool>,
         active: Arc<Mutex<std::collections::HashSet<String>>>,
-        passkeys: Arc<Mutex<FakePasskeys>>,
+        passkeys: Arc<Mutex<FakeAuth>>,
     ) -> Self {
         // Alice has a PIN, asked for here, so the fake opens her locked.
         let pin = match username {
@@ -822,6 +836,8 @@ impl FakeSession {
             pin.wrong += 1;
             if pin.wrong >= WRONG_PINS {
                 pin.revoked = true;
+                // Ten wrong PINs end trust too (P4-01).
+                self.lock_passkeys().trusted.remove(&self.username);
                 return Err(BackendError::SignInRequired);
             }
             return Err(BackendError::WrongCredentials);
@@ -1444,6 +1460,8 @@ impl Session for FakeSession {
                 pin.wrong += 1;
                 if pin.wrong >= WRONG_PINS {
                     pin.revoked = true;
+                    // Ten wrong PINs end trust too (P4-01).
+                    self.lock_passkeys().trusted.remove(&self.username);
                     return Err(BackendError::SignInRequired);
                 }
                 return Err(BackendError::WrongCredentials);
@@ -1509,6 +1527,66 @@ impl Session for FakeSession {
         Box::pin(async move {
             self.guard()?;
             Ok(None)
+        })
+    }
+
+    fn set_device_trust<'a>(
+        &'a self,
+        device: Option<&'a str>,
+        trusted: bool,
+        auto_login: bool,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            let own = device.is_none_or(|d| d == THIS_DEVICE);
+            if auto_login && !trusted {
+                return Err(BackendError::InvalidInput(
+                    "auto-login needs the device trusted".into(),
+                ));
+            }
+            if trusted && !own {
+                return Err(BackendError::InvalidInput(
+                    "only this device can be trusted from here".into(),
+                ));
+            }
+            let mut auth = self.lock_passkeys();
+            if (trusted || !own) && auth.stale {
+                return Err(BackendError::RecentSignInRequired);
+            }
+            match (own, trusted) {
+                (true, true) => {
+                    if auto_login {
+                        // One auto-login profile per device.
+                        for auto in auth.trusted.values_mut() {
+                            *auto = false;
+                        }
+                    }
+                    auth.trusted.insert(self.username.clone(), auto_login);
+                    drop(auth);
+                    if auto_login {
+                        self.pin_state().required.remove(THIS_DEVICE);
+                    }
+                }
+                // Stopping here ends this session; the profile stays.
+                (true, false) => {
+                    auth.trusted.remove(&self.username);
+                    drop(auth);
+                    self.pin_state().revoked = true;
+                }
+                (false, _) => auth.tv_untrusted = true,
+            }
+            Ok(())
+        })
+    }
+
+    fn sign_out(&self) -> BoxFuture<'_, Result<(), BackendError>> {
+        Box::pin(async move {
+            let mut auth = self.lock_passkeys();
+            auth.trusted.remove(&self.username);
+            auth.signed_out.insert(self.username.clone());
+            drop(auth);
+            self.pin_state().revoked = true;
+            Ok(())
         })
     }
 
@@ -1674,11 +1752,19 @@ impl Session for FakeSession {
         Box::pin(async move {
             self.guard()?;
             let pin = self.pin_state();
+            let auth = self.lock_passkeys();
+            let here = auth.trusted.get(&self.username).copied();
             let device = |id: &str, name: &str, ago: i64| DeviceInfo {
                 endpoint_id: id.to_owned(),
                 name: Some(name.to_owned()),
                 last_seen_at: 1_790_000_000 - ago,
                 pin_required: pin.required.contains(id),
+                trusted: if id == THIS_DEVICE {
+                    here.is_some()
+                } else {
+                    !auth.tv_untrusted
+                },
+                auto_login: id == THIS_DEVICE && here == Some(true),
                 this_device: id == THIS_DEVICE,
                 platform: Some(if id == THIS_DEVICE {
                     Platform::Linux
@@ -1710,6 +1796,13 @@ impl Session for FakeSession {
                 return Err(BackendError::RecentSignInRequired);
             }
             let device = device.unwrap_or(THIS_DEVICE).to_owned();
+            // The PIN back on here turns auto-login off (P4-01).
+            if required
+                && device == THIS_DEVICE
+                && let Some(auto) = self.lock_passkeys().trusted.get_mut(&self.username)
+            {
+                *auto = false;
+            }
             if required {
                 pin.required.insert(device);
             } else {
@@ -1735,6 +1828,7 @@ impl Session for FakeSession {
                     client_name: "spoolframe-linux".into(),
                     requested_at: unix_now(),
                     platform: Platform::Linux,
+                    remember: false,
                 });
             }
             match sign_ins.pending.get(code) {
@@ -1750,6 +1844,7 @@ impl Session for FakeSession {
     fn approve_device_sign_in<'a>(
         &'a self,
         code: &'a str,
+        remember: bool,
     ) -> BoxFuture<'a, Result<(), BackendError>> {
         Box::pin(async move {
             self.guard()?;
@@ -1765,8 +1860,9 @@ impl Session for FakeSession {
             sign_ins
                 .pending
                 .remove(code)
-                .map(|_| ())
-                .ok_or_else(|| BackendError::NotFound(format!("sign-in code {code}")))
+                .ok_or_else(|| BackendError::NotFound(format!("sign-in code {code}")))?;
+            sign_ins.approved.push((code.to_owned(), remember));
+            Ok(())
         })
     }
 
@@ -1784,7 +1880,17 @@ impl Session for FakeSession {
 }
 
 impl FakeSession {
-    fn lock_passkeys(&self) -> std::sync::MutexGuard<'_, FakePasskeys> {
+    /// The codes approved from this session, each with whether the device
+    /// was remembered.
+    pub fn approvals(&self) -> Vec<(String, bool)> {
+        self.sign_ins
+            .lock()
+            .expect("fake state is never poisoned")
+            .approved
+            .clone()
+    }
+
+    fn lock_passkeys(&self) -> std::sync::MutexGuard<'_, FakeAuth> {
         self.passkeys.lock().expect("fake state is never poisoned")
     }
 
@@ -1815,14 +1921,17 @@ pub struct FakeClient {
     phone_sign_ins: Mutex<PhoneSignIns>,
     /// Bumped by [`FakeClient::sign_out_elsewhere`].
     sign_outs: watch::Sender<u64>,
-    passkeys: Arc<Mutex<FakePasskeys>>,
+    passkeys: Arc<Mutex<FakeAuth>>,
 }
 
 /// How the fake answers a sign-in a phone approves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PhoneAnswer {
-    /// Approved by this account's user.
+    /// Approved by this account's user, remembering the device if it
+    /// asked.
     Approve(&'static str),
+    /// Approved, with "This device will be remembered" unticked.
+    ApproveForgetting(&'static str),
     Deny,
     Expire,
     /// Never: the phone is still deciding.
@@ -1866,6 +1975,7 @@ impl FakeClient {
             display_name: username.into(),
             locked: false,
             sign_in: Default::default(),
+            trust: None,
         }
     }
 
@@ -1878,6 +1988,7 @@ impl FakeClient {
             display_name: display_name.into(),
             locked: false,
             sign_in: Default::default(),
+            trust: None,
         };
         FakeClient {
             catalog: Arc::new(Catalog::new()),
@@ -1932,7 +2043,7 @@ impl FakeClient {
             signed_in: Mutex::new(vec![profile("andrey", "Andrey"), profile("alice", "Alice")]),
             sessions: Mutex::new(HashMap::new()),
             // Andrey made one in the web UI: listed, but no use in an app.
-            passkeys: Arc::new(Mutex::new(FakePasskeys {
+            passkeys: Arc::new(Mutex::new(FakeAuth {
                 keys: vec![FakePasskey {
                     username: "andrey".into(),
                     credential_id: vec![1, 2, 3, 4],
@@ -1943,6 +2054,9 @@ impl FakeClient {
                 }],
                 stale: false,
                 by_passkey: Default::default(),
+                trusted: HashMap::new(),
+                tv_untrusted: false,
+                signed_out: Default::default(),
             })),
             failed_sign_ins: Mutex::new((0, None)),
             connections: Mutex::new(HashMap::new()),
@@ -2001,6 +2115,12 @@ impl FakeClient {
         {
             state.send_replace(ConnectionState::Closed);
         }
+    }
+
+    /// The device sign-ins `username` approved on Home Media, each with
+    /// whether the device was remembered.
+    pub fn approvals_by(&self, username: &str) -> Vec<(String, bool)> {
+        self.fake_session(&Self::profile(username)).approvals()
     }
 
     /// The session behind `profile`, made on first use and kept, so watch
@@ -2168,18 +2288,82 @@ impl FakeClient {
 
     /// `username` signed in from this device, as a password or a phone's
     /// approval does.
+    fn lock_auth(&self) -> std::sync::MutexGuard<'_, FakeAuth> {
+        self.passkeys.lock().expect("fake state is never poisoned")
+    }
+
+    /// This device is now trusted for `username` (P4-01), not as the
+    /// auto-login profile.
+    fn trust(&self, username: &str) {
+        self.lock_auth()
+            .trusted
+            .entry(username.to_owned())
+            .or_insert(false);
+    }
+
+    /// The remembered profiles, as TrustedProfiles answers them.
+    fn remembered(&self, server: &ServerKey) -> Vec<TrustedProfile> {
+        let trusted = self.lock_auth().trusted.clone();
+        let mut remembered: Vec<TrustedProfile> = self
+            .accounts
+            .iter()
+            .filter(|(s, u, _)| s == server && trusted.contains_key(*u))
+            .map(|(_, username, display_name)| {
+                let profile = FakeClient::profile(username);
+                TrustedProfile {
+                    user_id: (*username).to_owned(),
+                    username: (*username).to_owned(),
+                    display_name: (*display_name).to_owned(),
+                    pin_required: self
+                        .fake_session(&profile)
+                        .pin_state()
+                        .required
+                        .contains(THIS_DEVICE),
+                    auto_login: trusted[*username],
+                }
+            })
+            .collect();
+        remembered.sort_by(|a, b| a.username.cmp(&b.username));
+        remembered
+    }
+
+    /// A remembered profile opened without a password: a new session,
+    /// locked if the PIN is required here, and no recent sign-in.
+    fn resumed_as(&self, server: &ServerKey, username: &str, display_name: &str) -> Profile {
+        let profile = Profile {
+            server: server.clone(),
+            username: username.into(),
+            display_name: display_name.into(),
+            locked: false,
+            sign_in: Default::default(),
+            trust: None,
+        };
+        let mut signed_in = self.signed_in.lock().expect("fake state is never poisoned");
+        if !signed_in.contains(&profile) {
+            signed_in.push(profile.clone());
+        }
+        drop(signed_in);
+        let session = self.fake_session(&profile);
+        let mut pin = session.pin_state();
+        pin.revoked = false;
+        let locked = pin.required.contains(THIS_DEVICE) && pin.pin.is_some();
+        pin.locked = locked;
+        Profile { locked, ..profile }
+    }
+
     fn signed_in_as(&self, server: &ServerKey, username: &str, display_name: &str) -> Profile {
         // A sign-in is fresh: adding and removing passkeys works again.
-        self.passkeys
-            .lock()
-            .expect("fake state is never poisoned")
-            .stale = false;
+        let mut auth = self.lock_auth();
+        auth.stale = false;
+        auth.signed_out.remove(username);
+        drop(auth);
         let profile = Profile {
             server: server.clone(),
             username: (*username).into(),
             display_name: (*display_name).into(),
             locked: false,
             sign_in: Default::default(),
+            trust: None,
         };
         let mut signed_in = self.signed_in.lock().expect("fake state is never poisoned");
         if !signed_in.contains(&profile) {
@@ -2358,6 +2542,7 @@ impl Client for FakeClient {
                 .lock()
                 .expect("fake state is never poisoned")
                 .retain(|p| &p.server != server);
+            self.lock_auth().trusted.clear();
             Ok(())
         })
     }
@@ -2375,9 +2560,10 @@ impl Client for FakeClient {
                 .clone();
             // A revoked session is kept by name, as the SDK keeps it, to
             // sign in again with a password.
-            Ok(signed_in
+            let gone = self.lock_auth().signed_out.clone();
+            let listed: Vec<Profile> = signed_in
                 .into_iter()
-                .filter(|p| &p.server == server)
+                .filter(|p| &p.server == server && !gone.contains(&p.username))
                 .map(|p| {
                     if self.fake_session(&p).pin_state().revoked {
                         let by_passkey = self
@@ -2402,7 +2588,13 @@ impl Client for FakeClient {
                         }
                     }
                 })
-                .collect())
+                .collect();
+            // The remembered ones folded in, as the SDK backend does.
+            Ok(crate::sdk::with_trust(
+                listed,
+                self.remembered(server),
+                server,
+            ))
         })
     }
 
@@ -2411,8 +2603,45 @@ impl Client for FakeClient {
         server: &'a ServerKey,
         username: &'a str,
         password: &'a str,
+        remember: bool,
     ) -> BoxFuture<'a, Result<Profile, BackendError>> {
-        Box::pin(async move { self.sign_in_now(server, username, password) })
+        Box::pin(async move {
+            let profile = self.sign_in_now(server, username, password)?;
+            if remember {
+                self.trust(username);
+            }
+            Ok(profile)
+        })
+    }
+
+    fn trusted_profiles<'a>(
+        &'a self,
+        server: &'a ServerKey,
+    ) -> BoxFuture<'a, Result<Vec<TrustedProfile>, BackendError>> {
+        Box::pin(async move {
+            self.pinned(server)?;
+            Ok(self.remembered(server))
+        })
+    }
+
+    fn resume_profile<'a>(
+        &'a self,
+        server: &'a ServerKey,
+        user_id: &'a str,
+    ) -> BoxFuture<'a, Result<Profile, BackendError>> {
+        Box::pin(async move {
+            self.pinned(server)?;
+            if !self.lock_auth().trusted.contains_key(user_id) {
+                return Err(BackendError::SignInRequired);
+            }
+            let (_, username, display_name) = self
+                .accounts
+                .iter()
+                .find(|(s, u, _)| s == server && *u == user_id)
+                .ok_or(BackendError::SignInRequired)?;
+            let profile = self.resumed_as(server, username, display_name);
+            Ok(profile)
+        })
     }
 
     fn begin_passkey_sign_in<'a>(
@@ -2436,6 +2665,7 @@ impl Client for FakeClient {
         &'a self,
         server: &'a ServerKey,
         signed: FinishPasskeySignIn,
+        remember: bool,
     ) -> BoxFuture<'a, Result<Profile, BackendError>> {
         Box::pin(async move {
             self.pinned(server)?;
@@ -2456,13 +2686,18 @@ impl Client for FakeClient {
                 .iter()
                 .find(|(s, u, _)| s == server && *u == username)
                 .ok_or(BackendError::WrongCredentials)?;
-            Ok(self.signed_in_as(server, username, display_name))
+            let profile = self.signed_in_as(server, username, display_name);
+            if remember {
+                self.trust(username);
+            }
+            Ok(profile)
         })
     }
 
     fn begin_device_sign_in<'a>(
         &'a self,
         server: &'a ServerKey,
+        remember: bool,
     ) -> BoxFuture<'a, Result<DeviceSignIn, BackendError>> {
         Box::pin(async move {
             self.pinned(server)?;
@@ -2474,6 +2709,7 @@ impl Client for FakeClient {
             let (head, tail) = FAKE_PHONE_CODE.split_at(4);
             Ok(DeviceSignIn {
                 server: server.clone(),
+                remember,
                 display_code: format!("{head}-{tail}"),
                 web_url: sign_ins.web.then(|| {
                     format!("https://media.example.org/auth/device?code={FAKE_PHONE_CODE}")
@@ -2487,7 +2723,7 @@ impl Client for FakeClient {
     fn await_device_sign_in<'a>(
         &'a self,
         sign_in: &'a DeviceSignIn,
-    ) -> BoxFuture<'a, Result<Profile, BackendError>> {
+    ) -> BoxFuture<'a, Result<(Profile, Option<bool>), BackendError>> {
         Box::pin(async move {
             let answer = self.phone_sign_ins().answer;
             if answer == PhoneAnswer::Wait {
@@ -2495,13 +2731,19 @@ impl Client for FakeClient {
             }
             self.phone_sign_ins().pending -= 1;
             match answer {
-                PhoneAnswer::Approve(username) => {
+                PhoneAnswer::Approve(username) | PhoneAnswer::ApproveForgetting(username) => {
                     let (_, username, display_name) = self
                         .accounts
                         .iter()
                         .find(|(s, u, _)| *s == sign_in.server && *u == username)
                         .ok_or_else(|| BackendError::NotFound(username.into()))?;
-                    Ok(self.signed_in_as(&sign_in.server, username, display_name))
+                    let profile = self.signed_in_as(&sign_in.server, username, display_name);
+                    // Remembered only if it asked and the approver let it.
+                    let remembered = sign_in.remember && matches!(answer, PhoneAnswer::Approve(_));
+                    if remembered {
+                        self.trust(username);
+                    }
+                    Ok((profile, Some(remembered)))
                 }
                 PhoneAnswer::Deny => Err(BackendError::SignInDenied),
                 PhoneAnswer::Expire => Err(BackendError::SignInExpired),
@@ -3277,7 +3519,7 @@ mod tests {
     #[test]
     fn signing_in_adds_a_profile() {
         let client = FakeClient::new(None);
-        ready(client.sign_in(&home_media(), "steve", FAKE_PASSWORD)).unwrap();
+        ready(client.sign_in(&home_media(), "steve", FAKE_PASSWORD, false)).unwrap();
         let profiles = ready(client.profiles(&home_media())).unwrap();
         assert_eq!(usernames(&profiles), ["andrey", "alice", "steve"]);
     }
@@ -3286,7 +3528,7 @@ mod tests {
     fn an_unknown_user_gets_the_same_refusal_as_a_wrong_password() {
         let client = FakeClient::new(None);
         assert_eq!(
-            ready(client.sign_in(&home_media(), "mallory", FAKE_PASSWORD)),
+            ready(client.sign_in(&home_media(), "mallory", FAKE_PASSWORD, false)),
             Err(BackendError::WrongCredentials)
         );
     }
@@ -3295,9 +3537,9 @@ mod tests {
     fn repeated_failures_are_rate_limited() {
         let client = FakeClient::new(None);
         for _ in 0..SIGN_IN_ATTEMPTS {
-            let _ = ready(client.sign_in(&home_media(), "steve", "hunter2"));
+            let _ = ready(client.sign_in(&home_media(), "steve", "hunter2", false));
         }
-        let refused = ready(client.sign_in(&home_media(), "steve", FAKE_PASSWORD));
+        let refused = ready(client.sign_in(&home_media(), "steve", FAKE_PASSWORD, false));
         assert!(
             matches!(refused, Err(BackendError::RateLimited(_))),
             "{refused:?}"
@@ -3337,7 +3579,7 @@ mod tests {
     fn forgetting_a_server_drops_it_and_its_profiles() {
         let client = FakeClient::new(None);
         let key = home_media();
-        ready(client.sign_in(&key, "andrey", FAKE_PASSWORD)).unwrap();
+        ready(client.sign_in(&key, "andrey", FAKE_PASSWORD, false)).unwrap();
         ready(client.forget(&key)).unwrap();
         let servers = ready(client.servers()).unwrap();
         assert!(!servers.iter().any(|s| s.key == key));
@@ -3347,7 +3589,7 @@ mod tests {
     fn signing_out_keeps_the_server_but_no_profiles() {
         let client = FakeClient::new(None);
         let key = home_media();
-        ready(client.sign_in(&key, "andrey", FAKE_PASSWORD)).unwrap();
+        ready(client.sign_in(&key, "andrey", FAKE_PASSWORD, false)).unwrap();
         ready(client.sign_out(&key)).unwrap();
         assert_eq!(ready(client.profiles(&key)), Ok(Vec::new()));
     }
@@ -3368,7 +3610,7 @@ mod tests {
         let client = FakeClient::new(None);
         let key = added_server(&client);
         assert_eq!(
-            ready(client.sign_in(&key, "andrey", FAKE_PASSWORD)),
+            ready(client.sign_in(&key, "andrey", FAKE_PASSWORD, false)),
             Err(BackendError::NotPinned(key.0.clone()))
         );
     }
@@ -3390,7 +3632,7 @@ mod tests {
         let key = added_server(&client);
         let server = ready(client.pin(&key, false)).unwrap();
         assert_eq!((server.pinned, server.verified), (true, false));
-        assert!(ready(client.sign_in(&key, "andrey", FAKE_PASSWORD)).is_ok());
+        assert!(ready(client.sign_in(&key, "andrey", FAKE_PASSWORD, false)).is_ok());
     }
 
     #[test]
@@ -3434,7 +3676,7 @@ mod tests {
     #[test]
     fn a_phone_sign_in_shows_a_code_and_the_page_to_open() {
         let client = FakeClient::new(None);
-        let begun = ready(client.begin_device_sign_in(&home_media())).unwrap();
+        let begun = ready(client.begin_device_sign_in(&home_media(), false)).unwrap();
         assert_eq!(
             (begun.display_code.as_str(), begun.web_url.as_deref()),
             (
@@ -3447,23 +3689,23 @@ mod tests {
     #[test]
     fn a_server_without_a_web_address_gives_only_the_code() {
         let client = FakeClient::new(None).without_web_address();
-        let begun = ready(client.begin_device_sign_in(&home_media())).unwrap();
+        let begun = ready(client.begin_device_sign_in(&home_media(), false)).unwrap();
         assert_eq!(begun.web_url, None);
     }
 
     #[test]
     fn an_approved_phone_sign_in_adds_the_profile() {
         let client = FakeClient::new(None).answering_phone_sign_in(PhoneAnswer::Approve("steve"));
-        let begun = ready(client.begin_device_sign_in(&home_media())).unwrap();
+        let begun = ready(client.begin_device_sign_in(&home_media(), false)).unwrap();
         let profile = ready(client.await_device_sign_in(&begun)).unwrap();
         assert!(usernames(&ready(client.profiles(&home_media())).unwrap()).contains(&"steve"));
-        assert_eq!(profile.username, "steve");
+        assert_eq!(profile.0.username, "steve");
     }
 
     #[test]
     fn a_refused_phone_sign_in_says_so() {
         let client = FakeClient::new(None).answering_phone_sign_in(PhoneAnswer::Deny);
-        let begun = ready(client.begin_device_sign_in(&home_media())).unwrap();
+        let begun = ready(client.begin_device_sign_in(&home_media(), false)).unwrap();
         assert_eq!(
             ready(client.await_device_sign_in(&begun)),
             Err(BackendError::SignInDenied)
@@ -3474,10 +3716,10 @@ mod tests {
     fn a_fourth_pending_phone_sign_in_is_refused() {
         let client = FakeClient::new(None).answering_phone_sign_in(PhoneAnswer::Wait);
         for _ in 0..3 {
-            ready(client.begin_device_sign_in(&home_media())).unwrap();
+            ready(client.begin_device_sign_in(&home_media(), false)).unwrap();
         }
         assert!(matches!(
-            ready(client.begin_device_sign_in(&home_media())),
+            ready(client.begin_device_sign_in(&home_media(), false)),
             Err(BackendError::RateLimited(_))
         ));
     }
@@ -3513,7 +3755,7 @@ mod tests {
     #[test]
     fn a_server_not_set_up_signs_in_but_has_no_catalog() {
         let client = FakeClient::new(None).not_set_up();
-        let profile = ready(client.sign_in(&home_media(), "steve", FAKE_PASSWORD)).unwrap();
+        let profile = ready(client.sign_in(&home_media(), "steve", FAKE_PASSWORD, false)).unwrap();
         let session = client.session(&profile).unwrap();
         assert_eq!(
             [
@@ -3617,6 +3859,7 @@ mod tests {
             display_name: "Andrey".into(),
             locked: false,
             sign_in: Default::default(),
+            trust: None,
         };
         let session = client.session(&profile).unwrap();
         let start =
@@ -3686,7 +3929,8 @@ mod tests {
         let andrey = session_for(&client, "andrey");
         ready(andrey.begin_passkey_registration()).unwrap();
         ready(andrey.finish_passkey_registration(made(&[9, 9], "YubiKey 5C"))).unwrap();
-        let profile = ready(client.finish_passkey_sign_in(&home_media(), signed(&[9, 9]))).unwrap();
+        let profile =
+            ready(client.finish_passkey_sign_in(&home_media(), signed(&[9, 9]), false)).unwrap();
         assert_eq!(profile.username, "andrey");
     }
 
@@ -3698,7 +3942,7 @@ mod tests {
         assert_eq!(
             (
                 listed.iter().map(|p| p.usable_here).collect::<Vec<_>>(),
-                ready(client.finish_passkey_sign_in(&home_media(), signed(&[1, 2, 3, 4])))
+                ready(client.finish_passkey_sign_in(&home_media(), signed(&[1, 2, 3, 4]), false))
                     .unwrap_err(),
             ),
             (vec![false], BackendError::WrongCredentials)
@@ -3765,7 +4009,7 @@ mod tests {
         ready(alice.finish_passkey_registration(made(&[8], "Key"))).unwrap();
         let mut signed = signed(&[8]);
         signed.user_handle = b"alice".to_vec();
-        ready(client.finish_passkey_sign_in(&home_media(), signed)).unwrap();
+        ready(client.finish_passkey_sign_in(&home_media(), signed, false)).unwrap();
         let alice = session_for(&client, "alice");
         for _ in 0..10 {
             let _ = ready(alice.unlock("0000"));
@@ -3810,6 +4054,94 @@ mod tests {
             (true, ProfileSignIn::Password)
         );
         sign_outs.mark_unchanged();
+    }
+
+    fn remembered_sign_in(client: &FakeClient, username: &str) {
+        ready(client.sign_in(&home_media(), username, FAKE_PASSWORD, true)).unwrap();
+    }
+
+    #[test]
+    fn a_remembered_profile_resumes_after_its_session_ends() {
+        let client = FakeClient::new(None);
+        remembered_sign_in(&client, "andrey");
+        // The session ends (signed out elsewhere); the trust stays.
+        client
+            .fake_session(&FakeClient::profile("andrey"))
+            .pin_state()
+            .revoked = true;
+        let profile = profile_of(&client, "andrey");
+        assert_eq!(profile.sign_in, ProfileSignIn::Resume);
+        let user_id = profile.trust.unwrap().user_id;
+        assert!(ready(client.resume_profile(&home_media(), &user_id)).is_ok());
+    }
+
+    #[test]
+    fn remember_is_off_unless_asked() {
+        let client = FakeClient::new(None);
+        ready(client.sign_in(&home_media(), "andrey", FAKE_PASSWORD, false)).unwrap();
+        assert!(
+            ready(client.trusted_profiles(&home_media()))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn signing_out_forgets_the_profile_and_its_trust() {
+        let client = FakeClient::new(None);
+        remembered_sign_in(&client, "andrey");
+        ready(session_for(&client, "andrey").sign_out()).unwrap();
+        assert!(
+            !usernames(&ready(client.profiles(&home_media())).unwrap()).contains(&"andrey")
+                && ready(client.resume_profile(&home_media(), "andrey")).unwrap_err()
+                    == BackendError::SignInRequired
+        );
+    }
+
+    #[test]
+    fn one_profile_opens_at_start_and_it_has_no_pin_here() {
+        let client = FakeClient::new(None);
+        remembered_sign_in(&client, "andrey");
+        remembered_sign_in(&client, "alice");
+        let alice = session_for(&client, "alice");
+        ready(alice.unlock(FAKE_PIN)).unwrap();
+        ready(session_for(&client, "andrey").set_device_trust(None, true, true)).unwrap();
+        ready(alice.set_device_trust(None, true, true)).unwrap();
+        let remembered = ready(client.trusted_profiles(&home_media())).unwrap();
+        let auto: Vec<(&str, bool, bool)> = remembered
+            .iter()
+            .map(|t| (t.username.as_str(), t.auto_login, t.pin_required))
+            .collect();
+        assert_eq!(auto, [("alice", true, false), ("andrey", false, false)]);
+    }
+
+    #[test]
+    fn the_pin_back_on_turns_auto_login_off() {
+        let client = FakeClient::new(None);
+        remembered_sign_in(&client, "alice");
+        let alice = session_for(&client, "alice");
+        ready(alice.unlock(FAKE_PIN)).unwrap();
+        ready(alice.set_device_trust(None, true, true)).unwrap();
+        ready(alice.set_pin_required(None, true)).unwrap();
+        assert!(!ready(client.trusted_profiles(&home_media())).unwrap()[0].auto_login);
+    }
+
+    #[test]
+    fn auto_login_without_trust_is_refused() {
+        let client = FakeClient::new(None);
+        assert!(matches!(
+            ready(session_for(&client, "andrey").set_device_trust(None, false, true)),
+            Err(BackendError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn a_device_approved_with_remember_unticked_is_not_remembered() {
+        let client =
+            FakeClient::new(None).answering_phone_sign_in(PhoneAnswer::ApproveForgetting("andrey"));
+        let begun = ready(client.begin_device_sign_in(&home_media(), true)).unwrap();
+        let (_, remembered) = ready(client.await_device_sign_in(&begun)).unwrap();
+        assert_eq!(remembered, Some(false));
     }
 
     #[test]
@@ -3942,9 +4274,22 @@ mod tests {
     }
 
     #[test]
+    fn the_approver_decides_whether_the_device_is_remembered() {
+        let client = FakeClient::new(None);
+        let andrey = session_for(&client, "andrey");
+        let asked = ready(andrey.lookup_device_sign_in(FAKE_SIGN_IN_CODE)).unwrap();
+        assert!(asked.remember, "the fixture TV asks to be remembered");
+        ready(andrey.approve_device_sign_in(FAKE_SIGN_IN_CODE, false)).unwrap();
+        assert_eq!(
+            client.approvals_by("andrey"),
+            [(FAKE_SIGN_IN_CODE.to_owned(), false)]
+        );
+    }
+
+    #[test]
     fn an_approved_code_is_used_up() {
         let andrey = andrey();
-        ready(andrey.approve_device_sign_in(FAKE_SIGN_IN_CODE)).unwrap();
+        ready(andrey.approve_device_sign_in(FAKE_SIGN_IN_CODE, false)).unwrap();
         assert!(matches!(
             ready(andrey.lookup_device_sign_in(FAKE_SIGN_IN_CODE)),
             Err(BackendError::NotFound(_))
@@ -3954,7 +4299,7 @@ mod tests {
     #[test]
     fn approving_this_devices_own_code_is_refused() {
         assert!(matches!(
-            ready(andrey().approve_device_sign_in(FAKE_OWN_SIGN_IN_CODE)),
+            ready(andrey().approve_device_sign_in(FAKE_OWN_SIGN_IN_CODE, false)),
             Err(BackendError::InvalidInput(_))
         ));
     }
@@ -3975,7 +4320,7 @@ mod tests {
     fn a_locked_profile_cannot_approve() {
         let alice = session_for(&FakeClient::new(None), "alice");
         assert_eq!(
-            ready(alice.approve_device_sign_in(FAKE_SIGN_IN_CODE)).unwrap_err(),
+            ready(alice.approve_device_sign_in(FAKE_SIGN_IN_CODE, false)).unwrap_err(),
             BackendError::ProfileLocked
         );
     }

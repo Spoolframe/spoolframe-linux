@@ -14,6 +14,11 @@
 //!   portal), and the screen shows the code and a Cancel. A server without
 //!   a web address has no page: the password form takes over, saying why.
 //!
+//! "Remember this device", ticked in the sign-in form, goes with the
+//! request (P4-02), and the approver decides: the screen says it was
+//! asked, and, once approved, whether it was remembered, for a moment
+//! before the profile opens.
+//!
 //! A server holds at most three waiting requests per device, so one is
 //! begun when the screen opens and again only when the user asks (a new
 //! code, or trying again); closing the screen stops the wait.
@@ -50,6 +55,8 @@ pub struct RemoteSignIn {
     client: Arc<dyn Client>,
     server: Server,
     via: Via,
+    /// Asked to remember this device (P4-02).
+    remember: bool,
     ends: Ends,
     stack: gtk::Stack,
     qr: gtk::Picture,
@@ -66,6 +73,8 @@ pub struct RemoteSignIn {
     new_code: gtk::Button,
     try_again: gtk::Button,
     problem: adw::StatusPage,
+    /// Approved, remembered or not.
+    approved: adw::StatusPage,
     /// The call with the server in flight, stopped when the screen closes.
     call: RefCell<Option<tokio::task::AbortHandle>>,
     /// When the code shown stops working.
@@ -74,7 +83,13 @@ pub struct RemoteSignIn {
 }
 
 impl RemoteSignIn {
-    pub fn new(client: Arc<dyn Client>, server: &Server, via: Via, ends: Ends) -> Rc<Self> {
+    pub fn new(
+        client: Arc<dyn Client>,
+        server: &Server,
+        via: Via,
+        remember: bool,
+        ends: Ends,
+    ) -> Rc<Self> {
         let asking = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(12)
@@ -133,6 +148,11 @@ impl RemoteSignIn {
             .build();
         waiting_row.append(&gtk::Spinner::builder().spinning(true).build());
         waiting_row.append(&countdown);
+        let asked_to_remember = wrapped(
+            "Asked to remember this device · the approver decides",
+            &["dim-label", "small-text"],
+        );
+        asked_to_remember.set_visible(remember);
         let use_password = gtk::Button::builder()
             .label(match via {
                 Via::Phone => "Use a password instead",
@@ -149,6 +169,7 @@ impl RemoteSignIn {
             code.upcast_ref(),
             fingerprint.upcast_ref(),
             waiting_row.upcast_ref(),
+            asked_to_remember.upcast_ref(),
             use_password.upcast_ref(),
         ] {
             waiting.append(widget);
@@ -205,6 +226,12 @@ impl RemoteSignIn {
             .child(&problem_retry)
             .build();
 
+        // Approved: remembered or not, as the approver chose.
+        let approved = adw::StatusPage::builder()
+            .icon_name(crate::icons::CHECK)
+            .css_classes(["small-icon", "success-icon"])
+            .build();
+
         let stack = gtk::Stack::builder()
             .transition_type(gtk::StackTransitionType::Crossfade)
             .vhomogeneous(false)
@@ -214,6 +241,7 @@ impl RemoteSignIn {
         stack.add_named(&expired_page, Some("expired"));
         stack.add_named(&denied, Some("denied"));
         stack.add_named(&problem, Some("problem"));
+        stack.add_named(&approved, Some("approved"));
 
         let body = adw::Clamp::builder()
             .maximum_size(408)
@@ -237,6 +265,7 @@ impl RemoteSignIn {
             client,
             server: server.clone(),
             via,
+            remember,
             ends,
             stack,
             qr,
@@ -250,6 +279,7 @@ impl RemoteSignIn {
             new_code,
             try_again,
             problem,
+            approved,
             call: RefCell::new(None),
             expires: Cell::new(None),
             open: Cell::new(true),
@@ -287,7 +317,8 @@ impl RemoteSignIn {
         self.expires.set(None);
         self.stack.set_visible_child_name("asking");
         let (client, key) = (self.client.clone(), self.server.key.clone());
-        let begun = relm4::spawn(async move { client.begin_device_sign_in(&key).await });
+        let remember = self.remember;
+        let begun = relm4::spawn(async move { client.begin_device_sign_in(&key, remember).await });
         self.call.replace(Some(begun.abort_handle()));
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
@@ -426,10 +457,30 @@ impl RemoteSignIn {
             }
             this.expires.set(None);
             match answer {
-                Ok(profile) => (this.ends.done)(profile),
+                Ok((profile, remembered)) => this.approved(profile, remembered),
                 Err(BackendError::SignInExpired) => this.stack.set_visible_child_name("expired"),
                 Err(BackendError::SignInDenied) => this.stack.set_visible_child_name("denied"),
                 Err(e) => this.trouble(&e.to_string()),
+            }
+        });
+    }
+
+    /// Signed in. When remembering was asked, or the approver remembered
+    /// it anyway, says which for a moment before the profile opens; a
+    /// server before P4-01 says nothing of it.
+    fn approved(self: &Rc<Self>, profile: Profile, remembered: Option<bool>) {
+        let Some(remembered) = remembered.filter(|r| *r || self.remember) else {
+            return (self.ends.done)(profile);
+        };
+        let (title, body) = approval(&profile.display_name, remembered);
+        self.approved.set_title(&title);
+        self.approved.set_description(Some(&body));
+        self.stack.set_visible_child_name("approved");
+        // Closed meanwhile or not, the session is made: it opens.
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_seconds_local_once(2, move || {
+            if let Some(this) = weak.upgrade() {
+                (this.ends.done)(profile);
             }
         });
     }
@@ -445,6 +496,26 @@ impl RemoteSignIn {
         if let Some(call) = self.call.take() {
             call.abort();
         }
+    }
+}
+
+/// What the approved page says, as the LinuxPhoneSignIn board has it.
+fn approval(name: &str, remembered: bool) -> (String, String) {
+    if remembered {
+        (
+            format!("Signed in as {name}"),
+            format!(
+                "This device is remembered: {name} can reopen the profile here without a \
+                 password, until signing out."
+            ),
+        )
+    } else {
+        (
+            format!("Signed in as {name}, just this once"),
+            "The approver didn’t remember this device, so after signing out it needs a \
+             sign-in again. You can turn it on in Preferences › Profile."
+                .to_owned(),
+        )
     }
 }
 
@@ -519,6 +590,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_device_not_remembered_says_it_is_just_this_once() {
+        let (title, body) = approval("Alice", false);
+        assert_eq!(title, "Signed in as Alice, just this once");
+        assert!(body.contains("Preferences › Profile"));
+    }
+
+    #[test]
     fn the_page_is_shown_as_people_type_it() {
         assert_eq!(
             page_address("https://home-media.lan/device?code=BCDFGHJK"),
@@ -556,6 +634,10 @@ mod tests {
     }
 
     fn open_via(client: FakeClient, via: Via) -> (Rc<RemoteSignIn>, Rc<Ended>) {
+        open_asking(client, via, false)
+    }
+
+    fn open_asking(client: FakeClient, via: Via, remember: bool) -> (Rc<RemoteSignIn>, Rc<Ended>) {
         let client: Arc<dyn Client> = Arc::new(client);
         let server = ready(client.servers())
             .unwrap()
@@ -579,7 +661,7 @@ mod tests {
                 Rc::new(move |url| ended.opened.borrow_mut().push(url.to_owned()))
             },
         };
-        let screen = RemoteSignIn::new(client, &server, via, ends);
+        let screen = RemoteSignIn::new(client, &server, via, remember, ends);
         let window = adw::Window::builder()
             .default_width(800)
             .default_height(760)
@@ -608,6 +690,8 @@ mod tests {
         gtk::init().unwrap();
         adw::init().unwrap();
         an_approval_ends_as_a_password_sign_in();
+        a_remembered_approval_says_so_before_the_profile_opens();
+        an_approval_that_forgot_the_device_says_just_this_once();
         an_expired_code_is_replaced_on_asking();
         a_denial_offers_another_try();
         without_a_web_address_there_is_only_the_code();
@@ -649,6 +733,31 @@ mod tests {
             .borrow()
             .is_some()));
         assert_eq!(ended.profile.borrow().as_ref().unwrap().username, "andrey");
+    }
+
+    fn a_remembered_approval_says_so_before_the_profile_opens() {
+        let (screen, ended) = open_asking(FakeClient::new(None), Via::Phone, true);
+        assert!(reaches(&screen, "approved"), "the approval was not said");
+        assert_eq!(screen.approved.title(), "Signed in as Andrey");
+        assert!(
+            ended.profile.borrow().is_none(),
+            "opened before it was said"
+        );
+        assert!(run_until(Duration::from_secs(5), || ended
+            .profile
+            .borrow()
+            .is_some()));
+    }
+
+    fn an_approval_that_forgot_the_device_says_just_this_once() {
+        let (screen, _) = open_asking(
+            FakeClient::new(None).answering_phone_sign_in(PhoneAnswer::ApproveForgetting("andrey")),
+            Via::Phone,
+            true,
+        );
+        assert!(reaches(&screen, "approved"));
+        assert!(screen.approved.title().ends_with("just this once"));
+        screen.dialog.force_close();
     }
 
     fn an_expired_code_is_replaced_on_asking() {
