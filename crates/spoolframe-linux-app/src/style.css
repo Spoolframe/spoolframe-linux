@@ -1190,6 +1190,11 @@ button.pin-key.flat:hover {
 }
 
 .key-blink {
+  /* Its size here, not as a size request: GTK measures the box with its
+     margins before a request applies, and an empty box with these
+     margins measured -6 ("sizes must be >= 0"). */
+  min-width: 16px;
+  min-height: 16px;
   border-radius: 8px;
   margin: -6px -6px 0 0;
   background-color: var(--accent-bg-color);

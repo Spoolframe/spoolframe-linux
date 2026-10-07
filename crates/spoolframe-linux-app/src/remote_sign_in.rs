@@ -139,6 +139,11 @@ impl RemoteSignIn {
                 .css_classes(["monospace", "sign-in-fingerprint"])
                 .build(),
         );
+        if let Some(site) = server.passkey_site() {
+            let line = crate::start::passkey_site(&site);
+            line.set_halign(gtk::Align::Center);
+            fingerprint.append(&line);
+        }
         let countdown = gtk::Label::builder()
             .css_classes(["dim-label", "small-text"])
             .build();
@@ -327,7 +332,10 @@ impl RemoteSignIn {
                 return;
             };
             match answer {
-                Ok(sign_in) => {
+                Ok(mut sign_in) => {
+                    // A page that is no web page is no page: the code only,
+                    // as for a server without a web address.
+                    sign_in.web_url = sign_in.web_url.filter(|u| crate::browser::is_web(u));
                     this.show(&sign_in);
                     if this.open.get() {
                         this.wait(sign_in);
@@ -474,7 +482,8 @@ impl RemoteSignIn {
         };
         let (title, body) = approval(&profile.display_name, remembered);
         self.approved.set_title(&title);
-        self.approved.set_description(Some(&body));
+        self.approved
+            .set_description(Some(&crate::markup::plain(&body)));
         self.stack.set_visible_child_name("approved");
         // Closed meanwhile or not, the session is made: it opens.
         let weak = Rc::downgrade(self);
@@ -487,7 +496,8 @@ impl RemoteSignIn {
 
     fn trouble(&self, why: &str) {
         self.expires.set(None);
-        self.problem.set_description(Some(why));
+        self.problem
+            .set_description(Some(&crate::markup::plain(why)));
         self.stack.set_visible_child_name("problem");
     }
 

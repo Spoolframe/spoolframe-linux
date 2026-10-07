@@ -1100,10 +1100,11 @@ impl SearchPage {
         clear(&self.elsewhere);
         let places = elsewhere(counts, scope);
         if places.is_empty() {
-            self.none.set_description(Some(&format!(
-                "Nothing anywhere in {} matches. Check the spelling, or try fewer words.",
-                self.needs.server
-            )));
+            self.none
+                .set_description(Some(&crate::markup::plain(&format!(
+                    "Nothing anywhere in {} matches. Check the spelling, or try fewer words.",
+                    self.needs.server
+                ))));
         } else {
             self.none
                 .set_description(Some("It does match in other places:"));
@@ -1152,7 +1153,8 @@ impl SearchPage {
     fn failed(&self, error: &BackendError) {
         self.results.set_opacity(1.0);
         self.none.set_title("Search failed");
-        self.none.set_description(Some(&error.to_string()));
+        self.none
+            .set_description(Some(&crate::markup::plain(&error.to_string())));
         clear(&self.elsewhere);
         self.body.set_visible_child_name("none");
     }

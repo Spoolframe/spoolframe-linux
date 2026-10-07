@@ -275,7 +275,8 @@ impl View {
             }
             Change::Failed(error) => {
                 self.starting.set_visible(false);
-                self.error.set_description(Some(error));
+                self.error
+                    .set_description(Some(&crate::markup::plain(error)));
                 self.error.set_visible(true);
             }
             Change::Volume(_) | Change::Muted(_) => self.controls.volume.show(change),

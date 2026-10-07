@@ -30,7 +30,7 @@ use crate::backend::{
 };
 use crate::backend::{
     FinishPasskeyRegistration, FinishPasskeySignIn, PasskeyCreation, PasskeyInfo, PasskeyRequest,
-    Trust, TrustedProfile,
+    TrackPreferencesInfo, Trust, TrustedProfile,
 };
 use crate::storage::Storage;
 
@@ -50,6 +50,7 @@ pub fn backend_error(error: sdk::SdkError) -> BackendError {
         E::NotFound(what) => BackendError::NotFound(what),
         E::NotPinned(id) => BackendError::NotPinned(id),
         E::IdentityChanged { saved, now } => BackendError::IdentityChanged { saved, now },
+        E::ServerIdChanged { saved, now, .. } => BackendError::ServerIdChanged { saved, now },
         E::Busy => BackendError::Busy,
         E::ProfileLocked => BackendError::ProfileLocked,
         E::InvalidInput(why) => BackendError::InvalidInput(why),
@@ -100,6 +101,7 @@ fn server(entry: sdk::ServerEntry) -> Server {
         on_network: entry.on_network,
         verified_at: entry.verified_at,
         last_connected_at: entry.last_connected_at,
+        server_id: entry.server_id,
     }
 }
 
@@ -889,7 +891,7 @@ impl Session for SdkSession {
         let id = id.clone();
         Box::pin(self.call(move |s| async move { s.unhide_from_continue(&id).await }))
     }
-    fn track_preferences(&self) -> BoxFuture<'_, Result<TrackPreferences, BackendError>> {
+    fn track_preferences(&self) -> BoxFuture<'_, Result<TrackPreferencesInfo, BackendError>> {
         Box::pin(self.call(|s| async move { s.track_preferences().await }))
     }
 
@@ -1038,6 +1040,11 @@ impl Session for SdkSession {
         }))
     }
 
+    fn forget_device<'a>(&'a self, device: &'a str) -> BoxFuture<'a, Result<(), BackendError>> {
+        let device = device.to_owned();
+        Box::pin(self.call(move |s| async move { s.forget_device(&device).await }))
+    }
+
     fn sign_out(&self) -> BoxFuture<'_, Result<(), BackendError>> {
         Box::pin(self.call(|s| async move { s.sign_out().await }))
     }
@@ -1082,6 +1089,21 @@ mod tests {
                 backend_error(sdk::SdkError::NoPreviews)
             ],
             [BackendError::PreviewsNotReady(40), BackendError::NoPreviews]
+        );
+    }
+
+    #[test]
+    fn a_changed_server_id_keeps_both_ids() {
+        assert_eq!(
+            backend_error(sdk::SdkError::ServerIdChanged {
+                endpoint_id: "k".into(),
+                saved: "k7f3q2m4x9pq8z2a".into(),
+                now: "w4n8b2r6t3kq7x5m".into(),
+            }),
+            BackendError::ServerIdChanged {
+                saved: "k7f3q2m4x9pq8z2a".into(),
+                now: "w4n8b2r6t3kq7x5m".into(),
+            }
         );
     }
 

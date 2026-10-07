@@ -285,8 +285,16 @@ pub fn fingerprint_check(
         .selectable(true)
         .css_classes(["fingerprint", "monospace"])
         .build();
+    let code_column = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(4)
+        .build();
+    code_column.append(&code);
+    if let Some(site) = server.passkey_site() {
+        code_column.append(&passkey_site(&site));
+    }
     let code_box = adw::Bin::builder()
-        .child(&code)
+        .child(&code_column)
         .halign(gtk::Align::Center)
         .css_classes(["fingerprint-box"])
         .build();
@@ -371,41 +379,153 @@ pub fn fingerprint_check(
     dialog
 }
 
+/// "Passkeys · <server id>.spoolframe.app" (PX-14): where the server's
+/// passkeys are kept, under its fingerprint wherever a server shows.
+pub fn passkey_site(site: &str) -> gtk::Label {
+    gtk::Label::builder()
+        .use_markup(true)
+        .label(format!(
+            "<span font_family=\"sans\" weight=\"600\">Passkeys</span> · {}",
+            glib_escape(site)
+        ))
+        .xalign(0.0)
+        .css_classes(["monospace", "passkey-site", "dim-label"])
+        .build()
+}
+
+/// A labelled code in an alert: "Previously" over a fingerprint, "Saved
+/// server ID" over an id.
+fn code_row(label: &str, code: &str, class: &str) -> gtk::Box {
+    let column = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(4)
+        .css_classes(["identity-row"])
+        .build();
+    column.append(
+        &gtk::Label::builder()
+            .label(label)
+            .xalign(0.0)
+            .css_classes(["caption-heading", "dim-label"])
+            .build(),
+    );
+    column.append(
+        &gtk::Label::builder()
+            .label(code)
+            .xalign(0.0)
+            .selectable(true)
+            .css_classes(["monospace", "identity-code", class])
+            .build(),
+    );
+    column
+}
+
+/// An alert's shape with the warning mark above the heading, which an
+/// AlertDialog cannot carry: the body, `extra` under it, then two
+/// responses, the second destructive and running `act`.
+fn alert(
+    heading: &str,
+    body: &str,
+    extra: &gtk::Box,
+    responses: (&str, &str),
+    act: Rc<dyn Fn()>,
+) -> adw::Dialog {
+    let icon = gtk::Image::builder()
+        .icon_name(crate::icons::WARNING)
+        .pixel_size(40)
+        .css_classes(["identity-warning"])
+        .build();
+    let title = gtk::Label::builder()
+        .label(heading)
+        .css_classes(["title-3", "dialog-title"])
+        .build();
+    let text = gtk::Label::builder()
+        .use_markup(true)
+        .label(body)
+        .wrap(true)
+        .justify(gtk::Justification::Center)
+        .css_classes(["dim-label"])
+        .build();
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(14)
+        .margin_top(28)
+        .margin_bottom(22)
+        .margin_start(28)
+        .margin_end(28)
+        .build();
+    content.append(&icon);
+    content.append(&title);
+    content.append(&text);
+    content.append(extra);
+    let close = gtk::Button::builder()
+        .label(responses.0)
+        .hexpand(true)
+        .css_classes(["flat", "alert-response"])
+        .build();
+    let action = gtk::Button::builder()
+        .label(responses.1)
+        .hexpand(true)
+        .css_classes(["flat", "alert-response", "destructive"])
+        .build();
+    let row = gtk::Box::builder()
+        .homogeneous(true)
+        .css_classes(["alert-responses"])
+        .build();
+    row.append(&close);
+    row.append(&gtk::Separator::new(gtk::Orientation::Vertical));
+    row.append(&action);
+    let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    column.append(&content);
+    column.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    column.append(&row);
+    let dialog = adw::Dialog::builder()
+        .title(heading)
+        .content_width(460)
+        .child(&column)
+        .build();
+    {
+        let dialog = dialog.downgrade();
+        close.connect_clicked(move |_| {
+            if let Some(dialog) = dialog.upgrade() {
+                dialog.close();
+            }
+        });
+    }
+    {
+        let dialog = dialog.downgrade();
+        action.connect_clicked(move |_| {
+            if let Some(dialog) = dialog.upgrade() {
+                dialog.close();
+            }
+            act();
+        });
+    }
+    dialog.set_focus(Some(&close));
+    dialog
+}
+
 /// "Server identity changed" (P1-13): a saved server answered with another
-/// key. Both codes, the full keys on request, and the choice: Cancel
-/// (nothing changes) or Trust New Identity (everyone signs in again).
-pub fn identity_changed(name: &str, saved: &str, now: &str, trust: Rc<dyn Fn()>) -> adw::Dialog {
+/// key. Both codes, the server's passkey site (kept: its id is the same),
+/// the full keys on request, and the choice: Cancel (nothing changes) or
+/// Trust New Identity (everyone signs in again).
+pub fn identity_changed(
+    name: &str,
+    saved: &str,
+    now: &str,
+    site: Option<&str>,
+    trust: Rc<dyn Fn()>,
+) -> adw::Dialog {
     let code =
         |key: &str| spoolframe_protocol::fingerprint::of_hex(key).unwrap_or_else(|| key.to_owned());
-    let row = |label: &str, key: &str, class: &str| {
-        let column = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .spacing(4)
-            .css_classes(["identity-row"])
-            .build();
-        column.append(
-            &gtk::Label::builder()
-                .label(label)
-                .xalign(0.0)
-                .css_classes(["caption-heading", "dim-label"])
-                .build(),
-        );
-        column.append(
-            &gtk::Label::builder()
-                .label(code(key))
-                .xalign(0.0)
-                .selectable(true)
-                .css_classes(["monospace", "identity-code", class])
-                .build(),
-        );
-        column
-    };
     let extra = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(10)
         .build();
-    extra.append(&row("Previously", saved, "dim-label"));
-    extra.append(&row("Now", now, "identity-new"));
+    extra.append(&code_row("Previously", &code(saved), "dim-label"));
+    extra.append(&code_row("Now", &code(now), "identity-new"));
+    if let Some(site) = site {
+        extra.append(&passkey_site(site));
+    }
     extra.append(&full_keys(&[saved, now]));
     extra.append(
         &gtk::Label::builder()
@@ -420,86 +540,41 @@ pub fn identity_changed(name: &str, saved: &str, now: &str, trust: Rc<dyn Fn()>)
             .css_classes(["dim-label", "caption"])
             .build(),
     );
-    // An alert's shape, with the warning mark above the heading that an
-    // AlertDialog cannot carry: the codes, Cancel and Trust New Identity.
-    let icon = gtk::Image::builder()
-        .icon_name(crate::icons::WARNING)
-        .pixel_size(40)
-        .css_classes(["identity-warning"])
-        .build();
-    let heading = gtk::Label::builder()
-        .label("Server identity changed")
-        .css_classes(["title-3", "dialog-title"])
-        .build();
-    let body = gtk::Label::builder()
-        .use_markup(true)
-        .label(format!(
+    alert(
+        "Server identity changed",
+        &format!(
             "<b>{}</b> has a different key than the one saved on this computer. \
              This may mean the server was reinstalled, or that you're connecting \
              to a different server.",
             glib_escape(name)
-        ))
-        .wrap(true)
-        .justify(gtk::Justification::Center)
-        .css_classes(["dim-label"])
-        .build();
-    let content = gtk::Box::builder()
+        ),
+        &extra,
+        ("Cancel", "Trust New Identity"),
+        trust,
+    )
+}
+
+/// "Server ID changed" (PX-14): a saved server answered with its key but
+/// another server id. It is not trusted as the same server, and there is
+/// no accepting it: Close, or Remove server to add it again.
+pub fn server_id_changed(name: &str, saved: &str, now: &str, remove: Rc<dyn Fn()>) -> adw::Dialog {
+    let extra = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .spacing(14)
-        .margin_top(28)
-        .margin_bottom(22)
-        .margin_start(28)
-        .margin_end(28)
+        .spacing(10)
         .build();
-    content.append(&icon);
-    content.append(&heading);
-    content.append(&body);
-    content.append(&extra);
-    let cancel = gtk::Button::builder()
-        .label("Cancel")
-        .hexpand(true)
-        .css_classes(["flat", "alert-response"])
-        .build();
-    let trust_button = gtk::Button::builder()
-        .label("Trust New Identity")
-        .hexpand(true)
-        .css_classes(["flat", "alert-response", "destructive"])
-        .build();
-    let responses = gtk::Box::builder()
-        .homogeneous(true)
-        .css_classes(["alert-responses"])
-        .build();
-    responses.append(&cancel);
-    responses.append(&gtk::Separator::new(gtk::Orientation::Vertical));
-    responses.append(&trust_button);
-    let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    column.append(&content);
-    column.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-    column.append(&responses);
-    let dialog = adw::Dialog::builder()
-        .title("Server identity changed")
-        .content_width(460)
-        .child(&column)
-        .build();
-    {
-        let dialog = dialog.downgrade();
-        cancel.connect_clicked(move |_| {
-            if let Some(dialog) = dialog.upgrade() {
-                dialog.close();
-            }
-        });
-    }
-    {
-        let dialog = dialog.downgrade();
-        trust_button.connect_clicked(move |_| {
-            if let Some(dialog) = dialog.upgrade() {
-                dialog.close();
-            }
-            trust();
-        });
-    }
-    dialog.set_focus(Some(&cancel));
-    dialog
+    extra.append(&code_row("Saved server ID", saved, "dim-label"));
+    extra.append(&code_row("This server says", now, "identity-new"));
+    alert(
+        "Server ID changed",
+        &format!(
+            "<b>{}</b> has the same key as before, but a different server ID. It can’t be \
+             trusted as the same server. Remove it and add it again if this is expected.",
+            glib_escape(name)
+        ),
+        &extra,
+        ("Close", "Remove server"),
+        remove,
+    )
 }
 
 /// "Show full key(s)": a link that shows the hex keys behind the codes,
@@ -1333,6 +1408,65 @@ mod tests {
 
     use super::*;
 
+    /// Every widget of type `T` under `widget`.
+    fn all<T: IsA<gtk::Widget>>(widget: &gtk::Widget) -> Vec<T> {
+        let mut found = Vec::new();
+        if let Some(it) = widget.downcast_ref::<T>() {
+            found.push(it.clone());
+        }
+        let mut child = widget.first_child();
+        while let Some(c) = child {
+            found.extend(all::<T>(&c));
+            child = c.next_sibling();
+        }
+        found
+    }
+
+    /// One test: GTK binds itself to the first thread that starts it.
+    #[test]
+    #[ignore = "needs a display; run on its own"]
+    fn start_dialogs_on_a_display() {
+        gtk::init().unwrap();
+        adw::init().unwrap();
+        a_changed_server_id_shows_both_and_offers_removing_it();
+    }
+
+    fn a_changed_server_id_shows_both_and_offers_removing_it() {
+        let removed = Rc::new(std::cell::Cell::new(false));
+        let dialog = {
+            let removed = removed.clone();
+            server_id_changed(
+                "Home Media",
+                "k7f3q2m4x5pq6z2a",
+                "w4n2b2r6t3kq7x5m",
+                Rc::new(move || removed.set(true)),
+            )
+        };
+        let window = adw::Window::builder()
+            .default_width(800)
+            .default_height(600)
+            .build();
+        window.present();
+        dialog.present(Some(&window));
+        let root = dialog.child().expect("the alert's content");
+        let texts: Vec<String> = all::<gtk::Label>(&root)
+            .iter()
+            .map(|l| l.text().to_string())
+            .collect();
+        assert!(
+            texts.iter().any(|t| t == "k7f3q2m4x5pq6z2a")
+                && texts.iter().any(|t| t == "w4n2b2r6t3kq7x5m"),
+            "{texts:?}"
+        );
+        all::<gtk::Button>(&root)
+            .into_iter()
+            .find(|b| b.label().as_deref() == Some("Remove server"))
+            .expect("a Remove server button")
+            .emit_clicked();
+        assert!(removed.get(), "Remove server did not remove it");
+        window.destroy();
+    }
+
     fn remembered(sign_in: ProfileSignIn, trust: Trust) -> Profile {
         Profile {
             server: ServerKey("home".into()),
@@ -1433,6 +1567,7 @@ mod tests {
             on_network: true,
             verified_at: None,
             last_connected_at: None,
+            server_id: None,
         }
     }
 

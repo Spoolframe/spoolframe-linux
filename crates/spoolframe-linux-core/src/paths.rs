@@ -39,16 +39,60 @@ pub fn cache_dir() -> Option<PathBuf> {
 
 /// Files that live only while the app runs (an external subtitle handed
 /// to GStreamer): the runtime directory where the platform has one, else
-/// the temporary directory.
-pub fn runtime_dir() -> PathBuf {
-    project(APP)
-        .and_then(|p| p.runtime_dir().map(Path::to_path_buf))
-        .unwrap_or_else(std::env::temp_dir)
+/// a private directory made for this run. None if that cannot be made.
+pub fn runtime_dir() -> Option<PathBuf> {
+    runtime_dir_or_private(project(APP).and_then(|p| p.runtime_dir().map(Path::to_path_buf)))
+}
+
+/// `runtime`, or a directory of this run's own under the temporary one:
+/// randomly named and open to this user only, so no one else can guess a
+/// file's name there or put a link in its place (PX-11, C-14). Made once,
+/// and kept until the app ends.
+fn runtime_dir_or_private(runtime: Option<PathBuf>) -> Option<PathBuf> {
+    static PRIVATE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    runtime.or_else(|| {
+        PRIVATE
+            .get_or_init(|| {
+                use std::os::unix::fs::PermissionsExt;
+                // tempfile leaves the mode to the umask: 0755 by default.
+                tempfile::Builder::new()
+                    .prefix(&format!("{APP}-"))
+                    .permissions(std::fs::Permissions::from_mode(0o700))
+                    .tempdir()
+                    .inspect_err(|e| tracing::warn!(error = %e, "no private temporary directory"))
+                    .ok()
+                    .map(tempfile::TempDir::keep)
+            })
+            .clone()
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn without_a_runtime_directory_files_go_in_a_private_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = runtime_dir_or_private(None).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert!(
+            dir != std::env::temp_dir() && mode == 0o700,
+            "{} is shared, or open to others ({mode:o})",
+            dir.display()
+        );
+    }
+
+    #[test]
+    fn the_private_directory_is_made_once_a_run() {
+        assert_eq!(runtime_dir_or_private(None), runtime_dir_or_private(None));
+    }
+
+    #[test]
+    fn the_platforms_runtime_directory_is_used_as_it_is() {
+        let given = PathBuf::from("/run/user/1000/spoolframe-relm4");
+        assert_eq!(runtime_dir_or_private(Some(given.clone())), Some(given));
+    }
 
     #[test]
     fn the_directories_carry_the_apps_name() {

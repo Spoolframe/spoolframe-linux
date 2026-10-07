@@ -13,6 +13,28 @@ use spoolframe_linux_core::artcache::ArtworkCache;
 use spoolframe_linux_core::backend::{ArtworkSize, BackendError, ServerKey, Session};
 use spoolframe_types::{Artwork, ArtworkId, ArtworkKind};
 
+/// The most pixels an image from the server may have: 8192 × 8192, 256 MB
+/// decoded. A hostile server could send a few bytes that claim far more
+/// (PX-11, C-14).
+pub const MAX_PIXELS: u64 = 8192 * 8192;
+
+/// An image's width and height, read from its header; nothing is
+/// decoded. None for bytes that are no image format it knows.
+pub fn image_size(bytes: &[u8]) -> Option<(u64, u64)> {
+    let size = imagesize::blob_size(bytes).ok()?;
+    Some((size.width as u64, size.height as u64))
+}
+
+/// The server's image bytes as a texture, refused unread when the header
+/// says it is larger than [`MAX_PIXELS`].
+pub fn decode(bytes: &[u8]) -> Result<gdk::Texture, String> {
+    let (width, height) = image_size(bytes).ok_or("not an image")?;
+    if width.saturating_mul(height) > MAX_PIXELS {
+        return Err(format!("{width}×{height} is too large"));
+    }
+    gdk::Texture::from_bytes(&glib::Bytes::from(bytes)).map_err(|e| e.to_string())
+}
+
 /// Loads one session's artwork.
 pub struct Art {
     session: Arc<dyn Session>,
@@ -131,9 +153,9 @@ where
             Ok(Err(e)) => return tracing::debug!(error = %e, "no artwork"),
             Err(e) => return tracing::warn!(error = %e, "artwork fetch panicked"),
         };
-        let texture = match gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)) {
+        let texture = match decode(&bytes) {
             Ok(texture) => texture,
-            Err(e) => return tracing::warn!(error = %e, "artwork is not an image"),
+            Err(e) => return tracing::warn!(error = %e, "artwork is not an image to show"),
         };
         if let Some(tile) = tile.upgrade() {
             paint(&tile, &texture);
@@ -264,6 +286,41 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A 1×1 PNG.
+    const SMALL_PNG: [u8; 70] = [
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6,
+        0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 248, 207, 192, 240,
+        31, 0, 5, 0, 1, 255, 137, 153, 61, 29, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+    ];
+
+    /// 69 bytes of PNG whose header says 100 000 × 100 000: 40 GB of
+    /// pixels once decoded.
+    const BOMB_PNG: [u8; 69] = [
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 1, 134, 160, 0, 1, 134,
+        160, 8, 6, 0, 0, 0, 168, 82, 11, 200, 0, 0, 0, 12, 73, 68, 65, 84, 120, 156, 99, 96, 160,
+        12, 0, 0, 0, 64, 0, 1, 183, 52, 124, 239, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+    ];
+
+    #[test]
+    fn an_images_size_is_read_from_its_header() {
+        assert_eq!(image_size(&BOMB_PNG), Some((100_000, 100_000)));
+    }
+
+    #[test]
+    fn an_image_too_large_is_refused_before_it_is_decoded() {
+        assert!(decode(&BOMB_PNG).is_err_and(|e| e.contains("too large")));
+    }
+
+    #[test]
+    fn a_small_image_is_decoded() {
+        assert!(decode(&SMALL_PNG).is_ok_and(|t| t.width() == 1));
+    }
+
+    #[test]
+    fn bytes_that_are_no_image_are_refused() {
+        assert!(decode(b"<html>not found</html>").is_err());
+    }
 
     /// A 200×300 poster, all one colour.
     fn poster() -> gdk::Texture {

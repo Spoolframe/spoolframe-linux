@@ -20,6 +20,7 @@ relm4 = { workspace = true }
 adw = { workspace = true }
 gtk = { workspace = true }
 pango = { workspace = true }
+imagesize = { workspace = true }
 qrcode = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }

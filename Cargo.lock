@@ -2998,6 +2998,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "imagesize"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65b27460c2c92b037f3f94c538ed9a3342f3fdf923606781629ccb35f82d042a"
+
+[[package]]
 name = "indexmap"
 version = "1.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5842,6 +5848,7 @@ dependencies = [
  "futures-util",
  "iroh",
  "iroh-mdns-address-lookup",
+ "parking_lot",
  "serde",
  "serde_json",
  "spoolframe-protocol",
@@ -5864,6 +5871,7 @@ dependencies = [
  "gstreamer-base",
  "gstreamer-play",
  "gtk4",
+ "imagesize",
  "libadwaita",
  "mpris-server",
  "pango",
@@ -5889,12 +5897,15 @@ dependencies = [
  "async-trait",
  "directories",
  "foyer",
+ "futures",
  "oo7",
+ "serde_cbor_2",
  "spoolframe-client-sdk",
  "spoolframe-policy",
  "spoolframe-protocol",
  "spoolframe-test-dir",
  "spoolframe-types",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

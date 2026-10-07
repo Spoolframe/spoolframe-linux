@@ -32,10 +32,12 @@ const FIRST_NAME: &str = "Security key";
 
 /// "Made on the web · created 20 Aug · last used 3 weeks ago".
 pub fn passkey_line(passkey: &PasskeyInfo, created: &str, now: i64) -> String {
-    let kind = if passkey.app {
-        "Spoolframe app"
-    } else {
-        "Made on the web"
+    let kind = match (passkey.app, passkey.usable_here) {
+        (true, true) => "Spoolframe app".to_owned(),
+        // Made for spoolframe.app before each server had its own relying
+        // party (PX-14): it signs in nowhere now.
+        (true, false) => "Old: add again".to_owned(),
+        (false, _) => format!("Made on the web at {}", passkey.rp_id),
     };
     let used = match passkey.last_used_at {
         Some(at) => format!("last used {}", ago(at, now)),
@@ -53,23 +55,6 @@ pub fn ago(at: i64, now: i64) -> String {
         days @ 14..=59 => format!("{} weeks ago", days / 7),
         days => format!("{} months ago", days / 30),
     }
-}
-
-/// The id the server names an app passkey by: its credential id,
-/// base64url with no padding.
-pub fn passkey_id(credential_id: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::with_capacity(credential_id.len().div_ceil(3) * 4);
-    for chunk in credential_id.chunks(3) {
-        let bits = chunk
-            .iter()
-            .enumerate()
-            .fold(0u32, |acc, (i, b)| acc | (u32::from(*b) << (16 - 8 * i)));
-        for i in 0..=chunk.len() {
-            out.push(ALPHABET[((bits >> (18 - 6 * i)) & 63) as usize] as char);
-        }
-    }
-    out
 }
 
 fn now() -> i64 {
@@ -135,7 +120,7 @@ type Again = Rc<dyn Fn(&Rc<View>)>;
 impl View {
     fn toast(&self, text: &str) {
         if let Some(toasts) = self.toasts.upgrade() {
-            toasts.add_toast(adw::Toast::new(text));
+            toasts.add_toast(crate::markup::toast(text));
         }
     }
 
@@ -411,6 +396,24 @@ impl View {
     }
 }
 
+/// Step 3's note: what a name is for, and where the password manager lists
+/// the passkey (PX-14): under the server's site, as "alice @ Home Media".
+fn listed_line(creation: &spoolframe_linux_core::backend::PasskeyCreation) -> String {
+    format!(
+        "A name to tell it apart later, like “YubiKey 5C” or “Alice’s iPhone”. Your password \
+         manager lists it under {}, as “{}”.",
+        creation.rp_id, creation.user_name
+    )
+}
+
+/// Why the server would not take a name.
+fn rename_refusal(error: &BackendError) -> String {
+    match error {
+        BackendError::InvalidInput(_) => "A name is 1 to 64 characters.".to_owned(),
+        other => crate::confirm::refusal(other),
+    }
+}
+
 /// The Add a passkey dialog's three steps.
 struct Adding {
     dialog: adw::Dialog,
@@ -420,8 +423,17 @@ struct Adding {
     back: gtk::Button,
     key: Rc<KeyPage>,
     name: gtk::Entry,
+    /// Under the name: why the server would not take it.
+    problem: gtk::Label,
+    /// Where the password manager lists it, once the server has said.
+    listed: gtk::Label,
     /// What the key made, kept to rename it from step 3.
     made: RefCell<Option<FinishPasskeyRegistration>>,
+    /// The name the server refused last: closing again with it leaves the
+    /// passkey under its first name.
+    refused: RefCell<Option<String>>,
+    /// A rename is on its way.
+    renaming: std::cell::Cell<bool>,
 }
 
 impl Adding {
@@ -468,7 +480,22 @@ impl Adding {
             back,
             key,
             name,
+            problem: gtk::Label::builder()
+                .visible(false)
+                .wrap(true)
+                .max_width_chars(1)
+                .xalign(0.0)
+                .css_classes(["error", "small-text"])
+                .build(),
+            listed: gtk::Label::builder()
+                .label("A name to tell it apart later, like “YubiKey 5C” or “Alice’s iPhone”.")
+                .wrap(true)
+                .max_width_chars(1)
+                .css_classes(["dim-label", "key-body"])
+                .build(),
             made: RefCell::new(None),
+            refused: RefCell::new(None),
+            renaming: std::cell::Cell::new(false),
         });
         adding
             .stack
@@ -500,6 +527,20 @@ impl Adding {
                     adding.with(Via::Key);
                 }
             }));
+            // At step 3 the passkey is saved, and closing any way (Escape,
+            // the window) names it as Done does.
+            let weak = Rc::downgrade(&adding);
+            adding.dialog.connect_close_attempt(move |_| {
+                if let Some(adding) = weak.upgrade() {
+                    adding.finish_name();
+                }
+            });
+            let weak = Rc::downgrade(&adding);
+            adding.name.connect_changed(move |_| {
+                if let Some(adding) = weak.upgrade() {
+                    adding.problem.set_visible(false);
+                }
+            });
             let weak = Rc::downgrade(&adding);
             adding.dialog.connect_closed(move |_| {
                 if let Some(adding) = weak.upgrade() {
@@ -526,6 +567,7 @@ impl Adding {
             _ => ("STEP 3 OF 3", ""),
         };
         self.step.set_label(step);
+        self.dialog.set_can_close(page != "name");
         self.back.set_label(back);
         self.back.set_visible(!back.is_empty());
         self.stack.set_visible_child_name(page);
@@ -605,15 +647,9 @@ impl Adding {
                 .build(),
         );
         field.append(&self.name);
+        field.append(&self.problem);
         page.append(&field);
-        page.append(
-            &gtk::Label::builder()
-                .label("A name to tell it apart later, like “YubiKey 5C” or “Alice’s iPhone”.")
-                .wrap(true)
-                .max_width_chars(1)
-                .css_classes(["dim-label", "key-body"])
-                .build(),
-        );
+        page.append(&self.listed);
         let done = gtk::Button::builder()
             .label("Done")
             .css_classes(["action", "suggested-action"])
@@ -648,6 +684,7 @@ impl Adding {
                 let Some(adding) = weak.upgrade() else { return };
                 match begun {
                     Ok(creation) => {
+                        adding.listed.set_label(&listed_line(&creation));
                         let done: Rc<dyn Fn(Done)> = {
                             let weak = Rc::downgrade(&adding);
                             Rc::new(move |done| {
@@ -704,28 +741,45 @@ impl Adding {
         );
     }
 
-    /// Renames it if the user changed its name, then closes.
+    /// Renames it if the user changed its name, then closes. A refusal is
+    /// said under the name and the dialog stays; closing again with the
+    /// same name keeps the first one.
     fn finish_name(self: &Rc<Self>) {
+        if self.renaming.get() {
+            return;
+        }
         let name = self.name.text().trim().to_owned();
         let made = self.made.borrow().clone();
         let (Some(view), Some(made)) = (self.view.upgrade(), made) else {
-            self.dialog.close();
+            self.dialog.force_close();
             return;
         };
-        if name.is_empty() || name == FIRST_NAME {
-            self.dialog.close();
+        if name.is_empty()
+            || name == FIRST_NAME
+            || self.refused.borrow().as_deref() == Some(name.as_str())
+        {
+            self.dialog.force_close();
             return;
         }
-        let id = passkey_id(&made.credential_id);
+        self.renaming.set(true);
+        let id = spoolframe_linux_core::passkey::passkey_id(&made.credential_id);
         let weak = Rc::downgrade(self);
+        let asked = name.clone();
         view.run(
             move |s| Box::pin(async move { s.rename_passkey(&id, &name).await }),
-            move |view, renamed| {
-                if let Err(e) = renamed {
-                    view.toast(&e.to_string());
-                }
-                if let Some(adding) = weak.upgrade() {
-                    adding.dialog.close();
+            move |_, renamed| {
+                let Some(adding) = weak.upgrade() else { return };
+                adding.renaming.set(false);
+                match renamed {
+                    Ok(()) => adding.dialog.force_close(),
+                    Err(e) => {
+                        adding.problem.set_label(&format!(
+                            "{} Close again to keep it as “{FIRST_NAME}”.",
+                            rename_refusal(&e)
+                        ));
+                        adding.problem.set_visible(true);
+                        adding.refused.replace(Some(asked));
+                    }
                 }
             },
         );
@@ -742,7 +796,11 @@ mod tests {
             name: "YubiKey 5C".into(),
             created_at: 0,
             last_used_at,
-            rp_id: "spoolframe.app".into(),
+            rp_id: if app {
+                "homemediaserver2.spoolframe.app".into()
+            } else {
+                "media.example.org".into()
+            },
             app,
             usable_here: app,
         }
@@ -753,8 +811,35 @@ mod tests {
         let day = 86_400;
         assert_eq!(
             passkey_line(&passkey(false, Some(0)), "20 Aug", 21 * day),
-            "Made on the web · created 20 Aug · last used 3 weeks ago"
+            "Made on the web at media.example.org · created 20 Aug · last used 3 weeks ago"
         );
+    }
+
+    #[test]
+    fn step_three_says_where_the_password_manager_lists_it() {
+        let creation = spoolframe_linux_core::backend::PasskeyCreation {
+            rp_id: "k7f3q2m4x5pq6z2a.spoolframe.app".into(),
+            origin: "https://k7f3q2m4x5pq6z2a.spoolframe.app".into(),
+            challenge: Vec::new(),
+            user_id: Vec::new(),
+            user_name: "alice @ Home Media".into(),
+            display_name: "Alice".into(),
+            exclude_credential_ids: Vec::new(),
+        };
+        assert!(
+            listed_line(&creation)
+                .ends_with("under k7f3q2m4x5pq6z2a.spoolframe.app, as “alice @ Home Media”.")
+        );
+    }
+
+    #[test]
+    fn an_app_passkey_from_before_each_server_had_its_own_says_to_add_it_again() {
+        let old = PasskeyInfo {
+            rp_id: "spoolframe.app".into(),
+            usable_here: false,
+            ..passkey(true, None)
+        };
+        assert!(passkey_line(&old, "2 Oct", 0).starts_with("Old: add again"));
     }
 
     fn run_until(limit: std::time::Duration, done: impl Fn() -> bool) -> bool {
@@ -777,6 +862,100 @@ mod tests {
         gtk::init().unwrap();
         adw::init().unwrap();
         a_web_ui_passkey_is_listed();
+        a_name_typed_at_step_three_sticks_however_the_dialog_closes();
+        a_refused_name_is_said_in_the_dialog();
+    }
+
+    /// A view of the fake's Home Media for andrey, and his session.
+    fn fake_view() -> (Rc<View>, Arc<dyn Session>) {
+        use spoolframe_linux_core::backend::Client;
+        use spoolframe_linux_core::fake::FakeClient;
+        let client: Arc<dyn Client> = Arc::new(FakeClient::new(None));
+        let profile = FakeClient::profile("andrey");
+        let session = client.session(&profile).unwrap();
+        let view = Rc::new(View {
+            server: Server {
+                key: profile.server.clone(),
+                name: "Home Media".into(),
+                addresses: Vec::new(),
+                pinned: true,
+                fingerprint: String::new(),
+                verified: true,
+                on_network: true,
+                verified_at: None,
+                last_connected_at: None,
+                server_id: None,
+            },
+            session: RefCell::new(session.clone()),
+            toasts: adw::ToastOverlay::new().downgrade(),
+            group: adw::PreferencesGroup::new(),
+            rows: RefCell::new(Vec::new()),
+        });
+        (view, session)
+    }
+
+    /// Add a passkey…, shown in a window, with the key done: step 3.
+    fn at_step_three(view: &Rc<View>) -> Rc<Adding> {
+        let window = adw::Window::builder()
+            .default_width(600)
+            .default_height(600)
+            .build();
+        window.present();
+        let adding = Adding::new(view);
+        adding.dialog.present(Some(&window));
+        adding.save(FinishPasskeyRegistration {
+            credential_id: vec![7; 16],
+            attestation_object: vec![1],
+            client_data_json: vec![1],
+            name: FIRST_NAME.to_owned(),
+        });
+        assert!(
+            run_until(std::time::Duration::from_secs(5), || adding
+                .stack
+                .visible_child_name()
+                .as_deref()
+                == Some("name")),
+            "the passkey was not saved"
+        );
+        adding
+    }
+
+    fn names(session: &Arc<dyn Session>) -> Vec<String> {
+        spoolframe_linux_core::testing::ready(session.passkeys())
+            .unwrap()
+            .into_iter()
+            .map(|p| p.name)
+            .collect()
+    }
+
+    fn a_name_typed_at_step_three_sticks_however_the_dialog_closes() {
+        let (view, session) = fake_view();
+        let adding = at_step_three(&view);
+        adding.name.set_text("thumb");
+        // Escape, or the window closing: not Done.
+        adding.dialog.close();
+        assert!(
+            run_until(std::time::Duration::from_secs(5), || names(&session)
+                .contains(&"thumb".to_owned())),
+            "names: {:?}",
+            names(&session)
+        );
+    }
+
+    fn a_refused_name_is_said_in_the_dialog() {
+        let (view, _) = fake_view();
+        let adding = at_step_three(&view);
+        // Longer than the 64 characters a name may have.
+        adding.name.set_text(&"t".repeat(65));
+        adding.name.emit_activate();
+        assert!(
+            run_until(std::time::Duration::from_secs(5), || adding
+                .problem
+                .is_visible()),
+            "the refusal was not said in the dialog"
+        );
+        assert!(adding.dialog.is_mapped(), "the dialog closed on a refusal");
+        adding.dialog.force_close();
     }
 
     fn a_web_ui_passkey_is_listed() {
@@ -795,6 +974,7 @@ mod tests {
             on_network: true,
             verified_at: None,
             last_connected_at: None,
+            server_id: None,
         };
         let toasts = adw::ToastOverlay::new();
         let group = group(Needs { server, session }, &toasts);
@@ -836,18 +1016,6 @@ mod tests {
         assert_eq!(
             passkey_line(&passkey(true, None), "12 Sep", 0),
             "Spoolframe app · created 12 Sep · never used"
-        );
-    }
-
-    #[test]
-    fn an_app_passkey_is_named_by_its_credential_id_in_base64url() {
-        assert_eq!(
-            (
-                passkey_id(&[1, 2, 3]),
-                passkey_id(&[0xfb, 0xff]),
-                passkey_id(&[0])
-            ),
-            ("AQID".to_owned(), "-_8".to_owned(), "AA".to_owned())
         );
     }
 }

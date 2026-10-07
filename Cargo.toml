@@ -49,6 +49,10 @@ adw = { package = "libadwaita", version = "0.9", features = ["v1_6"] }
 gtk = { package = "gtk4", version = "0.11", features = ["v4_16"] }
 # v1_56: a font file added to the font map, for the wordmark's face.
 pango = { version = "0.22", features = ["v1_56"] }
+# An image's size from its header alone, so the server's artwork is
+# measured before it is decoded (PX-11, C-14). gdk-pixbuf's loader cannot
+# do it: once it knows the size, it makes room for the whole image.
+imagesize = "0.15"
 
 # Player: GstPlay drives playbin3. gtk4paintablesink is linked in rather
 # than loaded as a system plugin, so that it uses the app's own GTK: a
@@ -85,10 +89,17 @@ glib-build-tools = "0.22"
 # tokio-tungstenite with native-tls, which the crate fixes (accepted).
 webauthn-authenticator-rs = { version = "=0.6.1-dev", default-features = false, features = ["usb", "cable"] }
 webauthn-rs-proto = "=0.6.1-dev"
+# Reads the passkey's id out of a key's attestation object: the library
+# leaves it empty for CTAP2 keys.
+serde_cbor_2 = "0.13"
+# Wraps each security key the library finds (passkey::Discoverable).
+futures = "0.3"
 tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros"] }
 
 # Where config, data and cache live, by each platform's rules.
 directories = "6"
+# A private temporary directory where the platform has no runtime one.
+tempfile = "3"
 
 # Secrets (the device key, session tokens) in the desktop's Secret
 # Service, never a plain file.

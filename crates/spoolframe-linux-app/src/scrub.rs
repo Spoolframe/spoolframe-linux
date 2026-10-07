@@ -187,7 +187,7 @@ impl Frames {
             };
             let sheet = answer
                 .map_err(|e| e.to_string())
-                .and_then(|bytes| decode(&bytes).map_err(|e| e.to_string()));
+                .and_then(|bytes| decode(&bytes));
             match sheet {
                 Ok(sheet) => {
                     if let State::Ready { sheets, .. } = &mut *frames.state.borrow_mut()
@@ -207,8 +207,8 @@ impl Frames {
 }
 
 /// A sheet's image as pixels.
-fn decode(bytes: &[u8]) -> Result<Sheet, glib::Error> {
-    let texture = gdk::Texture::from_bytes(&glib::Bytes::from(bytes))?;
+fn decode(bytes: &[u8]) -> Result<Sheet, String> {
+    let texture = crate::artwork::decode(bytes)?;
     let (width, height) = (texture.width() as usize, texture.height() as usize);
     let stride = width * 4;
     let mut pixels = vec![0u8; stride * height];

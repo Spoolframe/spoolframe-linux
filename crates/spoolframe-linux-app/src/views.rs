@@ -29,8 +29,8 @@ pub struct Cards {
     /// Marks an item watched (`true`) or clears its progress (`false`),
     /// from a Continue watching card's menu; none before a session exists.
     pub set_watched: Option<Rc<dyn Fn(MediaId, bool)>>,
-    /// Takes an item out of Continue watching (P1-22).
-    pub hide: Option<Rc<dyn Fn(Item)>>,
+    /// Takes a card out of its row (P1-22): that card only.
+    pub hide: Option<Rc<dyn Fn(Item, Shelf)>>,
     /// Puts a track, an album or an artist's albums in the play queue
     /// (P1-23), from its card's menu.
     pub enqueue: Option<Rc<dyn Fn(Item, Enqueue)>>,
@@ -234,7 +234,23 @@ fn heading(title: &str) -> gtk::Label {
 /// A 16:9 card for "Continue watching": the title on the tile, a progress
 /// strip along its bottom edge, and below it what the item is and how much
 /// is left.
-pub fn continue_card(item: &Item, cards: &Cards) -> gtk::Widget {
+/// The home rows a watch-state card sits in, which its Remove names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shelf {
+    ContinueWatching,
+    NextUp,
+}
+
+impl Shelf {
+    pub fn name(self) -> &'static str {
+        match self {
+            Shelf::ContinueWatching => "Continue watching",
+            Shelf::NextUp => "Next up",
+        }
+    }
+}
+
+pub fn continue_card(item: &Item, cards: &Cards, shelf: Shelf) -> gtk::Widget {
     let facts = Facts::of(item);
     // An episode's tile shows its show; the caption says which episode.
     let on_tile = facts.parent.clone().unwrap_or_else(|| facts.title.clone());
@@ -291,7 +307,7 @@ pub fn continue_card(item: &Item, cards: &Cards) -> gtk::Widget {
     let card = card(item, &tile, &below, LANDSCAPE.0, &cards.open);
     card.add_css_class("continue-card");
     if let (Some(set_watched), Some(hide)) = (&cards.set_watched, &cards.hide) {
-        card_menu(&card, item, set_watched, hide, &cards.open);
+        card_menu(&card, item, shelf, set_watched, hide, &cards.open);
     }
     card
 }
@@ -415,8 +431,9 @@ pub(crate) fn card(
 fn card_menu(
     card: &gtk::Widget,
     item: &Item,
+    shelf: Shelf,
     set_watched: &Rc<dyn Fn(MediaId, bool)>,
-    hide: &Rc<dyn Fn(Item)>,
+    hide: &Rc<dyn Fn(Item, Shelf)>,
     open: &Open,
 ) {
     let watch = |label, icon, watched| {
@@ -428,9 +445,9 @@ fn card_menu(
         MenuEntry {
             destructive: true,
             ..MenuEntry::new(
-                "Remove from Continue watching",
+                format!("Remove from {}", shelf.name()),
                 crate::icons::REMOVE,
-                move || hide(item.clone()),
+                move || hide(item.clone(), shelf),
             )
         }
     };

@@ -176,6 +176,24 @@ impl KeyState {
                         .into(),
                     "Try another key",
                 ),
+                KeyError::CannotKeep { full: true } => failed(
+                    "warning",
+                    "This key is full",
+                    "It has no room for another passkey. Remove one with its maker’s tool, or use \
+                     another key."
+                        .into(),
+                    "Try another key",
+                ),
+                // A passkey it could not find again would never sign in:
+                // signing in does not ask for a name.
+                KeyError::CannotKeep { full: false } => failed(
+                    "warning",
+                    "This key can’t keep a passkey",
+                    "It can only sign in when told which passkey to use, and Spoolframe signs in \
+                     without asking your name. Use another key, or your phone."
+                        .into(),
+                    "Try another key",
+                ),
                 KeyError::AlreadyMade => failed(
                     "warning",
                     if phone {
@@ -278,8 +296,6 @@ impl KeyPage {
             .pixel_size(32)
             .build();
         let blink = gtk::Box::builder()
-            .width_request(16)
-            .height_request(16)
             .halign(gtk::Align::End)
             .valign(gtk::Align::Start)
             .visible(false)
@@ -959,6 +975,47 @@ mod tests {
         adw::init().unwrap();
         every_key_state_shows();
         sign_in_opens_on_which_kind();
+        touch_your_key_lays_out_with_the_apps_stylesheet();
+    }
+
+    /// GTK's warnings that a widget measured below zero, from here on.
+    fn negative_sizes() -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kept = seen.clone();
+        glib::log_set_writer_func(move |level, fields| {
+            let message = fields
+                .iter()
+                .find(|f| f.key() == "MESSAGE")
+                .and_then(|f| f.value_str())
+                .unwrap_or_default();
+            if message.contains("sizes must be >= 0") {
+                kept.lock().unwrap().push(message.to_owned());
+            }
+            glib::log_writer_default(level, fields)
+        });
+        seen
+    }
+
+    fn touch_your_key_lays_out_with_the_apps_stylesheet() {
+        let css = gtk::CssProvider::new();
+        css.load_from_string(include_str!("style.css"));
+        gtk::style_context_add_provider_for_display(
+            &gtk::gdk::Display::default().unwrap(),
+            &css,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+        let seen = negative_sizes();
+        let page = KeyPage::new("Home Media", None);
+        page.show(KeyState::Touch);
+        let window = gtk::Window::builder().child(&page.widget).build();
+        window.present();
+        let context = glib::MainContext::default();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < until {
+            context.iteration(false);
+        }
+        window.destroy();
+        assert_eq!(*seen.lock().unwrap(), Vec::<String>::new());
     }
 
     fn every_key_state_shows() {
@@ -974,6 +1031,8 @@ mod tests {
             KeyState::Failed(KeyError::Replug),
             KeyState::Failed(KeyError::NoPasskey),
             KeyState::Failed(KeyError::AlreadyMade),
+            KeyState::Failed(KeyError::CannotKeep { full: true }),
+            KeyState::Failed(KeyError::CannotKeep { full: false }),
             KeyState::Failed(KeyError::TimedOut),
             KeyState::Failed(KeyError::NoDevice),
             KeyState::Failed(KeyError::Cancelled),

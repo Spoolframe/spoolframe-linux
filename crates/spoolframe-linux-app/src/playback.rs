@@ -1268,7 +1268,9 @@ impl Playback {
             }
             Err(e) => return tracing::warn!(error = %e, "no external subtitle"),
         };
-        let dir = spoolframe_linux_core::paths::runtime_dir();
+        let Some(dir) = spoolframe_linux_core::paths::runtime_dir() else {
+            return tracing::warn!("no private directory for the subtitle");
+        };
         // The app's runtime directory exists only once something makes it.
         if let Err(e) = std::fs::create_dir_all(&dir) {
             return tracing::warn!(error = %e, dir = %dir.display(), "cannot make the runtime directory");

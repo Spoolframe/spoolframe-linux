@@ -13,7 +13,7 @@ use gtk::glib;
 use relm4::{Component, ComponentParts, ComponentSender};
 use spoolframe_linux_core::backend::{
     BackendError, ChosenTracks, Client, ConnectionState, HomeScreen, Person, Profile,
-    ProfileSignIn, SearchScope, Selection, Server, ServerKey, Session,
+    ProfileSignIn, SearchScope, Selection, Server, ServerKey, Session, TrackPreferencesInfo,
 };
 use spoolframe_linux_core::next_episode::next_episode;
 use spoolframe_linux_core::theme::Theme;
@@ -270,9 +270,9 @@ pub enum Msg {
     SetShowDiagnostics(bool),
     /// Leave the full player and keep playing in the bar.
     MinimizePlayer,
-    /// Take an item out of Continue watching (`true`), or put it back
-    /// (`false`, from the toast's Undo).
-    HideFromContinue(Box<Item>, bool),
+    /// Take a card out of its home row (`true`), or put it back (`false`,
+    /// from the toast's Undo).
+    HideFromContinue(Box<Item>, views::Shelf, bool),
     /// Connect to `server` and show its fingerprint; `true` when it is a
     /// saved server being verified.
     CheckServer(Server, bool),
@@ -281,6 +281,9 @@ pub enum Msg {
     PinServer(Server, bool, bool),
     /// Replace a saved server's pin with the key that answered for it.
     TrustIdentity(ServerKey, ServerKey),
+    /// Forget a saved server: its server id changed (PX-14), and only
+    /// adding it again can trust it.
+    RemoveServer(ServerKey),
     /// Back to the full player from the bar.
     ExpandPlayer,
     StopPlayback,
@@ -319,12 +322,13 @@ pub enum Loaded {
     Checked(Server, bool, Result<Server, BackendError>),
     /// The user decided at the check; the flag as for `Checked`.
     Pinned(bool, Result<Server, BackendError>),
-    /// An item was taken out of Continue watching (`true`) or put back.
-    Hidden(Box<Item>, bool, Result<(), BackendError>),
+    /// A card was taken out of its row (`true`) or put back.
+    Hidden(Box<Item>, views::Shelf, bool, Result<(), BackendError>),
     /// What an enqueued item stands for: tracks, grouped by album.
     Enqueued(Enqueue, Result<Vec<AlbumTracks>, BackendError>),
     /// The user trusted a server's new identity (P1-13).
     Trusted(Result<Server, BackendError>),
+    ServerRemoved(ServerKey, Result<(), BackendError>),
     Profiles(Server, Result<Vec<Profile>, BackendError>),
     ProfileForgotten(Server, Result<(), BackendError>),
     /// A profile signed out, from Who's watching or the sidebar (P4-02).
@@ -359,7 +363,7 @@ pub enum Loaded {
     /// A change the user does not need to hear about unless it failed.
     Saved(Result<(), BackendError>),
     TracksForgotten(Box<Item>, Result<(), BackendError>),
-    Preferences(Result<TrackPreferences, BackendError>),
+    Preferences(Result<TrackPreferencesInfo, BackendError>),
     /// What the server said to the PIN typed for a locked profile.
     Unlocked(Box<Profile>, Result<(), BackendError>),
     Activated(u64, Box<Profile>, Result<(), BackendError>),
@@ -403,7 +407,7 @@ impl Loaded {
             | Loaded::Artist(_, Err(e))
             | Loaded::Album(_, Err(e))
             | Loaded::WatchChanged(Err(e))
-            | Loaded::Hidden(_, _, Err(e))
+            | Loaded::Hidden(_, _, _, Err(e))
             | Loaded::Enqueued(_, Err(e))
             | Loaded::Saved(Err(e))
             | Loaded::TracksForgotten(_, Err(e))
@@ -855,7 +859,7 @@ impl Component for App {
             // A server not saved yet has its fingerprint checked first.
             Msg::ChooseServer(server) if server.pinned => self.load_profiles(server, &sender),
             Msg::ChooseServer(server) => sender.input(Msg::CheckServer(server, false)),
-            Msg::HideFromContinue(item, hide) => {
+            Msg::HideFromContinue(item, shelf, hide) => {
                 let Some(session) = self.session.clone() else {
                     return;
                 };
@@ -865,7 +869,7 @@ impl Component for App {
                     } else {
                         session.unhide_from_continue(item.id()).await
                     };
-                    Loaded::Hidden(item, hide, done)
+                    Loaded::Hidden(item, shelf, hide, done)
                 });
             }
             Msg::CheckServer(server, verifying) => {
@@ -885,6 +889,13 @@ impl Component for App {
                 let client = self.client.clone();
                 self.command(&sender, async move {
                     Loaded::Trusted(client.trust_new_identity(&saved, &now).await)
+                });
+            }
+            Msg::RemoveServer(key) => {
+                let client = self.client.clone();
+                self.command(&sender, async move {
+                    let removed = client.forget(&key).await;
+                    Loaded::ServerRemoved(key, removed)
                 });
             }
             Msg::OpenAddServer => {
@@ -1069,7 +1080,7 @@ impl Component for App {
                     },
                     open: {
                         let window = root.downgrade();
-                        Rc::new(move |url| open_in_browser(url, window.upgrade().as_ref()))
+                        Rc::new(move |url| crate::browser::open(url, window.upgrade().as_ref()))
                     },
                 };
                 let screen = RemoteSignIn::new(self.client.clone(), server, via, remember, ends);
@@ -1473,14 +1484,14 @@ impl Component for App {
                     if let Some(dialog) = widgets.add_server.take() {
                         dialog.dialog.close();
                     }
-                    server_error(widgets, "This server", &e, &sender, root);
+                    server_error(widgets, None, &e, &sender, root);
                 }
             },
             Loaded::Checked(_, verifying, Ok(server)) => {
                 check_fingerprint(&server, verifying, &sender, root)
             }
             Loaded::Checked(server, _, Err(e)) => {
-                server_error(widgets, &server.name, &e, &sender, root)
+                server_error(widgets, Some(&server), &e, &sender, root)
             }
             Loaded::Pinned(verifying, Ok(server)) => {
                 self.load_servers(&sender);
@@ -1493,8 +1504,8 @@ impl Component for App {
                     self.load_profiles(server, &sender);
                 }
             }
-            Loaded::Pinned(_, Err(e)) => server_error(widgets, "This server", &e, &sender, root),
-            Loaded::Hidden(item, hide, Ok(())) => {
+            Loaded::Pinned(_, Err(e)) => server_error(widgets, None, &e, &sender, root),
+            Loaded::Hidden(item, shelf, hide, Ok(())) => {
                 self.load_home(&sender);
                 if hide {
                     let title = views::Facts::of(&item).caption();
@@ -1504,15 +1515,15 @@ impl Component for App {
                         .use_markup(false)
                         .button_label("Undo")
                         .build();
-                    toast.set_title(&format!("{title} removed from Continue watching"));
+                    toast.set_title(&format!("{title} removed from {}", shelf.name()));
                     let sender = sender.clone();
                     toast.connect_button_clicked(move |_| {
-                        sender.input(Msg::HideFromContinue(item.clone(), false))
+                        sender.input(Msg::HideFromContinue(item.clone(), shelf, false))
                     });
                     widgets.toasts.add_toast(toast);
                 }
             }
-            Loaded::Hidden(_, _, Err(e)) => toast(widgets, &e),
+            Loaded::Hidden(_, _, _, Err(e)) => toast(widgets, &e),
             Loaded::Activated(generation, profile, result) => {
                 if generation != self.profile_scope.generation() {
                     return;
@@ -1539,6 +1550,15 @@ impl Component for App {
                 self.load_profiles(server, &sender);
             }
             Loaded::Trusted(Err(e)) => toast(widgets, &e),
+            Loaded::ServerRemoved(key, Ok(())) => {
+                if self.server.as_ref().is_some_and(|s| s.key == key) {
+                    self.invalidate_session();
+                    self.server = None;
+                }
+                self.load_servers(&sender);
+                widgets.screens.set_visible_child_name("servers");
+            }
+            Loaded::ServerRemoved(_, Err(e)) => toast(widgets, &e),
             Loaded::ProfileForgotten(server, Ok(())) => self.load_profiles(server, &sender),
             Loaded::ProfileForgotten(_, Err(e)) => toast(widgets, &e),
             Loaded::ProfileSignedOut(server, signed_out) => {
@@ -1622,7 +1642,7 @@ impl Component for App {
             }
             Loaded::Profiles(server, Err(e)) => {
                 tracing::warn!(server = %server.name, error = %e, "cannot list profiles");
-                server_error(widgets, &server.name, &e, &sender, root);
+                server_error(widgets, Some(&server), &e, &sender, root);
                 widgets.screens.set_visible_child_name("servers");
             }
             Loaded::SignedIn(Ok(profile)) => {
@@ -1671,15 +1691,17 @@ impl Component for App {
                 if !home.continue_watching.is_empty() {
                     rows.push(views::row(
                         "Continue watching",
-                        home.continue_watching
-                            .iter()
-                            .map(|i| views::continue_card(i, cards)),
+                        home.continue_watching.iter().map(|i| {
+                            views::continue_card(i, cards, views::Shelf::ContinueWatching)
+                        }),
                     ));
                 }
                 if !home.next_up.is_empty() {
                     rows.push(views::row(
                         "Next up",
-                        home.next_up.iter().map(|i| views::continue_card(i, cards)),
+                        home.next_up
+                            .iter()
+                            .map(|i| views::continue_card(i, cards, views::Shelf::NextUp)),
                     ));
                 }
                 if !home.recently_added.is_empty() {
@@ -1877,7 +1899,7 @@ impl Component for App {
 impl App {
     fn preferences_dialog(
         &self,
-        tracks: Option<TrackPreferences>,
+        tracks: Option<TrackPreferencesInfo>,
         sender: &ComponentSender<Self>,
     ) -> adw::Dialog {
         let set_theme: Rc<dyn Fn(Theme)> = {
@@ -2004,7 +2026,9 @@ impl App {
             }),
             hide: Some({
                 let sender = sender.clone();
-                Rc::new(move |item| sender.input(Msg::HideFromContinue(Box::new(item), true)))
+                Rc::new(move |item, shelf| {
+                    sender.input(Msg::HideFromContinue(Box::new(item), shelf, true))
+                })
             }),
             enqueue: Some({
                 let sender = sender.clone();
@@ -2093,17 +2117,17 @@ impl App {
                 Change::Item(item) => {
                     now_playing.send_replace(Some(item.id().clone()));
                 }
-                Change::Skipped(message) => toasts.add_toast(adw::Toast::new(message)),
+                Change::Skipped(message) => toasts.add_toast(crate::markup::toast(message)),
                 // Nothing plays it again: the player and the bar close.
                 Change::SignedOut => stop.input(Msg::SessionEnded),
                 Change::Stopped => {
-                    toasts.add_toast(adw::Toast::new(
+                    toasts.add_toast(crate::markup::toast(
                         "Playback was stopped by the server's admin",
                     ));
                     stop.input(Msg::StopPlayback);
                 }
                 Change::Failed(error) if weak.upgrade().is_some_and(|p| !p.is_video()) => {
-                    toasts.add_toast(adw::Toast::new(&format!("Cannot play: {error}")));
+                    toasts.add_toast(crate::markup::toast(&format!("Cannot play: {error}")));
                 }
                 _ => {}
             }
@@ -2727,16 +2751,6 @@ fn scope_of(kind: LibraryKind) -> SearchScope {
     }
 }
 
-/// Opens `url` in the system browser, through the portal in a sandbox. A
-/// failure is logged; the screen shows the address to open by hand.
-fn open_in_browser(url: &str, window: Option<&adw::ApplicationWindow>) {
-    gtk::UriLauncher::new(url).launch(window, None::<&gtk::gio::Cancellable>, |result| {
-        if let Err(e) = result {
-            tracing::warn!(error = %e, "cannot open the browser");
-        }
-    });
-}
-
 fn show_error(widgets: &AppWidgets, title: &str, error: &BackendError, retry: Rc<dyn Fn()>) {
     show_content(widgets);
     widgets.root_page.set_title(title);
@@ -2808,7 +2822,7 @@ fn toast(widgets: &AppWidgets, error: &BackendError) {
 }
 
 fn toast_text(widgets: &AppWidgets, text: &str) {
-    widgets.toasts.add_toast(adw::Toast::new(text));
+    widgets.toasts.add_toast(crate::markup::toast(text));
 }
 
 fn error_status(error: &BackendError, retry: Option<Rc<dyn Fn()>>) -> adw::StatusPage {
@@ -2830,7 +2844,7 @@ fn error_status(error: &BackendError, retry: Option<Rc<dyn Fn()>>) -> adw::Statu
         .icon_name(crate::icons::ERROR)
         .title(title)
         // The description is markup; the error's text is not.
-        .description(glib::markup_escape_text(&description))
+        .description(crate::markup::plain(&description))
         .vexpand(true)
         .build();
     if let Some(retry) = retry {
@@ -2911,27 +2925,39 @@ fn check_fingerprint(
 }
 
 /// A server's error: the identity alert when it answered with another key,
-/// otherwise a toast.
+/// the server-id alert when it answered with another id (PX-14),
+/// otherwise a toast. `server` is the one asked, when known.
 fn server_error(
     widgets: &AppWidgets,
-    name: &str,
+    server: Option<&Server>,
     error: &BackendError,
     sender: &ComponentSender<App>,
     root: &adw::ApplicationWindow,
 ) {
-    let BackendError::IdentityChanged { saved, now } = error else {
-        return toast(widgets, error);
-    };
-    let trust: Rc<dyn Fn()> = {
-        let (sender, saved, now) = (sender.clone(), saved.clone(), now.clone());
-        Rc::new(move || {
-            sender.input(Msg::TrustIdentity(
-                ServerKey(saved.clone()),
-                ServerKey(now.clone()),
-            ))
-        })
-    };
-    start::identity_changed(name, saved, now, trust).present(Some(root));
+    let name = server.map_or("This server", |s| s.name.as_str());
+    match (error, server) {
+        (BackendError::IdentityChanged { saved, now }, _) => {
+            let trust: Rc<dyn Fn()> = {
+                let (sender, saved, now) = (sender.clone(), saved.clone(), now.clone());
+                Rc::new(move || {
+                    sender.input(Msg::TrustIdentity(
+                        ServerKey(saved.clone()),
+                        ServerKey(now.clone()),
+                    ))
+                })
+            };
+            let site = server.and_then(Server::passkey_site);
+            start::identity_changed(name, saved, now, site.as_deref(), trust).present(Some(root));
+        }
+        (BackendError::ServerIdChanged { saved, now }, Some(server)) => {
+            let remove: Rc<dyn Fn()> = {
+                let (sender, key) = (sender.clone(), server.key.clone());
+                Rc::new(move || sender.input(Msg::RemoveServer(key.clone())))
+            };
+            start::server_id_changed(name, saved, now, remove).present(Some(root));
+        }
+        (other, _) => toast(widgets, other),
+    }
 }
 
 #[cfg(test)]

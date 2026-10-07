@@ -14,19 +14,18 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use spoolframe_protocol::TrustedProfile;
-pub use spoolframe_protocol::{
-    APP_ORIGIN, APP_RP_ID, FinishPasskeyRegistration, FinishPasskeySignIn, PasskeyCreation,
-    PasskeyInfo, PasskeyRequest,
-};
 pub use spoolframe_protocol::{
     ArtworkSize, ChosenTracks, DeviceInfo, DeviceSignInRequest, HomeScreen, PlaybackHandle,
     PlaybackPlan, Selection, TrackReason,
 };
 pub use spoolframe_protocol::{
+    FinishPasskeyRegistration, FinishPasskeySignIn, PasskeyCreation, PasskeyInfo, PasskeyRequest,
+};
+pub use spoolframe_protocol::{
     PinProof, PinState, PlexLink, PlexSyncSummary, PreviewTile, Previews, SearchCounts,
     SearchGroup, SearchRequest, SearchResults, TopResult,
 };
+pub use spoolframe_protocol::{TrackPreferencesInfo, TrustedProfile};
 pub use spoolframe_types::Platform;
 use spoolframe_types::{
     ArtworkId, Item, Library, LibraryId, MediaId, MediaTracks, SubtitleFormat, TrackPreferences,
@@ -107,6 +106,11 @@ pub enum BackendError {
     /// another server. Both are keys, hex; the user may trust the new one.
     #[error("the server answered with another key")]
     IdentityChanged { saved: String, now: String },
+    /// A saved server answered with its key but another server id
+    /// (PX-14): not the same server, and never trusted as it. Removing it
+    /// and adding it again is the way on.
+    #[error("the server answered with another server id")]
+    ServerIdChanged { saved: String, now: String },
     /// The server runs, but its admin has not finished setup (P3-10): it
     /// has no catalog yet. Signing in still works.
     #[error("this server is not set up yet")]
@@ -182,6 +186,18 @@ pub struct Server {
     pub verified_at: Option<std::time::SystemTime>,
     /// When this device last connected to it.
     pub last_connected_at: Option<std::time::SystemTime>,
+    /// Its server id (PX-14): stable across key changes, and the name of
+    /// its passkeys' relying party. `None` until it has been reached.
+    pub server_id: Option<String>,
+}
+
+impl Server {
+    /// The relying party its passkeys are for, `<server id>.spoolframe.app`,
+    /// once its id is known.
+    pub fn passkey_site(&self) -> Option<String> {
+        let id = spoolframe_protocol::ServerId::parse(self.server_id.as_deref()?).ok()?;
+        Some(id.rp_id())
+    }
 }
 
 /// A user signed in on a server from this device: one profile on "Who's
@@ -585,8 +601,9 @@ pub trait Session: Send + Sync {
         id: &'a MediaId,
     ) -> BoxFuture<'a, Result<(), BackendError>>;
 
-    /// The user's audio and subtitle preferences.
-    fn track_preferences(&self) -> BoxFuture<'_, Result<TrackPreferences, BackendError>>;
+    /// The user's audio and subtitle preferences, and whether the server
+    /// reads picture subtitles as text (PX-13).
+    fn track_preferences(&self) -> BoxFuture<'_, Result<TrackPreferencesInfo, BackendError>>;
 
     fn set_track_preferences<'a>(
         &'a self,
@@ -690,6 +707,12 @@ pub trait Session: Send + Sync {
         remember: bool,
     ) -> BoxFuture<'a, Result<(), BackendError>>;
 
+    /// Deletes another of this user's devices (P4-03): its sessions for
+    /// this user end, its trust goes, and it shows up as new if it signs
+    /// in again. Always needs a recent sign-in; this device is
+    /// [`BackendError::InvalidInput`] (sign out instead).
+    fn forget_device<'a>(&'a self, device: &'a str) -> BoxFuture<'a, Result<(), BackendError>>;
+
     /// Trusts a device for this user, or stops (P4-01); `None` is this
     /// one. Turning trust or auto-login on is for this device only, and
     /// needs a recent sign-in; so does turning trust off for another.
@@ -738,6 +761,34 @@ mod tests {
     fn a_long_key_is_shortened_to_its_ends() {
         let key = ServerKey("k5d2r8w1tqz7m3c0vnh4q7fa".into());
         assert_eq!(key.short(), "k5d2…q7fa");
+    }
+
+    fn with_id(server_id: Option<&str>) -> Server {
+        Server {
+            key: ServerKey("k".into()),
+            name: "Home Media".into(),
+            addresses: Vec::new(),
+            pinned: true,
+            fingerprint: String::new(),
+            verified: true,
+            on_network: false,
+            verified_at: None,
+            last_connected_at: None,
+            server_id: server_id.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_servers_passkeys_are_for_its_own_site() {
+        assert_eq!(
+            with_id(Some("k7f3q2m4x5pq6z2a")).passkey_site().as_deref(),
+            Some("k7f3q2m4x5pq6z2a.spoolframe.app")
+        );
+    }
+
+    #[test]
+    fn a_server_not_yet_heard_from_has_no_passkey_site() {
+        assert_eq!(with_id(None).passkey_site(), None);
     }
 
     #[test]

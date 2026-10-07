@@ -214,10 +214,15 @@ pub fn page(signed: Signed, dialog: &adw::ToastOverlay) -> adw::PreferencesPage 
         dialog: dialog.downgrade(),
         devices: adw::PreferencesGroup::builder()
             .title("Devices")
+            // The legend (canvas v74), in markup: the terms bold.
             .description(
-                "PIN: asked for when your profile opens there. Trusted: it can reopen your \
-                 profile without a password. You can forget a device here; trusting one is \
-                 done in the web app.",
+                "<b>Trusted</b>: remembered on this device: picking your profile on Who’s \
+                 watching opens it without your password. Ends when you sign out there, change \
+                 your password, or don’t use it for 180 days.\n\
+                 <b>Open at start</b>: opens your profile as soon as the app starts, instead of \
+                 showing Who’s watching. Needs Trusted; one profile per device.\n\
+                 <b>PIN</b>: asks for your PIN before opening your profile here, even when the \
+                 device is trusted.",
             )
             .build(),
         remember_row: adw::SwitchRow::builder()
@@ -358,7 +363,7 @@ pub fn page(signed: Signed, dialog: &adw::ToastOverlay) -> adw::PreferencesPage 
     page.add(&others);
     // Linking a Plex account is the web UI's (P3-12): the row opens it,
     // when the server has a web address a browser can reach.
-    if let Some(web) = view.session.web_url() {
+    if let Some(web) = view.session.web_url().filter(|u| crate::browser::is_web(u)) {
         let plex = adw::PreferencesGroup::builder().title("Plex").build();
         let row = view.plex_row.clone();
         row.set_subtitle("…");
@@ -412,7 +417,7 @@ struct Here {
 impl View {
     fn toast(&self, text: &str) {
         if let Some(dialog) = self.dialog.upgrade() {
-            dialog.add_toast(adw::Toast::new(text));
+            dialog.add_toast(crate::markup::toast(text));
         }
     }
 
@@ -566,7 +571,72 @@ impl View {
             });
             row.add_suffix(&forget);
         }
+        // Delete (canvas v75): any other device, gone from the list until
+        // it signs in again. This computer signs out instead.
+        if !device.this_device {
+            let delete = gtk::Button::builder()
+                .label("Delete")
+                .valign(gtk::Align::Center)
+                .css_classes(["row-button", "destructive-tint"])
+                .build();
+            let (this, id, name) = (
+                Rc::downgrade(self),
+                device.endpoint_id.clone(),
+                row.title().to_string(),
+            );
+            delete.connect_clicked(move |_| {
+                if let Some(this) = this.upgrade() {
+                    this.ask_delete(id.clone(), name.clone());
+                }
+            });
+            row.add_suffix(&delete);
+        }
         row
+    }
+
+    /// "Delete <device>?" (LinuxTrustStates): it is signed out of this
+    /// profile and forgotten, and shows up as new if it signs in again.
+    fn ask_delete(self: &Rc<Self>, id: String, name: String) {
+        let weak = Rc::downgrade(self);
+        self.ask(
+            &format!("Delete {name}?"),
+            "It is signed out and forgotten. If it signs in again it shows up as new.",
+            "Delete",
+            true,
+            Rc::new(move || {
+                if let Some(this) = weak.upgrade() {
+                    this.delete(id.clone(), name.clone());
+                }
+            }),
+            Rc::new(|| {}),
+        );
+    }
+
+    /// Deletes the device; the server always wants a recent sign-in for
+    /// it, so a refusal confirms it is them and deletes again.
+    fn delete(self: &Rc<Self>, id: String, name: String) {
+        let (again_id, again_name) = (id.clone(), name.clone());
+        self.run(
+            move |s| Box::pin(async move { s.forget_device(&id).await }),
+            move |this, result| match result {
+                Ok(()) => {
+                    this.toast(&format!("Deleted {name}"));
+                    this.load();
+                }
+                Err(BackendError::RecentSignInRequired) => {
+                    let weak = Rc::downgrade(this);
+                    this.confirm(
+                        "Delete a device",
+                        Rc::new(move || {
+                            if let Some(this) = weak.upgrade() {
+                                this.delete(again_id.clone(), again_name.clone());
+                            }
+                        }),
+                    );
+                }
+                Err(e) => this.toast(&refusal(&e)),
+            },
+        );
     }
 
     /// A question over Preferences: `yes` on `action`, `no` on Cancel.
@@ -1243,18 +1313,14 @@ impl ProofInput {
 /// Opens `url` in the browser, over the window `widget` is in.
 fn open_in_browser(widget: &impl IsA<gtk::Widget>, url: &str) {
     let window = widget.root().and_downcast::<gtk::Window>();
-    gtk::UriLauncher::new(url).launch(window.as_ref(), None::<&gtk::gio::Cancellable>, |result| {
-        if let Err(e) = result {
-            tracing::warn!(error = %e, "cannot open the browser");
-        }
-    });
+    crate::browser::open(url, window.as_ref());
 }
 
 /// "Open My profile in the web app", for an account with no password:
 /// the web UI proves who it is with a passkey or provider, and sets or
 /// removes the PIN there. None when the server has no web address.
 fn web_profile_link(session: &dyn Session) -> Option<gtk::Button> {
-    let url = profile_url(&session.web_url()?);
+    let url = profile_url(&session.web_url().filter(|u| crate::browser::is_web(u))?);
     let body = gtk::Box::builder().spacing(4).build();
     body.append(&gtk::Label::new(Some("Open My profile in the web app")));
     body.append(&gtk::Image::from_icon_name(crate::icons::EXTERNAL));
@@ -1702,6 +1768,59 @@ mod tests {
         gtk::init().unwrap();
         adw::init().unwrap();
         remembering_this_computer_lets_it_open_at_start();
+        only_another_device_can_be_deleted();
+    }
+
+    fn only_another_device_can_be_deleted() {
+        use spoolframe_linux_core::backend::{Client, Server};
+        use spoolframe_linux_core::fake::FakeClient;
+        let client: Arc<dyn Client> = Arc::new(FakeClient::new(None));
+        let profile = FakeClient::profile("andrey");
+        let server = Server {
+            key: profile.server.clone(),
+            name: "Home Media".into(),
+            addresses: Vec::new(),
+            pinned: true,
+            fingerprint: String::new(),
+            verified: true,
+            on_network: true,
+            verified_at: None,
+            last_connected_at: None,
+            server_id: None,
+        };
+        let page = page(
+            Signed {
+                session: client.session(&profile).unwrap(),
+                server_key: server.key.0.clone(),
+                server_name: server.name.clone(),
+                server,
+                display_name: "Andrey".into(),
+                username: "andrey".into(),
+                left: Rc::new(|| {}),
+            },
+            &adw::ToastOverlay::new(),
+        );
+        let deletable = |title: &str| {
+            all::<adw::ActionRow>(page.upcast_ref())
+                .into_iter()
+                .find(|r| r.title() == title)
+                .map(|row| {
+                    all::<gtk::Button>(row.upcast_ref())
+                        .iter()
+                        .any(|b| b.label().as_deref() == Some("Delete"))
+                })
+        };
+        assert!(
+            run_until(std::time::Duration::from_secs(5), || deletable(
+                "Living room TV"
+            )
+            .is_some()),
+            "the devices never listed"
+        );
+        assert_eq!(
+            (deletable("Living room TV"), deletable("This computer")),
+            (Some(true), Some(false))
+        );
     }
 
     fn remembering_this_computer_lets_it_open_at_start() {
@@ -1721,6 +1840,7 @@ mod tests {
             on_network: true,
             verified_at: None,
             last_connected_at: None,
+            server_id: None,
         };
         let toasts = adw::ToastOverlay::new();
         let page = page(

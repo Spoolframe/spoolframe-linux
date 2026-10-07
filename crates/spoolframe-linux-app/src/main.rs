@@ -1,13 +1,14 @@
 mod app;
 mod artwork;
+mod browser;
 mod capabilities;
 mod confirm;
 mod fonts;
 mod icons;
 mod library;
 mod logo;
-// Checks over the sources: unit tests, kept beside the code they scan.
-#[cfg(test)]
+// Text shown as it is where GTK reads markup, and the checks over the
+// sources that keep it so.
 mod markup;
 mod minibar;
 mod mpris;

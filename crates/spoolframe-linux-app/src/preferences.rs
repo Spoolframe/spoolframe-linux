@@ -10,10 +10,13 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use adw::prelude::*;
+use spoolframe_linux_core::backend::TrackPreferencesInfo;
 use spoolframe_linux_core::backend::{Client, Server};
 use spoolframe_linux_core::format;
 use spoolframe_linux_core::theme::Theme;
-use spoolframe_types::{AudioRole, SdhPreference, SubtitleMode, TrackPreferences};
+use spoolframe_types::{
+    AudioRole, BitmapPreference, SdhPreference, SubtitleMode, TrackPreferences,
+};
 
 /// When subtitles show, in the order the dialog lists them.
 const MODES: [(SubtitleMode, &str); 4] = [
@@ -34,7 +37,7 @@ const SDH: [(SdhPreference, &str); 3] = [
 
 pub fn dialog(
     theme: Theme,
-    tracks: Option<TrackPreferences>,
+    tracks: Option<TrackPreferencesInfo>,
     servers: Servers,
     set_theme: Rc<dyn Fn(Theme)>,
     set_tracks: SetTracks,
@@ -274,7 +277,26 @@ fn in_use(server: &Server, user: Option<&str>, servers: &Rc<Servers>) -> adw::Pr
     keys.set_halign(gtk::Align::Start);
     keys.set_margin_top(8);
     group.add(&keys);
+    if let Some(site) = server.passkey_site() {
+        let line = crate::start::passkey_site(&site);
+        line.set_margin_top(4);
+        group.add(&line);
+    }
     group
+}
+
+/// Another saved server's line: where it is, who is signed in, where its
+/// passkeys are kept (PX-14), and whether its fingerprint was checked.
+fn other_line(server: &Server, user: Option<&str>) -> String {
+    let state = if server.verified {
+        "Verified"
+    } else {
+        "Not verified"
+    };
+    match server.passkey_site() {
+        Some(site) => format!("{} · passkeys {site} · {state}", whereabouts(server, user)),
+        None => format!("{} · {state}", whereabouts(server, user)),
+    }
 }
 
 /// A saved server not in use: where it is and who is signed in, whether
@@ -286,17 +308,9 @@ fn other_row(
     servers: &Rc<Servers>,
     group: &adw::PreferencesGroup,
 ) -> adw::ActionRow {
-    let state = if server.verified {
-        "Verified"
-    } else {
-        "Not verified"
-    };
     let row = adw::ActionRow::builder().use_markup(false).build();
     row.set_title(&server.name);
-    row.set_subtitle(&format!(
-        "{} · {state}",
-        whereabouts(server, user.as_deref())
-    ));
+    row.set_subtitle(&other_line(server, user.as_deref()));
     row.add_prefix(
         &gtk::Image::builder()
             .icon_name(if server.verified {
@@ -615,6 +629,34 @@ fn paint_swatch(
     cr.stroke()
 }
 
+/// The picture-subtitle choices, in the row's order.
+const BITMAP: [(BitmapPreference, &str); 2] = [
+    (BitmapPreference::Text, "Read as text (OCR)"),
+    (BitmapPreference::Pictures, "Show as pictures"),
+];
+
+/// The picture-subtitle row as it shows: which choice, and whether it can
+/// change. Without OCR on the server only pictures can be.
+fn bitmap_row(preference: BitmapPreference, ocr_offered: bool) -> (u32, bool) {
+    let shown = if ocr_offered {
+        preference
+    } else {
+        BitmapPreference::Pictures
+    };
+    let index = BITMAP.iter().position(|(b, _)| *b == shown).unwrap_or(0);
+    (index as u32, ocr_offered)
+}
+
+/// The picture-subtitle preference to save: the row's, unless the server
+/// has no OCR and the row only shows what it does instead; then the
+/// user's own choice stays, for their other servers.
+fn bitmap_saved(original: BitmapPreference, selected: u32, ocr_offered: bool) -> BitmapPreference {
+    match BITMAP.get(selected as usize) {
+        Some((choice, _)) if ocr_offered => *choice,
+        _ => original,
+    }
+}
+
 /// Saves a new bitrate limit.
 pub type SetBitrate = Rc<dyn Fn(Option<u64>)>;
 
@@ -697,6 +739,8 @@ struct PlaybackRows {
     mode: adw::ComboRow,
     subtitle_languages: adw::EntryRow,
     sdh: adw::ComboRow,
+    bitmap: adw::ComboRow,
+    ocr_offered: bool,
 }
 
 impl PlaybackRows {
@@ -722,6 +766,11 @@ impl PlaybackRows {
         if let Some((sdh, _)) = SDH.get(self.sdh.selected() as usize) {
             preferences.subtitles.sdh = *sdh;
         }
+        preferences.subtitles.bitmap = bitmap_saved(
+            self.original.subtitles.bitmap,
+            self.bitmap.selected(),
+            self.ocr_offered,
+        );
         preferences
     }
 }
@@ -741,7 +790,7 @@ pub struct Device {
 /// The bitrate limit and skipping intros, on this device, and the user's
 /// track preferences when the server gave them.
 fn playback(
-    tracks: Option<(TrackPreferences, SetTracks)>,
+    tracks: Option<(TrackPreferencesInfo, SetTracks)>,
     device: &Device,
 ) -> adw::PreferencesPage {
     let skip = adw::SwitchRow::builder()
@@ -772,8 +821,8 @@ fn playback(
     streaming.add(&hdr);
     page.add(&streaming);
     page.add(&markers);
-    if let Some((preferences, set_tracks)) = tracks {
-        let (audio, subtitles) = track_groups(preferences, set_tracks);
+    if let Some((info, set_tracks)) = tracks {
+        let (audio, subtitles) = track_groups(info, set_tracks);
         page.add(&audio);
         page.add(&subtitles);
     }
@@ -782,9 +831,13 @@ fn playback(
 
 /// Audio and Subtitles, kept on the server for all the user's devices.
 fn track_groups(
-    preferences: TrackPreferences,
+    info: TrackPreferencesInfo,
     set_tracks: SetTracks,
 ) -> (adw::PreferencesGroup, adw::PreferencesGroup) {
+    let TrackPreferencesInfo {
+        preferences,
+        ocr_offered,
+    } = info;
     let audio_languages = adw::EntryRow::builder()
         .title("Preferred languages")
         .text(format::language_list(&preferences.audio.languages))
@@ -843,9 +896,25 @@ fn track_groups(
         .title("Subtitles")
         .description("Empty languages: the audio's language.")
         .build();
+    // How picture subtitles (PGS, VobSub, DVB) show (PX-13). Without OCR
+    // on the server they can only be pictures: the row says so and keeps
+    // the user's choice for a server that has it.
+    let (selected, sensitive) = bitmap_row(preferences.subtitles.bitmap, ocr_offered);
+    let bitmap = adw::ComboRow::builder()
+        .title("Picture subtitles")
+        .subtitle(if ocr_offered {
+            "Subtitles stored as pictures: read as text, or shown as they are"
+        } else {
+            "This server doesn't read picture subtitles as text"
+        })
+        .model(&gtk::StringList::new(&BITMAP.map(|(_, name)| name)))
+        .selected(selected)
+        .sensitive(sensitive)
+        .build();
     subtitles.add(&mode);
     subtitles.add(&subtitle_languages);
     subtitles.add(&sdh);
+    subtitles.add(&bitmap);
 
     let rows = PlaybackRows {
         original: preferences,
@@ -855,6 +924,8 @@ fn track_groups(
         mode,
         subtitle_languages,
         sdh,
+        bitmap,
+        ocr_offered,
     };
     let save = {
         let rows = rows.clone();
@@ -868,7 +939,7 @@ fn track_groups(
         let save = save.clone();
         switch.connect_active_notify(move |_| save());
     }
-    for combo in [&rows.mode, &rows.sdh] {
+    for combo in [&rows.mode, &rows.sdh, &rows.bitmap] {
         let save = save.clone();
         combo.connect_selected_notify(move |_| save());
     }
@@ -878,6 +949,52 @@ fn track_groups(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn another_servers_line_names_its_passkey_site() {
+        let server = Server {
+            key: spoolframe_linux_core::backend::ServerKey("k".into()),
+            name: "Cabin".into(),
+            addresses: vec!["10.10.0.6:7430".into()],
+            pinned: true,
+            fingerprint: String::new(),
+            verified: true,
+            on_network: false,
+            verified_at: None,
+            last_connected_at: None,
+            server_id: Some("q2d2w5nb3kx7m4ra".into()),
+        };
+        assert_eq!(
+            other_line(&server, Some("Alice")),
+            "10.10.0.6 · signed in as Alice · passkeys q2d2w5nb3kx7m4ra.spoolframe.app · Verified"
+        );
+    }
+
+    #[test]
+    fn without_ocr_the_choice_shows_pictures_and_cannot_change() {
+        assert_eq!(bitmap_row(BitmapPreference::Text, false), (1, false));
+    }
+
+    #[test]
+    fn with_ocr_the_users_choice_shows() {
+        assert_eq!(bitmap_row(BitmapPreference::Pictures, true), (1, true));
+    }
+
+    #[test]
+    fn saving_without_ocr_keeps_the_users_choice() {
+        assert_eq!(
+            bitmap_saved(BitmapPreference::Text, 1, false),
+            BitmapPreference::Text
+        );
+    }
+
+    #[test]
+    fn saving_with_ocr_takes_the_row() {
+        assert_eq!(
+            bitmap_saved(BitmapPreference::Text, 1, true),
+            BitmapPreference::Pictures
+        );
+    }
 
     #[test]
     fn no_setting_is_no_limit() {

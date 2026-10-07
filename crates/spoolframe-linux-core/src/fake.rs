@@ -29,10 +29,6 @@ use spoolframe_types::{
 use tokio::sync::watch;
 
 use crate::backend::{
-    APP_RP_ID, FinishPasskeyRegistration, FinishPasskeySignIn, PasskeyCreation, PasskeyInfo,
-    PasskeyRequest,
-};
-use crate::backend::{
     ArtworkSize, BackendError, BoxFuture, ChosenTracks, Chunk, Client, ConnectionPath,
     ConnectionState, DeviceInfo, DeviceSignIn, DeviceSignInRequest, HomeScreen, MAX_READ, Marker,
     Person, PersonId, PersonRole, PinProof, PinState, Platform, PlaybackHandle, PlaybackPlan,
@@ -40,12 +36,22 @@ use crate::backend::{
     SearchKind, SearchRequest, SearchResults, SearchScope, Selection, Server, ServerKey, Session,
     TopResult, TrustedProfile,
 };
+use crate::backend::{
+    FinishPasskeyRegistration, FinishPasskeySignIn, PasskeyCreation, PasskeyInfo, PasskeyRequest,
+    TrackPreferencesInfo,
+};
 
 /// Every fake account's password.
 pub const FAKE_PASSWORD: &str = "spoolframe";
 
 /// What the fake server asks a passkey to sign (P3-19).
 pub const FAKE_PASSKEY_CHALLENGE: [u8; 32] = [7; 32];
+
+/// Home Media's server id (PX-14), which names its passkeys' relying
+/// party.
+pub fn fake_server_id() -> spoolframe_protocol::ServerId {
+    spoolframe_protocol::ServerId::parse("homemediaserver2").expect("a server id")
+}
 
 /// What the fake server keeps about this device's sign-ins, for every
 /// session of it: passkeys (P3-19) and trust (P4-01).
@@ -73,18 +79,16 @@ struct FakePasskey {
     name: String,
     created_at: i64,
     last_used_at: Option<i64>,
-    /// Made in an app, for APP_RP_ID; a web UI's otherwise.
-    app: bool,
+    /// The relying party it was made for: Home Media's own, the old
+    /// shared `spoolframe.app`, or the web UI's host.
+    rp_id: String,
 }
 
 impl FakePasskey {
-    /// The id the server names a passkey by. The real one is base64url;
-    /// any stable text does here.
+    /// The id the server names a passkey by, as the real one does: so a
+    /// passkey made in the app is renamed by the id the app works out.
     fn id(&self) -> String {
-        self.credential_id
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect()
+        crate::passkey::passkey_id(&self.credential_id)
     }
 
     fn info(&self) -> PasskeyInfo {
@@ -93,14 +97,15 @@ impl FakePasskey {
             name: self.name.clone(),
             created_at: self.created_at,
             last_used_at: self.last_used_at,
-            rp_id: if self.app {
-                APP_RP_ID.to_owned()
-            } else {
-                "media.example.org".to_owned()
-            },
-            app: self.app,
-            usable_here: self.app,
+            rp_id: self.rp_id.clone(),
+            app: spoolframe_protocol::is_app_rp_id(&self.rp_id),
+            usable_here: self.usable(),
         }
+    }
+
+    /// An app signs in with it: made for Home Media's relying party.
+    fn usable(&self) -> bool {
+        self.rp_id == fake_server_id().rp_id()
     }
 }
 
@@ -522,6 +527,8 @@ struct FakePin {
     wrong: u32,
     /// Ten wrong PINs in a row ended the session here.
     revoked: bool,
+    /// Devices this user deleted (P4-03): gone from the list.
+    deleted: std::collections::HashSet<String>,
 }
 
 /// The fake's two devices: this one, and a TV to set from here.
@@ -665,17 +672,18 @@ impl FakeSession {
     }
 
     /// What hiding `id` hides: an episode hides its whole show.
-    fn hide_key(&self, id: &MediaId) -> MediaId {
+    /// The show an episode belongs to.
+    fn show_of(&self, id: &MediaId) -> Option<MediaId> {
         match self.catalog.items.get(id) {
-            Some(Item::Episode(e)) => e.show_id.clone(),
-            _ => id.clone(),
+            Some(Item::Episode(e)) => Some(e.show_id.clone()),
+            _ => None,
         }
     }
 
-    /// Progress or a mark on `id` brings it back, as on the server.
+    /// Progress or a mark on `id` brings that card back, as on the
+    /// server: only it, not the show's other removed cards.
     fn unhide(&self, id: &MediaId) {
-        let key = self.hide_key(id);
-        self.watch().hidden.remove(&key);
+        self.watch().hidden.remove(id);
     }
 
     fn home_now(&self) -> HomeScreen {
@@ -692,15 +700,19 @@ impl FakeSession {
             .collect();
 
         // For each show with recent activity, newest first: the first
-        // unwatched episode after the latest watched one, unless it is
-        // already in Continue watching.
+        // unwatched episode after the latest watched one. A show with an
+        // episode in progress has that in Continue watching instead.
+        let in_progress: Vec<MediaId> = continue_ids
+            .iter()
+            .filter_map(|id| self.show_of(id))
+            .collect();
         let mut next_up = Vec::new();
         let mut shows_seen = Vec::new();
         for id in watch.touched.iter().rev() {
             let Some(Item::Episode(e)) = self.catalog.items.get(id) else {
                 continue;
             };
-            if shows_seen.contains(&e.show_id) {
+            if shows_seen.contains(&e.show_id) || in_progress.contains(&e.show_id) {
                 continue;
             }
             shows_seen.push(e.show_id.clone());
@@ -714,15 +726,14 @@ impl FakeSession {
             let next = last_watched
                 .and_then(|i| episodes.get(i + 1..))
                 .and_then(|rest| rest.iter().find(|ep| !watch.get(ep).watched));
-            if let Some(next) = next
-                && !continue_ids.contains(next)
-            {
+            if let Some(next) = next {
                 next_up.push(next.clone());
             }
         }
         let hidden = watch.hidden.clone();
         drop(watch);
-        let shown = |id: &MediaId| !hidden.contains(&self.hide_key(id));
+        // Removed cards (P1-22): that card only, as on the server.
+        let shown = |id: &MediaId| !hidden.contains(id);
         let continue_ids: Vec<MediaId> = continue_ids.into_iter().filter(|id| shown(id)).collect();
         let next_up: Vec<MediaId> = next_up.into_iter().filter(|id| shown(id)).collect();
         HomeScreen {
@@ -1377,8 +1388,7 @@ impl Session for FakeSession {
     ) -> BoxFuture<'a, Result<(), BackendError>> {
         Box::pin(async move {
             self.catalog.get(id)?;
-            let key = self.hide_key(id);
-            self.watch().hidden.insert(key);
+            self.watch().hidden.insert(id.clone());
             Ok(())
         })
     }
@@ -1402,13 +1412,17 @@ impl Session for FakeSession {
             Ok(())
         })
     }
-    fn track_preferences(&self) -> BoxFuture<'_, Result<TrackPreferences, BackendError>> {
+    fn track_preferences(&self) -> BoxFuture<'_, Result<TrackPreferencesInfo, BackendError>> {
         Box::pin(async move {
-            Ok(self
-                .preferences
-                .lock()
-                .expect("fake state is never poisoned")
-                .clone())
+            Ok(TrackPreferencesInfo {
+                preferences: self
+                    .preferences
+                    .lock()
+                    .expect("fake state is never poisoned")
+                    .clone(),
+                // The fake reads picture subtitles as text.
+                ocr_offered: true,
+            })
         })
     }
 
@@ -1614,13 +1628,15 @@ impl Session for FakeSession {
                 .lock_passkeys()
                 .keys
                 .iter()
-                .filter(|k| k.app && k.username == self.username)
+                .filter(|k| k.usable() && k.username == self.username)
                 .map(|k| k.credential_id.clone())
                 .collect();
             if allow.is_empty() {
                 return Err(BackendError::NotFound("app passkey".into()));
             }
             Ok(PasskeyRequest {
+                rp_id: fake_server_id().rp_id(),
+                origin: fake_server_id().origin(),
                 challenge: FAKE_PASSKEY_CHALLENGE.to_vec(),
                 allow_credential_ids: allow,
             })
@@ -1635,7 +1651,7 @@ impl Session for FakeSession {
             self.guard()?;
             let mut passkeys = self.lock_passkeys();
             let theirs = passkeys.keys.iter().any(|k| {
-                k.app && k.username == self.username && k.credential_id == signed.credential_id
+                k.usable() && k.username == self.username && k.credential_id == signed.credential_id
             });
             if !theirs {
                 return Err(BackendError::WrongCredentials);
@@ -1653,6 +1669,8 @@ impl Session for FakeSession {
                 return Err(BackendError::RecentSignInRequired);
             }
             Ok(PasskeyCreation {
+                rp_id: fake_server_id().rp_id(),
+                origin: fake_server_id().origin(),
                 challenge: FAKE_PASSKEY_CHALLENGE.to_vec(),
                 user_id: self.username.as_bytes().to_vec(),
                 user_name: format!("{} on Home Media", self.username),
@@ -1660,7 +1678,7 @@ impl Session for FakeSession {
                 exclude_credential_ids: passkeys
                     .keys
                     .iter()
-                    .filter(|k| k.app && k.username == self.username)
+                    .filter(|k| k.usable() && k.username == self.username)
                     .map(|k| k.credential_id.clone())
                     .collect(),
             })
@@ -1687,7 +1705,7 @@ impl Session for FakeSession {
                 name,
                 created_at: 1_791_000_000,
                 last_used_at: None,
-                app: true,
+                rp_id: fake_server_id().rp_id(),
             });
             Ok(())
         })
@@ -1772,10 +1790,34 @@ impl Session for FakeSession {
                     Platform::Tvos
                 }),
             };
-            Ok(vec![
+            Ok([
                 device(THIS_DEVICE, "This computer", 0),
                 device(LIVING_ROOM_TV, "Living room TV", 3 * 86_400),
-            ])
+            ]
+            .into_iter()
+            .filter(|d| !pin.deleted.contains(&d.endpoint_id))
+            .collect())
+        })
+    }
+
+    fn forget_device<'a>(&'a self, device: &'a str) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            if device == THIS_DEVICE {
+                return Err(BackendError::InvalidInput(
+                    "this device signs out instead".into(),
+                ));
+            }
+            if self.lock_passkeys().stale {
+                return Err(BackendError::RecentSignInRequired);
+            }
+            let mut pin = self.pin_state();
+            if device != LIVING_ROOM_TV || pin.deleted.contains(device) {
+                return Err(BackendError::NotFound(format!("device {device}")));
+            }
+            pin.deleted.insert(device.to_owned());
+            pin.required.remove(device);
+            Ok(())
         })
     }
 
@@ -2022,6 +2064,7 @@ impl FakeClient {
                     on_network: true,
                     verified_at: None,
                     last_connected_at: None,
+                    server_id: Some(fake_server_id().as_str().to_owned()),
                 },
                 Server {
                     key: basement(),
@@ -2033,6 +2076,7 @@ impl FakeClient {
                     on_network: true,
                     verified_at: None,
                     last_connected_at: None,
+                    server_id: None,
                 },
             ]),
             accounts: vec![
@@ -2042,16 +2086,28 @@ impl FakeClient {
             ],
             signed_in: Mutex::new(vec![profile("andrey", "Andrey"), profile("alice", "Alice")]),
             sessions: Mutex::new(HashMap::new()),
-            // Andrey made one in the web UI: listed, but no use in an app.
+            // Andrey made one in the web UI, and one in an app before each
+            // server had its own relying party (PX-14): both listed, no
+            // use in an app.
             passkeys: Arc::new(Mutex::new(FakeAuth {
-                keys: vec![FakePasskey {
-                    username: "andrey".into(),
-                    credential_id: vec![1, 2, 3, 4],
-                    name: "Firefox on nimble".into(),
-                    created_at: 1_790_000_000,
-                    last_used_at: Some(1_790_500_000),
-                    app: false,
-                }],
+                keys: vec![
+                    FakePasskey {
+                        username: "andrey".into(),
+                        credential_id: vec![1, 2, 3, 4],
+                        name: "Firefox on nimble".into(),
+                        created_at: 1_790_000_000,
+                        last_used_at: Some(1_790_500_000),
+                        rp_id: "media.example.org".into(),
+                    },
+                    FakePasskey {
+                        username: "andrey".into(),
+                        credential_id: vec![5, 6, 7, 8],
+                        name: "Old YubiKey".into(),
+                        created_at: 1_789_000_000,
+                        last_used_at: None,
+                        rp_id: spoolframe_protocol::LEGACY_APP_RP_ID.into(),
+                    },
+                ],
                 stale: false,
                 by_passkey: Default::default(),
                 trusted: HashMap::new(),
@@ -2423,6 +2479,7 @@ impl Client for FakeClient {
                         on_network: false,
                         verified_at: None,
                         last_connected_at: None,
+                        server_id: None,
                     });
                     servers.last_mut().expect("just pushed")
                 }
@@ -2484,6 +2541,7 @@ impl Client for FakeClient {
                 on_network: true,
                 verified_at: None,
                 last_connected_at: None,
+                server_id: None,
             };
             servers.push(entry.clone());
             drop(servers);
@@ -2655,6 +2713,8 @@ impl Client for FakeClient {
             // (PX-10): the key offers whichever it holds for this server.
             let _ = username;
             Ok(PasskeyRequest {
+                rp_id: fake_server_id().rp_id(),
+                origin: fake_server_id().origin(),
                 challenge: FAKE_PASSKEY_CHALLENGE.to_vec(),
                 allow_credential_ids: Vec::new(),
             })
@@ -2674,7 +2734,7 @@ impl Client for FakeClient {
                 let key = passkeys
                     .keys
                     .iter_mut()
-                    .find(|k| k.app && k.credential_id == signed.credential_id)
+                    .find(|k| k.usable() && k.credential_id == signed.credential_id)
                     .ok_or(BackendError::WrongCredentials)?;
                 key.last_used_at = Some(1_791_000_000);
                 let username = key.username.clone();
@@ -3188,6 +3248,23 @@ mod tests {
     }
 
     #[test]
+    fn a_show_with_an_episode_in_progress_is_not_in_next_up() {
+        let (_dir, path) = file_with("progress", b"stand-in");
+        let client = FakeClient::new(Some(path));
+        let session = session_for(&client, "andrey");
+        // Andor E1–2 watched; E4 started, past E3, as with Vigil S2E3.
+        let e4 = media(MediaKind::Episode, "65");
+        let playback = ready(session.start_playback(&e4, None, None)).unwrap();
+        ready(session.update_progress(&playback.handle, Duration::from_secs(120))).unwrap();
+        let home = ready(session.home()).unwrap();
+        assert!(
+            !titles(&home.next_up).contains(&"Reckoning"),
+            "Next up: {:?}",
+            titles(&home.next_up)
+        );
+    }
+
+    #[test]
     fn next_up_skips_an_episode_already_in_continue_watching() {
         let client = FakeClient::new(None);
         let alice = session_for(&client, "alice");
@@ -3227,6 +3304,25 @@ mod tests {
         ready(session.hide_from_continue(first.id())).unwrap();
         let home = ready(session.home()).unwrap();
         assert!(!home.continue_watching.iter().any(|i| i.id() == first.id()));
+    }
+
+    #[test]
+    fn playing_another_episode_leaves_a_removed_one_removed() {
+        let (_dir, path) = file_with("progress", b"stand-in");
+        let client = FakeClient::new(Some(path));
+        let session = session_for(&client, "andrey");
+        // Severance E4 is in Continue watching; E5 is the show's next.
+        let e4 = media(MediaKind::Episode, "25");
+        ready(session.hide_from_continue(&e4)).unwrap();
+        let e5 = media(MediaKind::Episode, "26");
+        let playback = ready(session.start_playback(&e5, None, None)).unwrap();
+        ready(session.update_progress(&playback.handle, Duration::from_secs(120))).unwrap();
+        let home = ready(session.home()).unwrap();
+        assert!(
+            !home.continue_watching.iter().any(|i| i.id() == &e4),
+            "{:?}",
+            titles(&home.continue_watching)
+        );
     }
 
     #[test]
@@ -3802,7 +3898,7 @@ mod tests {
     #[test]
     fn always_with_sdh_preferred_picks_the_sdh_track() {
         let session = andrey();
-        let mut preferences = ready(session.track_preferences()).unwrap();
+        let mut preferences = ready(session.track_preferences()).unwrap().preferences;
         preferences.subtitles.mode = SubtitleMode::Always;
         preferences.subtitles.sdh = SdhPreference::Prefer;
         ready(session.set_track_preferences(&preferences)).unwrap();
@@ -3919,7 +4015,7 @@ mod tests {
             authenticator_data: vec![0],
             client_data_json: b"{}".to_vec(),
             signature: vec![0],
-            user_handle: b"andrey".to_vec(),
+            user_handle: Some(b"andrey".to_vec()),
         }
     }
 
@@ -3935,17 +4031,27 @@ mod tests {
     }
 
     #[test]
-    fn a_web_ui_passkey_is_listed_but_does_not_sign_in_here() {
+    fn web_ui_and_old_app_passkeys_are_listed_but_do_not_sign_in_here() {
         let client = FakeClient::new(None);
         let andrey = session_for(&client, "andrey");
         let listed = ready(andrey.passkeys()).unwrap();
+        let refused = |id: &[u8]| {
+            ready(client.finish_passkey_sign_in(&home_media(), signed(id), false)).unwrap_err()
+        };
         assert_eq!(
             (
-                listed.iter().map(|p| p.usable_here).collect::<Vec<_>>(),
-                ready(client.finish_passkey_sign_in(&home_media(), signed(&[1, 2, 3, 4]), false))
-                    .unwrap_err(),
+                listed
+                    .iter()
+                    .map(|p| (p.app, p.usable_here))
+                    .collect::<Vec<_>>(),
+                refused(&[1, 2, 3, 4]),
+                refused(&[5, 6, 7, 8]),
             ),
-            (vec![false], BackendError::WrongCredentials)
+            (
+                vec![(false, false), (true, false)],
+                BackendError::WrongCredentials,
+                BackendError::WrongCredentials
+            )
         );
     }
 
@@ -4008,7 +4114,7 @@ mod tests {
         ready(alice.unlock(FAKE_PIN)).unwrap();
         ready(alice.finish_passkey_registration(made(&[8], "Key"))).unwrap();
         let mut signed = signed(&[8]);
-        signed.user_handle = b"alice".to_vec();
+        signed.user_handle = Some(b"alice".to_vec());
         ready(client.finish_passkey_sign_in(&home_media(), signed, false)).unwrap();
         let alice = session_for(&client, "alice");
         for _ in 0..10 {
@@ -4113,6 +4219,44 @@ mod tests {
             .map(|t| (t.username.as_str(), t.auto_login, t.pin_required))
             .collect();
         assert_eq!(auto, [("alice", true, false), ("andrey", false, false)]);
+    }
+
+    #[test]
+    fn a_deleted_device_leaves_the_list() {
+        let andrey = andrey();
+        ready(andrey.forget_device(LIVING_ROOM_TV)).unwrap();
+        let ids: Vec<String> = ready(andrey.devices())
+            .unwrap()
+            .into_iter()
+            .map(|d| d.endpoint_id)
+            .collect();
+        assert_eq!(ids, [THIS_DEVICE]);
+    }
+
+    #[test]
+    fn this_device_cannot_be_deleted_from_here() {
+        assert!(matches!(
+            ready(andrey().forget_device(THIS_DEVICE)),
+            Err(BackendError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn deleting_a_device_long_after_signing_in_asks_to_sign_in_again() {
+        let client = FakeClient::new(None);
+        client.age_sign_ins();
+        assert_eq!(
+            ready(session_for(&client, "andrey").forget_device(LIVING_ROOM_TV)),
+            Err(BackendError::RecentSignInRequired)
+        );
+    }
+
+    #[test]
+    fn an_unknown_device_is_not_found() {
+        assert!(matches!(
+            ready(andrey().forget_device("someone-elses")),
+            Err(BackendError::NotFound(_))
+        ));
     }
 
     #[test]

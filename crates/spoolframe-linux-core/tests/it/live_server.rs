@@ -205,6 +205,52 @@ fn a_remembered_profile_resumes_and_signing_out_forgets_it() {
     eprintln!("signed out: forgotten, and no longer resumes");
 }
 
+/// PX-14: the server's passkey requests name its own relying party,
+/// `<server id>.spoolframe.app`, and the origin under it. Begun only: no
+/// passkey is made, and the challenges go unused.
+#[test]
+#[ignore = "needs a running Spoolframe server; see the module docs"]
+fn passkeys_are_asked_for_the_servers_own_relying_party() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (client, key) = new_device(&runtime);
+    run(
+        &runtime,
+        client.add_address(&key, &env("SPOOLFRAME_TEST_ADDR")),
+    )
+    .unwrap();
+    run(&runtime, client.pin(&key, false)).unwrap();
+    let sign_in = run(&runtime, client.begin_passkey_sign_in(&key, None)).unwrap();
+    let profile = run(
+        &runtime,
+        client.sign_in(
+            &key,
+            &env("SPOOLFRAME_TEST_USER"),
+            &env("SPOOLFRAME_TEST_PASSWORD"),
+            false,
+        ),
+    )
+    .unwrap();
+    let session = client.session(&profile).unwrap();
+    let creation = run(&runtime, session.begin_passkey_registration()).unwrap();
+    let id = creation
+        .rp_id
+        .strip_suffix(".spoolframe.app")
+        .unwrap_or_else(|| panic!("not a server's relying party: {}", creation.rp_id));
+    assert!(
+        spoolframe_protocol::ServerId::parse(id).is_ok()
+            && creation.origin == format!("https://{}", creation.rp_id)
+            && (sign_in.rp_id.as_str(), sign_in.origin.as_str())
+                == (creation.rp_id.as_str(), creation.origin.as_str()),
+        "creation {} at {}; sign-in {} at {}",
+        creation.rp_id,
+        creation.origin,
+        sign_in.rp_id,
+        sign_in.origin
+    );
+    eprintln!("passkeys for {} at {}", creation.rp_id, creation.origin);
+    run(&runtime, session.sign_out()).unwrap();
+}
+
 /// A device that asks to be remembered, approved by a signed-in one that
 /// unticks the box: it is signed in just this once (P4-01, P4-02).
 #[test]
