@@ -22,7 +22,7 @@ pub fn select_audio(
     info: &gst_play::PlayMediaInfo,
     position: usize,
 ) -> Result<(), glib::BoolError> {
-    let stream = info
+    let stream = now(play, info)
         .audio_streams()
         .get(position)
         .cloned()
@@ -38,6 +38,15 @@ pub fn select_audio(
     play.set_audio_track_id(Some(&id))
 }
 
+/// What GstPlay plays now, else `info`. A pick is a position, and the
+/// position is looked up here: every load is a new URI to GstPlay, so new
+/// stream ids, and a list kept from before (the menu's, the first media
+/// info's) names streams that are gone, which GstPlay refuses ("Failed to
+/// set subtitle track", Vigil S2E05).
+fn now(play: &gst_play::Play, info: &gst_play::PlayMediaInfo) -> gst_play::PlayMediaInfo {
+    play.media_info().unwrap_or_else(|| info.clone())
+}
+
 /// Shows the `position`th subtitle stream of `info`, or none.
 pub fn select_subtitle(
     play: &gst_play::Play,
@@ -48,7 +57,7 @@ pub fn select_subtitle(
         play.set_subtitle_track_enabled(false);
         return Ok(());
     };
-    let stream = info
+    let stream = now(play, info)
         .subtitle_streams()
         .get(position)
         .cloned()
@@ -78,6 +87,7 @@ pub fn menu(
     play: &gst_play::Play,
     info: &gst_play::PlayMediaInfo,
     subtitles_on: &Rc<Cell<bool>>,
+    failed: Rc<dyn Fn(&str)>,
 ) -> gtk::Popover {
     let column = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -162,22 +172,27 @@ pub fn menu(
 
     let weak = play.downgrade();
     {
-        let (play, info, marks) = (weak.clone(), info.clone(), audio.clone());
+        let (play, info, marks, failed) =
+            (weak.clone(), info.clone(), audio.clone(), failed.clone());
         audio.list.connect_row_activated(move |_, row| {
             let Some(play) = play.upgrade() else { return };
             let position = row.index() as usize;
             match select_audio(&play, &info, position) {
                 Ok(()) => marks.mark(Some(position)),
-                Err(e) => tracing::warn!(error = %e, position, "cannot switch audio"),
+                Err(e) => {
+                    tracing::warn!(error = %e, position, "cannot switch audio");
+                    failed(crate::playback::AUDIO_FAILED);
+                }
             }
         });
     }
     {
-        let (play, info, marks, on) = (
+        let (play, info, marks, on, failed) = (
             weak.clone(),
             info.clone(),
             subtitles.clone(),
             subtitles_on.clone(),
+            failed.clone(),
         );
         subtitles.list.connect_row_activated(move |_, row| {
             let Some(play) = play.upgrade() else { return };
@@ -188,7 +203,10 @@ pub fn menu(
                     on.set(position.is_some());
                     marks.mark(Some(row.index() as usize));
                 }
-                Err(e) => tracing::warn!(error = %e, ?position, "cannot switch subtitles"),
+                Err(e) => {
+                    tracing::warn!(error = %e, ?position, "cannot switch subtitles");
+                    failed(crate::playback::SUBTITLES_FAILED);
+                }
             }
         });
     }
@@ -374,7 +392,13 @@ mod tests {
         for sink in ["video-sink", "audio-sink"] {
             pipeline.set_property(sink, gst::ElementFactory::make("fakesink").build().unwrap());
         }
-        play.set_uri(Some(&gst::glib::filename_to_uri(path, None).unwrap()));
+        play_on(play, path)
+    }
+
+    /// `play` opened on `path`, paused once its streams are known.
+    fn play_on(play: gst_play::Play, path: &Path) -> (gst_play::Play, gst_play::PlayMediaInfo) {
+        let uri = gst::glib::filename_to_uri(path, None).unwrap();
+        play.set_uri(Some(&uri));
         play.pause();
         let bus = play.message_bus();
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
@@ -386,7 +410,10 @@ mod tests {
                 gst_play::PlayMessage::parse(&message)
             {
                 let info = m.media_info().clone();
-                if info.audio_streams().len() == 2 && info.subtitle_streams().len() == 1 {
+                if info.uri() == uri
+                    && info.audio_streams().len() == 2
+                    && info.subtitle_streams().len() == 1
+                {
                     return (play, info);
                 }
             }
@@ -444,6 +471,40 @@ mod tests {
         assert_eq!(
             showing,
             Some(PlayStreamInfoExt::stream_id(&info.subtitle_streams()[0]))
+        );
+    }
+
+    /// Each load is a new URI to GstPlay, so new stream ids: the app gives
+    /// every playback its own spoolframe:// URI. A pick made with what the
+    /// last load listed still lands (Vigil S2E05's subtitles did not).
+    #[test]
+    fn a_pick_made_with_an_earlier_loads_list_still_lands() {
+        gst::init().unwrap();
+        let (_dir, path) = clip_path("reloaded");
+        clip(&path);
+        let (play, earlier) = play(&path);
+        play.stop();
+        let again = path.with_file_name("again.mkv");
+        std::fs::copy(&path, &again).unwrap();
+        let (play, now) = play_on(play, &again);
+        let picked = (
+            select_audio(&play, &earlier, 1),
+            select_subtitle(&play, &earlier, Some(0)),
+        );
+        let playing = (
+            play.current_audio_track()
+                .map(|t| PlayStreamInfoExt::stream_id(&t)),
+            play.current_subtitle_track()
+                .map(|t| PlayStreamInfoExt::stream_id(&t)),
+        );
+        play.stop();
+        assert!(picked.0.is_ok() && picked.1.is_ok(), "{picked:?}");
+        assert_eq!(
+            playing,
+            (
+                Some(PlayStreamInfoExt::stream_id(&now.audio_streams()[1])),
+                Some(PlayStreamInfoExt::stream_id(&now.subtitle_streams()[0]))
+            )
         );
     }
 

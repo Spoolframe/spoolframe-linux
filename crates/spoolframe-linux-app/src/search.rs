@@ -1117,9 +1117,10 @@ impl SearchPage {
                     .child(
                         &gtk::Label::builder()
                             .use_markup(true)
-                            .label(format!(
-                                "{} <span fgalpha=\"65%\" weight=\"500\">{count}</span>",
-                                glib::markup_escape_text(scope_name(other))
+                            .label(crate::markup::markup!(
+                                "{} <span fgalpha=\"65%\" weight=\"500\">{}</span>",
+                                scope_name(other),
+                                count
                             ))
                             .build(),
                     )

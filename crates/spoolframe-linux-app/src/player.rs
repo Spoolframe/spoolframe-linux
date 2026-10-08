@@ -286,6 +286,7 @@ impl View {
             Change::Modes { .. }
             | Change::Queue
             | Change::Skipped(_)
+            | Change::TrackFailed(_)
             | Change::Stopped
             | Change::SignedOut => {}
         }

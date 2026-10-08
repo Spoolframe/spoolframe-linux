@@ -2117,7 +2117,9 @@ impl App {
                 Change::Item(item) => {
                     now_playing.send_replace(Some(item.id().clone()));
                 }
-                Change::Skipped(message) => toasts.add_toast(crate::markup::toast(message)),
+                Change::Skipped(message) | Change::TrackFailed(message) => {
+                    toasts.add_toast(crate::markup::toast(message))
+                }
                 // Nothing plays it again: the player and the bar close.
                 Change::SignedOut => stop.input(Msg::SessionEnded),
                 Change::Stopped => {

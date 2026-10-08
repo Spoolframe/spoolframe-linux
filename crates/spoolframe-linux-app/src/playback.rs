@@ -38,10 +38,13 @@ pub use crate::pipeline::VideoSink;
 pub use crate::queue::Repeat;
 use crate::queue::{Queue, Queued};
 
-/// Registers the linked-in gtk4paintablesink and the spoolframe:// source.
-/// Call once, after GTK is up.
+/// Takes the demuxers and decoders the app never needs out of the
+/// registry, and registers the linked-in gtk4paintablesink and the
+/// spoolframe:// source. Call once, after GTK is up, before any pipeline
+/// is built or the capabilities are read.
 pub fn init() -> anyhow::Result<()> {
     gst::init()?;
+    crate::denylist::apply();
     gstgtk4::plugin_register_static()?;
     crate::source::register()?;
     Ok(())
@@ -102,6 +105,9 @@ pub enum Change<'a> {
     /// A queued item could not play and was passed over; what to tell
     /// the user.
     Skipped(&'a str),
+    /// An audio or subtitle track could not be picked, at the start or
+    /// from the menu; what to tell the user.
+    TrackFailed(&'a str),
     /// The button over the video from the item's markers (P2-10), or
     /// none.
     Offer(Option<Offer>),
@@ -170,6 +176,10 @@ pub fn shutdown() {
 /// How long quitting waits for the last calls to the server.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(3);
 
+/// What a failed pick tells the user.
+pub const SUBTITLES_FAILED: &str = "Couldn't turn on subtitles";
+pub const AUDIO_FAILED: &str = "Couldn't switch the audio track";
+
 /// How long to wait before asking again for a subtitle the server is
 /// still reading as text; less in tests, whose clip is four seconds.
 const SUBTITLE_RETRY: Duration = if cfg!(test) {
@@ -225,6 +235,8 @@ pub struct Playback {
     length: Cell<Duration>,
     stopped: Cell<bool>,
     listeners: RefCell<Vec<Listener>>,
+    /// Itself, for callbacks that outlive a borrow (the track menu's).
+    me: Weak<Self>,
     progress_tail: RefCell<Option<tokio::sync::oneshot::Receiver<()>>>,
 }
 
@@ -403,8 +415,10 @@ impl Playback {
         start: Start,
         autoplay: bool,
     ) -> anyhow::Result<Rc<Self>> {
-        let playback = Rc::new(Self {
-            pipeline: Pipeline::new()?,
+        let pipeline = Pipeline::new()?;
+        let playback = Rc::new_cyclic(|me| Self {
+            me: me.clone(),
+            pipeline,
             session,
             queue: RefCell::new(queue),
             current: RefCell::new(None),
@@ -644,9 +658,16 @@ impl Playback {
         self.pipeline.paintable()
     }
 
-    /// The audio and subtitle menu for `info`.
+    /// The audio and subtitle menu for `info`. A pick that fails says so
+    /// as [`Change::TrackFailed`], as one at the start does.
     pub fn track_menu(&self, info: &gst_play::PlayMediaInfo) -> gtk::Popover {
-        self.pipeline.track_menu(info, &self.subtitles_on)
+        let weak = self.me.clone();
+        let failed: Rc<dyn Fn(&str)> = Rc::new(move |message| {
+            if let Some(this) = weak.upgrade() {
+                this.emit(&Change::TrackFailed(message));
+            }
+        });
+        self.pipeline.track_menu(info, &self.subtitles_on, failed)
     }
 
     pub fn is_playing(&self) -> bool {
@@ -1500,7 +1521,10 @@ impl Playback {
             .is_some_and(subtitle_in_output);
         match self.pipeline.select_subtitle(info, in_output.then_some(0)) {
             Ok(()) => self.subtitles_on.set(in_output),
-            Err(e) => tracing::warn!(error = %e, "cannot pick the converted subtitle"),
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot pick the converted subtitle");
+                self.emit(&Change::TrackFailed(SUBTITLES_FAILED));
+            }
         }
     }
 
@@ -1512,6 +1536,7 @@ impl Playback {
             && let Err(e) = self.pipeline.select_audio(info, audio as usize)
         {
             tracing::warn!(error = %e, audio, "cannot pick the audio track");
+            self.emit(&Change::TrackFailed(AUDIO_FAILED));
         }
         let track_list = current.track_list.borrow();
         let embedded = selection.subtitle.and_then(|n| {
@@ -1530,7 +1555,12 @@ impl Playback {
         }
         match self.pipeline.select_subtitle(info, embedded) {
             Ok(()) => self.subtitles_on.set(embedded.is_some()),
-            Err(e) => tracing::warn!(error = %e, ?embedded, "cannot pick the subtitle"),
+            Err(e) => {
+                tracing::warn!(error = %e, ?embedded, "cannot pick the subtitle");
+                if embedded.is_some() {
+                    self.emit(&Change::TrackFailed(SUBTITLES_FAILED));
+                }
+            }
         }
     }
 

@@ -32,6 +32,8 @@ use adw::prelude::*;
 use gtk::glib;
 use spoolframe_linux_core::backend::{BackendError, Client, DeviceSignIn, Profile, Server};
 
+use crate::markup::{Markup, markup};
+
 /// Where the user approves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Via {
@@ -367,20 +369,26 @@ impl RemoteSignIn {
         match sign_in.web_url.as_deref().map(page_address) {
             Some(page) => {
                 self.dialog.set_title("Approve from another device");
-                self.page.set_markup(&lead(
-                    "Scan with your phone, or open",
-                    &page,
-                    "on any device and type",
-                ));
+                self.page.set_markup(
+                    lead(
+                        "Scan with your phone, or open",
+                        &page,
+                        "on any device and type",
+                    )
+                    .escaped(),
+                );
             }
             None => {
                 self.dialog.set_title("Sign in with another device");
-                self.page.set_markup(&lead(
-                    "This server has no web address, so there's no QR. On a phone or \
+                self.page.set_markup(
+                    lead(
+                        "This server has no web address, so there's no QR. On a phone or \
                      computer that's already signed in, open",
-                    "Preferences › Sign In a Device…",
-                    "and type:",
-                ));
+                        "Preferences › Sign In a Device…",
+                        "and type:",
+                    )
+                    .escaped(),
+                );
             }
         }
         self.showing(sign_in);
@@ -398,12 +406,15 @@ impl RemoteSignIn {
         };
         (self.ends.open)(url);
         self.qr.set_visible(false);
-        self.page.set_markup(&lead(
-            "Sign in in your browser, then approve this computer. If the browser \
+        self.page.set_markup(
+            lead(
+                "Sign in in your browser, then approve this computer. If the browser \
              did not open, go to",
-            url,
-            "",
-        ));
+                url,
+                "",
+            )
+            .escaped(),
+        );
         self.showing(sign_in);
     }
 
@@ -580,16 +591,13 @@ fn pill(label: &str, suggested: bool) -> gtk::Button {
         .build()
 }
 
-/// "`before` **`address`** `after`" as markup, the address escaped.
-fn lead(before: &str, address: &str, after: &str) -> String {
-    format!(
-        "{} <b>{}</b> {}",
-        glib::markup_escape_text(before),
-        glib::markup_escape_text(address),
-        glib::markup_escape_text(after)
-    )
-    .trim_end()
-    .to_owned()
+/// "`before` **`address`** `after`" as markup, each escaped.
+fn lead(before: &str, address: &str, after: &str) -> Markup {
+    if after.is_empty() {
+        markup!("{} <b>{}</b>", before, address)
+    } else {
+        markup!("{} <b>{}</b> {}", before, address, after)
+    }
 }
 
 #[cfg(test)]

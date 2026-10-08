@@ -3,6 +3,7 @@ mod artwork;
 mod browser;
 mod capabilities;
 mod confirm;
+mod denylist;
 mod fonts;
 mod icons;
 mod library;
@@ -25,6 +26,7 @@ mod profile_page;
 mod qr;
 mod queue;
 mod remote_sign_in;
+mod sandbox;
 mod saved_queue;
 mod scrub;
 mod search;
@@ -68,6 +70,10 @@ struct Cli {
     /// Increase log verbosity (-v = debug, -vv = trace).
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
+    /// Confine the app, say what it can and cannot do (`FILE` is a file
+    /// it must not read), and exit: 0 when confined as it should be.
+    #[arg(long, hide = true, value_name = "FILE")]
+    self_check: Option<std::path::PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -83,6 +89,15 @@ fn main() -> Result<()> {
         .map(EnvFilter::new)
         .unwrap_or_else(|_| EnvFilter::new(level));
     tracing_subscriber::fmt().with_env_filter(filter).init();
+    // Before GTK, GStreamer or the SDK start a thread (C-15).
+    let confinement = sandbox::confine();
+    if let Some(probe) = cli.self_check {
+        std::process::exit(if sandbox::self_check(confinement, &probe) {
+            0
+        } else {
+            1
+        });
+    }
 
     // clap has parsed the arguments; GTK gets none, or it would reject ours.
     let app = RelmApp::new(APP_ID).with_args(Vec::new());

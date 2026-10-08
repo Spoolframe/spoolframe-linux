@@ -18,8 +18,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use adw::prelude::*;
 use gtk::glib;
 use spoolframe_linux_core::backend::{
-    BackendError, BoxFuture, DeviceInfo, DeviceSignInRequest, PinProof, PinState, Platform,
-    PlexLink, Session,
+    AddressNetwork, BackendError, BoxFuture, DeviceAddress, DeviceInfo, DeviceSignInRequest,
+    PinProof, PinState, Platform, PlexLink, Session,
 };
 use spoolframe_protocol::device_sign_in;
 
@@ -174,6 +174,52 @@ fn device_icon(platform: Option<Platform>) -> &'static str {
     }
 }
 
+/// Where a device asked to sign in from, as the approval says it (security
+/// finding 27): a home network or the server's own machine plainly, the
+/// internet as a warning (`true`), since a code someone sent you is theirs.
+/// None when the server does not say.
+fn asked_from(device: &str, from: Option<&DeviceAddress>) -> Option<(String, bool)> {
+    let from = from?;
+    Some(match from.network {
+        AddressNetwork::Loopback => (format!("{device} asked from this computer"), false),
+        // A device in the server's own /64 counts as local, though its
+        // address is public: say so.
+        AddressNetwork::Local if public_ipv6(&from.address) => (
+            format!(
+                "{device} asked from {}, on your network (public IPv6)",
+                from.address
+            ),
+            false,
+        ),
+        AddressNetwork::Local => (format!("{device} asked from {}", from.address), false),
+        // Unknown: a kind a newer server names; warned of as the internet.
+        AddressNetwork::Internet | AddressNetwork::Unknown => (
+            format!(
+                "{device} asked from {}. This device is on the internet, not on your network. \
+                 Approve only a device you can see. A code someone sent you is theirs.",
+                from.address
+            ),
+            true,
+        ),
+    })
+}
+
+/// A global unicast IPv6 address: not unique-local (fc00::/7), not
+/// link-local (fe80::/10), not IPv4-mapped, and not loopback, unspecified
+/// or multicast.
+fn public_ipv6(address: &str) -> bool {
+    let Ok(ip) = address.parse::<std::net::Ipv6Addr>() else {
+        return false;
+    };
+    let first = ip.segments()[0];
+    !(first & 0xfe00 == 0xfc00
+        || first & 0xffc0 == 0xfe80
+        || ip.to_ipv4_mapped().is_some()
+        || ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_multicast())
+}
+
 /// A device's trust, as the pill beside it says.
 fn trust_pill(trusted: bool) -> &'static str {
     if trusted { "Trusted" } else { "Not trusted" }
@@ -226,6 +272,7 @@ pub fn page(signed: Signed, dialog: &adw::ToastOverlay) -> adw::PreferencesPage 
             )
             .build(),
         remember_row: adw::SwitchRow::builder()
+            .use_markup(false)
             .title("Remember this device")
             .subtitle(
                 "Reopen your profile here without a password, until you sign out. Forgotten \
@@ -233,6 +280,7 @@ pub fn page(signed: Signed, dialog: &adw::ToastOverlay) -> adw::PreferencesPage 
             )
             .build(),
         auto_row: adw::SwitchRow::builder()
+            .use_markup(false)
             .title("Open this profile when Spoolframe starts")
             .subtitle(
                 "Skips Who’s watching. Turns off your PIN on this computer, and stops any other \
@@ -244,7 +292,11 @@ pub fn page(signed: Signed, dialog: &adw::ToastOverlay) -> adw::PreferencesPage 
         syncing: std::cell::Cell::new(false),
         left: signed.left,
         rows: std::cell::RefCell::new(Vec::new()),
-        pin_row: adw::ActionRow::builder().title("PIN").subtitle("…").build(),
+        pin_row: adw::ActionRow::builder()
+            .use_markup(false)
+            .title("PIN")
+            .subtitle("…")
+            .build(),
         set_button: gtk::Button::builder()
             .label("Set PIN…")
             .valign(gtk::Align::Center)
@@ -345,6 +397,7 @@ pub fn page(signed: Signed, dialog: &adw::ToastOverlay) -> adw::PreferencesPage 
         .build();
     // The name the web page and the other clients use for it.
     let approve = adw::ActionRow::builder()
+        .use_markup(false)
         .title("Sign In a Device…")
         .subtitle("Type the code a TV or phone shows, and approve it here")
         .activatable(true)
@@ -973,6 +1026,21 @@ impl View {
                                 flow.show(None);
                                 flow.proof.refused(&e);
                             }
+                            // A first PIN, with nothing to prove it by,
+                            // wants a recent sign-in: confirm it is them,
+                            // then save the PIN typed, as it still is.
+                            Err(BackendError::RecentSignInRequired) => {
+                                flow.next.set_sensitive(true);
+                                let again = flow.next.downgrade();
+                                this.confirm(
+                                    "Set a PIN",
+                                    Rc::new(move || {
+                                        if let Some(next) = again.upgrade() {
+                                            next.emit_clicked();
+                                        }
+                                    }),
+                                );
+                            }
                             Err(e) => {
                                 if let Some(dialog) = dialog.upgrade() {
                                     dialog.close();
@@ -1571,6 +1639,20 @@ impl View {
             );
             body.append(&row);
         }
+        if let Some((line, warn)) = asked_from(&device, request.requested_from.as_ref()) {
+            body.append(
+                &gtk::Label::builder()
+                    .label(line)
+                    .wrap(true)
+                    .justify(gtk::Justification::Center)
+                    .css_classes(if warn {
+                        vec!["warning", "asked-from"]
+                    } else {
+                        vec!["dim-label", "small-text", "asked-from"]
+                    })
+                    .build(),
+            );
+        }
         let warning = gtk::Label::builder()
             .label("Only continue if you started this on a device in front of you.")
             .wrap(true)
@@ -1787,6 +1869,9 @@ mod tests {
             verified_at: None,
             last_connected_at: None,
             server_id: None,
+            advertised: Vec::new(),
+            relays: Vec::new(),
+            advertised_at: None,
         };
         let page = page(
             Signed {
@@ -1841,6 +1926,9 @@ mod tests {
             verified_at: None,
             last_connected_at: None,
             server_id: None,
+            advertised: Vec::new(),
+            relays: Vec::new(),
+            advertised_at: None,
         };
         let toasts = adw::ToastOverlay::new();
         let page = page(
@@ -1879,6 +1967,87 @@ mod tests {
                 .is_sensitive()),
             "Open at start stayed off-limits once remembered"
         );
+    }
+
+    fn from(address: &str, network: AddressNetwork) -> DeviceAddress {
+        DeviceAddress {
+            address: address.into(),
+            network,
+        }
+    }
+
+    #[test]
+    fn a_device_on_the_home_network_says_where_it_asked_from() {
+        assert_eq!(
+            asked_from(
+                "The TV",
+                Some(&from("192.168.86.20", AddressNetwork::Local))
+            ),
+            Some(("The TV asked from 192.168.86.20".to_owned(), false))
+        );
+    }
+
+    #[test]
+    fn a_device_on_the_home_network_with_a_public_ipv6_address_says_so() {
+        assert_eq!(
+            asked_from(
+                "The TV",
+                Some(&from("2603:8000:c33e:6ac6::20", AddressNetwork::Local))
+            ),
+            Some((
+                "The TV asked from 2603:8000:c33e:6ac6::20, on your network (public IPv6)"
+                    .to_owned(),
+                false
+            ))
+        );
+    }
+
+    #[test]
+    fn a_unique_local_or_link_local_ipv6_address_reads_plainly() {
+        let line = |address| {
+            asked_from("The TV", Some(&from(address, AddressNetwork::Local))).map(|(l, _)| l)
+        };
+        assert_eq!(
+            (line("fd7a:115c:a1e0::1"), line("fe80::1")),
+            (
+                Some("The TV asked from fd7a:115c:a1e0::1".to_owned()),
+                Some("The TV asked from fe80::1".to_owned())
+            )
+        );
+    }
+
+    #[test]
+    fn a_device_on_the_servers_own_machine_is_this_computer() {
+        assert_eq!(
+            asked_from("The TV", Some(&from("127.0.0.1", AddressNetwork::Loopback))),
+            Some(("The TV asked from this computer".to_owned(), false))
+        );
+    }
+
+    #[test]
+    fn a_device_on_the_internet_is_a_warning_with_its_address() {
+        let (line, warn) = asked_from(
+            "The TV",
+            Some(&from("203.0.113.5", AddressNetwork::Internet)),
+        )
+        .unwrap();
+        assert!(warn && line.contains("203.0.113.5") && line.contains("not on your network"));
+    }
+
+    #[test]
+    fn a_network_this_build_does_not_know_warns_too() {
+        assert!(
+            asked_from(
+                "The TV",
+                Some(&from("2001:db8::1", AddressNetwork::Unknown))
+            )
+            .is_some_and(|(_, warn)| warn)
+        );
+    }
+
+    #[test]
+    fn without_an_address_nothing_is_said() {
+        assert_eq!(asked_from("The TV", None), None);
     }
 
     #[test]

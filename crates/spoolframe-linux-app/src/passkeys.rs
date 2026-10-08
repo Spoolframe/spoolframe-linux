@@ -885,6 +885,9 @@ mod tests {
                 verified_at: None,
                 last_connected_at: None,
                 server_id: None,
+                advertised: Vec::new(),
+                relays: Vec::new(),
+                advertised_at: None,
             },
             session: RefCell::new(session.clone()),
             toasts: adw::ToastOverlay::new().downgrade(),
@@ -975,6 +978,9 @@ mod tests {
             verified_at: None,
             last_connected_at: None,
             server_id: None,
+            advertised: Vec::new(),
+            relays: Vec::new(),
+            advertised_at: None,
         };
         let toasts = adw::ToastOverlay::new();
         let group = group(Needs { server, session }, &toasts);

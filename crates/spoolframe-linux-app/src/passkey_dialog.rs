@@ -462,7 +462,12 @@ impl KeyPage {
     }
 
     pub fn show(&self, state: KeyState) {
-        let text = state.text(&self.server, self.via.get());
+        let text = restart_hint(
+            &state,
+            &self.server,
+            self.via.get(),
+            crate::sandbox::keys_at_start(),
+        );
         // The phone's code instead of the key's tile.
         match &state {
             KeyState::Scan(url) => {
@@ -937,9 +942,73 @@ pub(crate) fn option(icon: &str, name: &str, detail: &str) -> gtk::Button {
         .build()
 }
 
+/// `state`'s words, unless the app cannot reach the key. Confined (C-15),
+/// it opens only the security keys plugged in when it started
+/// (`keys_at_start`, `None` when not confined): Landlock refuses one
+/// plugged in later, which the key library reports as no key, as no key in
+/// time, or as no permission (which [`KeyError::NoBluetooth`] stands for).
+/// Then the dialog says to reopen the app with the key plugged in.
+fn restart_hint(
+    state: &KeyState,
+    server: &str,
+    via: Via,
+    keys_at_start: Option<usize>,
+) -> StateText {
+    const RESTART: &str = "Spoolframe can only use a security key that was plugged in when it \
+                           started. Plug in your key, then quit and reopen Spoolframe.";
+    let text = state.text(server, via);
+    let Some(keys) = keys_at_start.filter(|_| via == Via::Key) else {
+        return text;
+    };
+    match state {
+        KeyState::Waiting if keys == 0 => StateText {
+            title: "Plug in your key, then reopen Spoolframe".into(),
+            body: RESTART.into(),
+            spinner: None,
+            ..text
+        },
+        KeyState::Failed(KeyError::TimedOut) if keys == 0 => StateText {
+            body: RESTART.into(),
+            ..text
+        },
+        KeyState::Failed(KeyError::NoDevice | KeyError::NoBluetooth) => StateText {
+            body: RESTART.into(),
+            ..KeyState::Failed(KeyError::NoDevice).text(server, via)
+        },
+        _ => text,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn confined_without_a_key_at_start_the_dialog_says_to_reopen_the_app() {
+        for state in [
+            KeyState::Waiting,
+            KeyState::Failed(KeyError::TimedOut),
+            KeyState::Failed(KeyError::NoDevice),
+            // A refused hidraw node reads as no permission.
+            KeyState::Failed(KeyError::NoBluetooth),
+        ] {
+            let text = restart_hint(&state, "Home Media", Via::Key, Some(0));
+            assert!(text.body.contains("quit and reopen"), "{state:?}: {text:?}");
+        }
+    }
+
+    #[test]
+    fn unconfined_or_by_phone_the_dialog_is_as_before() {
+        for (via, keys) in [(Via::Key, None), (Via::Phone, Some(0))] {
+            let state = KeyState::Failed(KeyError::NoBluetooth);
+            assert_eq!(
+                restart_hint(&state, "Home Media", via, keys),
+                state.text("Home Media", via)
+            );
+        }
+        let waiting = restart_hint(&KeyState::Waiting, "Home Media", Via::Key, Some(1));
+        assert_eq!(waiting, KeyState::Waiting.text("Home Media", Via::Key));
+    }
 
     #[test]
     fn a_wrong_pin_says_so_and_keeps_the_field() {

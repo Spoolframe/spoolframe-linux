@@ -101,6 +101,12 @@ directories = "6"
 # A private temporary directory where the platform has no runtime one.
 tempfile = "3"
 
+# The app confined at start (C-15): Landlock for files, seccomp for
+# calls, as the server confines its media tools.
+landlock = "0.4"
+seccompiler = "0.5"
+libc = "0.2"
+
 # Secrets (the device key, session tokens) in the desktop's Secret
 # Service, never a plain file.
 oo7 = "0.6"

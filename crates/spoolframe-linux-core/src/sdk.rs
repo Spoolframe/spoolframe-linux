@@ -102,6 +102,13 @@ fn server(entry: sdk::ServerEntry) -> Server {
         verified_at: entry.verified_at,
         last_connected_at: entry.last_connected_at,
         server_id: entry.server_id,
+        advertised: entry
+            .advertised_addrs
+            .iter()
+            .map(SocketAddr::to_string)
+            .collect(),
+        relays: entry.relays,
+        advertised_at: entry.advertised_at,
     }
 }
 

@@ -6,6 +6,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 use spoolframe_linux_core::backend::{Profile, ProfileSignIn, Server};
 
+use crate::markup::{Markup, markup};
 use crate::remote_sign_in::Via;
 
 pub type Choose<T> = Rc<dyn Fn(T)>;
@@ -178,7 +179,7 @@ fn saved_row(server: &Server, choose: &Choose<Server>, verify: &Choose<Server>) 
 /// prints at start (`server identity … fingerprint=…`), never its raw key,
 /// after the host it answered from.
 fn nearby_subtitle(server: &Server) -> String {
-    match server.addresses.first() {
+    match server.shown_address() {
         Some(address) => format!("{}  ·  {}", host(address), server.fingerprint),
         None => server.fingerprint.clone(),
     }
@@ -267,17 +268,14 @@ pub fn fingerprint_check(
         .label("Is this your server?")
         .css_classes(["title-2", "dialog-title"])
         .build();
-    let address = server.addresses.first().map(String::as_str);
+    let address = server.shown_address();
+    let who = match address {
+        Some(address) => markup!("<b>{}</b> · {}", server.name, address),
+        None => markup!("<b>{}</b>", server.name),
+    };
     let who = gtk::Label::builder()
         .use_markup(true)
-        .label(match address {
-            Some(address) => format!(
-                "<b>{}</b> · {}",
-                glib_escape(&server.name),
-                glib_escape(address)
-            ),
-            None => format!("<b>{}</b>", glib_escape(&server.name)),
-        })
+        .label(who.escaped())
         .css_classes(["dim-label"])
         .build();
     let code = gtk::Label::builder()
@@ -384,9 +382,9 @@ pub fn fingerprint_check(
 pub fn passkey_site(site: &str) -> gtk::Label {
     gtk::Label::builder()
         .use_markup(true)
-        .label(format!(
+        .label(markup!(
             "<span font_family=\"sans\" weight=\"600\">Passkeys</span> · {}",
-            glib_escape(site)
+            site
         ))
         .xalign(0.0)
         .css_classes(["monospace", "passkey-site", "dim-label"])
@@ -424,7 +422,7 @@ fn code_row(label: &str, code: &str, class: &str) -> gtk::Box {
 /// responses, the second destructive and running `act`.
 fn alert(
     heading: &str,
-    body: &str,
+    body: &Markup,
     extra: &gtk::Box,
     responses: (&str, &str),
     act: Rc<dyn Fn()>,
@@ -440,7 +438,7 @@ fn alert(
         .build();
     let text = gtk::Label::builder()
         .use_markup(true)
-        .label(body)
+        .label(body.escaped())
         .wrap(true)
         .justify(gtk::Justification::Center)
         .css_classes(["dim-label"])
@@ -542,11 +540,11 @@ pub fn identity_changed(
     );
     alert(
         "Server identity changed",
-        &format!(
+        &markup!(
             "<b>{}</b> has a different key than the one saved on this computer. \
              This may mean the server was reinstalled, or that you're connecting \
              to a different server.",
-            glib_escape(name)
+            name
         ),
         &extra,
         ("Cancel", "Trust New Identity"),
@@ -566,10 +564,10 @@ pub fn server_id_changed(name: &str, saved: &str, now: &str, remove: Rc<dyn Fn()
     extra.append(&code_row("This server says", now, "identity-new"));
     alert(
         "Server ID changed",
-        &format!(
+        &markup!(
             "<b>{}</b> has the same key as before, but a different server ID. It can’t be \
              trusted as the same server. Remove it and add it again if this is expected.",
-            glib_escape(name)
+            name
         ),
         &extra,
         ("Close", "Remove server"),
@@ -667,10 +665,6 @@ fn action(label: &str, icon: Option<&str>, classes: &[&str]) -> gtk::Button {
         button.add_css_class(class);
     }
     button
-}
-
-fn glib_escape(text: &str) -> String {
-    gtk::glib::markup_escape_text(text).to_string()
 }
 
 /// What a profile's tile says under its name, and its icon.
@@ -1161,8 +1155,12 @@ pub struct AddServer {
 
 impl AddServer {
     pub fn new(submit: Rc<dyn Fn(String, String)>) -> Self {
-        let key = adw::EntryRow::builder().title("Server key").build();
+        let key = adw::EntryRow::builder()
+            .use_markup(false)
+            .title("Server key")
+            .build();
         let address = adw::EntryRow::builder()
+            .use_markup(false)
             .title("Address, such as 192.168.1.20:4433")
             .build();
         let fields = adw::PreferencesGroup::builder()
@@ -1347,17 +1345,23 @@ impl NotSetUp {
         self.title.set_label(&server.name);
         self.status
             .set_title(&format!("{} isn't set up yet", server.name));
-        // The words dimmed, the address not: it is what to type.
+        // The words dimmed, the address not: it is what to type. Where
+        // the server says it is, else where it was reached.
         let hint = "If that's you: open the address in the server's log";
-        self.hint
-            .set_markup(&match admin_example(&server.addresses) {
-                Some(address) => format!(
-                    "<span fgalpha=\"55%\">{hint}, for example</span> \
-                     <span font_family=\"JetBrains Mono\">{}</span>",
-                    glib_escape(&address)
-                ),
-                None => format!("<span fgalpha=\"55%\">{hint}.</span>"),
-            });
+        let hint = match admin_example(if server.advertised.is_empty() {
+            &server.addresses
+        } else {
+            &server.advertised
+        }) {
+            Some(address) => markup!(
+                "<span fgalpha=\"55%\">{}, for example</span> \
+                 <span font_family=\"JetBrains Mono\">{}</span>",
+                hint,
+                address
+            ),
+            None => markup!("<span fgalpha=\"55%\">{}.</span>", hint),
+        };
+        self.hint.set_markup(hint.escaped());
     }
 }
 
@@ -1568,6 +1572,9 @@ mod tests {
             verified_at: None,
             last_connected_at: None,
             server_id: None,
+            advertised: Vec::new(),
+            relays: Vec::new(),
+            advertised_at: None,
         }
     }
 

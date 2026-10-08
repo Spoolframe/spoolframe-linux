@@ -34,8 +34,12 @@ mpris-server = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 snmalloc-rs = { workspace = true }
+landlock = { workspace = true }
+seccompiler = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 spoolframe-linux-core = { workspace = true, features = ["testing"] }
 
 [build-dependencies]

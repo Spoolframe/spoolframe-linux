@@ -248,8 +248,9 @@ impl Pipeline {
         &self,
         info: &gst_play::PlayMediaInfo,
         subtitles_on: &std::rc::Rc<std::cell::Cell<bool>>,
+        failed: std::rc::Rc<dyn Fn(&str)>,
     ) -> gtk::Popover {
-        tracks::menu(self.play(), info, subtitles_on)
+        tracks::menu(self.play(), info, subtitles_on, failed)
     }
 
     pub fn reader_status(&self) -> Option<reader::Status> {

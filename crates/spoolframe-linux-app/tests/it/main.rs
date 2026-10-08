@@ -2,3 +2,4 @@
 //! docs/agent_guide/integration_test_binaries.md).
 
 mod cli;
+mod sandbox;

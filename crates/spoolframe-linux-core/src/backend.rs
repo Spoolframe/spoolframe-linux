@@ -15,6 +15,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use spoolframe_protocol::{
+    AddressNetwork, DeviceAddress, TrackPreferencesInfo, TrustedProfile,
+};
+pub use spoolframe_protocol::{
     ArtworkSize, ChosenTracks, DeviceInfo, DeviceSignInRequest, HomeScreen, PlaybackHandle,
     PlaybackPlan, Selection, TrackReason,
 };
@@ -25,7 +28,6 @@ pub use spoolframe_protocol::{
     PinProof, PinState, PlexLink, PlexSyncSummary, PreviewTile, Previews, SearchCounts,
     SearchGroup, SearchRequest, SearchResults, TopResult,
 };
-pub use spoolframe_protocol::{TrackPreferencesInfo, TrustedProfile};
 pub use spoolframe_types::Platform;
 use spoolframe_types::{
     ArtworkId, Item, Library, LibraryId, MediaId, MediaTracks, SubtitleFormat, TrackPreferences,
@@ -189,9 +191,26 @@ pub struct Server {
     /// Its server id (PX-14): stable across key changes, and the name of
     /// its passkeys' relying party. `None` until it has been reached.
     pub server_id: Option<String>,
+    /// The addresses the server says it has, in its order (protocol 7):
+    /// the latest list it pushed. Empty until it has told this device.
+    pub advertised: Vec<String>,
+    /// The relays it says it can be reached through; none while relays
+    /// are off.
+    pub relays: Vec<String>,
+    /// When it last told this device its addresses.
+    pub advertised_at: Option<std::time::SystemTime>,
 }
 
 impl Server {
+    /// Where to say the server is: the first address it advertises, else
+    /// the first this device has for it (a reached one may be stale).
+    pub fn shown_address(&self) -> Option<&str> {
+        self.advertised
+            .first()
+            .or(self.addresses.first())
+            .map(String::as_str)
+    }
+
     /// The relying party its passkeys are for, `<server id>.spoolframe.app`,
     /// once its id is known.
     pub fn passkey_site(&self) -> Option<String> {
@@ -775,7 +794,29 @@ mod tests {
             verified_at: None,
             last_connected_at: None,
             server_id: server_id.map(str::to_owned),
+            advertised: Vec::new(),
+            relays: Vec::new(),
+            advertised_at: None,
         }
+    }
+
+    #[test]
+    fn a_server_is_shown_where_it_says_it_is() {
+        let server = Server {
+            addresses: vec!["172.17.0.1:7430".into()],
+            advertised: vec!["192.168.86.10:7430".into()],
+            ..with_id(None)
+        };
+        assert_eq!(server.shown_address(), Some("192.168.86.10:7430"));
+    }
+
+    #[test]
+    fn a_server_that_never_said_is_shown_where_it_was_reached() {
+        let server = Server {
+            addresses: vec!["10.10.0.6:7430".into()],
+            ..with_id(None)
+        };
+        assert_eq!(server.shown_address(), Some("10.10.0.6:7430"));
     }
 
     #[test]

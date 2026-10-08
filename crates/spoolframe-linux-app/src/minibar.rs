@@ -444,6 +444,7 @@ impl MiniBar {
             | Change::Stopped
             | Change::SignedOut
             | Change::Skipped(_)
+            | Change::TrackFailed(_)
             | Change::Offer(_)
             | Change::IntroSkipped => {}
         }

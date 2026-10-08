@@ -495,6 +495,12 @@ impl Default for SignIns {
             platform: Platform::Tvos,
             // It asks to be remembered, so the approver's box shows ticked.
             remember: true,
+            // On the home network (PX-09 finding 27); the approval screen
+            // does not show it yet.
+            requested_from: Some(spoolframe_client_sdk::DeviceAddress {
+                address: "192.168.86.20".into(),
+                network: spoolframe_client_sdk::AddressNetwork::Local,
+            }),
         };
         Self {
             pending: [(FAKE_SIGN_IN_CODE.to_owned(), request)].into(),
@@ -1520,6 +1526,10 @@ impl Session for FakeSession {
                     ));
                 };
                 self.check_proof(&proof)?;
+            } else if proof.is_none() && self.lock_passkeys().stale {
+                // A first PIN has nothing to prove it by: it wants a
+                // recent sign-in, as on the server since protocol 6.
+                return Err(BackendError::RecentSignInRequired);
             }
             self.pin_state().pin = Some(new.to_owned());
             Ok(())
@@ -1871,6 +1881,10 @@ impl Session for FakeSession {
                     requested_at: unix_now(),
                     platform: Platform::Linux,
                     remember: false,
+                    requested_from: Some(spoolframe_client_sdk::DeviceAddress {
+                        address: "127.0.0.1".into(),
+                        network: spoolframe_client_sdk::AddressNetwork::Loopback,
+                    }),
                 });
             }
             match sign_ins.pending.get(code) {
@@ -2065,6 +2079,9 @@ impl FakeClient {
                     verified_at: None,
                     last_connected_at: None,
                     server_id: Some(fake_server_id().as_str().to_owned()),
+                    advertised: vec!["192.168.1.20:7430".into(), "10.10.0.6:7430".into()],
+                    relays: Vec::new(),
+                    advertised_at: None,
                 },
                 Server {
                     key: basement(),
@@ -2077,6 +2094,9 @@ impl FakeClient {
                     verified_at: None,
                     last_connected_at: None,
                     server_id: None,
+                    advertised: Vec::new(),
+                    relays: Vec::new(),
+                    advertised_at: None,
                 },
             ]),
             accounts: vec![
@@ -2480,6 +2500,9 @@ impl Client for FakeClient {
                         verified_at: None,
                         last_connected_at: None,
                         server_id: None,
+                        advertised: Vec::new(),
+                        relays: Vec::new(),
+                        advertised_at: None,
                     });
                     servers.last_mut().expect("just pushed")
                 }
@@ -2542,6 +2565,9 @@ impl Client for FakeClient {
                 verified_at: None,
                 last_connected_at: None,
                 server_id: None,
+                advertised: Vec::new(),
+                relays: Vec::new(),
+                advertised_at: None,
             };
             servers.push(entry.clone());
             drop(servers);
@@ -4219,6 +4245,16 @@ mod tests {
             .map(|t| (t.username.as_str(), t.auto_login, t.pin_required))
             .collect();
         assert_eq!(auto, [("alice", true, false), ("andrey", false, false)]);
+    }
+
+    #[test]
+    fn a_first_pin_long_after_signing_in_asks_to_sign_in_again() {
+        let client = FakeClient::new(None);
+        client.age_sign_ins();
+        assert_eq!(
+            ready(session_for(&client, "andrey").set_pin("2468", None)),
+            Err(BackendError::RecentSignInRequired)
+        );
     }
 
     #[test]

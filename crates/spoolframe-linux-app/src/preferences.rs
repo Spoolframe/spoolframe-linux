@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use adw::prelude::*;
 use spoolframe_linux_core::backend::TrackPreferencesInfo;
-use spoolframe_linux_core::backend::{Client, Server};
+use spoolframe_linux_core::backend::{Client, ConnectionPath, Server};
 use spoolframe_linux_core::format;
 use spoolframe_linux_core::theme::Theme;
 use spoolframe_types::{
@@ -211,7 +211,7 @@ fn whereabouts(server: &Server, user: Option<&str>) -> String {
         Some(user) => format!("signed in as {user}"),
         None => "signed out".to_owned(),
     };
-    match server.addresses.first() {
+    match server.shown_address() {
         Some(address) => format!("{} · {signed}", crate::start::host(address)),
         None => signed,
     }
@@ -282,7 +282,58 @@ fn in_use(server: &Server, user: Option<&str>, servers: &Rc<Servers>) -> adw::Pr
         line.set_margin_top(4);
         group.add(&line);
     }
+    // What the server says about where it can be reached (protocol 7),
+    // the address in use marked; nothing until it has said.
+    if !server.advertised.is_empty() {
+        let in_use = match servers.client.connection_path(&server.key) {
+            ConnectionPath::Lan(at) | ConnectionPath::Direct(at) => Some(at),
+            ConnectionPath::Relay | ConnectionPath::Unknown => None,
+        };
+        let mut lines = vec![
+            format!("Addresses: {}", address_list(&server.advertised, in_use)),
+            format!("Relays: {}", relay_list(&server.relays)),
+        ];
+        if let Some(at) = server.advertised_at {
+            lines.push(format!("as of {}", crate::start::day(at)));
+        }
+        group.add(
+            &gtk::Label::builder()
+                .label(lines.join("\n"))
+                .selectable(true)
+                .wrap(true)
+                .xalign(0.0)
+                .margin_top(4)
+                .css_classes(["monospace", "dim-label", "caption"])
+                .build(),
+        );
+    }
     group
+}
+
+/// The server's advertised addresses, in its order, the one this
+/// connection uses marked.
+fn address_list(advertised: &[String], in_use: Option<std::net::SocketAddr>) -> String {
+    advertised
+        .iter()
+        .map(|address| {
+            let used = in_use.is_some_and(|at| address.parse() == Ok(at));
+            if used {
+                format!("{address} (in use)")
+            } else {
+                address.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The relays the server says it can be reached through, or none.
+fn relay_list(relays: &[String]) -> String {
+    if relays.is_empty() {
+        "none".to_owned()
+    } else {
+        relays.join(", ")
+    }
 }
 
 /// Another saved server's line: where it is, who is signed in, where its
@@ -476,6 +527,7 @@ fn appearance(
     group.add(&themes);
 
     let dark_player = adw::ActionRow::builder()
+        .use_markup(false)
         .title("Dark player")
         .subtitle("The player stays dark with every theme")
         .build();
@@ -487,6 +539,7 @@ fn appearance(
             .build(),
     );
     let diagnostics = adw::SwitchRow::builder()
+        .use_markup(false)
         .title("Show playback diagnostics")
         .subtitle("Decoder, buffer and network details over the video")
         .active(show_diagnostics)
@@ -712,6 +765,7 @@ fn streaming(current: Option<u64>, set: SetBitrate) -> adw::PreferencesGroup {
     let names: Vec<String> = BITRATE_LIMITS.iter().map(|l| bitrate_name(*l)).collect();
     let names: Vec<&str> = names.iter().map(String::as_str).collect();
     let row = adw::ComboRow::builder()
+        .use_markup(false)
         .title("Bitrate limit")
         .subtitle(
             "Above it, the server converts the video to fit. Applies when Spoolframe next starts.",
@@ -794,6 +848,7 @@ fn playback(
     device: &Device,
 ) -> adw::PreferencesPage {
     let skip = adw::SwitchRow::builder()
+        .use_markup(false)
         .title("Skip intros automatically")
         .subtitle("On this computer only. Otherwise a Skip intro button shows.")
         .active(device.skip_intros)
@@ -809,6 +864,7 @@ fn playback(
         .build();
     let streaming = streaming(device.bitrate, device.set_bitrate.clone());
     let hdr = adw::SwitchRow::builder()
+        .use_markup(false)
         .title("Show HDR")
         .subtitle(
             "Off: the server converts HDR films to SDR, even for an HDR monitor. \
@@ -839,11 +895,13 @@ fn track_groups(
         ocr_offered,
     } = info;
     let audio_languages = adw::EntryRow::builder()
+        .use_markup(false)
         .title("Preferred languages")
         .text(format::language_list(&preferences.audio.languages))
         .show_apply_button(true)
         .build();
     let avoid_description = adw::SwitchRow::builder()
+        .use_markup(false)
         .title("Avoid audio description")
         .subtitle("Unless it is the only track")
         .active(
@@ -854,6 +912,7 @@ fn track_groups(
         )
         .build();
     let avoid_commentary = adw::SwitchRow::builder()
+        .use_markup(false)
         .title("Avoid commentary")
         .subtitle("Unless it is the only track")
         .active(preferences.audio.avoid.contains(&AudioRole::Commentary))
@@ -869,6 +928,7 @@ fn track_groups(
     audio.add(&avoid_commentary);
 
     let mode = adw::ComboRow::builder()
+        .use_markup(false)
         .title("Show subtitles")
         .model(&gtk::StringList::new(&MODES.map(|(_, name)| name)))
         .selected(
@@ -879,11 +939,13 @@ fn track_groups(
         )
         .build();
     let subtitle_languages = adw::EntryRow::builder()
+        .use_markup(false)
         .title("Preferred languages")
         .text(format::language_list(&preferences.subtitles.languages))
         .show_apply_button(true)
         .build();
     let sdh = adw::ComboRow::builder()
+        .use_markup(false)
         .title("Subtitles for the deaf (SDH)")
         .model(&gtk::StringList::new(&SDH.map(|(_, name)| name)))
         .selected(
@@ -901,16 +963,17 @@ fn track_groups(
     // the user's choice for a server that has it.
     let (selected, sensitive) = bitmap_row(preferences.subtitles.bitmap, ocr_offered);
     let bitmap = adw::ComboRow::builder()
+        .use_markup(false)
         .title("Picture subtitles")
-        .subtitle(if ocr_offered {
-            "Subtitles stored as pictures: read as text, or shown as they are"
-        } else {
-            "This server doesn't read picture subtitles as text"
-        })
         .model(&gtk::StringList::new(&BITMAP.map(|(_, name)| name)))
         .selected(selected)
         .sensitive(sensitive)
         .build();
+    bitmap.set_subtitle(if ocr_offered {
+        "Subtitles stored as pictures: read as text, or shown as they are"
+    } else {
+        "This server doesn't read picture subtitles as text"
+    });
     subtitles.add(&mode);
     subtitles.add(&subtitle_languages);
     subtitles.add(&sdh);
@@ -951,6 +1014,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_address_in_use_is_marked_among_the_advertised() {
+        assert_eq!(
+            address_list(
+                &["10.10.0.6:7430".into(), "192.168.86.10:7430".into()],
+                Some("192.168.86.10:7430".parse().unwrap())
+            ),
+            "10.10.0.6:7430, 192.168.86.10:7430 (in use)"
+        );
+    }
+
+    #[test]
+    fn no_relays_reads_none() {
+        assert_eq!(relay_list(&[]), "none");
+    }
+
+    #[test]
     fn another_servers_line_names_its_passkey_site() {
         let server = Server {
             key: spoolframe_linux_core::backend::ServerKey("k".into()),
@@ -963,6 +1042,9 @@ mod tests {
             verified_at: None,
             last_connected_at: None,
             server_id: Some("q2d2w5nb3kx7m4ra".into()),
+            advertised: Vec::new(),
+            relays: Vec::new(),
+            advertised_at: None,
         };
         assert_eq!(
             other_line(&server, Some("Alice")),

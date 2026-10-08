@@ -1019,6 +1019,7 @@ mod tests {
         adw::init().unwrap();
         let header = adw::HeaderBar::new();
         let banner = adw::Banner::new("Reconnecting");
+        banner.set_use_markup(false);
         banner.set_revealed(true);
         let heading = gtk::Label::new(Some("Music"));
         let view = toolbar(
