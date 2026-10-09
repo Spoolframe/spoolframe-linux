@@ -349,7 +349,9 @@ pub enum ConnectionPath {
     Unknown,
 }
 
-pub use spoolframe_client_sdk::{Chunk, Playback as PlaybackStart};
+pub use spoolframe_client_sdk::{
+    Chunk, Playback as PlaybackStart, PlaybackChange, PlaybackQuality,
+};
 pub use spoolframe_protocol::MAX_READ;
 
 /// What an invite link says (P6-01), read without a word to the server:
@@ -568,6 +570,21 @@ pub trait Session: Send + Sync {
     /// How this device reaches the server now. Asks nothing.
     fn connection_path(&self) -> ConnectionPath;
 
+    /// How fast the link to the server has carried direct reads lately,
+    /// in bits per second (P6-06); `None` until something was read.
+    fn link_rate(&self) -> Option<u64>;
+
+    /// Plans a playback again for a link that carries only
+    /// `link_bitrate` bits per second, from `position` (P6-06): a direct
+    /// play too big for it becomes a conversion that fits. The plan comes
+    /// back unchanged when it fits already.
+    fn limit_playback<'a>(
+        &'a self,
+        handle: &'a PlaybackHandle,
+        link_bitrate: u64,
+        position: Duration,
+    ) -> BoxFuture<'a, Result<PlaybackChange, BackendError>>;
+
     /// The item's preview frames for scrubbing (P3-13). Asking also puts
     /// the item first in the server's queue to make them.
     fn previews<'a>(&'a self, id: &'a MediaId) -> BoxFuture<'a, Result<Previews, BackendError>>;
@@ -624,13 +641,25 @@ pub trait Session: Send + Sync {
     /// Starts playback with these tracks, or with the server's choice from
     /// the user's preferences and series override (`None`). A converted
     /// playback's encode begins at `start` (P2-03); direct play reads from
-    /// wherever the player likes, and the server ignores it.
+    /// wherever the player likes, and the server ignores it. `quality` is
+    /// the viewer's choice (P6-06): Auto plans for the link.
     fn start_playback<'a>(
         &'a self,
         id: &'a MediaId,
         selection: Option<Selection>,
         start: Option<Duration>,
+        quality: PlaybackQuality,
     ) -> BoxFuture<'a, Result<PlaybackStart, BackendError>>;
+
+    /// Plans a playing playback again for the quality the viewer chose
+    /// now, from `position` (P6-06): the new plan, size and epoch, as a
+    /// subtitle change gives them.
+    fn change_quality<'a>(
+        &'a self,
+        handle: &'a PlaybackHandle,
+        quality: PlaybackQuality,
+        position: Duration,
+    ) -> BoxFuture<'a, Result<PlaybackChange, BackendError>>;
 
     /// Up to `length` bytes of a converted playback's output from
     /// `offset`, for its `epoch` (P2-04). A read past what is encoded

@@ -869,14 +869,29 @@ impl Session for SdkSession {
         id: &'a MediaId,
         selection: Option<Selection>,
         start: Option<Duration>,
+        quality: sdk::PlaybackQuality,
     ) -> BoxFuture<'a, Result<PlaybackStart, BackendError>> {
         let id = id.clone();
         Box::pin(self.call(move |s| async move {
             let options = sdk::PlaybackOptions {
                 start,
+                quality,
                 ..Default::default()
             };
             s.start_playback_with(&id, selection, options).await
+        }))
+    }
+
+    fn change_quality<'a>(
+        &'a self,
+        handle: &'a PlaybackHandle,
+        quality: sdk::PlaybackQuality,
+        position: Duration,
+    ) -> BoxFuture<'a, Result<sdk::PlaybackChange, BackendError>> {
+        let handle = handle.clone();
+        Box::pin(self.call(move |s| async move {
+            s.change_quality(&handle, quality, Default::default(), position)
+                .await
         }))
     }
 
@@ -946,6 +961,23 @@ impl Session for SdkSession {
 
     fn connection_path(&self) -> ConnectionPath {
         connection_path(self.session.connection_path())
+    }
+
+    fn link_rate(&self) -> Option<u64> {
+        self.session.link_rate()
+    }
+
+    fn limit_playback<'a>(
+        &'a self,
+        handle: &'a PlaybackHandle,
+        link_bitrate: u64,
+        position: Duration,
+    ) -> BoxFuture<'a, Result<sdk::PlaybackChange, BackendError>> {
+        let handle = handle.clone();
+        Box::pin(self.call(move |s| async move {
+            s.limit_playback(&handle, link_bitrate, Default::default(), position)
+                .await
+        }))
     }
 
     fn previews<'a>(&'a self, id: &'a MediaId) -> BoxFuture<'a, Result<Previews, BackendError>> {

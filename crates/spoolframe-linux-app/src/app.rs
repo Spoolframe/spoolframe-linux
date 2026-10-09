@@ -66,6 +66,8 @@ pub struct PlayRequest {
     pub album: Option<Album>,
     /// Shuffle on from the start (an album's Shuffle button).
     pub shuffle: bool,
+    /// The quality chosen on the item page (P6-06); Auto otherwise.
+    pub quality: spoolframe_client_sdk::PlaybackQuality,
 }
 
 impl PlayRequest {
@@ -83,7 +85,14 @@ impl PlayRequest {
             tracks,
             album: None,
             shuffle: false,
+            quality: Default::default(),
         }
+    }
+
+    /// At the quality the viewer chose before playing (P6-06).
+    fn at_quality(mut self, quality: spoolframe_client_sdk::PlaybackQuality) -> Self {
+        self.quality = quality;
+        self
     }
 }
 
@@ -1300,6 +1309,7 @@ impl Component for App {
                     tracks,
                     album,
                     shuffle,
+                    quality,
                 } = *request;
                 // A new context keeps the queue, as Spotify does.
                 self.stop_playback(widgets);
@@ -1312,6 +1322,7 @@ impl Component for App {
                     selection,
                     tracks,
                     album,
+                    quality,
                 }) {
                     Ok(playback) => {
                         if shuffle {
@@ -1863,13 +1874,11 @@ impl Component for App {
                     .ok();
                 let play: pages::Play = {
                     let (sender, item, tracks) = (sender.clone(), item.clone(), tracks.clone());
-                    Rc::new(move |from, selection| {
-                        sender.input(Msg::Play(Box::new(PlayRequest::one(
-                            item.clone(),
-                            from,
-                            selection,
-                            tracks.clone(),
-                        ))))
+                    Rc::new(move |from, selection, quality| {
+                        sender.input(Msg::Play(Box::new(
+                            PlayRequest::one(item.clone(), from, selection, tracks.clone())
+                                .at_quality(quality),
+                        )))
                     })
                 };
                 let id = item.id().clone();
@@ -1952,6 +1961,7 @@ impl Component for App {
                             tracks: None,
                             album: Some(album.clone()),
                             shuffle,
+                            quality: Default::default(),
                         })))
                     })
                 };
@@ -2319,6 +2329,7 @@ impl App {
                 tracks: None,
                 album,
                 shuffle: false,
+                quality: Default::default(),
             })));
             return;
         };
@@ -2392,6 +2403,7 @@ impl App {
                     tracks: None,
                     album: None,
                     shuffle: true,
+                    quality: Default::default(),
                 })));
             })
         };

@@ -25,6 +25,7 @@ mod player;
 mod preferences;
 mod profile_page;
 mod qr;
+mod quality;
 mod queue;
 mod remote_sign_in;
 mod sandbox;

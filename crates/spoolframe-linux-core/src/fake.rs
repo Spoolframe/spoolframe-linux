@@ -576,6 +576,8 @@ struct Serving {
     signed_out: bool,
     /// How long a playback handle may go unused before it expires.
     handle_idle: Duration,
+    /// How fast the link has been, as the SDK would have measured it.
+    link_rate: Option<u64>,
     /// The server ends the first playback once a chunk read reaches this
     /// offset, as when it idled out: the read answers PlaybackExpired.
     expire_at: Option<u64>,
@@ -933,6 +935,8 @@ impl FakeSession {
                 },
             }),
             reasons: vec!["video 0: hevc is not supported; encoded to h264".into()],
+            // Progressive: no HLS variants (PX-21).
+            ladder: Vec::new(),
         }
     }
 
@@ -1154,6 +1158,7 @@ impl Session for FakeSession {
         id: &'a MediaId,
         selection: Option<Selection>,
         _start: Option<Duration>,
+        quality: crate::backend::PlaybackQuality,
     ) -> BoxFuture<'a, Result<PlaybackStart, BackendError>> {
         Box::pin(async move {
             self.catalog()?;
@@ -1181,7 +1186,11 @@ impl Session for FakeSession {
                         written: 0,
                     },
                 );
+            // A chosen bitrate converts the fake's file, as one that
+            // exceeds it would be (P6-06).
+            let capped = matches!(quality, crate::backend::PlaybackQuality::Bitrate(_));
             let (plan, size) = match self.serving.converting {
+                _ if capped => (Self::converted_plan(item, effective, false), 0),
                 Some(_) => (
                     Self::converted_plan(item, effective, self.serving.reading_subtitle.is_some()),
                     0,
@@ -1339,6 +1348,60 @@ impl Session for FakeSession {
 
     fn connection_path(&self) -> ConnectionPath {
         ConnectionPath::Lan(([192, 168, 1, 20], 7431).into())
+    }
+
+    fn link_rate(&self) -> Option<u64> {
+        self.serving.link_rate
+    }
+
+    /// A chosen bitrate converts the fake's file; Auto and Original play
+    /// it as it is, as the fake's link is never too slow.
+    fn change_quality<'a>(
+        &'a self,
+        handle: &'a PlaybackHandle,
+        quality: crate::backend::PlaybackQuality,
+        _position: Duration,
+    ) -> BoxFuture<'a, Result<crate::backend::PlaybackChange, BackendError>> {
+        Box::pin(async move {
+            let (id, selection, epoch) = self.with_playback(handle, |p| {
+                p.epoch += 1;
+                p.written = 0;
+                (p.item.clone(), p.selection, p.epoch)
+            })?;
+            let item = self.catalog.get(&id)?;
+            let (_, size) = self.media_size()?;
+            let (plan, size) = match quality {
+                crate::backend::PlaybackQuality::Bitrate(_) => {
+                    (Self::converted_plan(item, selection, false), 0)
+                }
+                _ => (Self::plan_for(item, &self.tracks_of(item), selection), size),
+            };
+            Ok(crate::backend::PlaybackChange { plan, size, epoch })
+        })
+    }
+
+    /// The fake's file is too big for any link it is told of: the
+    /// playback becomes a conversion, its encode started again, as the
+    /// server re-plans a direct play on a slow link (P6-06).
+    fn limit_playback<'a>(
+        &'a self,
+        handle: &'a PlaybackHandle,
+        _link_bitrate: u64,
+        _position: Duration,
+    ) -> BoxFuture<'a, Result<crate::backend::PlaybackChange, BackendError>> {
+        Box::pin(async move {
+            let (id, selection, epoch) = self.with_playback(handle, |p| {
+                p.epoch += 1;
+                p.written = 0;
+                (p.item.clone(), p.selection, p.epoch)
+            })?;
+            let item = self.catalog.get(&id)?;
+            Ok(crate::backend::PlaybackChange {
+                plan: Self::converted_plan(item, selection, false),
+                size: 0,
+                epoch,
+            })
+        })
     }
 
     fn previews<'a>(&'a self, id: &'a MediaId) -> BoxFuture<'a, Result<Previews, BackendError>> {
@@ -2093,6 +2156,7 @@ impl FakeClient {
                 stopped: false,
                 signed_out: false,
                 handle_idle: HANDLE_IDLE,
+                link_rate: None,
                 expire_at: None,
             },
             gone: Arc::default(),
@@ -2243,6 +2307,7 @@ impl FakeClient {
             code: code.map(str::to_owned),
             expires_at: Some(in_six_days),
             role: Some(spoolframe_types::Role::Consumer),
+            lookup: None,
         }
         .link()
     }
@@ -2353,6 +2418,12 @@ impl FakeClient {
     /// server's 5 minutes, so tests can wait past it.
     pub fn with_handle_idle(mut self, idle: Duration) -> Self {
         self.serving.handle_idle = idle;
+        self
+    }
+
+    /// The link has been carrying `bits_per_second` (P6-06).
+    pub fn with_link_rate(mut self, bits_per_second: u64) -> Self {
+        self.serving.link_rate = Some(bits_per_second);
         self
     }
 
@@ -3523,7 +3594,7 @@ mod tests {
         let session = session_for(&client, "andrey");
         // Andor E1–2 watched; E4 started, past E3, as with Vigil S2E3.
         let e4 = media(MediaKind::Episode, "65");
-        let playback = ready(session.start_playback(&e4, None, None)).unwrap();
+        let playback = ready(session.start_playback(&e4, None, None, Default::default())).unwrap();
         ready(session.update_progress(&playback.handle, Duration::from_secs(120))).unwrap();
         let home = ready(session.home()).unwrap();
         assert!(
@@ -3560,7 +3631,8 @@ mod tests {
         let client = FakeClient::new(Some(path));
         let session = session_for(&client, "andrey");
         let heat = media(MediaKind::Movie, "3");
-        let playback = ready(session.start_playback(&heat, None, None)).unwrap();
+        let playback =
+            ready(session.start_playback(&heat, None, None, Default::default())).unwrap();
         ready(session.update_progress(&playback.handle, Duration::from_secs(30))).unwrap();
         let home = ready(session.home()).unwrap();
         assert!(!titles(&home.continue_watching).contains(&"Heat"));
@@ -3584,7 +3656,7 @@ mod tests {
         let e4 = media(MediaKind::Episode, "25");
         ready(session.hide_from_continue(&e4)).unwrap();
         let e5 = media(MediaKind::Episode, "26");
-        let playback = ready(session.start_playback(&e5, None, None)).unwrap();
+        let playback = ready(session.start_playback(&e5, None, None, Default::default())).unwrap();
         ready(session.update_progress(&playback.handle, Duration::from_secs(120))).unwrap();
         let home = ready(session.home()).unwrap();
         assert!(
@@ -3601,7 +3673,8 @@ mod tests {
         let session = session_for(&client, "andrey");
         let first = ready(session.home()).unwrap().continue_watching[0].clone();
         ready(session.hide_from_continue(first.id())).unwrap();
-        let playback = ready(session.start_playback(first.id(), None, None)).unwrap();
+        let playback =
+            ready(session.start_playback(first.id(), None, None, Default::default())).unwrap();
         ready(session.update_progress(&playback.handle, Duration::from_secs(120))).unwrap();
         let home = ready(session.home()).unwrap();
         assert!(home.continue_watching.iter().any(|i| i.id() == first.id()));
@@ -3613,7 +3686,8 @@ mod tests {
         let client = FakeClient::new(Some(path));
         let session = session_for(&client, "andrey");
         let heat = media(MediaKind::Movie, "3");
-        let playback = ready(session.start_playback(&heat, None, None)).unwrap();
+        let playback =
+            ready(session.start_playback(&heat, None, None, Default::default())).unwrap();
         ready(session.update_progress(&playback.handle, Duration::from_secs(600))).unwrap();
         let home = ready(session.home()).unwrap();
         assert_eq!(title(&home.continue_watching[0]), "Heat");
@@ -3625,7 +3699,8 @@ mod tests {
         let client = FakeClient::new(Some(path));
         let session = session_for(&client, "andrey");
         let alien = media(MediaKind::Movie, "1");
-        let playback = ready(session.start_playback(&alien, None, None)).unwrap();
+        let playback =
+            ready(session.start_playback(&alien, None, None, Default::default())).unwrap();
         ready(session.update_progress(&playback.handle, Duration::from_secs(112 * 60))).unwrap();
         let (item, _) = ready(session.item(&alien)).unwrap();
         let Item::Movie(m) = item else { panic!() };
@@ -3831,7 +3906,8 @@ mod tests {
     #[test]
     fn playback_without_media_says_how_to_get_some() {
         let alien = media(MediaKind::Movie, "1");
-        let error = ready(andrey().start_playback(&alien, None, None)).unwrap_err();
+        let error =
+            ready(andrey().start_playback(&alien, None, None, Default::default())).unwrap_err();
         assert!(matches!(error, BackendError::Unavailable(m) if m.contains("--fake-media")));
     }
 
@@ -3842,7 +3918,7 @@ mod tests {
         let client = FakeClient::new(Some(path));
         let session = session_for(&client, "andrey");
         let alien = media(MediaKind::Movie, "1");
-        let start = ready(session.start_playback(&alien, None, None)).unwrap();
+        let start = ready(session.start_playback(&alien, None, None, Default::default())).unwrap();
         assert_eq!(start.size, 256);
         let read = ready(session.read(&start.handle, 250, 100)).unwrap();
         assert_eq!(read, (250..=255).collect::<Vec<u8>>());
@@ -3868,7 +3944,9 @@ mod tests {
             audio: None,
             subtitle: Some(0),
         };
-        let start = ready(session.start_playback(&alien, Some(selection), None)).unwrap();
+        let start =
+            ready(session.start_playback(&alien, Some(selection), None, Default::default()))
+                .unwrap();
         let (format, bytes) = ready(session.read_subtitle(&start.handle)).unwrap();
         assert_eq!(format, SubtitleFormat::Srt);
         assert!(String::from_utf8(bytes).unwrap().contains("read_subtitle"));
@@ -4326,8 +4404,13 @@ mod tests {
             trust: None,
         };
         let session = client.session(&profile).unwrap();
-        let start =
-            ready(session.start_playback(&media(MediaKind::Movie, "1"), None, None)).unwrap();
+        let start = ready(session.start_playback(
+            &media(MediaKind::Movie, "1"),
+            None,
+            None,
+            Default::default(),
+        ))
+        .unwrap();
         ready(session.stop_playback(&start.handle)).unwrap();
         assert_eq!(client.open_playbacks(&profile), 0);
     }

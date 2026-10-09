@@ -68,6 +68,9 @@ pub struct Playlist {
     pub tracks: Option<MediaTracks>,
     /// The album the tracks are from, for its cover and name.
     pub album: Option<Album>,
+    /// The quality the viewer chose (P6-06), for every item it plays
+    /// until they choose again.
+    pub quality: spoolframe_client_sdk::PlaybackQuality,
 }
 
 /// How the first item starts: see [`Playlist`].
@@ -75,6 +78,7 @@ struct Start {
     from: Option<Duration>,
     selection: Option<Selection>,
     tracks: Option<MediaTracks>,
+    quality: spoolframe_client_sdk::PlaybackQuality,
 }
 
 /// What a view hears from the playback.
@@ -179,6 +183,7 @@ const SHUTDOWN_WAIT: Duration = Duration::from_secs(3);
 /// What a failed pick tells the user.
 pub const SUBTITLES_FAILED: &str = "Couldn't turn on subtitles";
 pub const AUDIO_FAILED: &str = "Couldn't switch the audio track";
+pub const QUALITY_FAILED: &str = "Couldn't change the quality";
 
 /// How long to wait before asking again for a subtitle the server is
 /// still reading as text; less in tests, whose clip is four seconds.
@@ -235,6 +240,8 @@ pub struct Playback {
     skip_intros: Cell<bool>,
     /// Whether subtitles show; see [`crate::tracks::menu`].
     subtitles_on: Rc<Cell<bool>>,
+    /// The quality the viewer chose (P6-06): each item starts with it.
+    quality: Cell<spoolframe_client_sdk::PlaybackQuality>,
     playing: Cell<bool>,
     position: Cell<Duration>,
     length: Cell<Duration>,
@@ -390,6 +397,7 @@ impl Playback {
             from: playlist.from,
             selection: playlist.selection,
             tracks: playlist.tracks,
+            quality: playlist.quality,
         };
         Self::build(playlist.session, queue, start, true)
     }
@@ -405,6 +413,7 @@ impl Playback {
             from: (!at.is_zero()).then_some(at),
             selection: None,
             tracks: None,
+            quality: Default::default(),
         };
         Self::build(session, queue, start, false)
     }
@@ -431,6 +440,7 @@ impl Playback {
             autoplay: Cell::new(autoplay),
             skip_intros: Cell::new(false),
             subtitles_on: Rc::new(Cell::new(false)),
+            quality: Cell::new(start.quality),
             playing: Cell::new(false),
             position: Cell::new(Duration::ZERO),
             length: Cell::new(Duration::ZERO),
@@ -675,7 +685,71 @@ impl Playback {
                 this.emit(&Change::TrackFailed(message));
             }
         });
-        self.pipeline.track_menu(info, &self.subtitles_on, failed)
+        // Quality is a film's or an episode's; music plays as it is.
+        let quality = self.is_video().then(|| {
+            let (current, choose) = (self.me.clone(), self.me.clone());
+            crate::tracks::QualityMenu {
+                current: Rc::new(move || {
+                    current
+                        .upgrade()
+                        .map_or((Default::default(), None), |this| {
+                            let height = crate::quality::encoded_height(this.plan().as_ref());
+                            (this.quality.get(), height)
+                        })
+                }),
+                choose: Rc::new(move |quality| {
+                    if let Some(this) = choose.upgrade() {
+                        this.set_quality(quality);
+                    }
+                }),
+            }
+        });
+        self.pipeline
+            .track_menu(info, &self.subtitles_on, failed, quality)
+    }
+
+    /// Plans the playing item again for `quality` (P6-06), from where it
+    /// is, and keeps the choice for the items after it. A new plan gets a
+    /// new reader, as a resumed or re-planned playback does; the same plan
+    /// plays on.
+    pub fn set_quality(self: &Rc<Self>, quality: spoolframe_client_sdk::PlaybackQuality) {
+        self.quality.set(quality);
+        let Some(current) = self.now() else { return };
+        let Some(managed) = current.managed.borrow().clone() else {
+            return;
+        };
+        let before = managed.snapshot();
+        let at = self.position.get();
+        let changing = relm4::spawn(async move { managed.change_quality(quality, at).await });
+        let (weak, current) = (Rc::downgrade(self), Rc::downgrade(&current));
+        glib::spawn_future_local(async move {
+            let answer = changing.await;
+            let Some(playback) = weak.upgrade() else {
+                return;
+            };
+            if !current.upgrade().is_some_and(|c| playback.is_current(&c)) {
+                return;
+            }
+            match answer {
+                Ok(Ok(next)) => {
+                    let changed = next.handle != before.handle
+                        || next.epoch != before.epoch
+                        || next.plan != before.plan;
+                    if changed {
+                        tracing::info!(?quality, "the playback was planned again for its quality");
+                        playback.read_anew(at);
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, ?quality, "cannot change the quality");
+                    playback.emit(&Change::TrackFailed(QUALITY_FAILED));
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "the quality change did not finish");
+                    playback.emit(&Change::TrackFailed(QUALITY_FAILED));
+                }
+            }
+        });
     }
 
     pub fn is_playing(&self) -> bool {
@@ -843,19 +917,17 @@ impl Playback {
         self.reload(&current, next, to);
     }
 
-    /// The SDK started the playback again after the server ended it (it
-    /// idled out): a converted playback's reader held the old encode's
-    /// bytes, so a new reader plays the new encode from `at`, as after a
-    /// seek's restart. A direct one never gets here: its reads go on.
-    fn resumed(self: &Rc<Self>, at: Duration) {
+    /// The playback changed under its reader: the SDK started it again
+    /// after the server ended it (it idled out), or the server planned it
+    /// again for a slow link (P6-06), a direct play becoming a conversion.
+    /// Either way the reader's bytes are not the new plan's, so a new
+    /// reader, for the plan the SDK now has, plays from `at`, as after a
+    /// seek's restart.
+    fn read_anew(self: &Rc<Self>, at: Duration) {
         let Some(current) = self.now() else { return };
         let Some(managed) = current.managed.borrow().clone() else {
             return;
         };
-        tracing::info!(
-            at = at.as_secs(),
-            "the server ended the playback; it was started again"
-        );
         if let Stage::Restarting { .. } = &*current.stage.borrow() {
             // A restart under way replaces the reader itself.
             return;
@@ -1131,6 +1203,7 @@ impl Playback {
             current.item.id().clone(),
             current.requested,
         );
+        let quality = self.quality.get();
         let pending = self.progress_tail.borrow_mut().take();
         let started = relm4::spawn(async move {
             if let Some(pending) = pending {
@@ -1150,6 +1223,7 @@ impl Playback {
                 requested,
                 PlaybackOptions {
                     start: from,
+                    quality,
                     ..Default::default()
                 },
             );
@@ -1740,6 +1814,9 @@ enum Event {
     /// The SDK started the playback again after the server ended it; the
     /// new encode starts at the time given.
     Resumed(String, Duration),
+    /// The playback was planned again under its reader (P6-06): a direct
+    /// play the link was too slow for became a conversion.
+    Replanned(String),
     Started {
         current: Weak<Current>,
         from: Option<Duration>,
@@ -1793,7 +1870,21 @@ impl Playback {
             }
             Event::Resumed(uri, at) => {
                 if self.pipeline.accepts_error(&uri) {
-                    self.resumed(at);
+                    tracing::info!(
+                        at = at.as_secs(),
+                        "the server ended the playback; it was started again"
+                    );
+                    self.read_anew(at);
+                }
+            }
+            Event::Replanned(uri) => {
+                if self.pipeline.accepts_error(&uri) {
+                    let at = self.position.get();
+                    tracing::info!(
+                        at = at.as_secs(),
+                        "the playback was planned again for the link"
+                    );
+                    self.read_anew(at);
                 }
             }
             Event::Started {
@@ -1875,6 +1966,7 @@ fn connect(adapter: &gst_play::PlaySignalAdapter, playback: &Rc<Playback>) {
                 Some((name, _)) if name == crate::source::STOPPED => Event::Stopped(uri),
                 Some((name, _)) if name == crate::source::SIGNED_OUT => Event::SignedOut(uri),
                 Some((name, Some(at))) if name == crate::source::RESUMED => Event::Resumed(uri, at),
+                Some((name, _)) if name == crate::source::REPLANNED => Event::Replanned(uri),
                 _ => Event::Error(uri, error),
             });
         }
@@ -1949,6 +2041,7 @@ mod tests {
             audio: None,
             subtitle: Some(spoolframe_protocol::ConvertedSubtitle { index: 0, action }),
             reasons: Vec::new(),
+            ladder: Vec::new(),
         }
     }
 
@@ -2039,6 +2132,9 @@ mod tests {
         a_restored_queue_waits_paused_where_it_was();
         a_converted_playback_restarts_its_encode_on_a_seek();
         a_converted_playback_the_server_ended_plays_on();
+        a_direct_play_planned_again_plays_on_converted();
+        a_quality_chosen_while_playing_plans_it_again();
+        a_quality_chosen_before_playing_starts_with_it();
         a_late_subtitle_restarts_a_converted_playback_with_it();
         the_intro_is_offered_and_skipped_on_asking();
         an_automatic_intro_skip_happens_once_and_undoes();
@@ -2401,6 +2497,107 @@ mod tests {
         playback.stop();
     }
 
+    /// Choosing a bitrate while a film plays makes it a conversion that
+    /// plays on from there, and Original brings the file back (P6-06).
+    fn a_quality_chosen_while_playing_plans_it_again() {
+        use spoolframe_client_sdk::PlaybackQuality;
+        let dir = TestDir::new_blocking("spoolframe-quality");
+        let path = dir.join("clip.mkv");
+        clip(&path);
+        let client = FakeClient::new(Some(path));
+        let profile = FakeClient::profile("andrey");
+        let playback = start_first_movie(&client, &profile, None);
+        assert!(run_until(Duration::from_secs(20), || playback.position()
+            > Duration::from_secs(1)));
+        let failed = || matches!(&*playback.now().unwrap().stage.borrow(), Stage::Failed);
+        let plays_as = |converted: bool| {
+            run_until(Duration::from_secs(20), || {
+                failed()
+                    || (matches!(playback.plan(), Some(PlaybackPlan::Converted { .. }))
+                        == converted
+                        && playback.is_playing())
+            }) && !failed()
+        };
+        playback.set_quality(PlaybackQuality::Bitrate(4_000_000));
+        assert!(plays_as(true), "the 4 Mbit/s choice did not play converted");
+        playback.set_quality(PlaybackQuality::Original);
+        assert!(plays_as(false), "Original did not play the file again");
+        assert_eq!(client.open_playbacks(&profile), 1);
+        playback.stop();
+    }
+
+    /// A quality picked on the item page is the one the playback starts
+    /// with.
+    fn a_quality_chosen_before_playing_starts_with_it() {
+        let dir = TestDir::new_blocking("spoolframe-quality-start");
+        let path = dir.join("clip.mkv");
+        clip(&path);
+        let client = FakeClient::new(Some(path));
+        let profile = FakeClient::profile("andrey");
+        let session = client.session(&profile).unwrap();
+        let item = first_movie(&session);
+        let playback = Playback::start(Playlist {
+            session,
+            items: vec![item],
+            index: 0,
+            queued: Vec::new(),
+            from: None,
+            selection: None,
+            tracks: None,
+            album: None,
+            quality: spoolframe_client_sdk::PlaybackQuality::Bitrate(2_000_000),
+        })
+        .unwrap();
+        assert!(
+            run_until(Duration::from_secs(20), || playback.plan().is_some()),
+            "the playback never started"
+        );
+        assert!(matches!(
+            playback.plan(),
+            Some(PlaybackPlan::Converted { .. })
+        ));
+        playback.stop();
+    }
+
+    /// A direct play the link is too slow for is planned again as a
+    /// conversion (P6-06): the SDK swaps the plan in and the direct
+    /// reader's read fails as restarted. The player reads the conversion
+    /// from where the viewer was, instead of failing.
+    fn a_direct_play_planned_again_plays_on_converted() {
+        let dir = TestDir::new_blocking("spoolframe-replanned");
+        let path = dir.join("clip.mkv");
+        clip(&path);
+        let client = FakeClient::new(Some(path));
+        let profile = FakeClient::profile("andrey");
+        let playback = start_first_movie(&client, &profile, None);
+        assert!(run_until(Duration::from_secs(20), || playback.position()
+            > Duration::from_secs(1)));
+        assert!(matches!(playback.plan(), Some(PlaybackPlan::Direct { .. })));
+        let managed = playback.now().unwrap().managed.borrow().clone().unwrap();
+        glib::MainContext::default()
+            .block_on(managed.limit(1_000_000))
+            .unwrap();
+        // What the direct reader's next read tells the player.
+        let uri = playback.pipeline.playback_uri().unwrap();
+        playback.on(Event::Replanned(uri));
+        let failed = || matches!(&*playback.now().unwrap().stage.borrow(), Stage::Failed);
+        assert!(
+            run_until(Duration::from_secs(20), || failed()
+                || (matches!(
+                    playback.plan(),
+                    Some(PlaybackPlan::Converted { .. })
+                ) && playback.is_playing()
+                    && playback.position() > Duration::from_millis(500))),
+            "the conversion did not play (plan {:?}, playing {}, at {:?})",
+            playback.plan(),
+            playback.is_playing(),
+            playback.position()
+        );
+        assert!(!failed());
+        assert_eq!(client.open_playbacks(&profile), 1);
+        playback.stop();
+    }
+
     /// The server ends a converted playback mid-read, as one that idled
     /// out: the SDK starts it again, and its reader, whose bytes were the
     /// old encode's, is replaced from the new one's start. Playback goes
@@ -2490,6 +2687,7 @@ mod tests {
             selection: None,
             tracks: None,
             album: None,
+            quality: Default::default(),
         })
         .unwrap();
         assert!(run_until(Duration::from_secs(20), || playback.position()
@@ -2578,6 +2776,7 @@ mod tests {
             selection: None,
             tracks: None,
             album: None,
+            quality: Default::default(),
         })
         .unwrap();
         let (stopped, failed) = (Rc::new(Cell::new(false)), Rc::new(Cell::new(false)));
@@ -2617,6 +2816,7 @@ mod tests {
             selection: None,
             tracks: None,
             album: None,
+            quality: Default::default(),
         })
         .unwrap();
         let (stopped, failed) = (Rc::new(Cell::new(false)), Rc::new(Cell::new(false)));
@@ -2657,6 +2857,7 @@ mod tests {
             selection: None,
             tracks: None,
             album: None,
+            quality: Default::default(),
         })
         .unwrap();
         let failed = Rc::new(RefCell::new(None::<String>));
@@ -2694,6 +2895,7 @@ mod tests {
             selection: None,
             tracks: None,
             album: None,
+            quality: Default::default(),
         })
         .unwrap()
     }

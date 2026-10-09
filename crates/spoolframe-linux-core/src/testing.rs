@@ -29,7 +29,7 @@ pub fn thread_spawn() -> Spawn {
         runtime().spawn(future);
     })
 }
-fn runtime() -> &'static tokio::runtime::Runtime {
+pub fn runtime() -> &'static tokio::runtime::Runtime {
     static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
@@ -72,4 +72,17 @@ pub fn media_file(name: &str, len: usize) -> (TestDir, PathBuf, Vec<u8>) {
     let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
     let (dir, path) = file_with(name, &bytes);
     (dir, path, bytes)
+}
+
+/// The first movie of `session`'s catalog.
+pub async fn first_movie_id(
+    session: &Arc<dyn crate::backend::Session>,
+) -> spoolframe_types::MediaId {
+    let libraries = session.libraries().await.expect("the libraries");
+    let movies = libraries
+        .iter()
+        .find(|l| l.kind == spoolframe_types::LibraryKind::Movies)
+        .expect("a movie library");
+    let (items, _) = session.items(&movies.id, 0, 1).await.expect("its movies");
+    items.first().expect("a movie").id().clone()
 }

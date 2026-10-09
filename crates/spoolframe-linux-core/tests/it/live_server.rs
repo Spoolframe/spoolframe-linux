@@ -403,7 +403,11 @@ fn the_app_backend_works_against_a_live_server() {
     let (plan, chosen) = run(&runtime, session.playback_plan(item.id(), None)).unwrap();
     eprintln!("plan: {plan:?}\nchosen: {chosen:?}");
 
-    let start = run(&runtime, session.start_playback(item.id(), None, None)).unwrap();
+    let start = run(
+        &runtime,
+        session.start_playback(item.id(), None, None, Default::default()),
+    )
+    .unwrap();
     eprintln!("started: {} bytes", start.size);
     assert!(start.size > 0);
     let selection = start.chosen.map(|c| c.selection).unwrap_or_default();

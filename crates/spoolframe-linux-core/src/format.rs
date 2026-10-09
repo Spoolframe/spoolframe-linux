@@ -286,15 +286,37 @@ pub fn seasons(n: u32) -> String {
 }
 
 /// How the device reaches a server, as the chip beside its name says it:
-/// "Direct · LAN", "Direct · internet", "Relay"; `None` while it is not
-/// connected.
+/// "Direct · LAN", "Direct · internet", "Relayed" (P6-06's word); `None`
+/// while it is not connected.
 pub fn path_chip(path: crate::backend::ConnectionPath) -> Option<&'static str> {
     use crate::backend::ConnectionPath;
     match path {
         ConnectionPath::Lan(_) => Some("Direct · LAN"),
         ConnectionPath::Direct(_) => Some("Direct · internet"),
-        ConnectionPath::Relay => Some("Relay"),
+        ConnectionPath::Relay => Some("Relayed"),
         ConnectionPath::Unknown => None,
+    }
+}
+
+/// The path and how fast the link has carried media lately, for the
+/// player (P6-06): "Direct · LAN · 48 Mbit/s", "Relayed · 6.2 Mbit/s";
+/// the path alone before anything was measured, and `None` while not
+/// connected.
+pub fn link_line(path: crate::backend::ConnectionPath, rate: Option<u64>) -> Option<String> {
+    let path = path_chip(path)?;
+    Some(match rate {
+        Some(bits) => format!("{path} · {}", link_rate(bits)),
+        None => path.to_owned(),
+    })
+}
+
+/// A link's rate: to a tenth under 10 Mbit/s, where a tenth matters.
+fn link_rate(bits: u64) -> String {
+    let mbits = bits as f64 / 1_000_000.0;
+    if mbits < 10.0 {
+        format!("{mbits:.1} Mbit/s")
+    } else {
+        format!("{mbits:.0} Mbit/s")
     }
 }
 
@@ -305,7 +327,7 @@ pub fn connection_path(path: crate::backend::ConnectionPath) -> String {
     match path {
         ConnectionPath::Lan(addr) => format!("LAN · {addr}"),
         ConnectionPath::Direct(addr) => format!("direct · {addr}"),
-        ConnectionPath::Relay => "relay".to_owned(),
+        ConnectionPath::Relay => "relayed".to_owned(),
         ConnectionPath::Unknown => "—".to_owned(),
     }
 }
@@ -313,6 +335,27 @@ pub fn connection_path(path: crate::backend::ConnectionPath) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_relayed_link_says_so_and_how_fast_it_is() {
+        use crate::backend::ConnectionPath;
+        assert_eq!(
+            link_line(ConnectionPath::Relay, Some(6_200_000)).as_deref(),
+            Some("Relayed · 6.2 Mbit/s")
+        );
+    }
+
+    #[test]
+    fn a_fast_link_is_rounded_and_an_unmeasured_one_is_the_path_alone() {
+        use crate::backend::ConnectionPath;
+        let lan = ConnectionPath::Lan(([10, 10, 0, 6], 7431).into());
+        assert_eq!(
+            link_line(lan, Some(48_400_000)).as_deref(),
+            Some("Direct · LAN · 48 Mbit/s")
+        );
+        assert_eq!(link_line(lan, None).as_deref(), Some("Direct · LAN"));
+        assert_eq!(link_line(ConnectionPath::Unknown, Some(1)), None);
+    }
 
     #[test]
     fn a_public_path_is_not_called_lan() {

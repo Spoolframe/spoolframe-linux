@@ -57,3 +57,17 @@ fn unconfined_the_check_fails() {
     assert!(said.contains("probe: read"), "{said}");
     assert!(said.contains("exec: started"), "{said}");
 }
+
+/// Confined, GStreamer scans its plugins in the process, as it can start
+/// no helper: it must not try to, and warn on every start that its
+/// plugin loader failed.
+#[test]
+fn confined_gstreamer_does_not_try_its_plugin_scanner() {
+    let output = self_check(true);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        !stderr.contains("External plugin loader failed"),
+        "{stderr}"
+    );
+}

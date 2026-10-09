@@ -117,9 +117,20 @@ pub fn page(playback: &Rc<Playback>, actions: Actions, cards: &Cards) -> adw::Na
     let format_chip = chip("");
     format_chip.set_visible(false);
     chips.append(&format_chip);
-    let path_chip = chip("Direct · LAN");
-    path_chip.add_css_class("success");
+    // How this device reaches the server now, as it changes (P6-06).
+    let path_chip = chip("");
     chips.append(&path_chip);
+    show_path(&path_chip, playback);
+    {
+        let (chip, weak) = (path_chip.downgrade(), Rc::downgrade(playback));
+        gtk::glib::timeout_add_seconds_local(2, move || {
+            let (Some(chip), Some(playback)) = (chip.upgrade(), weak.upgrade()) else {
+                return gtk::glib::ControlFlow::Break;
+            };
+            show_path(&chip, &playback);
+            gtk::glib::ControlFlow::Continue
+        });
+    }
 
     let current = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -315,6 +326,24 @@ fn short_codec(codec: &str) -> String {
     match (codec.rfind('('), codec.rfind(')')) {
         (Some(open), Some(close)) if open < close => codec[open + 1..close].to_owned(),
         _ => codec.to_owned(),
+    }
+}
+
+/// The path chip: "Direct · LAN" and the like, green for a direct path,
+/// hidden while not connected.
+fn show_path(chip: &gtk::Label, playback: &Playback) {
+    use spoolframe_linux_core::backend::ConnectionPath;
+    let path = playback.session().connection_path();
+    let Some(label) = spoolframe_linux_core::format::path_chip(path) else {
+        chip.set_visible(false);
+        return;
+    };
+    chip.set_label(label);
+    chip.set_visible(true);
+    if matches!(path, ConnectionPath::Relay) {
+        chip.remove_css_class("success");
+    } else {
+        chip.add_css_class("success");
     }
 }
 

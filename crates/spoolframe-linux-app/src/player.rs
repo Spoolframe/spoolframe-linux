@@ -171,6 +171,11 @@ pub fn page(playback: &Rc<Playback>, actions: Actions) -> adw::NavigationPage {
             let (Some(view), Some(playback)) = (view.upgrade(), weak_playback.upgrade()) else {
                 return glib::ControlFlow::Break;
             };
+            let session = playback.session();
+            view.controls.show_link(format::link_line(
+                session.connection_path(),
+                session.link_rate(),
+            ));
             if let Some(status) = playback.reader_status() {
                 view.controls.show_buffered(status.ready);
                 if view.diagnostics.panel.is_visible() {
@@ -671,6 +676,8 @@ struct Controls {
     tracks: gtk::MenuButton,
     diagnostics: gtk::ToggleButton,
     fullscreen: gtk::ToggleButton,
+    /// The path to the server and the link's rate (P6-06).
+    link: gtk::Label,
     volume: Volume,
     /// The frame over the seek bar while scrubbing (P3-13).
     preview: Rc<crate::scrub::Preview>,
@@ -741,7 +748,14 @@ impl Controls {
             }
         });
         let volume = Volume::of(playback, 120);
+        let link = gtk::Label::builder()
+            .visible(false)
+            .valign(gtk::Align::Center)
+            .margin_end(6)
+            .css_classes(["caption", "dim-label", "player-link"])
+            .build();
         let extras = gtk::Box::builder().spacing(8).build();
+        extras.append(&link);
         extras.append(&tracks);
         extras.append(&diagnostics);
         extras.append(&fullscreen);
@@ -773,8 +787,18 @@ impl Controls {
             tracks,
             diagnostics,
             fullscreen,
+            link,
             volume,
             preview,
+        }
+    }
+
+    /// "Direct · LAN · 48 Mbit/s", "Relayed · 6.2 Mbit/s"; nothing while
+    /// not connected.
+    fn show_link(&self, line: Option<String>) {
+        self.link.set_visible(line.is_some());
+        if let Some(line) = line {
+            self.link.set_label(&line);
         }
     }
 
@@ -1215,6 +1239,7 @@ impl PlanSummary {
                 audio,
                 subtitle,
                 reasons,
+                ..
             } => {
                 let encodes = matches!(video, Some(ConvertedVideo::Encode { .. }))
                     || matches!(
@@ -1377,6 +1402,7 @@ mod tests {
                 },
             }),
             reasons: vec!["video 0: hevc is not supported".into()],
+            ladder: Vec::new(),
         }
     }
 
@@ -1414,6 +1440,7 @@ mod tests {
             audio: None,
             subtitle: None,
             reasons: Vec::new(),
+            ladder: Vec::new(),
         };
         assert_eq!(PlanSummary::of(&remux).badge, "Remux");
     }

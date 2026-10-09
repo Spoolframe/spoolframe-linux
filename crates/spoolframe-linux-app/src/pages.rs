@@ -21,7 +21,9 @@ const POSTER_OVER_BACKDROP: i32 = 150;
 
 /// Starts playback of the page's item, from a position or the start, with
 /// the tracks picked on the page, or with the server's choice (`None`).
-pub type Play = Rc<dyn Fn(Option<Duration>, Option<Selection>)>;
+/// Plays from a position, with the tracks and the quality (P6-06) picked.
+pub type Play =
+    Rc<dyn Fn(Option<Duration>, Option<Selection>, spoolframe_client_sdk::PlaybackQuality)>;
 
 /// Plays a list of tracks from one of them, as the context; shuffled
 /// (the queue's own shuffle, so the toggle shows it) when the flag says.
@@ -268,6 +270,9 @@ struct TrackPickers {
     column: gtk::Box,
     audio: Option<gtk::DropDown>,
     subtitles: Option<gtk::DropDown>,
+    /// Auto, a bitrate or Original (P6-06): for this playback, so not
+    /// remembered with the tracks.
+    quality: gtk::DropDown,
     /// What the server would play with no tracks asked for.
     chosen: Option<Selection>,
     remember: gtk::CheckButton,
@@ -308,6 +313,11 @@ impl TrackPickers {
             };
             picker(&row, "Subtitles", &names, selected)
         });
+        let qualities: Vec<String> = crate::quality::choices()
+            .into_iter()
+            .map(|q| crate::quality::label(q, None))
+            .collect();
+        let quality = picker(&row, "Quality", &qualities, 0);
 
         // A movie says what its file is, beside the pickers, as designed.
         if !series && let Some(file) = format::file(tracks.container, tracks.video.as_ref()) {
@@ -362,9 +372,18 @@ impl TrackPickers {
             column,
             audio,
             subtitles,
+            quality,
             chosen: start,
             remember,
         }
+    }
+
+    /// The quality picked for this playback.
+    fn quality(&self) -> spoolframe_client_sdk::PlaybackQuality {
+        crate::quality::choices()
+            .get(self.quality.selected() as usize)
+            .copied()
+            .unwrap_or_default()
     }
 
     /// What the pickers say now. Positions in the item's track lists; no
@@ -528,12 +547,12 @@ fn play_button(
     );
     button.connect_clicked(move |_| {
         let Some(pickers) = &pickers else {
-            return play(from, None);
+            return play(from, None, Default::default());
         };
         if pickers.remember.is_active() {
             remember(pickers.selection());
         }
-        play(from, pickers.request());
+        play(from, pickers.request(), pickers.quality());
     });
     button
 }

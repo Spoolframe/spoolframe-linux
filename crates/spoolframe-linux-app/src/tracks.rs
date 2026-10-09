@@ -83,11 +83,19 @@ pub const SEARCH_FROM: usize = 3;
 /// external subtitle); GstPlay has no call that says whether they are on.
 /// It holds GstPlay weakly: a menu outliving its playback must not hold
 /// the last reference (see [`crate::pipeline`]).
+/// The quality section (P6-06): what is chosen now, with the height the
+/// server encodes to, and how to choose.
+pub struct QualityMenu {
+    pub current: Rc<dyn Fn() -> (spoolframe_client_sdk::PlaybackQuality, Option<u32>)>,
+    pub choose: Rc<dyn Fn(spoolframe_client_sdk::PlaybackQuality)>,
+}
+
 pub fn menu(
     play: &gst_play::Play,
     info: &gst_play::PlayMediaInfo,
     subtitles_on: &Rc<Cell<bool>>,
     failed: Rc<dyn Fn(&str)>,
+    quality: Option<QualityMenu>,
 ) -> gtk::Popover {
     let column = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -211,6 +219,28 @@ pub fn menu(
         });
     }
 
+    // Below Subtitles, as sf-design placed it: Auto, the bitrates, and
+    // Original. Choosing plans the playback again.
+    let quality = quality.map(|menu| {
+        let choices = crate::quality::choices();
+        let names: Vec<String> = choices
+            .iter()
+            .map(|q| crate::quality::label(*q, None))
+            .collect();
+        let picks = PickList::new(&names);
+        column.append(&heading("Quality"));
+        column.append(&picks.list);
+        let (marks, choose) = (picks.clone(), menu.choose.clone());
+        picks.list.connect_row_activated(move |_, row| {
+            let index = row.index() as usize;
+            if let Some(quality) = choices.get(index) {
+                marks.mark(Some(index));
+                choose(*quality);
+            }
+        });
+        (picks, menu.current)
+    });
+
     let popover = gtk::Popover::builder().child(&column).build();
     // What plays can change without the menu (the item page's choice, an
     // external subtitle arriving), so the marks are read on each opening.
@@ -223,6 +253,14 @@ pub fn menu(
             true => current_subtitle(&play, &info).map(|p| p + 1),
         };
         subtitles.mark(subtitle);
+        if let Some((picks, current)) = &quality {
+            let (chosen, height) = current();
+            picks.rename(
+                0,
+                &crate::quality::label(spoolframe_client_sdk::PlaybackQuality::Auto, height),
+            );
+            picks.mark(Some(crate::quality::index(chosen)));
+        }
     });
     popover
 }
@@ -258,6 +296,7 @@ pub fn matches(label: &str, query: &str) -> bool {
 struct PickList {
     list: gtk::ListBox,
     checks: Rc<Vec<gtk::Image>>,
+    names: Rc<Vec<gtk::Label>>,
 }
 
 impl PickList {
@@ -268,6 +307,7 @@ impl PickList {
             .css_classes(["pick-list"])
             .build();
         let mut checks = Vec::new();
+        let mut labels = Vec::new();
         for name in names {
             let check = gtk::Image::builder()
                 .icon_name(crate::icons::CHECK)
@@ -281,14 +321,14 @@ impl PickList {
                 .margin_end(10)
                 .build();
             // As designed: the name, and the check at the right.
-            row.append(
-                &gtk::Label::builder()
-                    .label(name)
-                    .xalign(0.0)
-                    .hexpand(true)
-                    .ellipsize(gtk::pango::EllipsizeMode::End)
-                    .build(),
-            );
+            let label = gtk::Label::builder()
+                .label(name)
+                .xalign(0.0)
+                .hexpand(true)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .build();
+            row.append(&label);
+            labels.push(label);
             check.add_css_class("accent");
             row.append(&check);
             list.append(&row);
@@ -297,6 +337,14 @@ impl PickList {
         Self {
             list,
             checks: Rc::new(checks),
+            names: Rc::new(labels),
+        }
+    }
+
+    /// Names row `index` anew.
+    fn rename(&self, index: usize, name: &str) {
+        if let Some(label) = self.names.get(index) {
+            label.set_label(name);
         }
     }
 

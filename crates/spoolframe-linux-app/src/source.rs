@@ -34,6 +34,11 @@ pub const SIGNED_OUT: &str = "spoolframe-signed-out";
 /// new one's start. The details carry where it starts, as [`RESUMED_AT`].
 pub const RESUMED: &str = "spoolframe-playback-resumed";
 
+/// The same, when the playback was planned again under the reader: a
+/// direct play the link was too slow for became a conversion (P6-06).
+/// The app builds a new reader for the new plan, where the viewer is.
+pub const REPLANNED: &str = "spoolframe-playback-replanned";
+
 /// Where the resumed playback starts, in milliseconds (a `u64`).
 pub const RESUMED_AT: &str = "at-ms";
 
@@ -304,6 +309,17 @@ mod imp {
                     );
                     return Err(gst::FlowError::Error);
                 }
+                Err(ReadError::Backend(spoolframe_client_sdk::SdkError::PlaybackRestarted {
+                    ..
+                })) => {
+                    gst::element_imp_error!(
+                        self,
+                        gst::ResourceError::Read,
+                        ["the playback was planned again"],
+                        details: gst::Structure::new_empty(REPLANNED)
+                    );
+                    return Err(gst::FlowError::Error);
+                }
                 Err(ReadError::Backend(e)) => {
                     gst::element_imp_error!(self, gst::ResourceError::Read, ["{e}"]);
                     return Err(gst::FlowError::Error);
@@ -402,7 +418,7 @@ mod tests {
         let profile = FakeClient::profile("andrey");
         let session = client.session(&profile).unwrap();
         let item = MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap();
-        let start = ready(session.start_playback(&item, None, None)).unwrap();
+        let start = ready(session.start_playback(&item, None, None, Default::default())).unwrap();
         Published::new(MediaReader::new(
             spoolframe_linux_core::testing::managed(session, item, Selection::default(), start),
             thread_spawn(),
@@ -498,7 +514,7 @@ mod tests {
         let profile = FakeClient::profile("andrey");
         let session = client.session(&profile).unwrap();
         let item = MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap();
-        let start = ready(session.start_playback(&item, None, None)).unwrap();
+        let start = ready(session.start_playback(&item, None, None, Default::default())).unwrap();
         let published = Published::new(ProgressiveReader::new(
             spoolframe_linux_core::testing::managed(session, item, Selection::default(), start),
             thread_spawn(),
@@ -573,7 +589,7 @@ mod tests {
         let (items, _) = runtime.block_on(session.items(&movies.id, 0, 1)).unwrap();
         let item = items.into_iter().next().expect("a movie");
         let start = runtime
-            .block_on(session.start_playback(item.id(), None, None))
+            .block_on(session.start_playback(item.id(), None, None, Default::default()))
             .unwrap();
         eprintln!(
             "playing {} ({} bytes, {:?})",

@@ -302,6 +302,18 @@ fn security_keys() -> Vec<PathBuf> {
 
 /// Confines the app, as far as this kernel allows, unless `OPT_OUT` says
 /// not to, and logs how. Call first, before anything starts a thread.
+/// GStreamer scans its plugins in a helper program it starts
+/// (gst-plugin-scanner), which the seccomp filter refuses: it then scans
+/// them in the process anyway, but warns on every start that its plugin
+/// loader failed. Told not to fork, it scans in the process from the
+/// start.
+fn scan_plugins_in_process() {
+    // SAFETY: called from `confine`, before GTK, GStreamer or the SDK
+    // start a thread (it warns above when others run), so nothing reads
+    // the environment while it changes.
+    unsafe { std::env::set_var("GST_REGISTRY_FORK", "no") };
+}
+
 pub fn confine() -> Confinement {
     let off = Confinement {
         landlock: None,
@@ -349,6 +361,9 @@ pub fn confine() -> Confinement {
         landlock: landlock.as_ref().ok().copied(),
         seccomp: seccomp.is_ok(),
     };
+    if confinement.seccomp {
+        scan_plugins_in_process();
+    }
     if confinement.landlock.is_some() {
         let _ = KEYS_AT_START.set(keys.len());
     }
