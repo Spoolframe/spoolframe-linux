@@ -106,6 +106,9 @@ tempfile = "3"
 landlock = "0.4"
 seccompiler = "0.5"
 libc = "0.2"
+# The SDK's TLS provider (iroh's aws-lc-rs), which `--self-check` runs
+# confined: its random numbers and a key exchange.
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
 
 # Secrets (the device key, session tokens) in the desktop's Secret
 # Service, never a plain file.

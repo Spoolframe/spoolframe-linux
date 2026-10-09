@@ -188,10 +188,15 @@ const SUBTITLE_RETRY: Duration = if cfg!(test) {
     Duration::from_secs(5)
 };
 
-/// How many progress ticks between touches of a converted playback's
-/// handle: the server ends one not read for 5 minutes, and a paused film,
-/// or a slow one with a full buffer, reads nothing for longer.
-const KEEP_ALIVE_TICKS: u32 = 6;
+/// How often a playback the server would otherwise see unused is used:
+/// it ends one with no reads or progress for 5 minutes, and a paused
+/// film, or a slow converted one with a full buffer, reads nothing for
+/// longer. Less in tests, which wait past a short idle limit.
+const KEEP_ALIVE: Duration = if cfg!(test) {
+    Duration::from_millis(500)
+} else {
+    Duration::from_secs(60)
+};
 
 /// How often progress goes to the server while playing (P1-14 throttles
 /// on its side too).
@@ -454,7 +459,6 @@ impl Playback {
         });
 
         let weak = Rc::downgrade(&playback);
-        let ticks = Cell::new(0u32);
         glib::timeout_add_seconds_local(PROGRESS_EVERY, move || {
             let Some(playback) = weak.upgrade() else {
                 return glib::ControlFlow::Break;
@@ -462,10 +466,14 @@ impl Playback {
             if playback.playing.get() {
                 playback.report_progress();
             }
-            ticks.set(ticks.get() + 1);
-            if ticks.get().is_multiple_of(KEEP_ALIVE_TICKS) {
-                playback.keep_conversion_alive();
-            }
+            glib::ControlFlow::Continue
+        });
+        let weak = Rc::downgrade(&playback);
+        glib::timeout_add_local(KEEP_ALIVE, move || {
+            let Some(playback) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            playback.keep_alive();
             glib::ControlFlow::Continue
         });
         playback.begin(Some(start));
@@ -832,6 +840,38 @@ impl Playback {
             Ok(Err(e)) => return self.failed(&e.to_string()),
             Err(e) => return self.failed(&format!("seeking failed: {e}")),
         };
+        self.reload(&current, next, to);
+    }
+
+    /// The SDK started the playback again after the server ended it (it
+    /// idled out): a converted playback's reader held the old encode's
+    /// bytes, so a new reader plays the new encode from `at`, as after a
+    /// seek's restart. A direct one never gets here: its reads go on.
+    fn resumed(self: &Rc<Self>, at: Duration) {
+        let Some(current) = self.now() else { return };
+        let Some(managed) = current.managed.borrow().clone() else {
+            return;
+        };
+        tracing::info!(
+            at = at.as_secs(),
+            "the server ended the playback; it was started again"
+        );
+        if let Stage::Restarting { .. } = &*current.stage.borrow() {
+            // A restart under way replaces the reader itself.
+            return;
+        }
+        self.reload(&current, managed.snapshot(), at);
+        self.moved_to(at);
+    }
+
+    /// Plays `next`, the current item's new encode, from `to`, with a new
+    /// reader, paused or playing as the user left it.
+    fn reload(
+        self: &Rc<Self>,
+        current: &Rc<Current>,
+        next: spoolframe_client_sdk::Playback,
+        to: Duration,
+    ) {
         current.plan.replace(Some(next.plan.clone()));
         let managed = current.managed.borrow().clone().expect("started playback");
         let (mode, resume, reader) =
@@ -859,18 +899,35 @@ impl Playback {
         }
     }
 
-    /// Reads a byte of the converted output, which the server counts as
-    /// use: its handle stays alive while the reader has no reason to read.
-    fn keep_conversion_alive(&self) {
-        let Some(current) = self.now().filter(|c| c.is_converted()) else {
+    /// Uses the current playback, so the server does not end it as idle
+    /// (see [`KEEP_ALIVE`]). Paused, a film or episode reports where it is
+    /// paused. A paused song, which has no position to report (P1-14), and
+    /// a converted playback, which reads nothing while its buffer is full,
+    /// read a byte.
+    fn keep_alive(&self) {
+        let Some(current) = self.now() else { return };
+        let paused = !self.playing.get() && !self.stopped.get();
+        if paused && self.report_progress().is_some() {
             return;
-        };
+        }
+        let converted = current.is_converted();
+        if !paused && !converted {
+            return;
+        }
         let Some(managed) = current.managed.borrow().clone() else {
             return;
         };
         relm4::spawn(async move {
-            if let Err(e) = managed.read_chunk(&managed.snapshot(), 0, 1).await {
-                tracing::debug!(error = %e, "keeping the conversion alive");
+            let read = if converted {
+                managed
+                    .read_chunk(&managed.snapshot(), 0, 1)
+                    .await
+                    .map(drop)
+            } else {
+                managed.read(0, 1).await.map(drop)
+            };
+            if let Err(e) = read {
+                tracing::debug!(error = %e, "keeping the playback alive");
             }
         });
     }
@@ -1680,6 +1737,9 @@ enum Event {
     Stopped(String),
     /// A read was refused because the session ended.
     SignedOut(String),
+    /// The SDK started the playback again after the server ended it; the
+    /// new encode starts at the time given.
+    Resumed(String, Duration),
     Started {
         current: Weak<Current>,
         from: Option<Duration>,
@@ -1729,6 +1789,11 @@ impl Playback {
                 if self.pipeline.accepts_error(&uri) {
                     tracing::info!("the session ended under the playback");
                     self.emit(&Change::SignedOut);
+                }
+            }
+            Event::Resumed(uri, at) => {
+                if self.pipeline.accepts_error(&uri) {
+                    self.resumed(at);
                 }
             }
             Event::Started {
@@ -1792,7 +1857,10 @@ fn connect(adapter: &gst_play::PlaySignalAdapter, playback: &Rc<Playback>) {
         .message_bus()
         .set_sync_handler(move |_, message| {
             if let Ok(gst_play::PlayMessage::Error(error)) = gst_play::PlayMessage::parse(message) {
-                let marked = error.details().map(|d| d.name().to_string());
+                let marked = error.details().map(|d| {
+                    let at = d.get::<u64>(crate::source::RESUMED_AT).ok();
+                    (d.name().to_string(), at.map(Duration::from_millis))
+                });
                 let _ = send.send((error.uri().to_string(), error.error().to_string(), marked));
             }
             gst::BusSyncReply::Pass
@@ -1803,9 +1871,10 @@ fn connect(adapter: &gst_play::PlaySignalAdapter, playback: &Rc<Playback>) {
             let Some(playback) = weak.upgrade() else {
                 break;
             };
-            playback.on(match marked.as_deref() {
-                Some(crate::source::STOPPED) => Event::Stopped(uri),
-                Some(crate::source::SIGNED_OUT) => Event::SignedOut(uri),
+            playback.on(match marked {
+                Some((name, _)) if name == crate::source::STOPPED => Event::Stopped(uri),
+                Some((name, _)) if name == crate::source::SIGNED_OUT => Event::SignedOut(uri),
+                Some((name, Some(at))) if name == crate::source::RESUMED => Event::Resumed(uri, at),
                 _ => Event::Error(uri, error),
             });
         }
@@ -1964,9 +2033,12 @@ mod tests {
         a_playback_the_admin_stopped_says_so();
         a_session_ended_under_a_playback_says_so();
         pausing_saves_where_playback_got_to();
+        a_paused_film_keeps_its_playback_alive();
+        a_paused_song_keeps_its_playback_alive();
         resuming_plays_from_where_it_stopped();
         a_restored_queue_waits_paused_where_it_was();
         a_converted_playback_restarts_its_encode_on_a_seek();
+        a_converted_playback_the_server_ended_plays_on();
         a_late_subtitle_restarts_a_converted_playback_with_it();
         the_intro_is_offered_and_skipped_on_asking();
         an_automatic_intro_skip_happens_once_and_undoes();
@@ -2329,6 +2401,115 @@ mod tests {
         playback.stop();
     }
 
+    /// The server ends a converted playback mid-read, as one that idled
+    /// out: the SDK starts it again, and its reader, whose bytes were the
+    /// old encode's, is replaced from the new one's start. Playback goes
+    /// on instead of failing.
+    fn a_converted_playback_the_server_ended_plays_on() {
+        let dir = TestDir::new_blocking("spoolframe-resumed");
+        let path = dir.join("clip.mkv");
+        clip(&path);
+        let client = FakeClient::new(Some(path))
+            .converting(16 * 1024)
+            .expiring_at(32 * 1024);
+        let profile = FakeClient::profile("andrey");
+        let playback = start_first_movie(&client, &profile, None);
+        let failed = Rc::new(RefCell::new(None));
+        {
+            let failed = failed.clone();
+            playback.subscribe(move |change| {
+                if let Change::Failed(error) = change {
+                    failed.replace(Some(error.to_string()));
+                }
+                true
+            });
+        }
+        assert!(
+            run_until(Duration::from_secs(20), || playback.position()
+                > Duration::from_secs(1)
+                || failed.borrow().is_some()),
+            "the resumed playback never got past a second"
+        );
+        assert_eq!(failed.borrow().clone(), None);
+        assert_eq!(client.started_playbacks(&profile), 2);
+        assert_eq!(client.open_playbacks(&profile), 1);
+        playback.stop();
+    }
+
+    /// Paused past the server's idle limit, a film keeps its playback: the
+    /// paused position goes to the server every [`KEEP_ALIVE`], which
+    /// counts as use. With no reads or reports, the server ends a paused
+    /// playback (5 minutes then).
+    fn a_paused_film_keeps_its_playback_alive() {
+        let dir = TestDir::new_blocking("spoolframe-paused-film");
+        let path = dir.join("clip.mkv");
+        clip(&path);
+        let client = FakeClient::new(Some(path)).with_handle_idle(PAUSED_PAST_IDLE / 2);
+        let profile = FakeClient::profile("andrey");
+        let playback = start_first_movie(&client, &profile, None);
+        assert!(run_until(Duration::from_secs(20), || playback.position()
+            > Duration::from_secs(1)));
+        playback.toggle();
+        assert!(run_until(Duration::from_secs(3), || !playback.is_playing()));
+        let paused_at = playback.position();
+        run_until(PAUSED_PAST_IDLE, || false);
+        assert_eq!(
+            client.live_playbacks(&profile),
+            1,
+            "the paused playback idled out"
+        );
+        let reports = client.progress_reports(&profile);
+        assert!(
+            reports.len() >= 3,
+            "paused, the film reported only {reports:?}"
+        );
+        let (_, last) = reports.last().unwrap().clone();
+        assert!(
+            last.abs_diff(paused_at) < Duration::from_millis(500),
+            "reported {last:?}, paused at {paused_at:?}"
+        );
+        playback.stop();
+    }
+
+    /// A paused song keeps its playback too, though music reports no
+    /// position (P1-14): a read of one byte is the use.
+    fn a_paused_song_keeps_its_playback_alive() {
+        let dir = TestDir::new_blocking("spoolframe-paused-song");
+        let path = dir.join("clip.mkv");
+        clip(&path);
+        let client = FakeClient::new(Some(path)).with_handle_idle(PAUSED_PAST_IDLE / 2);
+        let profile = FakeClient::profile("andrey");
+        let session = client.session(&profile).unwrap();
+        let track = first_track(&session);
+        let playback = Playback::start(Playlist {
+            session,
+            items: vec![track],
+            index: 0,
+            queued: Vec::new(),
+            from: None,
+            selection: None,
+            tracks: None,
+            album: None,
+        })
+        .unwrap();
+        assert!(run_until(Duration::from_secs(20), || playback.position()
+            > Duration::from_secs(1)));
+        playback.toggle();
+        assert!(run_until(Duration::from_secs(3), || !playback.is_playing()));
+        run_until(PAUSED_PAST_IDLE, || false);
+        assert_eq!(
+            client.live_playbacks(&profile),
+            1,
+            "the paused playback idled out"
+        );
+        assert!(client.progress_reports(&profile).is_empty());
+        playback.stop();
+    }
+
+    /// How long the pause tests wait paused: twice their server's idle
+    /// limit, and several [`KEEP_ALIVE`]s.
+    const PAUSED_PAST_IDLE: Duration = Duration::from_secs(4);
+
     /// A movie of the fake catalog played from `clip`: it starts, plays,
     /// moves on, tells a view that attaches late where it is, and stops.
     fn a_playback_plays_and_tells_a_late_view_where_it_is() {
@@ -2515,6 +2696,22 @@ mod tests {
             album: None,
         })
         .unwrap()
+    }
+
+    /// The first track of the fake catalog's first artist's first album.
+    fn first_track(session: &Arc<dyn Session>) -> Item {
+        let context = glib::MainContext::default();
+        let libraries = context.block_on(session.libraries()).unwrap();
+        let music = libraries
+            .iter()
+            .find(|l| l.kind == spoolframe_types::LibraryKind::Music)
+            .unwrap();
+        let (artists, _) = context.block_on(session.items(&music.id, 0, 1)).unwrap();
+        let (_, albums) = context.block_on(session.item(artists[0].id())).unwrap();
+        let (_, tracks) = context.block_on(session.item(albums[0].id())).unwrap();
+        let track = tracks.into_iter().next().unwrap();
+        assert!(matches!(track, Item::Track(_)), "{track:?}");
+        track
     }
 
     /// The fake catalog's first movie.

@@ -30,11 +30,11 @@ use tokio::sync::watch;
 
 use crate::backend::{
     ArtworkSize, BackendError, BoxFuture, ChosenTracks, Chunk, Client, ConnectionPath,
-    ConnectionState, DeviceInfo, DeviceSignIn, DeviceSignInRequest, HomeScreen, MAX_READ, Marker,
-    Person, PersonId, PersonRole, PinProof, PinState, Platform, PlaybackHandle, PlaybackPlan,
-    PlaybackStart, PlexLink, Previews, Profile, ProfileSignIn, SearchCounts, SearchGroup,
-    SearchKind, SearchRequest, SearchResults, SearchScope, Selection, Server, ServerKey, Session,
-    TopResult, TrustedProfile,
+    ConnectionState, DeviceInfo, DeviceSignIn, DeviceSignInRequest, HomeScreen, Invite, MAX_READ,
+    Marker, Person, PersonId, PersonRole, PinProof, PinState, Platform, PlaybackHandle,
+    PlaybackPlan, PlaybackStart, PlexLink, Previews, Profile, ProfileSignIn, SearchCounts,
+    SearchGroup, SearchKind, SearchRequest, SearchResults, SearchScope, Selection, Server,
+    ServerKey, Session, TopResult, TrustedProfile,
 };
 use crate::backend::{
     FinishPasskeyRegistration, FinishPasskeySignIn, PasskeyCreation, PasskeyInfo, PasskeyRequest,
@@ -464,6 +464,8 @@ pub struct FakeSession {
     reports: Mutex<Vec<(MediaId, Duration)>>,
     playbacks: Mutex<HashMap<PlaybackHandle, Playback>>,
     next_handle: AtomicU64,
+    /// Set once [`Serving::expire_at`] has ended a playback.
+    expired_once: std::sync::atomic::AtomicBool,
     preferences: Mutex<TrackPreferences>,
     /// Tracks remembered per movie, or per show for its episodes.
     overrides: Mutex<HashMap<MediaId, TrackOverride>>,
@@ -572,6 +574,11 @@ struct Serving {
     /// Sessions end under their playbacks (a password changed elsewhere):
     /// reads ask to sign in again.
     signed_out: bool,
+    /// How long a playback handle may go unused before it expires.
+    handle_idle: Duration,
+    /// The server ends the first playback once a chunk read reaches this
+    /// offset, as when it idled out: the read answers PlaybackExpired.
+    expire_at: Option<u64>,
 }
 
 /// How the fake answers for an item's preview frames.
@@ -617,6 +624,7 @@ impl FakeSession {
             reports: Mutex::new(Vec::new()),
             playbacks: Mutex::new(HashMap::new()),
             next_handle: AtomicU64::new(1),
+            expired_once: std::sync::atomic::AtomicBool::new(false),
             preferences: Mutex::new(TrackPreferences::default()),
             overrides: Mutex::new(HashMap::new()),
             username: username.to_owned(),
@@ -970,7 +978,7 @@ impl FakeSession {
         let playback = playbacks
             .get_mut(handle)
             .ok_or(BackendError::PlaybackExpired)?;
-        if playback.last_used.elapsed() > HANDLE_IDLE {
+        if playback.last_used.elapsed() > self.serving.handle_idle {
             playbacks.remove(handle);
             return Err(BackendError::PlaybackExpired);
         }
@@ -1203,6 +1211,15 @@ impl Session for FakeSession {
                 return Err(BackendError::Unreachable("Home Media".into()));
             }
             let (_, size) = self.media_size()?;
+            if self.serving.expire_at.is_some_and(|at| offset >= at)
+                && !self.expired_once.swap(true, Ordering::SeqCst)
+            {
+                self.playbacks
+                    .lock()
+                    .expect("fake state is never poisoned")
+                    .remove(handle);
+                return Err(BackendError::PlaybackExpired);
+            }
             let grow = self.serving.converting.unwrap_or(size);
             // Each read lets the "encode" write a little more.
             let (current, written) = self.with_playback(handle, |p| {
@@ -1970,6 +1987,9 @@ pub struct FakeClient {
     connections: Mutex<HashMap<ServerKey, watch::Sender<ConnectionState>>>,
     /// The fake has no LAN: its list changes only when an address is added.
     servers_changed: watch::Sender<()>,
+    /// Accounts made on Cabin from an invite (P6-01), and whether
+    /// [`INVITE_CODE`]'s one use is spent.
+    joined: Mutex<(Vec<String>, bool)>,
     gone: Arc<std::sync::atomic::AtomicBool>,
     /// The profile that used the connection last (P2-08).
     active: Arc<Mutex<std::collections::HashSet<String>>>,
@@ -2018,6 +2038,19 @@ fn home_media() -> ServerKey {
     ServerKey("k5d2r8w1tqz7m3c0vnh4q7fa".into())
 }
 
+/// The server the fake's invites are for (P6-01): reachable, not on this
+/// network, not saved, and with a key an invite link can name.
+fn cabin() -> ServerKey {
+    ServerKey("c4b1".repeat(16))
+}
+
+/// An invite code of the fake's that makes one account, then is used up.
+pub const INVITE_CODE: &str = "QW7K2MFPXR4T";
+/// An invite code of the fake's that has expired.
+pub const EXPIRED_INVITE_CODE: &str = "EXPDEXPDEXPD";
+/// An invite code of the fake's whose every use is spent.
+pub const USED_INVITE_CODE: &str = "SPNTSPNTSPNT";
+
 fn basement() -> ServerKey {
     ServerKey("9fm0x2kq7wv4hj3n8spe1ac21".into())
 }
@@ -2059,6 +2092,8 @@ impl FakeClient {
                 previews: PreviewsAnswer::None,
                 stopped: false,
                 signed_out: false,
+                handle_idle: HANDLE_IDLE,
+                expire_at: None,
             },
             gone: Arc::default(),
             active: Arc::default(),
@@ -2103,6 +2138,7 @@ impl FakeClient {
                 (home_media(), "andrey", "Andrey"),
                 (home_media(), "alice", "Alice"),
                 (home_media(), "steve", "Steve"),
+                (cabin(), "alice", "Alice"),
             ],
             signed_in: Mutex::new(vec![profile("andrey", "Andrey"), profile("alice", "Alice")]),
             sessions: Mutex::new(HashMap::new()),
@@ -2138,6 +2174,7 @@ impl FakeClient {
             connections: Mutex::new(HashMap::new()),
             sign_outs: watch::Sender::new(0),
             servers_changed: watch::Sender::new(()),
+            joined: Mutex::default(),
         }
     }
 
@@ -2177,6 +2214,86 @@ impl FakeClient {
             .lock()
             .expect("fake state is never poisoned")
             .stale = true;
+    }
+
+    /// The device stops dialling `server` for `why`, as the SDK does on
+    /// an error that dialling again does not fix (an app too old for the
+    /// server, a server that is not the one saved).
+    pub fn stop_dialling(&self, server: &ServerKey, why: BackendError) {
+        self.connections
+            .lock()
+            .expect("fake state is never poisoned")
+            .entry(server.clone())
+            .or_insert_with(|| watch::Sender::new(ConnectionState::Closed))
+            .send_replace(ConnectionState::Stopped(why));
+    }
+
+    /// An invite link to Cabin (P6-01) with `code`, or one that only finds
+    /// the server; any code but the fake's own is wrong.
+    pub fn invite_link(code: Option<&str>) -> String {
+        let in_six_days = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+            + 6 * 24 * 60 * 60;
+        spoolframe_protocol::invite::Invite {
+            server: cabin().0,
+            name: Some("Cabin".into()),
+            addrs: vec!["203.0.113.24:41641".parse().expect("an address")],
+            relays: vec!["https://relay.cabin.example".into()],
+            code: code.map(str::to_owned),
+            expires_at: Some(in_six_days),
+            role: Some(spoolframe_types::Role::Consumer),
+        }
+        .link()
+    }
+
+    /// Cabin, as an invite finds it: saved if it was.
+    fn invited(
+        &self,
+        link: &str,
+    ) -> Result<(spoolframe_protocol::invite::Invite, Server), BackendError> {
+        let invite =
+            spoolframe_protocol::invite::parse_link(link).ok_or(BackendError::NotAnInvite)?;
+        if invite.server != cabin().0 {
+            return Err(BackendError::Unreachable(
+                invite.name.unwrap_or_else(|| "the server".into()),
+            ));
+        }
+        let saved = self
+            .servers
+            .lock()
+            .expect("fake state is never poisoned")
+            .iter()
+            .find(|s| s.key == cabin())
+            .cloned();
+        let server = saved.unwrap_or_else(|| Server {
+            key: cabin(),
+            name: "Cabin".into(),
+            addresses: invite.addrs.iter().map(ToString::to_string).collect(),
+            pinned: false,
+            fingerprint: fingerprint(&cabin()),
+            verified: false,
+            on_network: false,
+            verified_at: None,
+            last_connected_at: None,
+            server_id: Some("k7f3q2m4x6pq5z2a".into()),
+            advertised: Vec::new(),
+            relays: invite.relays.clone(),
+            advertised_at: None,
+        });
+        Ok((invite, server))
+    }
+
+    /// Cabin saved, verified: the invite came from its admin.
+    fn save_invited(&self, mut server: Server) -> Server {
+        server.pinned = true;
+        server.verified = true;
+        let mut servers = self.servers.lock().expect("fake state is never poisoned");
+        servers.retain(|s| s.key != server.key);
+        servers.push(server.clone());
+        drop(servers);
+        self.servers_changed.send_replace(());
+        server
     }
 
     /// The server stops answering, as when it is shut down mid-play: every
@@ -2230,6 +2347,30 @@ impl FakeClient {
     pub fn with_playbacks_stopped(mut self) -> Self {
         self.serving.stopped = true;
         self
+    }
+
+    /// A playback handle unused for `idle` expires, instead of after the
+    /// server's 5 minutes, so tests can wait past it.
+    pub fn with_handle_idle(mut self, idle: Duration) -> Self {
+        self.serving.handle_idle = idle;
+        self
+    }
+
+    /// The server ends the first playback once a chunk read reaches
+    /// `offset`, as one that idled out, so tests can see it resumed.
+    pub fn expiring_at(mut self, offset: u64) -> Self {
+        self.serving.expire_at = Some(offset);
+        self
+    }
+
+    /// How many playbacks `profile`'s session has started: one more for
+    /// each the client started again.
+    pub fn started_playbacks(&self, profile: &Profile) -> u64 {
+        self.sessions
+            .lock()
+            .expect("fake state is never poisoned")
+            .get(&(profile.server.clone(), profile.username.clone()))
+            .map_or(0, |s| s.next_handle.load(Ordering::Relaxed) - 1)
     }
 
     /// Reads answer at most `limit` bytes, like a server that sends less
@@ -2304,6 +2445,24 @@ impl FakeClient {
             })
     }
 
+    /// How many of `profile`'s playbacks were used within the idle limit:
+    /// the ones a read or report would still find.
+    pub fn live_playbacks(&self, profile: &Profile) -> usize {
+        let idle = self.serving.handle_idle;
+        self.sessions
+            .lock()
+            .expect("fake state is never poisoned")
+            .get(&(profile.server.clone(), profile.username.clone()))
+            .map_or(0, |s| {
+                s.playbacks
+                    .lock()
+                    .expect("fake state is never poisoned")
+                    .values()
+                    .filter(|p| p.last_used.elapsed() <= idle)
+                    .count()
+            })
+    }
+
     /// Basement shows on the network but does not answer: the fixture for
     /// an unreachable server. So does any server added by hand, which the
     /// fake has no accounts for.
@@ -2313,7 +2472,7 @@ impl FakeClient {
             .iter()
             .find(|s| &s.key == key)
             .ok_or_else(|| BackendError::NotFound(key.short()))?;
-        if server.key != home_media() {
+        if server.key != home_media() && server.key != cabin() {
             return Err(BackendError::Unreachable(server.name.clone()));
         }
         Ok(server.clone())
@@ -2512,6 +2671,90 @@ impl Client for FakeClient {
                 self.servers_changed.send_replace(());
             }
             Ok(entry.clone())
+        })
+    }
+
+    fn read_invite<'a>(&'a self, link: &'a str) -> BoxFuture<'a, Result<Invite, BackendError>> {
+        Box::pin(async move {
+            let invite =
+                spoolframe_protocol::invite::parse_link(link).ok_or(BackendError::NotAnInvite)?;
+            let key = ServerKey(invite.server.clone());
+            let saved = self
+                .servers
+                .lock()
+                .expect("fake state is never poisoned")
+                .iter()
+                .any(|s| s.key == key && s.pinned);
+            Ok(Invite {
+                fingerprint: fingerprint(&key),
+                key,
+                name: invite.name,
+                addresses: invite.addrs.iter().map(ToString::to_string).collect(),
+                relays: invite.relays,
+                has_code: invite.code.is_some(),
+                expires_at: invite
+                    .expires_at
+                    .map(|secs| std::time::UNIX_EPOCH + Duration::from_secs(secs)),
+                role: invite.role,
+                saved,
+            })
+        })
+    }
+
+    fn connect_invite<'a>(&'a self, link: &'a str) -> BoxFuture<'a, Result<Server, BackendError>> {
+        Box::pin(async move { self.invited(link).map(|(_, server)| server) })
+    }
+
+    fn save_invite_server<'a>(
+        &'a self,
+        link: &'a str,
+    ) -> BoxFuture<'a, Result<Server, BackendError>> {
+        Box::pin(async move {
+            let (_, server) = self.invited(link)?;
+            Ok(self.save_invited(server))
+        })
+    }
+
+    fn redeem_invite<'a>(
+        &'a self,
+        link: &'a str,
+        username: &'a str,
+        display_name: Option<&'a str>,
+        password: &'a str,
+    ) -> BoxFuture<'a, Result<Profile, BackendError>> {
+        Box::pin(async move {
+            let (invite, server) = self.invited(link)?;
+            let Some(code) = invite.code else {
+                return Err(BackendError::InvalidInput(
+                    "this invite has no code: it only finds the server; sign in instead".into(),
+                ));
+            };
+            let mut joined = self.joined.lock().expect("fake state is never poisoned");
+            match code.as_str() {
+                INVITE_CODE if joined.1 => return Err(BackendError::InviteExhausted),
+                INVITE_CODE => {}
+                EXPIRED_INVITE_CODE => return Err(BackendError::InviteExpired),
+                USED_INVITE_CODE => return Err(BackendError::InviteExhausted),
+                _ => return Err(BackendError::InviteInvalid),
+            }
+            let taken = self
+                .accounts
+                .iter()
+                .any(|(s, u, _)| *s == server.key && *u == username)
+                || joined.0.iter().any(|u| u == username);
+            if taken {
+                return Err(BackendError::UsernameTaken);
+            }
+            if password.chars().count() < 8 {
+                return Err(BackendError::InvalidInput(
+                    "the password needs at least 8 characters".into(),
+                ));
+            }
+            joined.0.push(username.to_owned());
+            joined.1 = true;
+            drop(joined);
+            let server = self.save_invited(server);
+            Ok(self.signed_in_as(&server.key, username, display_name.unwrap_or(username)))
         })
     }
 
@@ -3886,6 +4129,105 @@ mod tests {
             ],
             [Err(BackendError::NotSetUp), Err(BackendError::NotSetUp)]
         );
+    }
+
+    /// Each invite state the join flow draws (P6-01), from the fake.
+    mod invites {
+        use super::*;
+
+        fn saved(client: &FakeClient) -> bool {
+            ready(client.servers())
+                .unwrap()
+                .iter()
+                .any(|s| s.key == cabin() && s.pinned)
+        }
+
+        #[test]
+        fn a_link_reads_without_saving_and_a_paste_that_is_not_one_is_refused() {
+            let client = FakeClient::new(None);
+            let invite =
+                ready(client.read_invite(&FakeClient::invite_link(Some(INVITE_CODE)))).unwrap();
+            assert_eq!(
+                (invite.name.as_deref(), invite.has_code, invite.saved),
+                (Some("Cabin"), true, false)
+            );
+            assert_eq!(invite.role, Some(spoolframe_types::Role::Consumer));
+            assert_eq!(
+                ready(client.read_invite("https://home-media.example/admin/invites")),
+                Err(BackendError::NotAnInvite)
+            );
+            assert!(!saved(&client));
+        }
+
+        #[test]
+        fn connecting_shows_who_answers_and_saves_nothing() {
+            let client = FakeClient::new(None);
+            let server =
+                ready(client.connect_invite(&FakeClient::invite_link(Some(INVITE_CODE)))).unwrap();
+            assert_eq!(server.fingerprint, fingerprint(&cabin()));
+            assert!(server.passkey_site().is_some());
+            assert!(!saved(&client));
+        }
+
+        #[test]
+        fn a_link_without_a_code_saves_the_server_verified() {
+            let client = FakeClient::new(None);
+            let server = ready(client.save_invite_server(&FakeClient::invite_link(None))).unwrap();
+            assert!(server.pinned && server.verified);
+            assert!(saved(&client));
+        }
+
+        #[test]
+        fn redeeming_makes_the_account_signs_in_and_saves_the_server() {
+            let client = FakeClient::new(None);
+            let link = FakeClient::invite_link(Some(INVITE_CODE));
+            let profile =
+                ready(client.redeem_invite(&link, "mum", Some("Mum"), "long enough")).unwrap();
+            assert_eq!(
+                (
+                    profile.server,
+                    profile.username.as_str(),
+                    profile.display_name.as_str()
+                ),
+                (cabin(), "mum", "Mum")
+            );
+            assert!(saved(&client));
+            // Its one use is spent.
+            assert_eq!(
+                ready(client.redeem_invite(&link, "dad", None, "long enough")),
+                Err(BackendError::InviteExhausted)
+            );
+        }
+
+        #[test]
+        fn refused_codes_save_nothing() {
+            let client = FakeClient::new(None);
+            for (code, refusal) in [
+                ("ABCDABCDABCD", BackendError::InviteInvalid),
+                (EXPIRED_INVITE_CODE, BackendError::InviteExpired),
+                (USED_INVITE_CODE, BackendError::InviteExhausted),
+            ] {
+                let link = FakeClient::invite_link(Some(code));
+                assert_eq!(
+                    ready(client.redeem_invite(&link, "mum", None, "long enough")),
+                    Err(refusal)
+                );
+            }
+            assert!(!saved(&client));
+        }
+
+        /// A taken name leaves the invite unused: the next name works.
+        #[test]
+        fn a_taken_username_leaves_the_invite_unused() {
+            let client = FakeClient::new(None);
+            let link = FakeClient::invite_link(Some(INVITE_CODE));
+            assert_eq!(
+                ready(client.redeem_invite(&link, "alice", None, "long enough")),
+                Err(BackendError::UsernameTaken)
+            );
+            assert!(!saved(&client));
+            assert!(ready(client.redeem_invite(&link, "mum", None, "long enough")).is_ok());
+        }
     }
 
     #[test]

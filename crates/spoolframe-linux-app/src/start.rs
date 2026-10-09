@@ -46,7 +46,7 @@ pub fn servers(
         column.append(&section("Saved", &saved));
     }
     let add_button = gtk::Button::builder()
-        .label("Add a server by its key…")
+        .label("Add a server…")
         .halign(gtk::Align::Center)
         .css_classes(["pill"])
         .build();
@@ -649,7 +649,7 @@ pub fn with_cancel(dialog: &adw::Dialog, body: &impl IsA<gtk::Widget>) {
 
 /// A button as the boards draw them: 44 px, 10 px corners, with an icon
 /// when given one.
-fn action(label: &str, icon: Option<&str>, classes: &[&str]) -> gtk::Button {
+pub(crate) fn action(label: &str, icon: Option<&str>, classes: &[&str]) -> gtk::Button {
     let button = gtk::Button::builder().hexpand(true).build();
     match icon {
         Some(icon) => button.set_child(Some(
@@ -1108,7 +1108,7 @@ pub fn remember_row(remember: &gtk::CheckButton) -> gtk::Box {
 }
 
 /// A label over its field, as the boards lay out a form.
-fn field(label: &str, entry: &impl IsA<gtk::Widget>) -> gtk::Box {
+pub(crate) fn field(label: &str, entry: &impl IsA<gtk::Widget>) -> gtk::Box {
     let column = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(6)

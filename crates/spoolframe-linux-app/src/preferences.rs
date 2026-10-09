@@ -835,6 +835,8 @@ pub struct Device {
     pub set_bitrate: SetBitrate,
     pub show_hdr: bool,
     pub set_show_hdr: SetSkipIntros,
+    pub use_relays: bool,
+    pub set_use_relays: SetSkipIntros,
     pub skip_intros: bool,
     pub set_skip_intros: SetSkipIntros,
     pub show_diagnostics: bool,
@@ -875,6 +877,20 @@ fn playback(
     let set_show_hdr = device.set_show_hdr.clone();
     hdr.connect_active_notify(move |row| set_show_hdr(row.is_active()));
     streaming.add(&hdr);
+    // P6-03: one switch, no per-server choice; the relays are the
+    // server's own.
+    let relays = adw::SwitchRow::builder()
+        .use_markup(false)
+        .title("Use relays")
+        .subtitle(
+            "Reach a server through its relays when it can't be reached directly. \
+             Applies when Spoolframe next starts.",
+        )
+        .active(device.use_relays)
+        .build();
+    let set_use_relays = device.set_use_relays.clone();
+    relays.connect_active_notify(move |row| set_use_relays(row.is_active()));
+    streaming.add(&relays);
     page.add(&streaming);
     page.add(&markers);
     if let Some((info, set_tracks)) = tracks {

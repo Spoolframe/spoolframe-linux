@@ -29,6 +29,14 @@ pub const STOPPED: &str = "spoolframe-playback-stopped";
 /// password changed): the app goes back to "Who's watching".
 pub const SIGNED_OUT: &str = "spoolframe-signed-out";
 
+/// The same, when the SDK started an expired playback again: the reader's
+/// bytes were the old encode's, so the app builds a new reader from the
+/// new one's start. The details carry where it starts, as [`RESUMED_AT`].
+pub const RESUMED: &str = "spoolframe-playback-resumed";
+
+/// Where the resumed playback starts, in milliseconds (a `u64`).
+pub const RESUMED_AT: &str = "at-ms";
+
 const SCHEME: &str = "spoolframe";
 
 /// Published readers, by the number in their URI.
@@ -279,6 +287,20 @@ mod imp {
                         gst::ResourceError::NotAuthorized,
                         ["the session ended; sign in again"],
                         details: gst::Structure::new_empty(SIGNED_OUT)
+                    );
+                    return Err(gst::FlowError::Error);
+                }
+                Err(ReadError::Backend(spoolframe_client_sdk::SdkError::PlaybackResumed {
+                    at,
+                })) => {
+                    let at_ms = u64::try_from(at.as_millis()).unwrap_or(u64::MAX);
+                    gst::element_imp_error!(
+                        self,
+                        gst::ResourceError::Read,
+                        ["the playback was started again"],
+                        details: gst::Structure::builder(RESUMED)
+                            .field(RESUMED_AT, at_ms)
+                            .build()
                     );
                     return Err(gst::FlowError::Error);
                 }

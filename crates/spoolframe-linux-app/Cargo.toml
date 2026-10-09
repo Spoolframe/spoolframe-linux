@@ -37,6 +37,7 @@ snmalloc-rs = { workspace = true }
 landlock = { workspace = true }
 seccompiler = { workspace = true }
 libc = { workspace = true }
+rustls = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

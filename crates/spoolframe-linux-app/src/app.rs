@@ -12,7 +12,7 @@ use adw::prelude::*;
 use gtk::glib;
 use relm4::{Component, ComponentParts, ComponentSender};
 use spoolframe_linux_core::backend::{
-    BackendError, ChosenTracks, Client, ConnectionState, HomeScreen, Person, Profile,
+    BackendError, ChosenTracks, Client, ConnectionState, HomeScreen, Invite, Person, Profile,
     ProfileSignIn, SearchScope, Selection, Server, ServerKey, Session, TrackPreferencesInfo,
 };
 use spoolframe_linux_core::next_episode::next_episode;
@@ -180,6 +180,8 @@ pub struct AppWidgets {
     remote_sign_in: Option<Rc<RemoteSignIn>>,
     passkey_sign_in: Option<Rc<PasskeySignIn>>,
     add_server: Option<start::AddServer>,
+    /// "Add a server" from an invite (P6-01), while it is open.
+    invite: Option<Rc<crate::invite::InviteDialog>>,
     sidebar: gtk::ListBox,
     stack: adw::NavigationView,
     /// Above the split view: the player is pushed here, over the whole
@@ -205,8 +207,23 @@ pub struct AppWidgets {
 pub enum Msg {
     ShowServers,
     ChooseServer(Server),
-    OpenAddServer,
+    /// "Add a server": from an invite link (P6-01), pasted, or opened
+    /// from the desktop when given one.
+    OpenAddServer(Option<String>),
+    /// The way without an invite: a server's key and an address.
+    OpenAddServerByKey,
     AddServer(String, String),
+    /// Read the invite link pasted; nothing is sent.
+    ReadInvite(String),
+    /// Connect to the server an invite names, for its fingerprint.
+    ConnectInvite(String),
+    /// Save the server an invite names, without an account.
+    SaveInviteServer(String),
+    /// Make the account an invite offers: the link, username, display
+    /// name and password.
+    JoinInvite(String, String, Option<String>, Secret),
+    /// Sign in to a server an invite saved.
+    SignInToInvited(Server),
     ChooseProfile(Profile),
     /// The PIN typed for the locked profile being chosen (P2-08).
     Unlock(Secret),
@@ -261,6 +278,8 @@ pub enum Msg {
     /// Skip intros without asking (P2-10).
     SetSkipIntros(bool),
     SetShowHdr(bool),
+    /// Relays on or off (P6-03), from the next start.
+    SetUseRelays(bool),
     /// The session ended under the screen (signed out elsewhere, or its
     /// password changed): back to "Who's watching".
     SessionEnded,
@@ -317,6 +336,14 @@ impl Completion {
 pub enum Loaded {
     Servers(Result<Vec<Server>, BackendError>),
     ServerAdded(Result<Server, BackendError>),
+    /// What a pasted link says, for the link it was read from (P6-01).
+    InviteRead(String, Result<Invite, BackendError>),
+    /// Who answered for an invite.
+    InviteConnected(Result<Server, BackendError>),
+    /// The server an invite names, saved.
+    InviteServerSaved(Result<Server, BackendError>),
+    /// The account an invite made, signed in, with the username asked.
+    InviteJoined(String, Result<Profile, BackendError>),
     /// A server connected for its fingerprint check (P1-21); the flag says
     /// whether it is a saved server being verified.
     Checked(Server, bool, Result<Server, BackendError>),
@@ -787,6 +814,10 @@ impl Component for App {
             now_playing: tokio::sync::watch::Sender::new(None),
         };
         model.load_servers(&sender);
+        // Invite links the desktop opened before the window was up.
+        for link in opened::listen(sender.clone()) {
+            sender.input(Msg::OpenAddServer(Some(link)));
+        }
         // Discovery hears servers a moment after the client opens, so the
         // first list is often empty; it is listed again on each change.
         let mut changes = model.client.servers_changed();
@@ -816,6 +847,7 @@ impl Component for App {
                 passkey_sign_in: None,
                 pin_pad: None,
                 add_server: None,
+                invite: None,
                 sidebar,
                 stack,
                 root_page,
@@ -898,7 +930,44 @@ impl Component for App {
                     Loaded::ServerRemoved(key, removed)
                 });
             }
-            Msg::OpenAddServer => {
+            Msg::OpenAddServer(link) => {
+                let dialog = crate::invite::InviteDialog::new(invite_actions(&sender));
+                dialog.dialog.present(Some(root));
+                if let Some(link) = link {
+                    dialog.set_link(&link);
+                }
+                widgets.invite = Some(dialog);
+            }
+            Msg::ReadInvite(link) => {
+                let client = self.client.clone();
+                self.command(&sender, async move {
+                    let read = client.read_invite(&link).await;
+                    Loaded::InviteRead(link, read)
+                });
+            }
+            Msg::ConnectInvite(link) => {
+                let client = self.client.clone();
+                self.command(&sender, async move {
+                    Loaded::InviteConnected(client.connect_invite(&link).await)
+                });
+            }
+            Msg::SaveInviteServer(link) => {
+                let client = self.client.clone();
+                self.command(&sender, async move {
+                    Loaded::InviteServerSaved(client.save_invite_server(&link).await)
+                });
+            }
+            Msg::JoinInvite(link, username, display_name, Secret(password)) => {
+                let client = self.client.clone();
+                self.command(&sender, async move {
+                    let joined = client
+                        .redeem_invite(&link, &username, display_name.as_deref(), &password)
+                        .await;
+                    Loaded::InviteJoined(username, joined)
+                });
+            }
+            Msg::SignInToInvited(server) => self.load_profiles(server, &sender),
+            Msg::OpenAddServerByKey => {
                 let submit: Rc<dyn Fn(String, String)> = {
                     let sender = sender.clone();
                     Rc::new(move |key, address| sender.input(Msg::AddServer(key, address)))
@@ -1311,7 +1380,7 @@ impl Component for App {
                     Loaded::WatchChanged(done)
                 });
             }
-            Msg::ConnectionChanged(state) => show_connection(widgets, self.server.as_ref(), state),
+            Msg::ConnectionChanged(state) => show_connection(widgets, self.server.as_ref(), &state),
             Msg::RememberTracks(id, selection) => {
                 let Some(session) = self.session.clone() else {
                     return;
@@ -1378,6 +1447,18 @@ impl Component for App {
                         "HDR on · applies when Spoolframe next starts"
                     } else {
                         "HDR off · applies when Spoolframe next starts"
+                    },
+                );
+            }
+            Msg::SetUseRelays(on) => {
+                // The SDK's endpoint is made with or without relays.
+                self.settings.set_use_relays(on);
+                toast_text(
+                    widgets,
+                    if on {
+                        "Relays on · applies when Spoolframe next starts"
+                    } else {
+                        "Relays off · applies when Spoolframe next starts"
                     },
                 );
             }
@@ -1450,7 +1531,7 @@ impl Component for App {
                 };
                 let add: Rc<dyn Fn()> = {
                     let sender = sender.clone();
-                    Rc::new(move || sender.input(Msg::OpenAddServer))
+                    Rc::new(move || sender.input(Msg::OpenAddServer(None)))
                 };
                 let verify: start::Choose<Server> = {
                     let sender = sender.clone();
@@ -1474,6 +1555,48 @@ impl Component for App {
                 } else {
                     // Connected and learned its fingerprint: check it.
                     check_fingerprint(&server, false, &sender, root);
+                }
+            }
+            Loaded::InviteRead(link, read) => {
+                if let Some(dialog) = &widgets.invite {
+                    dialog.read(&link, read);
+                }
+            }
+            // A key claiming a saved server's id: the identity alert, as
+            // for any connect.
+            Loaded::InviteConnected(Err(e @ BackendError::IdentityChanged { .. })) => {
+                if let Some(dialog) = widgets.invite.take() {
+                    dialog.dialog.close();
+                }
+                server_error(widgets, None, &e, &sender, root);
+            }
+            Loaded::InviteConnected(answer) => {
+                if let Some(dialog) = &widgets.invite {
+                    dialog.connected(answer);
+                }
+            }
+            Loaded::InviteServerSaved(answer) => {
+                if answer.is_ok() {
+                    self.load_servers(&sender);
+                }
+                if let Some(dialog) = &widgets.invite {
+                    dialog.saved(answer);
+                }
+            }
+            Loaded::InviteJoined(_, Ok(profile)) => {
+                let server = widgets.invite.take().and_then(|dialog| {
+                    dialog.dialog.close();
+                    dialog.server()
+                });
+                self.load_servers(&sender);
+                if server.is_some() {
+                    self.server = server;
+                }
+                self.enter(profile, widgets, &sender);
+            }
+            Loaded::InviteJoined(username, Err(e)) => {
+                if let Some(dialog) = &widgets.invite {
+                    dialog.join_refused(&e, &username);
                 }
             }
             Loaded::ServerAdded(Err(e)) => match &widgets.add_server {
@@ -1939,6 +2062,10 @@ impl App {
             let sender = sender.clone();
             Rc::new(move |on| sender.input(Msg::SetShowHdr(on)))
         };
+        let set_use_relays: preferences::SetSkipIntros = {
+            let sender = sender.clone();
+            Rc::new(move |on| sender.input(Msg::SetUseRelays(on)))
+        };
         let set_show_diagnostics: preferences::SetSkipIntros = {
             let sender = sender.clone();
             Rc::new(move |on| sender.input(Msg::SetShowDiagnostics(on)))
@@ -1954,6 +2081,8 @@ impl App {
                 set_bitrate,
                 show_hdr: self.settings.show_hdr(),
                 set_show_hdr,
+                use_relays: self.settings.use_relays(),
+                set_use_relays,
                 skip_intros: self.settings.skip_intros(),
                 set_skip_intros,
                 show_diagnostics: self.settings.show_diagnostics(),
@@ -2085,7 +2214,7 @@ impl App {
         let sender = sender.clone();
         self.connection_watch = Some(glib::spawn_future_local(async move {
             loop {
-                let state = *states.borrow_and_update();
+                let state = states.borrow_and_update().clone();
                 sender.input(Msg::ConnectionChanged(state));
                 if states.changed().await.is_err() {
                     break;
@@ -2674,9 +2803,26 @@ fn open_with(sender: &ComponentSender<App>) -> views::Open {
     Rc::new(move |item| sender.input(Msg::Open(Box::new(item))))
 }
 
-fn show_connection(widgets: &AppWidgets, server: Option<&Server>, state: ConnectionState) {
+fn show_connection(widgets: &AppWidgets, server: Option<&Server>, state: &ConnectionState) {
     let name = server.map_or("the server", |s| s.name.as_str());
-    let (status, banner) = match state {
+    let (status, banner) = connection_text(name, state);
+    widgets
+        .profile_server
+        .set_label(&format!("{name} · {status}"));
+    match banner {
+        Some(text) => {
+            widgets.banner.set_title(&text);
+            widgets.banner.set_revealed(true);
+        }
+        None => widgets.banner.set_revealed(false),
+    }
+}
+
+/// The status beside the server's name, and the banner over the page, if
+/// any, for a connection in `state`. A link the SDK stopped dialling says
+/// why, since it will not reconnect by itself.
+fn connection_text(name: &str, state: &ConnectionState) -> (String, Option<String>) {
+    match state {
         ConnectionState::Connected => ("connected".to_owned(), None),
         ConnectionState::Connecting => (
             "connecting…".to_owned(),
@@ -2692,16 +2838,32 @@ fn show_connection(widgets: &AppWidgets, server: Option<&Server>, state: Connect
             "offline".to_owned(),
             Some(format!("Not connected to {name}.")),
         ),
-    };
-    widgets
-        .profile_server
-        .set_label(&format!("{name} · {status}"));
-    match banner {
-        Some(text) => {
-            widgets.banner.set_title(&text);
-            widgets.banner.set_revealed(true);
+        ConnectionState::Stopped(BackendError::UpdateRequired { server_protocol }) => (
+            "update needed".to_owned(),
+            Some(update_text(name, *server_protocol)),
+        ),
+        ConnectionState::Stopped(why) => (
+            "not connected".to_owned(),
+            Some(format!("Not connected to {name}: {why}.")),
+        ),
+    }
+}
+
+/// What to do when this app and the server speak different protocol
+/// revisions: whichever is older needs updating, when the server said its
+/// revision.
+fn update_text(name: &str, server_protocol: Option<u32>) -> String {
+    let ours = spoolframe_protocol::PROTOCOL_VERSION;
+    match server_protocol {
+        Some(theirs) if theirs > ours => {
+            format!("{name} runs a newer Spoolframe. Update this app to connect.")
         }
-        None => widgets.banner.set_revealed(false),
+        Some(theirs) if theirs < ours => {
+            format!("{name} runs an older Spoolframe. Ask its admin to update the server.")
+        }
+        _ => format!(
+            "This app and {name} speak different versions. Update Spoolframe, or ask the server's admin to update it."
+        ),
     }
 }
 
@@ -2840,6 +3002,10 @@ fn error_status(error: &BackendError, retry: Option<Rc<dyn Fn()>>) -> adw::Statu
             "Not available right now",
             format!("{} Try again once it is back.", sentence(why)),
         ),
+        BackendError::UpdateRequired { server_protocol } => (
+            "Spoolframe needs updating",
+            update_text("The server", *server_protocol),
+        ),
         other => ("Could not load this page", sentence(&other.to_string())),
     };
     let page = adw::StatusPage::builder()
@@ -2862,7 +3028,7 @@ fn error_status(error: &BackendError, retry: Option<Rc<dyn Fn()>>) -> adw::Statu
 }
 
 /// A message as a sentence: capitalised, with a full stop.
-fn sentence(message: &str) -> String {
+pub(crate) fn sentence(message: &str) -> String {
     let mut chars = message.trim().chars();
     let Some(first) = chars.next() else {
         return String::new();
@@ -2905,6 +3071,84 @@ fn player_page(
     };
     page.set_tag(Some(PLAYER_TAG));
     page
+}
+
+/// Invite links the desktop opens (P6-01): `spoolframe://invite?…`, from
+/// a browser or a file manager, through the desktop entry's scheme
+/// handler. GTK hands them to the running app, which may not have its
+/// window yet: those wait for it.
+pub mod opened {
+    use std::cell::RefCell;
+
+    use relm4::ComponentSender;
+
+    use super::{App, Msg};
+
+    thread_local! {
+        static OPENED: RefCell<(Option<ComponentSender<App>>, Vec<String>)> =
+            const { RefCell::new((None, Vec::new())) };
+    }
+
+    /// `link` goes to "Add a server", now or once the window is up.
+    pub fn open(link: String) {
+        OPENED.with(|opened| {
+            let mut opened = opened.borrow_mut();
+            match &opened.0 {
+                Some(sender) => sender.input(Msg::OpenAddServer(Some(link))),
+                None => opened.1.push(link),
+            }
+        });
+    }
+
+    /// From now on links go to `sender`; the ones that waited are
+    /// returned, oldest first.
+    pub(super) fn listen(sender: ComponentSender<App>) -> Vec<String> {
+        OPENED.with(|opened| {
+            let mut opened = opened.borrow_mut();
+            opened.0 = Some(sender);
+            std::mem::take(&mut opened.1)
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn waiting() -> Vec<String> {
+        OPENED.with(|opened| opened.borrow().1.clone())
+    }
+}
+
+/// What the invite dialog's buttons send.
+fn invite_actions(sender: &ComponentSender<App>) -> crate::invite::Actions {
+    let send = |make: fn(String) -> Msg| -> Rc<dyn Fn(String)> {
+        let sender = sender.clone();
+        Rc::new(move |link| sender.input(make(link)))
+    };
+    let join: Rc<dyn Fn(String, String, Option<String>, String)> = {
+        let sender = sender.clone();
+        Rc::new(move |link, username, display_name, password| {
+            sender.input(Msg::JoinInvite(
+                link,
+                username,
+                display_name,
+                Secret(password),
+            ))
+        })
+    };
+    let sign_in: Rc<dyn Fn(Server)> = {
+        let sender = sender.clone();
+        Rc::new(move |server| sender.input(Msg::SignInToInvited(server)))
+    };
+    let by_key: Rc<dyn Fn()> = {
+        let sender = sender.clone();
+        Rc::new(move || sender.input(Msg::OpenAddServerByKey))
+    };
+    crate::invite::Actions {
+        read: send(Msg::ReadInvite),
+        connect: send(Msg::ConnectInvite),
+        save: send(Msg::SaveInviteServer),
+        join,
+        sign_in,
+        by_key,
+    }
 }
 
 /// Shows "Is this your server?" for `server`; the user's answer pins it.
@@ -2958,6 +3202,9 @@ fn server_error(
             };
             start::server_id_changed(name, saved, now, remove).present(Some(root));
         }
+        (BackendError::UpdateRequired { server_protocol }, _) => {
+            toast_text(widgets, &update_text(name, *server_protocol))
+        }
         (other, _) => toast(widgets, other),
     }
 }
@@ -2965,6 +3212,76 @@ fn server_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fake's server stops being dialled for `why`; what the banner
+    /// then says.
+    fn banner_once_stopped(why: BackendError) -> (String, Option<String>) {
+        let client = spoolframe_linux_core::fake::FakeClient::new(None);
+        let server = spoolframe_linux_core::fake::FakeClient::profile("andrey").server;
+        let states = client.connection(&server);
+        assert_eq!(*states.borrow(), ConnectionState::Connected);
+        client.stop_dialling(&server, why);
+        let state = states.borrow().clone();
+        connection_text("Home Media", &state)
+    }
+
+    /// An app older than the server is told to update itself, not that
+    /// it is reconnecting: the SDK has stopped dialling.
+    #[test]
+    fn an_app_too_old_for_the_server_says_to_update_it() {
+        let newer = spoolframe_protocol::PROTOCOL_VERSION + 1;
+        assert_eq!(
+            banner_once_stopped(BackendError::UpdateRequired {
+                server_protocol: Some(newer)
+            }),
+            (
+                "update needed".to_owned(),
+                Some("Home Media runs a newer Spoolframe. Update this app to connect.".to_owned())
+            )
+        );
+    }
+
+    #[test]
+    fn a_server_older_than_the_app_is_its_admins_to_update() {
+        let older = spoolframe_protocol::PROTOCOL_VERSION - 1;
+        let (_, banner) = banner_once_stopped(BackendError::UpdateRequired {
+            server_protocol: Some(older),
+        });
+        assert_eq!(
+            banner.as_deref(),
+            Some("Home Media runs an older Spoolframe. Ask its admin to update the server.")
+        );
+    }
+
+    /// Any other reason the SDK stopped dialling is shown as it is, in
+    /// place of "reconnecting".
+    #[test]
+    fn a_link_stopped_for_another_reason_says_why() {
+        let (status, banner) = banner_once_stopped(BackendError::ServerFull);
+        assert_eq!(status, "not connected");
+        assert_eq!(
+            banner.as_deref(),
+            Some("Not connected to Home Media: the server is busy; try again later.")
+        );
+    }
+
+    /// A link the desktop opens before the window is up waits for it.
+    #[test]
+    fn an_invite_link_opened_before_the_window_waits_for_it() {
+        opened::open("spoolframe://invite?server=early".into());
+        assert_eq!(opened::waiting(), ["spoolframe://invite?server=early"]);
+    }
+
+    /// GTK passes an opened link as a GFile; its URI must be the link as
+    /// written, escapes and all, or the invite would not read.
+    #[test]
+    fn an_opened_invite_link_comes_through_gio_unchanged() {
+        let link = spoolframe_linux_core::fake::FakeClient::invite_link(Some(
+            spoolframe_linux_core::fake::INVITE_CODE,
+        ));
+        let link = link.replace("name=Cabin", "name=Home%20Media");
+        assert_eq!(gtk::gio::File::for_uri(&link).uri(), link);
+    }
 
     #[test]
     fn a_server_message_reads_as_a_sentence() {

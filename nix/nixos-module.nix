@@ -8,6 +8,8 @@
 #   BlueZ on the system bus.
 # - Hardware video decoding goes through VA-API (vah265dec and friends),
 #   which needs the system's graphics drivers.
+# - Invite links (spoolframe://invite?…, P6-01) open in the app: its
+#   desktop entry handles the scheme, and the module makes it the default.
 #
 # The root flake passes `packageFor`: the package is built there (see
 # nix/package.nix), so the module finds it for the system it is used on.
@@ -55,5 +57,8 @@ in {
     hardware.bluetooth.enable = lib.mkIf cfg.phonePasskeys (lib.mkDefault true);
     # VA-API decoding; the drivers come from the host's GPU configuration.
     hardware.graphics.enable = lib.mkDefault true;
+    # An invite link opened in a browser or a file manager.
+    xdg.mime.defaultApplications."x-scheme-handler/spoolframe" =
+      lib.mkDefault "casa.coldsteel.Spoolframe.desktop";
   };
 }

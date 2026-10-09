@@ -6,6 +6,7 @@ mod confirm;
 mod denylist;
 mod fonts;
 mod icons;
+mod invite;
 mod library;
 mod logo;
 // Text shown as it is where GTK reads markup, and the checks over the
@@ -74,6 +75,10 @@ struct Cli {
     /// it must not read), and exit: 0 when confined as it should be.
     #[arg(long, hide = true, value_name = "FILE")]
     self_check: Option<std::path::PathBuf>,
+    /// An invite link to open in "Add a server" (spoolframe://invite?…),
+    /// as the desktop passes one it was asked to open.
+    #[arg(value_name = "LINK")]
+    link: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -99,8 +104,23 @@ fn main() -> Result<()> {
         });
     }
 
-    // clap has parsed the arguments; GTK gets none, or it would reject ours.
-    let app = RelmApp::new(APP_ID).with_args(Vec::new());
+    // clap has parsed the arguments; GTK gets only an invite link, which
+    // it hands to the running app if there is one (P6-01), and none of
+    // ours, or it would reject them.
+    let app = RelmApp::new(APP_ID).with_args(match cli.link {
+        Some(link) => vec!["spoolframe-linux".to_owned(), link],
+        None => Vec::new(),
+    });
+    use gtk::gio::prelude::*;
+    let application = relm4::main_application();
+    application.set_flags(application.flags() | gtk::gio::ApplicationFlags::HANDLES_OPEN);
+    application.connect_open(|application, links, _| {
+        // Opening is not activating: the window is made by activate.
+        application.activate();
+        for link in links {
+            app::opened::open(link.uri().to_string());
+        }
+    });
     playback::init()?;
     icons::register();
     // The app's icon, from the resource when not installed.
@@ -123,6 +143,15 @@ fn main() -> Result<()> {
     }
     drop(runtime);
     Ok(())
+}
+
+/// How the SDK opens, from the user's settings: with or without relays
+/// (P6-03), which it cannot change while it runs.
+fn client_options(settings: &settings::Settings) -> sdk::ClientOptions {
+    sdk::ClientOptions {
+        relays: settings.use_relays(),
+        ..sdk::ClientOptions::default()
+    }
 }
 
 /// The artwork cache, or none if it cannot be opened: images are then
@@ -161,7 +190,28 @@ fn open_sdk(runtime: &tokio::runtime::Runtime) -> Result<SdkClient> {
         capabilities,
     };
     let client = runtime
-        .block_on(sdk::Client::open(Arc::new(SdkStorage(storage)), device))
+        .block_on(sdk::Client::open_with_options(
+            Arc::new(SdkStorage(storage)),
+            device,
+            client_options(&settings),
+        ))
         .context("cannot open this device's Spoolframe identity")?;
     Ok(SdkClient::new(client, runtime.handle().clone()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Relays turned off in Preferences reach the SDK at the next start
+    /// (P6-03); left alone, they are on.
+    #[test]
+    fn the_relay_setting_opens_the_sdk_with_or_without_relays() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.ini");
+        let mut settings = settings::Settings::at(&path);
+        assert!(client_options(&settings).relays);
+        settings.set_use_relays(false);
+        assert!(!client_options(&settings::Settings::at(&path)).relays);
+    }
 }

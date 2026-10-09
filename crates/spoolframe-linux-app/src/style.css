@@ -1563,3 +1563,53 @@ popover.scrub-preview > contents {
   padding: 14px 18px;
   border-radius: 12px;
 }
+
+/* "Add a server" from an invite (P6-01), as the LinuxInvite boards draw it. */
+.invite-link-frame {
+  border: 2px solid var(--accent-color);
+  border-radius: 10px;
+  background-color: var(--window-bg-color);
+}
+
+.invite-link-frame textview,
+.invite-link-frame textview text {
+  background-color: transparent;
+  font-size: 12px;
+}
+
+.invite-summary {
+  padding: 14px 16px;
+  border-radius: 12px;
+  background-color: var(--window-bg-color);
+}
+
+.invite-terms {
+  font-weight: 600;
+}
+
+.invite-badge {
+  padding: 2px 8px;
+  border-radius: 999px;
+  background-color: alpha(var(--accent-color), 0.18);
+  color: var(--accent-color);
+}
+
+.invite-server {
+  padding: 10px 12px;
+  border-radius: 10px;
+  background-color: var(--window-bg-color);
+}
+
+.invite-server-icon {
+  color: var(--success-color);
+}
+
+.invite-refusal {
+  padding: 12px 14px;
+  border-radius: 10px;
+  background-color: alpha(var(--error-color), 0.12);
+}
+
+.invite-refusal-icon {
+  color: var(--error-color);
+}

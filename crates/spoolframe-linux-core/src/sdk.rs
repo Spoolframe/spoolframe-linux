@@ -24,8 +24,8 @@ use tokio::sync::watch;
 
 use crate::backend::{
     ArtworkSize, BackendError, BoxFuture, ChosenTracks, Chunk, Client, ConnectionPath,
-    ConnectionState, DeviceInfo, DeviceSignIn, DeviceSignInRequest, HomeScreen, PersonId, PinProof,
-    PinState, PlaybackHandle, PlaybackPlan, PlaybackStart, PlexLink, Previews, Profile,
+    ConnectionState, DeviceInfo, DeviceSignIn, DeviceSignInRequest, HomeScreen, Invite, PersonId,
+    PinProof, PinState, PlaybackHandle, PlaybackPlan, PlaybackStart, PlexLink, Previews, Profile,
     ProfileSignIn, SearchRequest, SearchResults, Selection, Server, ServerKey, Session,
 };
 use crate::backend::{
@@ -66,11 +66,28 @@ pub fn backend_error(error: sdk::SdkError) -> BackendError {
         E::RecentSignInRequired => BackendError::RecentSignInRequired,
         E::ServerFull => BackendError::ServerFull,
         E::LastSignInMethod => BackendError::LastSignInMethod,
+        E::UpdateRequired { server_protocol } => BackendError::UpdateRequired { server_protocol },
+        E::NotAnInvite => BackendError::NotAnInvite,
+        E::InviteInvalid => BackendError::InviteInvalid,
+        E::InviteExpired => BackendError::InviteExpired,
+        E::InviteExhausted => BackendError::InviteExhausted,
+        E::UsernameTaken => BackendError::UsernameTaken,
         other => BackendError::Other(other.to_string()),
     }
 }
 
 /// The SDK's connection states, in the UI's words.
+/// A link's state with why the SDK stopped dialling, if it did: a
+/// disconnected link it stopped is [`ConnectionState::Stopped`].
+pub fn link_state(state: sdk::ConnectionState, stopped: Option<sdk::SdkError>) -> ConnectionState {
+    match (state, stopped) {
+        (sdk::ConnectionState::Disconnected, Some(why)) => {
+            ConnectionState::Stopped(backend_error(why))
+        }
+        (state, _) => connection_state(state),
+    }
+}
+
 pub fn connection_state(state: sdk::ConnectionState) -> ConnectionState {
     match state {
         sdk::ConnectionState::Disconnected => ConnectionState::Closed,
@@ -307,6 +324,78 @@ impl Client for SdkClient {
             })
             .await?;
             Ok(server(entry))
+        })
+    }
+
+    fn read_invite<'a>(&'a self, link: &'a str) -> BoxFuture<'a, Result<Invite, BackendError>> {
+        Box::pin(async move {
+            let (client, link) = (self.client.clone(), link.to_owned());
+            let info =
+                on_runtime(&self.handle, async move { client.read_invite(&link).await }).await?;
+            Ok(Invite {
+                key: ServerKey(info.endpoint_id),
+                fingerprint: info.fingerprint,
+                name: info.name,
+                addresses: info.addrs.iter().map(SocketAddr::to_string).collect(),
+                relays: info.relays,
+                has_code: info.has_code,
+                expires_at: info.expires_at,
+                role: info.role,
+                saved: info.saved,
+            })
+        })
+    }
+
+    fn connect_invite<'a>(&'a self, link: &'a str) -> BoxFuture<'a, Result<Server, BackendError>> {
+        Box::pin(async move {
+            let (client, link) = (self.client.clone(), link.to_owned());
+            on_runtime(
+                &self.handle,
+                async move { client.connect_invite(&link).await },
+            )
+            .await
+            .map(server)
+        })
+    }
+
+    fn save_invite_server<'a>(
+        &'a self,
+        link: &'a str,
+    ) -> BoxFuture<'a, Result<Server, BackendError>> {
+        Box::pin(async move {
+            let (client, link) = (self.client.clone(), link.to_owned());
+            let entry = on_runtime(&self.handle, async move {
+                client.save_invite_server(&link).await
+            })
+            .await?;
+            self.servers_changed.send_replace(());
+            Ok(server(entry))
+        })
+    }
+
+    fn redeem_invite<'a>(
+        &'a self,
+        link: &'a str,
+        username: &'a str,
+        display_name: Option<&'a str>,
+        password: &'a str,
+    ) -> BoxFuture<'a, Result<Profile, BackendError>> {
+        Box::pin(async move {
+            let client = self.client.clone();
+            let (link, username, display_name, password) = (
+                link.to_owned(),
+                username.to_owned(),
+                display_name.map(str::to_owned),
+                password.to_owned(),
+            );
+            let session = on_runtime(&self.handle, async move {
+                client
+                    .redeem_invite(&link, &username, display_name.as_deref(), &password)
+                    .await
+            })
+            .await?;
+            self.servers_changed.send_replace(());
+            Ok(self.remember(&session))
         })
     }
 
@@ -652,9 +741,9 @@ impl Client for SdkClient {
             Ok(mut watch) => {
                 let forward = sender.clone();
                 self.handle.spawn(async move {
-                    forward.send_replace(connection_state(watch.current()));
+                    forward.send_replace(link_state(watch.current(), watch.stopped()));
                     while let Some(state) = watch.changed().await {
-                        forward.send_replace(connection_state(state));
+                        forward.send_replace(link_state(state, watch.stopped()));
                     }
                 });
             }
@@ -1178,6 +1267,57 @@ mod tests {
     fn a_disconnected_server_shows_as_closed() {
         assert_eq!(
             connection_state(sdk::ConnectionState::Disconnected),
+            ConnectionState::Closed
+        );
+    }
+
+    #[test]
+    fn a_refused_protocol_says_to_update_with_the_servers_revision() {
+        assert_eq!(
+            backend_error(sdk::SdkError::UpdateRequired {
+                server_protocol: Some(9)
+            }),
+            BackendError::UpdateRequired {
+                server_protocol: Some(9)
+            }
+        );
+    }
+
+    /// Each refusal of an invite stays its own kind: the join flow draws
+    /// one screen per kind (P6-01).
+    #[test]
+    fn invite_refusals_keep_their_kind() {
+        for (sdk, backend) in [
+            (sdk::SdkError::NotAnInvite, BackendError::NotAnInvite),
+            (sdk::SdkError::InviteInvalid, BackendError::InviteInvalid),
+            (sdk::SdkError::InviteExpired, BackendError::InviteExpired),
+            (
+                sdk::SdkError::InviteExhausted,
+                BackendError::InviteExhausted,
+            ),
+            (sdk::SdkError::UsernameTaken, BackendError::UsernameTaken),
+        ] {
+            assert_eq!(backend_error(sdk), backend);
+        }
+    }
+
+    /// A link the SDK stopped dialling says why, in place of a plain
+    /// disconnect, so the app does not show it as about to reconnect.
+    #[test]
+    fn a_link_the_sdk_stopped_says_why() {
+        assert_eq!(
+            link_state(
+                sdk::ConnectionState::Disconnected,
+                Some(sdk::SdkError::UpdateRequired {
+                    server_protocol: None
+                })
+            ),
+            ConnectionState::Stopped(BackendError::UpdateRequired {
+                server_protocol: None
+            })
+        );
+        assert_eq!(
+            link_state(sdk::ConnectionState::Disconnected, None),
             ConnectionState::Closed
         );
     }

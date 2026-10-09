@@ -84,6 +84,30 @@ pub enum BackendError {
     /// The server is converting as many files as it may (P2-03).
     #[error("the server is busy converting other files; try again shortly")]
     Busy,
+    /// This app and the server speak different protocol revisions, so
+    /// they cannot talk; one of them needs updating. `server_protocol` is
+    /// the server's revision when it said it: above this app's
+    /// [`spoolframe_protocol::PROTOCOL_VERSION`] the app is the older.
+    #[error("the server speaks another protocol revision; update Spoolframe or the server")]
+    UpdateRequired { server_protocol: Option<u32> },
+    /// Pasted or opened text is not a Spoolframe invite link (P6-01);
+    /// nothing was sent.
+    #[error("this isn’t a Spoolframe invite")]
+    NotAnInvite,
+    /// The invite's code is wrong or was revoked (P6-01). Saving the server
+    /// still works.
+    #[error("this invite doesn’t work")]
+    InviteInvalid,
+    /// The invite's code has expired (P6-01).
+    #[error("this invite has expired")]
+    InviteExpired,
+    /// Every account the invite could make is made (P6-01).
+    #[error("this invite has been used")]
+    InviteExhausted,
+    /// Someone on the server has the username asked for; the invite is
+    /// still unused (P6-01).
+    #[error("that username is taken")]
+    UsernameTaken,
     /// The server takes no more connections from devices not yet signed
     /// in (PX-10): try again later, by hand.
     #[error("the server is busy; try again later")]
@@ -298,12 +322,19 @@ impl std::fmt::Debug for DeviceSignIn {
 }
 
 /// How the device's connection to a server is doing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionState {
     Connecting,
     Connected,
-    Reconnecting { attempt: u32 },
+    Reconnecting {
+        attempt: u32,
+    },
     Closed,
+    /// Not connected, and not dialling again by itself, for a reason that
+    /// dialling does not fix (the app needs updating, the server is not
+    /// the one saved, the device was signed out): shown in place of
+    /// "Reconnecting". The next call dials once, and fails the same way.
+    Stopped(BackendError),
 }
 
 /// How packets go to the server now, for the player's diagnostics. A
@@ -321,6 +352,31 @@ pub enum ConnectionPath {
 pub use spoolframe_client_sdk::{Chunk, Playback as PlaybackStart};
 pub use spoolframe_protocol::MAX_READ;
 
+/// What an invite link says (P6-01), read without a word to the server:
+/// for the "Add a server" summary and the join form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Invite {
+    /// The server's key, which the link pins.
+    pub key: ServerKey,
+    /// The key's fingerprint (P1-21).
+    pub fingerprint: String,
+    /// What the link calls the server, if it says.
+    pub name: Option<String>,
+    /// Where the link says the server may be reached.
+    pub addresses: Vec<String>,
+    /// The relays it may be reached through.
+    pub relays: Vec<String>,
+    /// Redeeming it makes an account ("Includes an account"); without a
+    /// code it only finds and saves the server.
+    pub has_code: bool,
+    /// When the code stops working, as the link says: a hint.
+    pub expires_at: Option<std::time::SystemTime>,
+    /// The role the account gets, as the link says: a hint.
+    pub role: Option<spoolframe_types::Role>,
+    /// The server is saved on this device already.
+    pub saved: bool,
+}
+
 /// This device: the servers it knows, and the users signed in on them.
 pub trait Client: Send + Sync {
     /// Servers on this network, and saved ones.
@@ -333,6 +389,34 @@ pub trait Client: Send + Sync {
         server: &'a ServerKey,
         address: &'a str,
     ) -> BoxFuture<'a, Result<Server, BackendError>>;
+
+    /// What invite `link` says (P6-01); nothing is sent or saved.
+    /// [`BackendError::NotAnInvite`] for anything that is not one.
+    fn read_invite<'a>(&'a self, link: &'a str) -> BoxFuture<'a, Result<Invite, BackendError>>;
+
+    /// Connects to the server invite `link` names and says who answered,
+    /// for "Is this the server you were invited to?". Nothing is saved.
+    fn connect_invite<'a>(&'a self, link: &'a str) -> BoxFuture<'a, Result<Server, BackendError>>;
+
+    /// Saves the server invite `link` names, its key pinned and verified:
+    /// "Save server only", and what a link without a code does.
+    fn save_invite_server<'a>(
+        &'a self,
+        link: &'a str,
+    ) -> BoxFuture<'a, Result<Server, BackendError>>;
+
+    /// Makes an account with invite `link`'s code and signs it in, adding
+    /// a profile; the server is saved with it. Refused with
+    /// [`BackendError::InviteInvalid`], [`BackendError::InviteExpired`],
+    /// [`BackendError::InviteExhausted`] or
+    /// [`BackendError::UsernameTaken`], saving nothing.
+    fn redeem_invite<'a>(
+        &'a self,
+        link: &'a str,
+        username: &'a str,
+        display_name: Option<&'a str>,
+        password: &'a str,
+    ) -> BoxFuture<'a, Result<Profile, BackendError>>;
 
     /// Connects to `server` and says who it is, its fingerprint included,
     /// without saving anything (P1-21): the user checks it first.

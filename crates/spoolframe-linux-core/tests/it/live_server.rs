@@ -333,7 +333,7 @@ fn the_app_backend_works_against_a_live_server() {
         profiles.contains(&profile),
         "the new session is a profile: {profiles:?}"
     );
-    let state = *client.connection(&key).borrow();
+    let state = client.connection(&key).borrow().clone();
     let session = client.session(&profile).unwrap();
 
     let libraries = run(&runtime, session.libraries()).unwrap();
@@ -451,7 +451,7 @@ fn the_app_backend_works_against_a_live_server() {
 
     // The connection was used, so it is up now.
     std::thread::sleep(Duration::from_millis(200));
-    let now = *client.connection(&key).borrow();
+    let now = client.connection(&key).borrow().clone();
     eprintln!("connection: {state:?} at first, {now:?} after use");
     assert_eq!(now, ConnectionState::Connected);
 }

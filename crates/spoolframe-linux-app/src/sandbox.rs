@@ -660,7 +660,7 @@ fn install(filters: &Filters) -> std::io::Result<()> {
 /// `--self-check PROBE`: after [`confine`], what the app can and cannot do,
 /// one line each. True when it is confined as it should be: `probe` (a file
 /// in the home directory) cannot be read, no program can start, the app's
-/// data directory can be written, and GStreamer still starts.
+/// data directory can be written, GStreamer still starts and so does TLS.
 pub fn self_check(confinement: Confinement, probe: &Path) -> bool {
     let mut ok = true;
     let mut say = |what: &str, good: bool| {
@@ -711,7 +711,31 @@ pub fn self_check(confinement: Confinement, probe: &Path) -> bool {
         Ok(_) => say("gstreamer: ok", true),
         Err(e) => say(&format!("gstreamer: {e}"), false),
     }
+    match tls() {
+        Ok(()) => say("tls: ok", true),
+        Err(e) => say(&format!("tls: {e}"), false),
+    }
     ok
+}
+
+/// What the SDK's TLS provider (aws-lc-rs, iroh's) does on its first
+/// connection: its CPU-feature probe, seeding its random numbers (getrandom,
+/// the fork and VM-snapshot checks) and a key exchange. An error, or an
+/// abort from aws-lc itself, if the confinement refuses any of it.
+fn tls() -> Result<(), String> {
+    use rustls::crypto::aws_lc_rs::default_provider;
+    let provider = default_provider();
+    let mut nonce = [0; 32];
+    provider
+        .secure_random
+        .fill(&mut nonce)
+        .map_err(|e| format!("random: {e:?}"))?;
+    let group = *provider.kx_groups.first().ok_or("no key exchange")?;
+    let ours = group.start().map_err(|e| format!("key exchange: {e}"))?;
+    let theirs = group.start().map_err(|e| format!("key exchange: {e}"))?;
+    ours.complete(theirs.pub_key())
+        .map_err(|e| format!("key exchange: {e}"))?;
+    Ok(())
 }
 
 #[cfg(test)]

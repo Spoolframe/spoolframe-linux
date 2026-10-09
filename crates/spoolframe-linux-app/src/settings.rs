@@ -13,6 +13,7 @@ const APPEARANCE: &str = "appearance";
 const THEME: &str = "theme";
 const CONNECTION: &str = "connection";
 const SERVER: &str = "server";
+const RELAYS: &str = "relays";
 const STREAMING: &str = "streaming";
 const MAX_BITRATE: &str = "max-bitrate";
 const SHOW_HDR: &str = "show-hdr";
@@ -45,6 +46,17 @@ impl Settings {
         Self { path, file }
     }
 
+    /// The settings in the file at `path`, for tests.
+    #[cfg(test)]
+    pub fn at(path: &std::path::Path) -> Self {
+        let file = glib::KeyFile::new();
+        let _ = file.load_from_file(path, glib::KeyFileFlags::KEEP_COMMENTS);
+        Self {
+            path: Some(path.to_owned()),
+            file,
+        }
+    }
+
     pub fn theme(&self) -> Theme {
         let Ok(key) = self.file.string(APPEARANCE, THEME) else {
             return Theme::default();
@@ -70,6 +82,19 @@ impl Settings {
 
     pub fn set_server(&mut self, key: &str) {
         self.file.set_string(CONNECTION, SERVER, key);
+        self.save();
+    }
+
+    /// Whether a server is reached through the relays it told this device
+    /// of, when it cannot be dialled directly (P6-03); on by default. Off,
+    /// no relay is ever contacted. Read once at start-up: the SDK's
+    /// endpoint has or lacks its relay transport for as long as it runs.
+    pub fn use_relays(&self) -> bool {
+        self.file.boolean(CONNECTION, RELAYS).unwrap_or(true)
+    }
+
+    pub fn set_use_relays(&mut self, on: bool) {
+        self.file.set_boolean(CONNECTION, RELAYS, on);
         self.save();
     }
 
@@ -143,5 +168,22 @@ impl Settings {
         }
         self.file.save_to_file(path)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Relays are used unless the user turned them off, and turning them
+    /// off is kept for the next start (P6-03).
+    #[test]
+    fn relays_are_on_until_turned_off_and_stay_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.ini");
+        let mut settings = Settings::at(&path);
+        assert!(settings.use_relays());
+        settings.set_use_relays(false);
+        assert!(!Settings::at(&path).use_relays());
     }
 }
