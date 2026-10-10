@@ -1,0 +1,63 @@
+# Flatpak of the Spoolframe Linux client, built as a bundle to install with
+# `flatpak install`: see flatpak/README.md.
+#
+# The sources are this project and the server workspace beside it, as the
+# client takes spoolframe-types and the SDK as path dependencies on
+# ../spoolframe. Crates come from cargo-sources.json, made from Cargo.lock
+# by flatpak-cargo-generator, as the build has no network.
+app-id: casa.coldsteel.Spoolframe
+runtime: org.gnome.Platform
+# GNOME 49 is the first with GTK 4.20, which gst-plugin-gtk4's gtk_v4_20
+# feature needs; 51 is the current one.
+runtime-version: '51'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+  # libclang, for bindgen in fido-hid-rs (security keys).
+  - org.freedesktop.Sdk.Extension.llvm22
+command: spoolframe-linux
+finish-args:
+  - --share=network
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --socket=pulseaudio
+  # The GPU (/dev/dri, for VA-API and GL) and security keys (/dev/hidraw*,
+  # for passkeys): Flatpak has no narrower grant for hidraw than all.
+  - --device=all
+  # A passkey on a phone proves the phone is near over Bluetooth, through
+  # BlueZ.
+  - --allow=bluetooth
+  - --system-talk-name=org.bluez
+  # MPRIS, for media keys and the desktop's player controls: the app
+  # registers org.mpris.MediaPlayer2.spoolframe.instance<pid>.
+  - --own-name=org.mpris.MediaPlayer2.spoolframe.*
+build-options:
+  # clang on the path too: bindgen asks it where its own headers are.
+  append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm22/bin
+  env:
+    CARGO_HOME: /run/build/spoolframe-linux/cargo
+    CARGO_NET_OFFLINE: 'true'
+    LIBCLANG_PATH: /usr/lib/sdk/llvm22/lib
+modules:
+  - name: spoolframe-linux
+    buildsystem: simple
+    build-commands:
+      - cd spoolframe-linux && cargo build --release --locked --offline -p spoolframe-linux-app
+      - install -Dm755 spoolframe-linux/target/release/spoolframe-linux /app/bin/spoolframe-linux
+      - install -Dm644 spoolframe-linux/crates/spoolframe-linux-app/data/casa.coldsteel.Spoolframe.desktop
+        /app/share/applications/casa.coldsteel.Spoolframe.desktop
+      - install -Dm644 spoolframe-linux/flatpak/casa.coldsteel.Spoolframe.metainfo.xml
+        /app/share/metainfo/casa.coldsteel.Spoolframe.metainfo.xml
+      - mkdir -p /app/share/icons && cp -r spoolframe-linux/crates/spoolframe-linux-app/data/icons/hicolor
+        /app/share/icons/
+    sources:
+      - type: dir
+        path: ..
+        dest: spoolframe-linux
+        skip: [target, .devenv, .direnv, .flatpak-builder]
+      - type: dir
+        path: ../../spoolframe
+        dest: spoolframe
+        skip: [target, .devenv, .direnv, .flatpak-builder]
+      - cargo-sources.json

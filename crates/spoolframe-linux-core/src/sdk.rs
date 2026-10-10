@@ -32,7 +32,74 @@ use crate::backend::{
     FinishPasskeyRegistration, FinishPasskeySignIn, PasskeyCreation, PasskeyInfo, PasskeyRequest,
     TrackPreferencesInfo, Trust, TrustedProfile,
 };
+use crate::backend::{InviteKind, InviteOrigin, InviteSpec, InviteSummary, MintedInvite};
 use crate::storage::Storage;
+
+fn invite_kind(kind: sdk::InviteKind) -> InviteKind {
+    match kind {
+        sdk::InviteKind::CreateUser => InviteKind::CreateUser,
+        sdk::InviteKind::PortableAccount => InviteKind::PortableAccount,
+        sdk::InviteKind::Federation => InviteKind::Federation,
+        _ => InviteKind::Unknown,
+    }
+}
+
+/// The SDK's invite to make; an unknown kind is never made, so it cannot
+/// come from here.
+fn sdk_invite_spec(spec: InviteSpec) -> sdk::InviteSpec {
+    sdk::InviteSpec {
+        kind: match spec.kind {
+            InviteKind::CreateUser | InviteKind::Unknown => sdk::InviteKind::CreateUser,
+            InviteKind::PortableAccount => sdk::InviteKind::PortableAccount,
+            InviteKind::Federation => sdk::InviteKind::Federation,
+        },
+        note: spec.note,
+        uses: spec.uses,
+        expires_in: spec.expires_in,
+        role: spec.role,
+    }
+}
+
+fn minted_invite(made: sdk::MintedInvite) -> MintedInvite {
+    MintedInvite {
+        id: made.id,
+        kind: invite_kind(made.kind),
+        code: made.code,
+        link: made.link,
+        copy_string: made.copy_string,
+        expires_at: Some(made.expires_at),
+        uses: Some(made.uses),
+    }
+}
+
+/// The SDK lists only invites that still work: none is revoked.
+fn invite_summary(invite: sdk::InviteSummary) -> InviteSummary {
+    InviteSummary {
+        id: invite.id,
+        kind: invite_kind(invite.kind),
+        note: invite.note,
+        uses: Some(invite.uses),
+        used: invite.used,
+        expires_at: Some(invite.expires_at),
+        created_by: invite.created_by.display_name,
+        created_by_username: invite.created_by.username,
+        created_from: match invite.created_from {
+            sdk::InviteOrigin::WebAdmin => InviteOrigin::WebAdmin,
+            sdk::InviteOrigin::Cli => InviteOrigin::Cli,
+            sdk::InviteOrigin::Device {
+                name,
+                platform,
+                this_device,
+            } => InviteOrigin::Device {
+                name,
+                platform,
+                this_device,
+            },
+            _ => InviteOrigin::Unknown,
+        },
+        revoked: false,
+    }
+}
 
 /// The SDK's errors, in the kinds the UI acts on.
 pub fn backend_error(error: sdk::SdkError) -> BackendError {
@@ -72,6 +139,7 @@ pub fn backend_error(error: sdk::SdkError) -> BackendError {
         E::InviteExpired => BackendError::InviteExpired,
         E::InviteExhausted => BackendError::InviteExhausted,
         E::UsernameTaken => BackendError::UsernameTaken,
+        E::AdminRequired => BackendError::AdminOnly,
         other => BackendError::Other(other.to_string()),
     }
 }
@@ -1093,6 +1161,32 @@ impl Session for SdkSession {
         Box::pin(self.call(move |s| async move { s.finish_confirm_passkey(signed).await }))
     }
 
+    fn is_admin(&self) -> bool {
+        self.session.user().role.is_admin()
+    }
+
+    fn create_invite(&self, spec: InviteSpec) -> BoxFuture<'_, Result<MintedInvite, BackendError>> {
+        let spec = sdk_invite_spec(spec);
+        Box::pin(async move {
+            self.call(|s| async move { s.create_invite(spec).await })
+                .await
+                .map(minted_invite)
+        })
+    }
+
+    fn invites(&self) -> BoxFuture<'_, Result<Vec<InviteSummary>, BackendError>> {
+        Box::pin(async move {
+            self.call(|s| async move { s.invites().await })
+                .await
+                .map(|invites| invites.into_iter().map(invite_summary).collect())
+        })
+    }
+
+    fn revoke_invite<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), BackendError>> {
+        let id = id.to_owned();
+        Box::pin(self.call(move |s| async move { s.revoke_invite(&id).await }))
+    }
+
     fn begin_passkey_registration(&self) -> BoxFuture<'_, Result<PasskeyCreation, BackendError>> {
         Box::pin(self.call(|s| async move { s.begin_passkey_registration().await }))
     }
@@ -1186,6 +1280,58 @@ impl Session for SdkSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An invite made with the server's CLI names no username; the list
+    /// shows its display name.
+    #[test]
+    fn a_cli_invite_is_listed_by_its_makers_name_without_a_username() {
+        let listed = invite_summary(sdk::InviteSummary {
+            id: "inv".into(),
+            kind: sdk::InviteKind::CreateUser,
+            note: None,
+            role: spoolframe_types::Role::Consumer,
+            uses: 2,
+            used: 1,
+            expires_at: std::time::UNIX_EPOCH,
+            created_at: std::time::UNIX_EPOCH,
+            created_by: sdk::InviteCreator {
+                display_name: "server CLI".into(),
+                username: None,
+            },
+            created_from: sdk::InviteOrigin::Cli,
+        });
+        assert_eq!(
+            (
+                listed.created_by,
+                listed.created_by_username,
+                listed.created_from,
+                listed.uses,
+                listed.revoked
+            ),
+            (
+                "server CLI".to_owned(),
+                None,
+                InviteOrigin::Cli,
+                Some(2),
+                false
+            )
+        );
+    }
+
+    /// A kind or a place from a newer server is listed as unknown, not
+    /// taken for one this build knows.
+    #[test]
+    fn a_newer_servers_kind_and_origin_are_unknown() {
+        assert_eq!(invite_kind(sdk::InviteKind::Unknown), InviteKind::Unknown);
+    }
+
+    #[test]
+    fn not_being_the_admin_is_admin_only() {
+        assert_eq!(
+            backend_error(sdk::SdkError::AdminRequired),
+            BackendError::AdminOnly
+        );
+    }
 
     #[test]
     fn a_remembered_profile_last_in_by_passkey_still_says_passkey() {

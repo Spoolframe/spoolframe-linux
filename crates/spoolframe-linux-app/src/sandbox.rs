@@ -115,9 +115,11 @@ impl Home {
             named.push((auth, Use::Read));
         }
         use spoolframe_linux_core::paths;
+        let data = under("XDG_DATA_HOME", ".local/share");
+        let keyring = keyring_file_dir(data.as_deref(), in_flatpak());
         Self {
             config: under("XDG_CONFIG_HOME", ".config"),
-            data: under("XDG_DATA_HOME", ".local/share"),
+            data,
             cache: under("XDG_CACHE_HOME", ".cache"),
             runtime: var("XDG_RUNTIME_DIR").filter(|p| p.is_absolute()),
             app: [
@@ -126,6 +128,7 @@ impl Home {
                 paths::cache_dir(),
                 // Made now if it is a private one under /tmp.
                 paths::runtime_dir(),
+                keyring,
             ]
             .into_iter()
             .flatten()
@@ -134,6 +137,20 @@ impl Home {
             named,
         }
     }
+}
+
+/// The app runs in a Flatpak.
+fn in_flatpak() -> bool {
+    Path::new("/.flatpak-info").exists()
+}
+
+/// Where oo7 keeps the app's secrets as a file of its own, which the app
+/// writes: in a Flatpak, `keyrings` under the app's private data
+/// directory (the Secret portal holds only the file's key). Outside one,
+/// oo7 asks the desktop's Secret Service, and `keyrings` there is the
+/// desktop's own keyring, never opened.
+fn keyring_file_dir(data: Option<&Path>, flatpak: bool) -> Option<PathBuf> {
+    flatpak.then(|| data.map(|d| d.join("keyrings"))).flatten()
 }
 
 /// The system's programs and libraries, to read and run.
@@ -168,6 +185,11 @@ const READ: &[&str] = &[
     "/proc/sys",
     "/proc/filesystems",
     "/proc/driver/nvidia",
+    // In a Flatpak: what it shares of the host (fonts, icons and
+    // font-dirs.xml, which fontconfig reads), and its own description,
+    // which GLib reads to choose portals.
+    "/run/host",
+    "/.flatpak-info",
 ];
 
 /// Devices every run uses: those written to, then those only read.
@@ -199,6 +221,7 @@ const CACHE_MADE: &[&str] = &[
     "fontconfig",
     "mesa_shader_cache",
     "mesa_shader_cache_db",
+    "radv_builtin_shaders",
 ];
 
 /// Every place the app may use, and how. Places that do not exist are left
@@ -730,6 +753,20 @@ pub fn self_check(confinement: Confinement, probe: &Path) -> bool {
         Ok(()) => say("tls: ok", true),
         Err(e) => say(&format!("tls: {e}"), false),
     }
+    match keyring_file_dir(Home::from_env().data.as_deref(), in_flatpak()) {
+        // As oo7 saves it: a new file beside the keyring, renamed over it.
+        Some(dir) => {
+            let (temp, file) = (dir.join(".self-check-tmp"), dir.join("self-check"));
+            match std::fs::write(&temp, b"ok")
+                .and_then(|()| std::fs::rename(&temp, &file))
+                .and_then(|()| std::fs::remove_file(&file))
+            {
+                Ok(()) => say("keyring: written", true),
+                Err(e) => say(&format!("keyring: refused ({e})"), false),
+            }
+        }
+        None => say("keyring: the desktop's", true),
+    }
     ok
 }
 
@@ -789,6 +826,27 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// In a Flatpak, oo7 keeps the app's secrets in a file of its own,
+    /// under the app's private data directory, as the tester's strace
+    /// showed: it must be written there.
+    #[test]
+    fn in_a_flatpak_the_keyring_file_beside_the_data_is_the_apps() {
+        assert_eq!(
+            keyring_file_dir(Some(Path::new("/home/u/.var/app/x/data")), true),
+            Some(PathBuf::from("/home/u/.var/app/x/data/keyrings"))
+        );
+    }
+
+    /// Outside one, ~/.local/share/keyrings is the desktop's keyring, every
+    /// password the user saved: it stays closed.
+    #[test]
+    fn outside_a_flatpak_the_desktops_keyrings_stay_closed() {
+        assert_eq!(
+            keyring_file_dir(Some(Path::new("/home/u/.local/share")), false),
+            None
+        );
     }
 
     #[test]

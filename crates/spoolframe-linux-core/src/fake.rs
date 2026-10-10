@@ -40,6 +40,7 @@ use crate::backend::{
     FinishPasskeyRegistration, FinishPasskeySignIn, PasskeyCreation, PasskeyInfo, PasskeyRequest,
     TrackPreferencesInfo,
 };
+use crate::backend::{InviteKind, InviteOrigin, InviteSpec, InviteSummary, MintedInvite};
 
 /// Every fake account's password.
 pub const FAKE_PASSWORD: &str = "spoolframe";
@@ -71,6 +72,8 @@ struct FakeAuth {
     stale: bool,
     /// Who last signed in here with a passkey, as the SDK remembers it.
     by_passkey: std::collections::HashSet<String>,
+    /// Invites admins made from the app (PX-44), oldest first.
+    invites: Vec<InviteSummary>,
 }
 
 struct FakePasskey {
@@ -380,6 +383,8 @@ impl Catalog {
                 artwork: Vec::new(),
                 playback: PlaybackState::default(),
                 content_rating: Some("TV-MA".into()),
+                year: None,
+                air_date: None,
             }));
         }
         self.children.insert(season_id, ids);
@@ -510,6 +515,18 @@ impl Default for SignIns {
             approved: Vec::new(),
         }
     }
+}
+
+/// The fake's admin (P2-09); everyone else is a consumer.
+pub const FAKE_ADMIN: &str = "andrey";
+
+/// A fake user's display name: their username, capitalized ("Andrey").
+fn display_name(username: &str) -> String {
+    let mut chars = username.chars();
+    chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
 }
 
 /// The code a TV shows in the fixtures, waiting for approval.
@@ -779,6 +796,7 @@ impl FakeSession {
             Item::Track(_) => MediaTracks {
                 duration: length_of(item),
                 container: Some(Container::Flac),
+                bit_rate: None,
                 video: None,
                 audio: vec![audio(None, 2, true, AudioRole::Main)],
                 subtitles: Vec::new(),
@@ -786,12 +804,14 @@ impl FakeSession {
             _ => MediaTracks {
                 duration: length_of(item),
                 container: Some(Container::Matroska),
+                bit_rate: None,
                 video: Some(VideoTrack {
                     codec: VideoCodec::Hevc,
                     width: 3840,
                     height: 2160,
                     bit_depth: 10,
                     hdr: Some(HdrFormat::Hdr10),
+                    bit_rate: None,
                 }),
                 audio: vec![
                     audio(None, 6, true, AudioRole::Main),
@@ -1751,6 +1771,120 @@ impl Session for FakeSession {
         })
     }
 
+    fn is_admin(&self) -> bool {
+        self.username == FAKE_ADMIN
+    }
+
+    fn create_invite(&self, spec: InviteSpec) -> BoxFuture<'_, Result<MintedInvite, BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            if !self.is_admin() {
+                return Err(BackendError::AdminOnly);
+            }
+            match spec.kind {
+                InviteKind::Federation => {
+                    return Err(BackendError::InvalidInput(
+                        "federation invites arrive with federation".into(),
+                    ));
+                }
+                InviteKind::PortableAccount if spec.role.is_some() => {
+                    return Err(BackendError::InvalidInput(
+                        "a portable account invite takes no role".into(),
+                    ));
+                }
+                _ => {}
+            }
+            let mut auth = self.lock_passkeys();
+            if auth.stale {
+                return Err(BackendError::RecentSignInRequired);
+            }
+            let n = auth.invites.len() + 1;
+            let id = format!("inv-{n}");
+            // A code the protocol reads, different for each invite.
+            let alphabet = spoolframe_protocol::invite::CODE_ALPHABET;
+            let code: String = (0..12)
+                .map(|i| char::from(alphabet[(n * 7 + i * 3) % alphabet.len()]))
+                .collect();
+            let expires_at = spec.expires_in.map(|d| std::time::SystemTime::now() + d);
+            let link = spoolframe_protocol::invite::Invite {
+                server: home_media().0,
+                name: Some("Home Media".into()),
+                addrs: vec!["192.168.1.20:7430".parse().expect("an address")],
+                relays: Vec::new(),
+                code: Some(code.clone()),
+                expires_at: expires_at.and_then(|at| {
+                    at.duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .map(|d| d.as_secs())
+                }),
+                role: spec.role,
+                kind: match spec.kind {
+                    InviteKind::PortableAccount => {
+                        spoolframe_protocol::invite::InviteLinkKind::PortableAccount
+                    }
+                    _ => spoolframe_protocol::invite::InviteLinkKind::CreateUser,
+                },
+                lookup: None,
+            }
+            .link();
+            auth.invites.push(InviteSummary {
+                id: id.clone(),
+                kind: spec.kind,
+                note: spec.note,
+                uses: spec.uses,
+                used: 0,
+                expires_at,
+                created_by: display_name(&self.username),
+                created_by_username: Some(self.username.clone()),
+                created_from: InviteOrigin::Device {
+                    name: Some("This computer".into()),
+                    platform: Platform::Linux,
+                    this_device: true,
+                },
+                revoked: false,
+            });
+            Ok(MintedInvite {
+                id,
+                kind: spec.kind,
+                code: spoolframe_protocol::invite::display_code(&code),
+                copy_string: link.clone(),
+                link,
+                expires_at,
+                uses: spec.uses,
+            })
+        })
+    }
+
+    fn invites(&self) -> BoxFuture<'_, Result<Vec<InviteSummary>, BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            if !self.is_admin() {
+                return Err(BackendError::AdminOnly);
+            }
+            Ok(self.lock_passkeys().invites.iter().rev().cloned().collect())
+        })
+    }
+
+    fn revoke_invite<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            if !self.is_admin() {
+                return Err(BackendError::AdminOnly);
+            }
+            let mut auth = self.lock_passkeys();
+            if auth.stale {
+                return Err(BackendError::RecentSignInRequired);
+            }
+            let invite = auth
+                .invites
+                .iter_mut()
+                .find(|i| i.id == id)
+                .ok_or_else(|| BackendError::NotFound(format!("invite {id}")))?;
+            invite.revoked = true;
+            Ok(())
+        })
+    }
+
     fn begin_passkey_registration(&self) -> BoxFuture<'_, Result<PasskeyCreation, BackendError>> {
         Box::pin(async move {
             self.guard()?;
@@ -2230,6 +2364,7 @@ impl FakeClient {
                 ],
                 stale: false,
                 by_passkey: Default::default(),
+                invites: Vec::new(),
                 trusted: HashMap::new(),
                 tv_untrusted: false,
                 signed_out: Default::default(),
@@ -2307,6 +2442,7 @@ impl FakeClient {
             code: code.map(str::to_owned),
             expires_at: Some(in_six_days),
             role: Some(spoolframe_types::Role::Consumer),
+            kind: spoolframe_protocol::invite::InviteLinkKind::CreateUser,
             lookup: None,
         }
         .link()
@@ -4928,5 +5064,161 @@ mod tests {
             ready(alice.approve_device_sign_in(FAKE_SIGN_IN_CODE, false)).unwrap_err(),
             BackendError::ProfileLocked
         );
+    }
+
+    /// Invites an admin makes from the app (PX-44).
+    mod minted_invites {
+        use super::*;
+
+        fn create_user() -> InviteSpec {
+            InviteSpec {
+                kind: InviteKind::CreateUser,
+                note: Some("For Sam".into()),
+                uses: Some(2),
+                expires_in: Some(Duration::from_secs(7 * 24 * 3600)),
+                role: Some(spoolframe_types::Role::Consumer),
+            }
+        }
+
+        #[test]
+        fn only_an_admins_session_is_an_admins() {
+            let client = FakeClient::new(None);
+            assert_eq!(
+                (
+                    session_for(&client, "andrey").is_admin(),
+                    session_for(&client, "bob").is_admin()
+                ),
+                (true, false)
+            );
+        }
+
+        #[test]
+        fn a_made_invite_is_listed_with_its_maker_and_no_uses() {
+            let andrey = andrey();
+            let made = ready(andrey.create_invite(create_user())).unwrap();
+            let listed = ready(andrey.invites()).unwrap();
+            assert_eq!(
+                listed,
+                vec![InviteSummary {
+                    id: made.id,
+                    kind: InviteKind::CreateUser,
+                    note: Some("For Sam".into()),
+                    uses: Some(2),
+                    used: 0,
+                    expires_at: made.expires_at,
+                    created_by: "Andrey".into(),
+                    created_by_username: Some("andrey".into()),
+                    created_from: InviteOrigin::Device {
+                        name: Some("This computer".into()),
+                        platform: Platform::Linux,
+                        this_device: true,
+                    },
+                    revoked: false,
+                }]
+            );
+        }
+
+        #[test]
+        fn a_made_invites_link_carries_its_code_as_shown() {
+            let made = ready(andrey().create_invite(create_user())).unwrap();
+            assert!(
+                made.link.ends_with(&format!("&cap={}", made.code)),
+                "{}",
+                made.link
+            );
+        }
+
+        #[test]
+        fn a_revoked_invite_stays_listed_as_revoked() {
+            let andrey = andrey();
+            let made = ready(andrey.create_invite(create_user())).unwrap();
+            ready(andrey.revoke_invite(&made.id)).unwrap();
+            assert!(ready(andrey.invites()).unwrap()[0].revoked);
+        }
+
+        #[test]
+        fn revoking_an_unknown_invite_is_not_found() {
+            assert!(matches!(
+                ready(andrey().revoke_invite("nope")),
+                Err(BackendError::NotFound(_))
+            ));
+        }
+
+        #[test]
+        fn someone_not_an_admin_is_refused_every_invite_request() {
+            let bob = session_for(&FakeClient::new(None), "bob");
+            assert_eq!(
+                (
+                    ready(bob.create_invite(create_user())).unwrap_err(),
+                    ready(bob.invites()).unwrap_err(),
+                    ready(bob.revoke_invite("any")).unwrap_err(),
+                ),
+                (
+                    BackendError::AdminOnly,
+                    BackendError::AdminOnly,
+                    BackendError::AdminOnly
+                )
+            );
+        }
+
+        #[test]
+        fn making_or_revoking_long_after_signing_in_asks_to_confirm() {
+            let client = FakeClient::new(None);
+            let andrey = session_for(&client, "andrey");
+            let made = ready(andrey.create_invite(create_user())).unwrap();
+            client.age_sign_ins();
+            assert_eq!(
+                (
+                    ready(andrey.create_invite(create_user())).unwrap_err(),
+                    ready(andrey.revoke_invite(&made.id)).unwrap_err(),
+                ),
+                (
+                    BackendError::RecentSignInRequired,
+                    BackendError::RecentSignInRequired
+                )
+            );
+        }
+
+        #[test]
+        fn listing_long_after_signing_in_needs_no_confirmation() {
+            let client = FakeClient::new(None);
+            let andrey = session_for(&client, "andrey");
+            client.age_sign_ins();
+            assert!(ready(andrey.invites()).is_ok());
+        }
+
+        #[test]
+        fn confirming_lets_an_old_sign_in_make_an_invite() {
+            let client = FakeClient::new(None);
+            let andrey = session_for(&client, "andrey");
+            client.age_sign_ins();
+            ready(andrey.confirm_password(FAKE_PASSWORD)).unwrap();
+            assert!(ready(andrey.create_invite(create_user())).is_ok());
+        }
+
+        #[test]
+        fn a_portable_account_invite_takes_no_role() {
+            let spec = InviteSpec {
+                kind: InviteKind::PortableAccount,
+                ..create_user()
+            };
+            assert!(matches!(
+                ready(andrey().create_invite(spec)),
+                Err(BackendError::InvalidInput(_))
+            ));
+        }
+
+        #[test]
+        fn a_federation_invite_is_refused_until_federation_arrives() {
+            let spec = InviteSpec {
+                kind: InviteKind::Federation,
+                role: None,
+                ..create_user()
+            };
+            assert!(matches!(
+                ready(andrey().create_invite(spec)),
+                Err(BackendError::InvalidInput(_))
+            ));
+        }
     }
 }

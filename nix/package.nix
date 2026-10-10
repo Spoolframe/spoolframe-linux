@@ -38,7 +38,7 @@
     inherit src;
     strictDeps = true;
     pname = "spoolframe-linux";
-    version = "0.1.0";
+    version = "0.6.1";
     cargoLock = src + "/spoolframe-linux/Cargo.lock";
     cargoToml = src + "/spoolframe-linux/Cargo.toml";
     # Build in the project's directory, so the path dependency on

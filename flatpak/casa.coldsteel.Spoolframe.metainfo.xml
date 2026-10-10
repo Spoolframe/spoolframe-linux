@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>casa.coldsteel.Spoolframe</id>
+  <name>Spoolframe</name>
+  <summary>Watch and listen to your Spoolframe library</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <developer id="casa.coldsteel">
+    <name>Coldsteel</name>
+  </developer>
+  <description>
+    <p>
+      Spoolframe plays the films, shows and music on your own Spoolframe
+      server, at home or away, over a connection only you and the people
+      you invite can use.
+    </p>
+  </description>
+  <launchable type="desktop-id">casa.coldsteel.Spoolframe.desktop</launchable>
+  <url type="homepage">https://git.coldsteel.casa/Coldsteel/foundry</url>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.6.1" date="2026-10-10"/>
+  </releases>
+</component>

@@ -761,6 +761,8 @@ mod tests {
             artwork: Vec::new(),
             playback: PlaybackState::default(),
             content_rating: None,
+            year: None,
+            air_date: None,
         })
     }
 

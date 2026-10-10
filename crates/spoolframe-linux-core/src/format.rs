@@ -386,6 +386,7 @@ mod tests {
             height,
             bit_depth: 10,
             hdr,
+            bit_rate: None,
         }
     }
 

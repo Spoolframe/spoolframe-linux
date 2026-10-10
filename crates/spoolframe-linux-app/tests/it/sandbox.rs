@@ -7,6 +7,10 @@ use std::process::{Command, Output};
 /// Runs `--self-check` with a fresh home holding a probe file, and the
 /// sandbox on or turned off.
 fn self_check(sandbox: bool) -> Output {
+    self_check_with(sandbox, &[])
+}
+
+fn self_check_with(sandbox: bool, env: &[(&str, &str)]) -> Output {
     let home = tempfile::tempdir().unwrap();
     let probe = home.path().join("probe-secret");
     std::fs::write(&probe, "not for the app").unwrap();
@@ -22,6 +26,7 @@ fn self_check(sandbox: bool) -> Output {
         .env("XDG_CACHE_HOME", home.path().join(".cache"))
         .env("XDG_RUNTIME_DIR", &runtime)
         .env_remove("SPOOLFRAME_NO_SANDBOX");
+    command.envs(env.iter().copied());
     if !sandbox {
         command.env("SPOOLFRAME_NO_SANDBOX", "1");
     }
@@ -70,4 +75,27 @@ fn confined_gstreamer_does_not_try_its_plugin_scanner() {
         !stderr.contains("External plugin loader failed"),
         "{stderr}"
     );
+}
+
+/// GNOME's Flatpak runtime ships gst-plugin-gtk4, as some distributions
+/// do: scanned in the process (as confined, above), it registers the
+/// sink's type before the app's linked-in copy could, which must then
+/// give way rather than panic. Ignored: it needs a gst-plugin-gtk4 build,
+/// named by `SPOOLFRAME_TEST_GTK4_PLUGINS`, a directory holding
+/// libgstgtk4.so:
+///
+/// ```sh
+/// SPOOLFRAME_TEST_GTK4_PLUGINS=$(nix build --no-link --print-out-paths \
+///   nixpkgs#gst_all_1.gst-plugins-rs)/lib/gstreamer-1.0 \
+///   cargo test -p spoolframe-linux-app --test it -- --ignored system_gtk4
+/// ```
+#[test]
+#[ignore = "needs a gst-plugin-gtk4 build in SPOOLFRAME_TEST_GTK4_PLUGINS"]
+fn a_system_gtk4_plugin_takes_the_place_of_the_linked_in_one() {
+    let plugins = std::env::var("SPOOLFRAME_TEST_GTK4_PLUGINS")
+        .expect("SPOOLFRAME_TEST_GTK4_PLUGINS names a directory with libgstgtk4.so");
+    assert!(Path::new(&plugins).join("libgstgtk4.so").exists());
+    let output = self_check_with(true, &[("GST_PLUGIN_PATH", &plugins)]);
+    let said = stdout(&output);
+    assert!(said.contains("gstreamer: ok"), "{output:?}");
 }

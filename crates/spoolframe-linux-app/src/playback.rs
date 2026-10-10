@@ -45,7 +45,14 @@ use crate::queue::{Queue, Queued};
 pub fn init() -> anyhow::Result<()> {
     gst::init()?;
     crate::denylist::apply();
-    gstgtk4::plugin_register_static()?;
+    // A gst-plugin-gtk4 among the system's plugins (GNOME's Flatpak
+    // runtime has one) is used instead: the sink's GLib type can be
+    // registered once, and a scan in the process (as confined) already
+    // did. That one is built for the system's GTK, which is then the
+    // app's.
+    if gst::ElementFactory::find("gtk4paintablesink").is_none() {
+        gstgtk4::plugin_register_static()?;
+    }
     crate::source::register()?;
     Ok(())
 }

@@ -22,6 +22,7 @@ ICONS=(
   globe settings triangle-alert clock smartphone history list-x calendar loader-circle
   monitor-play user-round log-out trash-2 external-link link laptop monitor layers-2
   mic-vocal disc-3 key-round usb clipboard user-plus
+  ticket fingerprint copy
 )
 
 here="$(cd "$(dirname "$0")" && pwd)"

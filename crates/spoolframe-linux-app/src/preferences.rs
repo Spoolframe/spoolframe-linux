@@ -3,8 +3,9 @@
 //! device), Playback (the bitrate limit and skipping intros on this
 //! device, P2-06 and P2-10, and, when signed in, the user's audio and
 //! subtitle preferences, kept on the server for every device, P1-20),
-//! Servers (the fingerprint of the server in use, P1-21) and Profile (the
-//! PIN and where it is asked for, P2-08).
+//! Servers (the fingerprint of the server in use, P1-21), Profile (the
+//! PIN and where it is asked for, P2-08) and, for the server's admin,
+//! Invites (PX-44).
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -59,7 +60,19 @@ pub fn dialog(
         servers_page(servers),
     ];
     if let Some(signed) = signed {
+        // An admin's own tab (PX-44): the server's invites.
+        let admin = signed
+            .session
+            .is_admin()
+            .then(|| crate::admin_invites::Admin {
+                session: signed.session.clone(),
+                server: signed.server.clone(),
+                username: signed.username.clone(),
+            });
         pages.push(crate::profile_page::page(signed, &toasts));
+        if let Some(admin) = admin {
+            pages.push(crate::admin_invites::page(admin, &toasts));
+        }
     }
     let stack = gtk::Stack::builder()
         .transition_type(gtk::StackTransitionType::Crossfade)
@@ -94,6 +107,22 @@ pub fn dialog(
                 tab.set_active(true);
                 first = Some(tab.clone());
             }
+        }
+        // A page that goes (Invites, when the user is no longer the
+        // admin) takes its tab, and shows the first page if it was open.
+        page.bind_property("visible", &tab, "visible")
+            .sync_create()
+            .build();
+        if let Some(first) = &first {
+            let first = first.downgrade();
+            tab.connect_visible_notify(move |tab| {
+                if !tab.is_visible()
+                    && tab.is_active()
+                    && let Some(first) = first.upgrade()
+                {
+                    first.set_active(true);
+                }
+            });
         }
         let (stack, page) = (stack.clone(), page.clone());
         tab.connect_toggled(move |tab| {

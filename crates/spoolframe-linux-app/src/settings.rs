@@ -62,7 +62,7 @@ impl Settings {
             return Theme::default();
         };
         Theme::from_key(&key).unwrap_or_else(|| {
-            tracing::warn!(path = ?self.path, theme = %key, "unknown theme in settings; following the system");
+            tracing::warn!(path = ?self.path, theme = %key, "unknown theme in settings; using the default");
             Theme::default()
         })
     }
@@ -185,5 +185,16 @@ mod tests {
         assert!(settings.use_relays());
         settings.set_use_relays(false);
         assert!(!Settings::at(&path).use_relays());
+    }
+
+    /// Spoolframe's own look until the user picks another: the system's
+    /// plain Adwaita leaves the app's controls without their styling.
+    #[test]
+    fn with_no_theme_saved_the_app_opens_in_mocha() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            Settings::at(&dir.path().join("settings.ini")).theme(),
+            Theme::Mocha
+        );
     }
 }

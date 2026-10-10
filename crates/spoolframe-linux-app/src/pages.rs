@@ -1231,6 +1231,8 @@ mod tests {
                 watched,
             },
             content_rating: None,
+            year: None,
+            air_date: None,
         })
     }
 

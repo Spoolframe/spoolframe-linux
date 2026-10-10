@@ -1,3 +1,4 @@
+mod admin_invites;
 mod app;
 mod artwork;
 mod browser;

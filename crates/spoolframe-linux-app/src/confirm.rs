@@ -41,6 +41,25 @@ pub fn ask(
     title: &str,
     again: Rc<dyn Fn()>,
 ) {
+    ask_because(
+        parent,
+        session,
+        server,
+        title,
+        "You signed in over 10 minutes ago.",
+        again,
+    );
+}
+
+/// As [`ask`], with `lead` under the heading saying why it is asked.
+pub fn ask_because(
+    parent: &impl IsA<gtk::Widget>,
+    session: Arc<dyn Session>,
+    server: &str,
+    title: &str,
+    lead: &str,
+    again: Rc<dyn Fn()>,
+) {
     let dialog = adw::Dialog::builder()
         .title(title)
         .content_width(380)
@@ -77,7 +96,9 @@ pub fn ask(
     );
     body.append(
         &gtk::Label::builder()
-            .label("You signed in over 10 minutes ago.")
+            .label(lead)
+            .wrap(true)
+            .justify(gtk::Justification::Center)
             .css_classes(["dim-label", "small-text"])
             .build(),
     );

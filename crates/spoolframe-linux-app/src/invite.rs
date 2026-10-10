@@ -712,7 +712,7 @@ fn terms_line(invite: &Invite, now: SystemTime) -> String {
 }
 
 /// "Oct 14", in local time.
-fn month_day(at: SystemTime) -> String {
+pub fn month_day(at: SystemTime) -> String {
     let secs = at
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);

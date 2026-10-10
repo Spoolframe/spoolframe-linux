@@ -4,11 +4,13 @@
 //! so stock widgets and our own (which use the same variables, never a
 //! literal colour) change together.
 
-/// A theme the user can pick in Preferences → Appearance.
+/// A theme the user can pick in Preferences → Appearance. Mocha until
+/// they do: the app is drawn for its own palettes, and the system's plain
+/// Adwaita leaves its controls without their styling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Theme {
-    #[default]
     System,
+    #[default]
     Mocha,
     Macchiato,
     Frappe,

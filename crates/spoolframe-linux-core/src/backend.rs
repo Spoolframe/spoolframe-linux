@@ -168,6 +168,9 @@ pub enum BackendError {
     /// The passkey is the user's last way to sign in, and is kept.
     #[error("this is your only way to sign in")]
     LastSignInMethod,
+    /// Only the server's admin may do this (PX-44's invites).
+    #[error("only the server’s admin can do that")]
+    AdminOnly,
     #[error("{0}")]
     Other(String),
 }
@@ -377,6 +380,85 @@ pub struct Invite {
     pub role: Option<spoolframe_types::Role>,
     /// The server is saved on this device already.
     pub saved: bool,
+}
+
+/// What an invite an admin makes does when it is redeemed (PX-44).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InviteKind {
+    /// Makes an account on this server (P6-01).
+    CreateUser,
+    /// Lets someone with a portable identity in (P7-05).
+    PortableAccount,
+    /// Pairs another server with this one (P8-01): refused until then.
+    Federation,
+    /// A kind this build does not know, from a newer server: listed, never
+    /// made.
+    Unknown,
+}
+
+/// An invite to make (PX-44): the web UI's fields, with its limits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InviteSpec {
+    pub kind: InviteKind,
+    /// For the admin's list: who it is for.
+    pub note: Option<String>,
+    /// How many times it may be redeemed; `None` leaves it to the server.
+    pub uses: Option<u32>,
+    /// How long it works for; `None` leaves it to the server.
+    pub expires_in: Option<Duration>,
+    /// The role the account gets: only for `CreateUser`.
+    pub role: Option<spoolframe_types::Role>,
+}
+
+/// An invite just made: its code shows only now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MintedInvite {
+    pub id: String,
+    pub kind: InviteKind,
+    /// As people read and type it: `QW7K-2MFP-XR4T`.
+    pub code: String,
+    /// `spoolframe://invite?…`, for the QR code and to send.
+    pub link: String,
+    /// The text to paste into "Add a server".
+    pub copy_string: String,
+    pub expires_at: Option<std::time::SystemTime>,
+    pub uses: Option<u32>,
+}
+
+/// An invite on the admin's list, without its code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InviteSummary {
+    pub id: String,
+    pub kind: InviteKind,
+    pub note: Option<String>,
+    pub uses: Option<u32>,
+    /// How many times it has been redeemed.
+    pub used: u32,
+    pub expires_at: Option<std::time::SystemTime>,
+    /// The admin who made it, by display name.
+    pub created_by: String,
+    /// `None` for an invite made with the server's command line.
+    pub created_by_username: Option<String>,
+    pub created_from: InviteOrigin,
+    pub revoked: bool,
+}
+
+/// Where an invite was made (PX-44).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InviteOrigin {
+    /// The web UI's admin pages; also every invite from before PX-44.
+    WebAdmin,
+    /// The server's command line.
+    Cli,
+    /// An app, by the device it ran on.
+    Device {
+        name: Option<String>,
+        platform: Platform,
+        /// The device asking now.
+        this_device: bool,
+    },
+    /// A place this build does not know, from a newer server.
+    Unknown,
 }
 
 /// This device: the servers it knows, and the users signed in on them.
@@ -883,6 +965,20 @@ pub trait Session: Send + Sync {
         &self,
         signed: FinishPasskeySignIn,
     ) -> BoxFuture<'_, Result<(), BackendError>>;
+
+    /// The user is the server's admin (P2-09): the app offers its admin
+    /// pages.
+    fn is_admin(&self) -> bool;
+
+    /// Makes an invite (PX-44). Admins only, after a recent confirmation
+    /// (`RecentSignInRequired` asks for one).
+    fn create_invite(&self, spec: InviteSpec) -> BoxFuture<'_, Result<MintedInvite, BackendError>>;
+
+    /// The server's invites, newest first; revoked ones too. Admins only.
+    fn invites(&self) -> BoxFuture<'_, Result<Vec<InviteSummary>, BackendError>>;
+
+    /// Stops an invite working. Admins only, after a recent confirmation.
+    fn revoke_invite<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), BackendError>>;
 }
 
 #[cfg(test)]

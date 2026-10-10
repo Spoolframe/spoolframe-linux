@@ -1613,3 +1613,14 @@ popover.scrub-preview > contents {
 .invite-refusal-icon {
   color: var(--error-color);
 }
+
+/* Invites (PX-44): each kind's colour, as the LinuxPrefsInvites board
+   has them: accounts teal, identities mauve, servers peach. */
+.invite-account { color: var(--accent-teal); }
+.invite-identity { color: var(--accent-purple); }
+.invite-server { color: var(--accent-orange); }
+.invite-chip {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 2px 8px;
+}
