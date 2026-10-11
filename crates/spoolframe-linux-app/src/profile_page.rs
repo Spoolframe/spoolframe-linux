@@ -1872,6 +1872,8 @@ mod tests {
             advertised: Vec::new(),
             relays: Vec::new(),
             advertised_at: None,
+            use_relays: None,
+            relays_edited: false,
         };
         let page = page(
             Signed {
@@ -1929,6 +1931,8 @@ mod tests {
             advertised: Vec::new(),
             relays: Vec::new(),
             advertised_at: None,
+            use_relays: None,
+            relays_edited: false,
         };
         let toasts = adw::ToastOverlay::new();
         let page = page(

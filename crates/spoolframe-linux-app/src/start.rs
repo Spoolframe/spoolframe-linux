@@ -14,11 +14,65 @@ pub type Choose<T> = Rc<dyn Fn(T)>;
 /// "Choose a server": servers on this network, then saved ones, and a way
 /// to add one the network does not show. Laid out as the design's server
 /// list: a card of nearby servers, each saved one a card of its own.
+/// A saved server the last try could not reach, for Choose a server's
+/// banner (LinuxReachability): what was tried, Details… and Try again.
+pub struct Unreachable {
+    pub key: spoolframe_linux_core::backend::ServerKey,
+    pub name: String,
+    /// What was tried and when it last worked.
+    pub line: String,
+    pub details: Rc<dyn Fn()>,
+    pub try_again: Rc<dyn Fn()>,
+}
+
+/// The banner over the saved servers: which one can't be reached, what
+/// was tried, and the way on.
+fn unreachable_banner(unreachable: &Unreachable) -> gtk::Box {
+    let card = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(6)
+        .css_classes(["card", "unreachable-banner"])
+        .build();
+    let heading = gtk::Label::builder()
+        .xalign(0.0)
+        .wrap(true)
+        .css_classes(["heading"])
+        .build();
+    heading.set_text(&format!("{} can’t be reached", unreachable.name));
+    let line = gtk::Label::builder()
+        .xalign(0.0)
+        .wrap(true)
+        .css_classes(["dim-label"])
+        .build();
+    line.set_text(&unreachable.line);
+    let details = gtk::Button::builder().label("Details…").build();
+    let try_again = gtk::Button::builder()
+        .label("Try again")
+        .css_classes(["suggested-action"])
+        .build();
+    let open = unreachable.details.clone();
+    details.connect_clicked(move |_| open());
+    let again = unreachable.try_again.clone();
+    try_again.connect_clicked(move |_| again());
+    let buttons = gtk::Box::builder()
+        .spacing(8)
+        .halign(gtk::Align::End)
+        .build();
+    buttons.append(&details);
+    buttons.append(&try_again);
+    card.append(&heading);
+    card.append(&line);
+    card.append(&buttons);
+    card
+}
+
 pub fn servers(
     servers: &[Server],
     choose: &Choose<Server>,
     verify: &Choose<Server>,
     add: &Rc<dyn Fn()>,
+    (relays, set_relays): (bool, &Rc<dyn Fn(bool)>),
+    unreachable: Option<&Unreachable>,
 ) -> gtk::Widget {
     let (clamp, column) = column();
     column.append(&crate::logo::mark(72));
@@ -33,12 +87,19 @@ pub fn servers(
         }
         column.append(&section("On this network", &[list]));
     }
+    if let Some(unreachable) = unreachable {
+        column.append(&unreachable_banner(unreachable));
+    }
     let saved: Vec<gtk::ListBox> = servers
         .iter()
         .filter(|s| s.pinned)
         .map(|server| {
             let list = boxed_list();
-            list.append(&saved_row(server, choose, verify));
+            let row = saved_row(server, choose, verify);
+            if unreachable.is_some_and(|u| u.key == server.key) {
+                row.add_suffix(&badge("Can’t be reached", "unreachable-pill"));
+            }
+            list.append(&row);
             list
         })
         .collect();
@@ -53,6 +114,22 @@ pub fn servers(
     let add = add.clone();
     add_button.connect_clicked(move |_| add());
     column.append(&add_button);
+    // Here too, so it can be set before signing in; also in Preferences.
+    let relays_row = adw::SwitchRow::builder()
+        .use_markup(false)
+        .title("Use relays")
+        .subtitle(
+            "Reach a server through its relays when it can't be reached directly. A \
+             server's own setting in Preferences › Servers wins.",
+        )
+        .active(relays)
+        .build();
+    relays_row.add_prefix(&gtk::Image::from_icon_name(crate::icons::BROWSER));
+    let set_relays = set_relays.clone();
+    relays_row.connect_active_notify(move |row| set_relays(row.is_active()));
+    let relays_list = boxed_list();
+    relays_list.append(&relays_row);
+    column.append(&section("Connection", &[relays_list]));
     let footer = dim(
         "Iroh proves each server's key when you connect. If a saved server's key \
          changes, Spoolframe asks before trusting the new one.",
@@ -1575,6 +1652,8 @@ mod tests {
             advertised: Vec::new(),
             relays: Vec::new(),
             advertised_at: None,
+            use_relays: None,
+            relays_edited: false,
         }
     }
 

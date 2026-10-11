@@ -22,6 +22,7 @@ use spoolframe_types::{
 use tokio::runtime::Handle;
 use tokio::sync::watch;
 
+use crate::backend::Reachability;
 use crate::backend::{
     ArtworkSize, BackendError, BoxFuture, ChosenTracks, Chunk, Client, ConnectionPath,
     ConnectionState, DeviceInfo, DeviceSignIn, DeviceSignInRequest, HomeScreen, Invite, PersonId,
@@ -119,6 +120,7 @@ pub fn backend_error(error: sdk::SdkError) -> BackendError {
         E::IdentityChanged { saved, now } => BackendError::IdentityChanged { saved, now },
         E::ServerIdChanged { saved, now, .. } => BackendError::ServerIdChanged { saved, now },
         E::Busy => BackendError::Busy,
+        E::WanStreamsFull { max } => BackendError::WanStreamsFull { max },
         E::ProfileLocked => BackendError::ProfileLocked,
         E::InvalidInput(why) => BackendError::InvalidInput(why),
         E::PlaybackRestarted { epoch } => BackendError::PlaybackRestarted { epoch },
@@ -140,6 +142,7 @@ pub fn backend_error(error: sdk::SdkError) -> BackendError {
         E::InviteExhausted => BackendError::InviteExhausted,
         E::UsernameTaken => BackendError::UsernameTaken,
         E::AdminRequired => BackendError::AdminOnly,
+        E::UnknownServer(id) => BackendError::NotFound(id),
         other => BackendError::Other(other.to_string()),
     }
 }
@@ -194,6 +197,8 @@ fn server(entry: sdk::ServerEntry) -> Server {
             .collect(),
         relays: entry.relays,
         advertised_at: entry.advertised_at,
+        use_relays: entry.use_relays,
+        relays_edited: entry.relays_edited,
     }
 }
 
@@ -423,6 +428,48 @@ impl Client for SdkClient {
             )
             .await
             .map(server)
+        })
+    }
+
+    fn reachability<'a>(
+        &'a self,
+        key: &'a ServerKey,
+    ) -> BoxFuture<'a, Result<Reachability, BackendError>> {
+        Box::pin(async move {
+            let (client, id) = (self.client.clone(), key.0.clone());
+            on_runtime(&self.handle, async move { client.reachability(&id).await }).await
+        })
+    }
+
+    fn set_server_relays<'a>(
+        &'a self,
+        key: &'a ServerKey,
+        relays: Option<bool>,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            let (client, id) = (self.client.clone(), key.0.clone());
+            on_runtime(&self.handle, async move {
+                client.set_server_relays(&id, relays).await
+            })
+            .await?;
+            self.servers_changed.send_replace(());
+            Ok(())
+        })
+    }
+
+    fn set_server_relay_urls<'a>(
+        &'a self,
+        key: &'a ServerKey,
+        relays: Vec<String>,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            let (client, id) = (self.client.clone(), key.0.clone());
+            on_runtime(&self.handle, async move {
+                client.set_server_relay_urls(&id, relays).await
+            })
+            .await?;
+            self.servers_changed.send_replace(());
+            Ok(())
         })
     }
 
@@ -936,18 +983,12 @@ impl Session for SdkSession {
         &'a self,
         id: &'a MediaId,
         selection: Option<Selection>,
-        start: Option<Duration>,
-        quality: sdk::PlaybackQuality,
+        options: sdk::PlaybackOptions,
     ) -> BoxFuture<'a, Result<PlaybackStart, BackendError>> {
         let id = id.clone();
-        Box::pin(self.call(move |s| async move {
-            let options = sdk::PlaybackOptions {
-                start,
-                quality,
-                ..Default::default()
-            };
-            s.start_playback_with(&id, selection, options).await
-        }))
+        Box::pin(
+            self.call(move |s| async move { s.start_playback_with(&id, selection, options).await }),
+        )
     }
 
     fn change_quality<'a>(
@@ -1280,6 +1321,16 @@ impl Session for SdkSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PX-46: off the home network, the server plays only so many at once.
+    #[test]
+    fn too_many_streams_outside_the_home_says_how_many_and_what_to_do() {
+        assert_eq!(
+            backend_error(sdk::SdkError::WanStreamsFull { max: 2 }).to_string(),
+            "Too many people are watching from outside the server’s home right now (it \
+             allows 2 at once). Try again when someone stops, or watch at home."
+        );
+    }
 
     /// An invite made with the server's CLI names no username; the list
     /// shows its display name.

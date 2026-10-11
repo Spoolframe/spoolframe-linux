@@ -142,6 +142,9 @@ pub struct App {
     /// heard only on a later listing; it is opened once, not on every
     /// change after.
     opened_last_server: bool,
+    /// The saved server the last try could not reach, and what this device
+    /// knows of reaching it: Choose a server's banner.
+    unreachable: Option<(Server, spoolframe_linux_core::backend::Reachability)>,
     /// The first listing of profiles this run is yet to come: the one that
     /// opens at start is opened from it, past Who's watching (P4-02).
     starting: bool,
@@ -216,6 +219,10 @@ pub struct AppWidgets {
 pub enum Msg {
     ShowServers,
     ChooseServer(Server),
+    /// Why a server can't be reached: the Details dialog.
+    ReachabilityDetails(Server),
+    /// The Relays dialog of a saved server, from Details.
+    ServerRelays(Server),
     /// "Add a server": from an invite link (P6-01), pasted, or opened
     /// from the desktop when given one.
     OpenAddServer(Option<String>),
@@ -366,6 +373,16 @@ pub enum Loaded {
     Trusted(Result<Server, BackendError>),
     ServerRemoved(ServerKey, Result<(), BackendError>),
     Profiles(Server, Result<Vec<Profile>, BackendError>),
+    /// What this device knows of reaching a server the last try did not:
+    /// for the banner, or for the Details dialog.
+    Unreachable(
+        Server,
+        Result<spoolframe_linux_core::backend::Reachability, BackendError>,
+    ),
+    ReachabilityDetails(
+        Server,
+        Result<spoolframe_linux_core::backend::Reachability, BackendError>,
+    ),
     ProfileForgotten(Server, Result<(), BackendError>),
     /// A profile signed out, from Who's watching or the sidebar (P4-02).
     ProfileSignedOut(Server, Result<(), BackendError>),
@@ -817,6 +834,7 @@ impl Component for App {
             library_cache: None,
             library: None,
             opened_last_server: false,
+            unreachable: None,
             starting: true,
             needs_sign_in: None,
             opening: None,
@@ -899,7 +917,27 @@ impl Component for App {
             }
             // A server not saved yet has its fingerprint checked first.
             Msg::ChooseServer(server) if server.pinned => self.load_profiles(server, &sender),
-            Msg::ChooseServer(server) => sender.input(Msg::CheckServer(server, false)),
+            Msg::ChooseServer(server) => {
+                // Tried again: the banner goes, and comes back if it fails.
+                self.unreachable = None;
+                sender.input(Msg::CheckServer(server, false));
+            }
+            Msg::ReachabilityDetails(server) => {
+                let client = self.client.clone();
+                self.command(&sender, async move {
+                    let reach = client.reachability(&server.key).await;
+                    Loaded::ReachabilityDetails(server, reach)
+                });
+            }
+            Msg::ServerRelays(server) => {
+                crate::server_relays::dialog(crate::server_relays::Needs {
+                    client: self.client.clone(),
+                    server,
+                    app_relays: self.settings.use_relays(),
+                    changed: Rc::new(|| {}),
+                })
+                .present(Some(root));
+            }
             Msg::HideFromContinue(item, shelf, hide) => {
                 let Some(session) = self.session.clone() else {
                     return;
@@ -1323,6 +1361,7 @@ impl Component for App {
                     tracks,
                     album,
                     quality,
+                    display: Some(crate::capabilities::display(self.settings.show_hdr())),
                 }) {
                     Ok(playback) => {
                         if shuffle {
@@ -1450,14 +1489,18 @@ impl Component for App {
                 }
             }
             Msg::SetShowHdr(on) => {
-                // Part of the device's capabilities, told as it connects.
+                // Told with each playback (PGPU-06): the queue playing now
+                // starts its next item with it.
                 self.settings.set_show_hdr(on);
+                if let Some(playback) = &self.playback {
+                    playback.set_display(Some(crate::capabilities::display(on)));
+                }
                 toast_text(
                     widgets,
                     if on {
-                        "HDR on · applies when Spoolframe next starts"
+                        "HDR on · from the next thing you play"
                     } else {
-                        "HDR off · applies when Spoolframe next starts"
+                        "HDR off · from the next thing you play"
                     },
                 );
             }
@@ -1548,9 +1591,36 @@ impl Component for App {
                     let sender = sender.clone();
                     Rc::new(move |s| sender.input(Msg::CheckServer(s, true)))
                 };
-                widgets
-                    .servers
-                    .set_child(Some(&start::servers(&servers, &choose, &verify, &add)));
+                let set_relays: Rc<dyn Fn(bool)> = {
+                    let sender = sender.clone();
+                    Rc::new(move |on| sender.input(Msg::SetUseRelays(on)))
+                };
+                let unreachable = self.unreachable.as_ref().map(|(server, reach)| {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs());
+                    start::Unreachable {
+                        key: server.key.clone(),
+                        name: server.name.clone(),
+                        line: crate::reachability::tried_line(reach, now),
+                        details: {
+                            let (sender, server) = (sender.clone(), server.clone());
+                            Rc::new(move || sender.input(Msg::ReachabilityDetails(server.clone())))
+                        },
+                        try_again: {
+                            let (sender, server) = (sender.clone(), server.clone());
+                            Rc::new(move || sender.input(Msg::ChooseServer(server.clone())))
+                        },
+                    }
+                });
+                widgets.servers.set_child(Some(&start::servers(
+                    &servers,
+                    &choose,
+                    &verify,
+                    &add,
+                    (self.settings.use_relays(), &set_relays),
+                    unreachable.as_ref(),
+                )));
                 if self.server.is_none() {
                     widgets.screens.set_visible_child_name("servers");
                 }
@@ -1774,6 +1844,43 @@ impl Component for App {
                     sender.input(Msg::OpenSignIn);
                 }
             }
+            Loaded::Profiles(
+                server,
+                Err(BackendError::Unreachable(_) | BackendError::TimedOut(_)),
+            ) if server.pinned => {
+                tracing::warn!(server = %server.name, "cannot reach the server");
+                let client = self.client.clone();
+                self.command(&sender, async move {
+                    let reach = client.reachability(&server.key).await;
+                    Loaded::Unreachable(server, reach)
+                });
+                widgets.screens.set_visible_child_name("servers");
+            }
+            Loaded::Unreachable(server, Ok(reach)) => {
+                self.unreachable = Some((server, reach));
+                self.load_servers(&sender);
+            }
+            Loaded::Unreachable(server, Err(e)) => {
+                tracing::warn!(server = %server.name, error = %e, "no reachability for it");
+                toast_text(widgets, &format!("{} can’t be reached.", server.name));
+            }
+            Loaded::ReachabilityDetails(server, Ok(reach)) => {
+                let relays: Rc<dyn Fn()> = {
+                    let (sender, server) = (sender.clone(), server.clone());
+                    Rc::new(move || sender.input(Msg::ServerRelays(server.clone())))
+                };
+                let try_again: Rc<dyn Fn()> = {
+                    let (sender, server) = (sender.clone(), server.clone());
+                    Rc::new(move || sender.input(Msg::ChooseServer(server.clone())))
+                };
+                crate::reachability::dialog(
+                    &reach,
+                    self.settings.use_relays(),
+                    crate::reachability::Actions { relays, try_again },
+                )
+                .present(Some(root));
+            }
+            Loaded::ReachabilityDetails(_, Err(e)) => toast(widgets, &e),
             Loaded::Profiles(server, Err(e)) => {
                 tracing::warn!(server = %server.name, error = %e, "cannot list profiles");
                 server_error(widgets, Some(&server), &e, &sender, root);
@@ -2059,6 +2166,7 @@ impl App {
                 let sender = sender.clone();
                 Rc::new(move || sender.input(Msg::ShowServers))
             },
+            app_relays: self.settings.use_relays(),
         };
         let set_bitrate: preferences::SetBitrate = {
             let sender = sender.clone();
@@ -2293,7 +2401,8 @@ impl App {
         if queue.current().is_none() {
             return;
         }
-        match Playback::restore(session, queue, at) {
+        let display = Some(crate::capabilities::display(self.settings.show_hdr()));
+        match Playback::restore(session, queue, at, display) {
             Ok(playback) => {
                 self.attach_playback(&playback, widgets, sender);
                 self.playback = Some(playback);

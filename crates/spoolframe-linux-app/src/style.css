@@ -1624,3 +1624,17 @@ popover.scrub-preview > contents {
   font-weight: 700;
   padding: 2px 8px;
 }
+
+/* Can't be reached (LinuxReachability): the banner over the saved
+   servers, red-tinted, and the saved row's pill. */
+.unreachable-banner {
+  padding: 14px 16px;
+  background-color: alpha(var(--error-color), 0.1);
+  border: 1px solid alpha(var(--error-color), 0.4);
+}
+.unreachable-pill {
+  color: var(--error-color);
+  background-color: alpha(var(--error-color), 0.12);
+  padding: 2px 8px;
+  border-radius: 999px;
+}

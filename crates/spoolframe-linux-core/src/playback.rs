@@ -27,7 +27,7 @@ impl PlaybackBackend for Adapter {
             ));
         }
         self.0
-            .start_playback(item, selection, options.start, options.quality)
+            .start_playback(item, selection, options)
             .await
             .map_err(error)
     }
@@ -189,5 +189,33 @@ mod tests {
             playback.read_chunk(&direct, 0, 1).await,
             Err(SdkError::PlaybackRestarted { epoch: next.epoch })
         );
+    }
+
+    /// What the screen shows (PGPU-06) reaches the server with each start,
+    /// so a change to Show HDR applies at the next play, not the next
+    /// connection.
+    #[test]
+    fn the_display_reaches_the_server_with_the_start() {
+        let (_dir, path) = crate::testing::file_with("display", &[0; 4096]);
+        crate::testing::runtime().block_on(display_reaches(path));
+    }
+
+    async fn display_reaches(path: std::path::PathBuf) {
+        let client = FakeClient::new(Some(path));
+        let profile = FakeClient::profile("andrey");
+        let session = client.session(&profile).unwrap();
+        let item = crate::testing::first_movie_id(&session).await;
+        let sdr = spoolframe_types::DisplayCapabilities {
+            bit_depth: None,
+            hdr: Some(Default::default()),
+        };
+        let options = PlaybackOptions {
+            display: Some(sdr.clone()),
+            ..Default::default()
+        };
+        ManagedPlayback::open(backend(session), item, None, options)
+            .await
+            .unwrap();
+        assert_eq!(client.displays_asked(&profile), vec![Some(sdr)]);
     }
 }

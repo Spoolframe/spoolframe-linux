@@ -467,6 +467,8 @@ pub struct FakeSession {
     gone: Arc<std::sync::atomic::AtomicBool>,
     /// Every progress report, in order, for tests.
     reports: Mutex<Vec<(MediaId, Duration)>>,
+    /// The display each playback was started for (PGPU-06), in order.
+    displays: Mutex<Vec<Option<spoolframe_types::DisplayCapabilities>>>,
     playbacks: Mutex<HashMap<PlaybackHandle, Playback>>,
     next_handle: AtomicU64,
     /// Set once [`Serving::expire_at`] has ended a playback.
@@ -641,6 +643,7 @@ impl FakeSession {
             preview_asks: AtomicU32::new(0),
             gone,
             reports: Mutex::new(Vec::new()),
+            displays: Mutex::new(Vec::new()),
             playbacks: Mutex::new(HashMap::new()),
             next_handle: AtomicU64::new(1),
             expired_once: std::sync::atomic::AtomicBool::new(false),
@@ -1177,11 +1180,15 @@ impl Session for FakeSession {
         &'a self,
         id: &'a MediaId,
         selection: Option<Selection>,
-        _start: Option<Duration>,
-        quality: crate::backend::PlaybackQuality,
+        options: crate::backend::PlaybackOptions,
     ) -> BoxFuture<'a, Result<PlaybackStart, BackendError>> {
         Box::pin(async move {
             self.catalog()?;
+            let quality = options.quality;
+            self.displays
+                .lock()
+                .expect("fake state is never poisoned")
+                .push(options.display);
             let item = self.catalog.get(id)?;
             let tracks = self.tracks_of(item);
             let (_, size) = self.media_size()?;
@@ -2315,6 +2322,8 @@ impl FakeClient {
                     advertised: vec!["192.168.1.20:7430".into(), "10.10.0.6:7430".into()],
                     relays: Vec::new(),
                     advertised_at: None,
+                    use_relays: None,
+                    relays_edited: false,
                 },
                 Server {
                     key: basement(),
@@ -2330,6 +2339,8 @@ impl FakeClient {
                     advertised: Vec::new(),
                     relays: Vec::new(),
                     advertised_at: None,
+                    use_relays: None,
+                    relays_edited: false,
                 },
             ]),
             accounts: vec![
@@ -2481,6 +2492,8 @@ impl FakeClient {
             advertised: Vec::new(),
             relays: invite.relays.clone(),
             advertised_at: None,
+            use_relays: None,
+            relays_edited: false,
         });
         Ok((invite, server))
     }
@@ -2489,12 +2502,34 @@ impl FakeClient {
     fn save_invited(&self, mut server: Server) -> Server {
         server.pinned = true;
         server.verified = true;
+        // As the SDK saves one: through the relays the link named.
+        if !server.relays.is_empty() {
+            server.use_relays = Some(true);
+        }
         let mut servers = self.servers.lock().expect("fake state is never poisoned");
         servers.retain(|s| s.key != server.key);
         servers.push(server.clone());
         drop(servers);
         self.servers_changed.send_replace(());
         server
+    }
+
+    /// Changes saved server `key` as `edit` says; NotPinned for one not
+    /// saved, as the SDK refuses it.
+    fn edit_saved(
+        &self,
+        key: &ServerKey,
+        edit: impl FnOnce(&mut Server),
+    ) -> Result<(), BackendError> {
+        let mut servers = self.servers.lock().expect("fake state is never poisoned");
+        let server = servers
+            .iter_mut()
+            .find(|s| &s.key == key && s.pinned)
+            .ok_or_else(|| BackendError::NotPinned(key.0.clone()))?;
+        edit(server);
+        drop(servers);
+        self.servers_changed.send_replace(());
+        Ok(())
     }
 
     /// The server stops answering, as when it is shut down mid-play: every
@@ -2578,6 +2613,23 @@ impl FakeClient {
             .expect("fake state is never poisoned")
             .get(&(profile.server.clone(), profile.username.clone()))
             .map_or(0, |s| s.next_handle.load(Ordering::Relaxed) - 1)
+    }
+
+    /// The display each of `profile`'s playbacks was started for, in order.
+    pub fn displays_asked(
+        &self,
+        profile: &Profile,
+    ) -> Vec<Option<spoolframe_types::DisplayCapabilities>> {
+        self.sessions
+            .lock()
+            .expect("fake state is never poisoned")
+            .get(&(profile.server.clone(), profile.username.clone()))
+            .map_or_else(Vec::new, |s| {
+                s.displays
+                    .lock()
+                    .expect("fake state is never poisoned")
+                    .clone()
+            })
     }
 
     /// Reads answer at most `limit` bytes, like a server that sends less
@@ -2869,6 +2921,8 @@ impl Client for FakeClient {
                         advertised: Vec::new(),
                         relays: Vec::new(),
                         advertised_at: None,
+                        use_relays: None,
+                        relays_edited: false,
                     });
                     servers.last_mut().expect("just pushed")
                 }
@@ -2919,6 +2973,105 @@ impl Client for FakeClient {
         Box::pin(async move {
             let (_, server) = self.invited(link)?;
             Ok(self.save_invited(server))
+        })
+    }
+
+    fn reachability<'a>(
+        &'a self,
+        key: &'a ServerKey,
+    ) -> BoxFuture<'a, Result<crate::backend::Reachability, BackendError>> {
+        Box::pin(async move {
+            use crate::backend::{
+                DialReport, DialStage, KnownPath, PathKind, Reachability, SavedAddr,
+            };
+            let server = self
+                .servers
+                .lock()
+                .expect("fake state is never poisoned")
+                .iter()
+                .find(|s| &s.key == key)
+                .cloned()
+                .ok_or_else(|| BackendError::NotFound(key.0.clone()))?;
+            let gone = self.gone.load(std::sync::atomic::Ordering::SeqCst);
+            let now = unix_now() as u64;
+            Ok(Reachability {
+                endpoint_id: server.key.0.clone(),
+                name: Some(server.name.clone()),
+                saved: server.pinned,
+                addrs: server
+                    .addresses
+                    .iter()
+                    .map(|addr| SavedAddr {
+                        addr: addr.clone(),
+                        reached: !gone,
+                        last_seen: now - 3600,
+                    })
+                    .collect(),
+                advertised_addrs: server.advertised.clone(),
+                advertised_at: None,
+                relays: server.relays.clone(),
+                relays_edited: server.relays_edited,
+                lookup: None,
+                use_relays: server.use_relays,
+                relays_effective: server.use_relays.unwrap_or(true),
+                heard_on_lan: if server.on_network {
+                    server.addresses.clone()
+                } else {
+                    Vec::new()
+                },
+                hinted_addrs: Vec::new(),
+                invite_relays: Vec::new(),
+                lookups: vec!["mdns".into()],
+                lookup_results: Vec::new(),
+                last_dial: Some(DialReport {
+                    at: now - 10,
+                    took_ms: if gone { 10_000 } else { 40 },
+                    connected: !gone,
+                    stage: gone.then_some(DialStage::Timeout),
+                    error: gone.then(|| "timed out".to_owned()),
+                    dialled: server.addresses.clone(),
+                    known: server
+                        .addresses
+                        .iter()
+                        .map(|addr| KnownPath {
+                            kind: PathKind::Lan,
+                            addr: addr.clone(),
+                            active: !gone,
+                        })
+                        .collect(),
+                }),
+                last_connected_at: Some(now - if gone { 3 * 24 * 3600 } else { 10 }),
+                live: Vec::new(),
+            })
+        })
+    }
+
+    fn set_server_relays<'a>(
+        &'a self,
+        key: &'a ServerKey,
+        relays: Option<bool>,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move { self.edit_saved(key, |server| server.use_relays = relays) })
+    }
+
+    fn set_server_relay_urls<'a>(
+        &'a self,
+        key: &'a ServerKey,
+        relays: Vec<String>,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            if relays
+                .iter()
+                .any(|r| !(r.starts_with("https://") || r.starts_with("http://")))
+            {
+                return Err(BackendError::InvalidInput(
+                    "a relay is an http:// or https:// URL".into(),
+                ));
+            }
+            self.edit_saved(key, |server| {
+                server.relays_edited = !relays.is_empty();
+                server.relays = relays;
+            })
         })
     }
 
@@ -3018,6 +3171,8 @@ impl Client for FakeClient {
                 advertised: Vec::new(),
                 relays: Vec::new(),
                 advertised_at: None,
+                use_relays: None,
+                relays_edited: false,
             };
             servers.push(entry.clone());
             drop(servers);
@@ -3730,7 +3885,7 @@ mod tests {
         let session = session_for(&client, "andrey");
         // Andor E1–2 watched; E4 started, past E3, as with Vigil S2E3.
         let e4 = media(MediaKind::Episode, "65");
-        let playback = ready(session.start_playback(&e4, None, None, Default::default())).unwrap();
+        let playback = ready(session.start_playback(&e4, None, Default::default())).unwrap();
         ready(session.update_progress(&playback.handle, Duration::from_secs(120))).unwrap();
         let home = ready(session.home()).unwrap();
         assert!(
@@ -3767,8 +3922,7 @@ mod tests {
         let client = FakeClient::new(Some(path));
         let session = session_for(&client, "andrey");
         let heat = media(MediaKind::Movie, "3");
-        let playback =
-            ready(session.start_playback(&heat, None, None, Default::default())).unwrap();
+        let playback = ready(session.start_playback(&heat, None, Default::default())).unwrap();
         ready(session.update_progress(&playback.handle, Duration::from_secs(30))).unwrap();
         let home = ready(session.home()).unwrap();
         assert!(!titles(&home.continue_watching).contains(&"Heat"));
@@ -3792,7 +3946,7 @@ mod tests {
         let e4 = media(MediaKind::Episode, "25");
         ready(session.hide_from_continue(&e4)).unwrap();
         let e5 = media(MediaKind::Episode, "26");
-        let playback = ready(session.start_playback(&e5, None, None, Default::default())).unwrap();
+        let playback = ready(session.start_playback(&e5, None, Default::default())).unwrap();
         ready(session.update_progress(&playback.handle, Duration::from_secs(120))).unwrap();
         let home = ready(session.home()).unwrap();
         assert!(
@@ -3809,8 +3963,7 @@ mod tests {
         let session = session_for(&client, "andrey");
         let first = ready(session.home()).unwrap().continue_watching[0].clone();
         ready(session.hide_from_continue(first.id())).unwrap();
-        let playback =
-            ready(session.start_playback(first.id(), None, None, Default::default())).unwrap();
+        let playback = ready(session.start_playback(first.id(), None, Default::default())).unwrap();
         ready(session.update_progress(&playback.handle, Duration::from_secs(120))).unwrap();
         let home = ready(session.home()).unwrap();
         assert!(home.continue_watching.iter().any(|i| i.id() == first.id()));
@@ -3822,8 +3975,7 @@ mod tests {
         let client = FakeClient::new(Some(path));
         let session = session_for(&client, "andrey");
         let heat = media(MediaKind::Movie, "3");
-        let playback =
-            ready(session.start_playback(&heat, None, None, Default::default())).unwrap();
+        let playback = ready(session.start_playback(&heat, None, Default::default())).unwrap();
         ready(session.update_progress(&playback.handle, Duration::from_secs(600))).unwrap();
         let home = ready(session.home()).unwrap();
         assert_eq!(title(&home.continue_watching[0]), "Heat");
@@ -3835,8 +3987,7 @@ mod tests {
         let client = FakeClient::new(Some(path));
         let session = session_for(&client, "andrey");
         let alien = media(MediaKind::Movie, "1");
-        let playback =
-            ready(session.start_playback(&alien, None, None, Default::default())).unwrap();
+        let playback = ready(session.start_playback(&alien, None, Default::default())).unwrap();
         ready(session.update_progress(&playback.handle, Duration::from_secs(112 * 60))).unwrap();
         let (item, _) = ready(session.item(&alien)).unwrap();
         let Item::Movie(m) = item else { panic!() };
@@ -4042,8 +4193,7 @@ mod tests {
     #[test]
     fn playback_without_media_says_how_to_get_some() {
         let alien = media(MediaKind::Movie, "1");
-        let error =
-            ready(andrey().start_playback(&alien, None, None, Default::default())).unwrap_err();
+        let error = ready(andrey().start_playback(&alien, None, Default::default())).unwrap_err();
         assert!(matches!(error, BackendError::Unavailable(m) if m.contains("--fake-media")));
     }
 
@@ -4054,7 +4204,7 @@ mod tests {
         let client = FakeClient::new(Some(path));
         let session = session_for(&client, "andrey");
         let alien = media(MediaKind::Movie, "1");
-        let start = ready(session.start_playback(&alien, None, None, Default::default())).unwrap();
+        let start = ready(session.start_playback(&alien, None, Default::default())).unwrap();
         assert_eq!(start.size, 256);
         let read = ready(session.read(&start.handle, 250, 100)).unwrap();
         assert_eq!(read, (250..=255).collect::<Vec<u8>>());
@@ -4081,8 +4231,7 @@ mod tests {
             subtitle: Some(0),
         };
         let start =
-            ready(session.start_playback(&alien, Some(selection), None, Default::default()))
-                .unwrap();
+            ready(session.start_playback(&alien, Some(selection), Default::default())).unwrap();
         let (format, bytes) = ready(session.read_subtitle(&start.handle)).unwrap();
         assert_eq!(format, SubtitleFormat::Srt);
         assert!(String::from_utf8(bytes).unwrap().contains("read_subtitle"));
@@ -4540,13 +4689,9 @@ mod tests {
             trust: None,
         };
         let session = client.session(&profile).unwrap();
-        let start = ready(session.start_playback(
-            &media(MediaKind::Movie, "1"),
-            None,
-            None,
-            Default::default(),
-        ))
-        .unwrap();
+        let start =
+            ready(session.start_playback(&media(MediaKind::Movie, "1"), None, Default::default()))
+                .unwrap();
         ready(session.stop_playback(&start.handle)).unwrap();
         assert_eq!(client.open_playbacks(&profile), 0);
     }
@@ -5218,6 +5363,112 @@ mod tests {
             assert!(matches!(
                 ready(andrey().create_invite(spec)),
                 Err(BackendError::InvalidInput(_))
+            ));
+        }
+    }
+
+    /// Each saved server's relays (per-server relays, d0d0c701).
+    mod server_relays {
+        use super::*;
+
+        fn home(client: &FakeClient) -> Server {
+            ready(client.servers())
+                .unwrap()
+                .into_iter()
+                .find(|s| s.key == home_media())
+                .unwrap()
+        }
+
+        #[test]
+        fn a_servers_relay_choice_is_kept() {
+            let client = FakeClient::new(None);
+            assert_eq!(home(&client).use_relays, None, "follows the app's setting");
+            ready(client.set_server_relays(&home_media(), Some(false))).unwrap();
+            assert_eq!(home(&client).use_relays, Some(false));
+        }
+
+        #[test]
+        fn a_list_set_is_the_users_and_an_empty_one_goes_back_to_the_server() {
+            let client = FakeClient::new(None);
+            let mine = vec!["https://relay.example".to_owned()];
+            ready(client.set_server_relay_urls(&home_media(), mine.clone())).unwrap();
+            let edited = home(&client);
+            ready(client.set_server_relay_urls(&home_media(), Vec::new())).unwrap();
+            let back = home(&client);
+            assert_eq!(
+                (edited.relays, edited.relays_edited, back.relays_edited),
+                (mine, true, false)
+            );
+        }
+
+        #[test]
+        fn a_relay_is_an_http_or_https_url() {
+            let client = FakeClient::new(None);
+            assert!(matches!(
+                ready(client.set_server_relay_urls(&home_media(), vec!["relay.example".into()])),
+                Err(BackendError::InvalidInput(_))
+            ));
+        }
+
+        #[test]
+        fn a_server_not_saved_has_no_relay_settings() {
+            let client = FakeClient::new(None);
+            assert!(matches!(
+                ready(client.set_server_relays(&basement(), Some(true))),
+                Err(BackendError::NotPinned(_))
+            ));
+        }
+
+        #[test]
+        fn a_server_saved_from_an_invite_with_relays_uses_them() {
+            let client = FakeClient::new(None);
+            let saved = ready(client.save_invite_server(&FakeClient::invite_link(None))).unwrap();
+            assert_eq!(saved.use_relays, Some(true));
+        }
+    }
+
+    /// Why a server can or cannot be reached (0d0c4ff4).
+    mod reachability {
+        use super::*;
+
+        #[test]
+        fn a_saved_server_says_where_it_was_reached() {
+            let client = FakeClient::new(None);
+            let reach = ready(client.reachability(&home_media())).unwrap();
+            assert_eq!(
+                (
+                    reach.saved,
+                    reach
+                        .addrs
+                        .iter()
+                        .map(|a| a.addr.as_str())
+                        .collect::<Vec<_>>(),
+                    reach.last_dial.map(|d| d.connected)
+                ),
+                (true, vec!["192.168.1.20"], Some(true))
+            );
+        }
+
+        #[test]
+        fn a_server_gone_quiet_says_its_last_dial_timed_out() {
+            let client = FakeClient::new(None);
+            client.go_away();
+            let dial = ready(client.reachability(&home_media()))
+                .unwrap()
+                .last_dial
+                .unwrap();
+            assert_eq!(
+                (dial.connected, dial.stage),
+                (false, Some(crate::backend::DialStage::Timeout))
+            );
+        }
+
+        #[test]
+        fn a_server_never_seen_is_not_found() {
+            let client = FakeClient::new(None);
+            assert!(matches!(
+                ready(client.reachability(&ServerKey("f00d".repeat(16)))),
+                Err(BackendError::NotFound(_))
             ));
         }
     }

@@ -117,14 +117,24 @@ pub fn capabilities() -> ClientCapabilities {
 /// film copied as it is, in Dolby's own colours until its RPU is applied,
 /// which GTK does not do; the server converts it to HDR10 instead.
 pub fn with_hdr(mut caps: ClientCapabilities, show: bool) -> ClientCapabilities {
-    use spoolframe_types::HdrFormat;
     let limits = caps.max_video.get_or_insert_with(Default::default);
-    limits.hdr = Some(if show {
-        [HdrFormat::Hdr10, HdrFormat::Hlg].into()
-    } else {
-        std::collections::BTreeSet::new()
-    });
+    limits.hdr = display(show).hdr;
     caps
+}
+
+/// What the screen shows, as each playback tells the server (PGPU-06): so
+/// a change to Show HDR applies at the next play. The HDR formats as
+/// [`with_hdr`] says them; the bit depth as the client said it connecting.
+pub fn display(show_hdr: bool) -> spoolframe_types::DisplayCapabilities {
+    use spoolframe_types::HdrFormat;
+    spoolframe_types::DisplayCapabilities {
+        bit_depth: None,
+        hdr: Some(if show_hdr {
+            [HdrFormat::Hdr10, HdrFormat::Hlg].into()
+        } else {
+            std::collections::BTreeSet::new()
+        }),
+    }
 }
 
 /// The decoders that say they are hardware ("Hardware" in their class):
@@ -184,6 +194,19 @@ fn supported<T: Ord + Copy>(
 #[cfg(test)]
 mod tests {
     use super::with_hdr;
+
+    /// Each playback says the same of HDR as the client did connecting.
+    #[test]
+    fn a_plays_display_says_what_show_hdr_says() {
+        for show in [false, true] {
+            assert_eq!(
+                super::display(show).hdr,
+                with_hdr(Default::default(), show)
+                    .max_video
+                    .and_then(|v| v.hdr)
+            );
+        }
+    }
 
     #[test]
     fn hdr_off_asks_the_server_to_tone_map_everything() {

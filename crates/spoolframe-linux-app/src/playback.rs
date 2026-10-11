@@ -78,6 +78,8 @@ pub struct Playlist {
     /// The quality the viewer chose (P6-06), for every item it plays
     /// until they choose again.
     pub quality: spoolframe_client_sdk::PlaybackQuality,
+    /// What the screen shows (PGPU-06), told with every start.
+    pub display: Option<spoolframe_types::DisplayCapabilities>,
 }
 
 /// How the first item starts: see [`Playlist`].
@@ -86,6 +88,7 @@ struct Start {
     selection: Option<Selection>,
     tracks: Option<MediaTracks>,
     quality: spoolframe_client_sdk::PlaybackQuality,
+    display: Option<spoolframe_types::DisplayCapabilities>,
 }
 
 /// What a view hears from the playback.
@@ -249,6 +252,8 @@ pub struct Playback {
     subtitles_on: Rc<Cell<bool>>,
     /// The quality the viewer chose (P6-06): each item starts with it.
     quality: Cell<spoolframe_client_sdk::PlaybackQuality>,
+    /// What the screen shows (PGPU-06): each item starts with it.
+    display: RefCell<Option<spoolframe_types::DisplayCapabilities>>,
     playing: Cell<bool>,
     position: Cell<Duration>,
     length: Cell<Duration>,
@@ -405,6 +410,7 @@ impl Playback {
             selection: playlist.selection,
             tracks: playlist.tracks,
             quality: playlist.quality,
+            display: playlist.display,
         };
         Self::build(playlist.session, queue, start, true)
     }
@@ -415,12 +421,14 @@ impl Playback {
         session: Arc<dyn Session>,
         queue: Queue,
         at: Duration,
+        display: Option<spoolframe_types::DisplayCapabilities>,
     ) -> anyhow::Result<Rc<Self>> {
         let start = Start {
             from: (!at.is_zero()).then_some(at),
             selection: None,
             tracks: None,
             quality: Default::default(),
+            display,
         };
         Self::build(session, queue, start, false)
     }
@@ -448,6 +456,7 @@ impl Playback {
             skip_intros: Cell::new(false),
             subtitles_on: Rc::new(Cell::new(false)),
             quality: Cell::new(start.quality),
+            display: RefCell::new(start.display.clone()),
             playing: Cell::new(false),
             position: Cell::new(Duration::ZERO),
             length: Cell::new(Duration::ZERO),
@@ -713,6 +722,12 @@ impl Playback {
         });
         self.pipeline
             .track_menu(info, &self.subtitles_on, failed, quality)
+    }
+
+    /// What the screen shows, for the items started from now on: the user
+    /// changed Show HDR.
+    pub fn set_display(&self, display: Option<spoolframe_types::DisplayCapabilities>) {
+        self.display.replace(display);
     }
 
     /// Plans the playing item again for `quality` (P6-06), from where it
@@ -1211,6 +1226,7 @@ impl Playback {
             current.requested,
         );
         let quality = self.quality.get();
+        let display = self.display.borrow().clone();
         let pending = self.progress_tail.borrow_mut().take();
         let started = relm4::spawn(async move {
             if let Some(pending) = pending {
@@ -1231,6 +1247,7 @@ impl Playback {
                 PlaybackOptions {
                     start: from,
                     quality,
+                    display,
                     ..Default::default()
                 },
             );
@@ -2416,7 +2433,7 @@ mod tests {
         let session = client.session(&profile).unwrap();
         let item = first_movie(&session);
         let queue = Queue::new(vec![item], 0, None, Vec::new());
-        let playback = Playback::restore(session, queue, Duration::from_secs(2)).unwrap();
+        let playback = Playback::restore(session, queue, Duration::from_secs(2), None).unwrap();
         let played = Rc::new(Cell::new(Duration::ZERO));
         {
             let played = played.clone();
@@ -2553,6 +2570,7 @@ mod tests {
             tracks: None,
             album: None,
             quality: spoolframe_client_sdk::PlaybackQuality::Bitrate(2_000_000),
+            display: None,
         })
         .unwrap();
         assert!(
@@ -2695,6 +2713,7 @@ mod tests {
             tracks: None,
             album: None,
             quality: Default::default(),
+            display: None,
         })
         .unwrap();
         assert!(run_until(Duration::from_secs(20), || playback.position()
@@ -2784,6 +2803,7 @@ mod tests {
             tracks: None,
             album: None,
             quality: Default::default(),
+            display: None,
         })
         .unwrap();
         let (stopped, failed) = (Rc::new(Cell::new(false)), Rc::new(Cell::new(false)));
@@ -2824,6 +2844,7 @@ mod tests {
             tracks: None,
             album: None,
             quality: Default::default(),
+            display: None,
         })
         .unwrap();
         let (stopped, failed) = (Rc::new(Cell::new(false)), Rc::new(Cell::new(false)));
@@ -2865,6 +2886,7 @@ mod tests {
             tracks: None,
             album: None,
             quality: Default::default(),
+            display: None,
         })
         .unwrap();
         let failed = Rc::new(RefCell::new(None::<String>));
@@ -2903,6 +2925,7 @@ mod tests {
             tracks: None,
             album: None,
             quality: Default::default(),
+            display: None,
         })
         .unwrap()
     }

@@ -81,6 +81,13 @@ pub enum BackendError {
     /// to 8 digits).
     #[error("{0}")]
     InvalidInput(String),
+    /// Off its home network the server plays only `max` playbacks at once
+    /// (PX-46), and that many are playing. At home this never happens.
+    #[error(
+        "Too many people are watching from outside the server’s home right now (it allows \
+         {max} at once). Try again when someone stops, or watch at home."
+    )]
+    WanStreamsFull { max: u32 },
     /// The server is converting as many files as it may (P2-03).
     #[error("the server is busy converting other files; try again shortly")]
     Busy,
@@ -226,6 +233,12 @@ pub struct Server {
     pub relays: Vec<String>,
     /// When it last told this device its addresses.
     pub advertised_at: Option<std::time::SystemTime>,
+    /// Whether it is reached through relays: `Some` whatever the app's
+    /// "Use relays" says, `None` as it says.
+    pub use_relays: Option<bool>,
+    /// `relays` is the user's own list: what the server says does not
+    /// change it.
+    pub relays_edited: bool,
 }
 
 impl Server {
@@ -353,7 +366,13 @@ pub enum ConnectionPath {
 }
 
 pub use spoolframe_client_sdk::{
-    Chunk, Playback as PlaybackStart, PlaybackChange, PlaybackQuality,
+    Chunk, Playback as PlaybackStart, PlaybackChange, PlaybackOptions, PlaybackQuality,
+};
+/// Why a server can or cannot be reached, as the SDK keeps it: plain
+/// data, shown as it is.
+pub use spoolframe_client_sdk::{
+    DialReport, DialStage, KnownPath, LivePath, LookupOutcome, LookupResult, PathKind,
+    Reachability, SavedAddr,
 };
 pub use spoolframe_protocol::MAX_READ;
 
@@ -481,6 +500,32 @@ pub trait Client: Send + Sync {
     /// Connects to the server invite `link` names and says who answered,
     /// for "Is this the server you were invited to?". Nothing is saved.
     fn connect_invite<'a>(&'a self, link: &'a str) -> BoxFuture<'a, Result<Server, BackendError>>;
+
+    /// What this device knows of reaching server `key`: its addresses,
+    /// relays, lookups, last dial and live paths. Never dials.
+    /// [`BackendError::NotFound`] for a server it knows nothing of.
+    fn reachability<'a>(
+        &'a self,
+        key: &'a ServerKey,
+    ) -> BoxFuture<'a, Result<Reachability, BackendError>>;
+
+    /// Whether saved server `key` is reached through relays: `Some` whatever
+    /// the app's setting says, `None` as it says. Used from the next
+    /// connection. [`BackendError::NotPinned`] for a server not saved.
+    fn set_server_relays<'a>(
+        &'a self,
+        key: &'a ServerKey,
+        relays: Option<bool>,
+    ) -> BoxFuture<'a, Result<(), BackendError>>;
+
+    /// Saved server `key`'s relay list from now on, the user's own; empty
+    /// gives it back to the server. [`BackendError::InvalidInput`] for one
+    /// that is not an http(s) URL.
+    fn set_server_relay_urls<'a>(
+        &'a self,
+        key: &'a ServerKey,
+        relays: Vec<String>,
+    ) -> BoxFuture<'a, Result<(), BackendError>>;
 
     /// Saves the server invite `link` names, its key pinned and verified:
     /// "Save server only", and what a link without a code does.
@@ -722,15 +767,16 @@ pub trait Session: Send + Sync {
 
     /// Starts playback with these tracks, or with the server's choice from
     /// the user's preferences and series override (`None`). A converted
-    /// playback's encode begins at `start` (P2-03); direct play reads from
-    /// wherever the player likes, and the server ignores it. `quality` is
-    /// the viewer's choice (P6-06): Auto plans for the link.
+    /// playback's encode begins at `options.start` (P2-03); direct play
+    /// reads from wherever the player likes, and the server ignores it.
+    /// `options.quality` is the viewer's choice (P6-06): Auto plans for the
+    /// link; `options.display` is what the screen shows (PGPU-06), in place
+    /// of what the client said as it connected.
     fn start_playback<'a>(
         &'a self,
         id: &'a MediaId,
         selection: Option<Selection>,
-        start: Option<Duration>,
-        quality: PlaybackQuality,
+        options: PlaybackOptions,
     ) -> BoxFuture<'a, Result<PlaybackStart, BackendError>>;
 
     /// Plans a playing playback again for the quality the viewer chose
@@ -1006,6 +1052,8 @@ mod tests {
             advertised: Vec::new(),
             relays: Vec::new(),
             advertised_at: None,
+            use_relays: None,
+            relays_edited: false,
         }
     }
 

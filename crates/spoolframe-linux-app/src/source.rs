@@ -418,7 +418,7 @@ mod tests {
         let profile = FakeClient::profile("andrey");
         let session = client.session(&profile).unwrap();
         let item = MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap();
-        let start = ready(session.start_playback(&item, None, None, Default::default())).unwrap();
+        let start = ready(session.start_playback(&item, None, Default::default())).unwrap();
         Published::new(MediaReader::new(
             spoolframe_linux_core::testing::managed(session, item, Selection::default(), start),
             thread_spawn(),
@@ -514,7 +514,7 @@ mod tests {
         let profile = FakeClient::profile("andrey");
         let session = client.session(&profile).unwrap();
         let item = MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap();
-        let start = ready(session.start_playback(&item, None, None, Default::default())).unwrap();
+        let start = ready(session.start_playback(&item, None, Default::default())).unwrap();
         let published = Published::new(ProgressiveReader::new(
             spoolframe_linux_core::testing::managed(session, item, Selection::default(), start),
             thread_spawn(),
@@ -589,7 +589,7 @@ mod tests {
         let (items, _) = runtime.block_on(session.items(&movies.id, 0, 1)).unwrap();
         let item = items.into_iter().next().expect("a movie");
         let start = runtime
-            .block_on(session.start_playback(item.id(), None, None, Default::default()))
+            .block_on(session.start_playback(item.id(), None, Default::default()))
             .unwrap();
         eprintln!(
             "playing {} ({} bytes, {:?})",

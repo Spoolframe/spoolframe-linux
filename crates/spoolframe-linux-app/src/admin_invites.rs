@@ -1153,6 +1153,8 @@ mod tests {
             advertised: vec!["192.168.1.20:7430".into()],
             relays: Vec::new(),
             advertised_at: None,
+            use_relays: None,
+            relays_edited: false,
         };
         let read = spoolframe_protocol::invite::parse_link(&share_link(&server)).unwrap();
         assert_eq!(

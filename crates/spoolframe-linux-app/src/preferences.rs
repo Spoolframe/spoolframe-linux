@@ -171,6 +171,64 @@ pub struct Servers {
     pub verify: Rc<dyn Fn(Server)>,
     pub use_server: Rc<dyn Fn(Server)>,
     pub add: Rc<dyn Fn()>,
+    /// The app's "Use relays", which a server follows unless it has its
+    /// own choice.
+    pub app_relays: bool,
+}
+
+/// A saved server's Relays row: its choice and list, and Relays… to change
+/// them; the line is read again when the dialog closes.
+fn relays_row(server: &Server, servers: &Rc<Servers>) -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .use_markup(false)
+        .title("Relays")
+        .build();
+    row.set_subtitle(&crate::server_relays::summary(server, servers.app_relays));
+    row.add_prefix(&gtk::Image::from_icon_name(crate::icons::BROWSER));
+    let open = gtk::Button::builder()
+        .label("Relays…")
+        .valign(gtk::Align::Center)
+        .css_classes(["flat", "dialog-text-button"])
+        .build();
+    let (server, servers, weak) = (server.clone(), servers.clone(), row.downgrade());
+    open.connect_clicked(move |button| open_relays(button, &server, &servers, weak.clone()));
+    row.add_suffix(&open);
+    row
+}
+
+/// The Relays dialog for `server`, over `anchor`; `line`, if given, is set
+/// to the server's summary again once it closes.
+fn open_relays(
+    anchor: &impl IsA<gtk::Widget>,
+    server: &Server,
+    servers: &Rc<Servers>,
+    line: gtk::glib::WeakRef<adw::ActionRow>,
+) {
+    let dialog = crate::server_relays::dialog(crate::server_relays::Needs {
+        client: servers.client.clone(),
+        server: server.clone(),
+        app_relays: servers.app_relays,
+        changed: Rc::new(|| {}),
+    });
+    let (client, key, app_relays) = (
+        servers.client.clone(),
+        server.key.clone(),
+        servers.app_relays,
+    );
+    dialog.connect_closed(move |_| {
+        let (client, key, line) = (client.clone(), key.clone(), line.clone());
+        gtk::glib::spawn_future_local(async move {
+            let Ok(saved) = client.servers().await else {
+                return;
+            };
+            if let (Some(server), Some(line)) =
+                (saved.into_iter().find(|s| s.key == key), line.upgrade())
+            {
+                line.set_subtitle(&crate::server_relays::summary(&server, app_relays));
+            }
+        });
+    });
+    dialog.present(Some(anchor));
 }
 
 /// The server in use, its fingerprint always shown (P1-21) so it can be
@@ -311,6 +369,7 @@ fn in_use(server: &Server, user: Option<&str>, servers: &Rc<Servers>) -> adw::Pr
         line.set_margin_top(4);
         group.add(&line);
     }
+    group.add(&relays_row(server, servers));
     // What the server says about where it can be reached (protocol 7),
     // the address in use marked; nothing until it has said.
     if !server.advertised.is_empty() {
@@ -373,10 +432,13 @@ fn other_line(server: &Server, user: Option<&str>) -> String {
     } else {
         "Not verified"
     };
-    match server.passkey_site() {
-        Some(site) => format!("{} · passkeys {site} · {state}", whereabouts(server, user)),
-        None => format!("{} · {state}", whereabouts(server, user)),
+    let mut parts = vec![whereabouts(server, user)];
+    if let Some(site) = server.passkey_site() {
+        parts.push(format!("passkeys {site}"));
     }
+    parts.extend(crate::server_relays::other_line_part(server));
+    parts.push(state.to_owned());
+    parts.join(" · ")
 }
 
 /// A saved server not in use: where it is and who is signed in, whether
@@ -495,7 +557,16 @@ fn other_row(
             })
         }
     };
-    let mut first = vec![verify];
+    let relays = {
+        let (server, servers, row) = (server.clone(), servers.clone(), row.downgrade());
+        let label = crate::server_relays::menu_label(&server, servers.app_relays);
+        crate::views::MenuEntry::new(&label, crate::icons::BROWSER, move || {
+            if let Some(anchor) = row.upgrade() {
+                open_relays(&anchor, &server, &servers, gtk::glib::WeakRef::new());
+            }
+        })
+    };
+    let mut first = vec![verify, relays];
     if user.is_some() {
         first.push(sign_out);
     }
@@ -899,7 +970,7 @@ fn playback(
         .title("Show HDR")
         .subtitle(
             "Off: the server converts HDR films to SDR, even for an HDR monitor. \
-             Applies when Spoolframe next starts.",
+             Applies from the next thing you play.",
         )
         .active(device.show_hdr)
         .build();
@@ -1090,6 +1161,8 @@ mod tests {
             advertised: Vec::new(),
             relays: Vec::new(),
             advertised_at: None,
+            use_relays: None,
+            relays_edited: false,
         };
         assert_eq!(
             other_line(&server, Some("Alice")),

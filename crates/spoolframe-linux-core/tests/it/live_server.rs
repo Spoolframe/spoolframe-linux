@@ -405,7 +405,7 @@ fn the_app_backend_works_against_a_live_server() {
 
     let start = run(
         &runtime,
-        session.start_playback(item.id(), None, None, Default::default()),
+        session.start_playback(item.id(), None, Default::default()),
     )
     .unwrap();
     eprintln!("started: {} bytes", start.size);
