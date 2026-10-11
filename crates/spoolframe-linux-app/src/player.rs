@@ -1251,7 +1251,7 @@ impl PlanSummary {
                     );
                 let mut parts = Vec::new();
                 match video {
-                    Some(ConvertedVideo::Copy { codec }) => {
+                    Some(ConvertedVideo::Copy { codec, .. }) => {
                         parts.push(format!("video copied ({codec})"))
                     }
                     Some(ConvertedVideo::Encode {
@@ -1436,6 +1436,7 @@ mod tests {
             container: Container::Matroska,
             video: Some(ConvertedVideo::Copy {
                 codec: VideoCodec::Hevc,
+                dolby_vision: false,
             }),
             audio: None,
             subtitle: None,

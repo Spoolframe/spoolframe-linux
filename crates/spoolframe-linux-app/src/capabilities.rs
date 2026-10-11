@@ -91,6 +91,9 @@ pub fn capabilities() -> ClientCapabilities {
     subtitle_handlers.extend(overlays());
     let mut caps = ClientCapabilities {
         video: supported(VIDEO, &decoders),
+        // What the GPU decodes (PGPU-06), so the server encodes to a codec
+        // that plays without the CPU: AV1 decoded in software is slow.
+        hardware_video: Some(supported(VIDEO, &hardware(&decoders))),
         audio: supported(AUDIO, &decoders),
         containers: supported(CONTAINERS, &demuxers),
         subtitles: supported(SUBTITLES, &subtitle_handlers),
@@ -107,13 +110,35 @@ pub fn capabilities() -> ClientCapabilities {
     caps
 }
 
-/// `caps` as the user set HDR: shown as HDR (no limit: the frames carry
+/// `caps` as the user set HDR: shown as HDR10 and HLG (the frames carry
 /// their colour state to GTK, and the compositor maps them per monitor),
-/// or none of it, so the server tone-maps every HDR film to SDR.
+/// or none of it, so the server tone-maps every HDR film to SDR. Never
+/// Dolby Vision: since PGPU-06 claiming it (or no limit) has a profile 5
+/// film copied as it is, in Dolby's own colours until its RPU is applied,
+/// which GTK does not do; the server converts it to HDR10 instead.
 pub fn with_hdr(mut caps: ClientCapabilities, show: bool) -> ClientCapabilities {
+    use spoolframe_types::HdrFormat;
     let limits = caps.max_video.get_or_insert_with(Default::default);
-    limits.hdr = (!show).then(std::collections::BTreeSet::new);
+    limits.hdr = Some(if show {
+        [HdrFormat::Hdr10, HdrFormat::Hlg].into()
+    } else {
+        std::collections::BTreeSet::new()
+    });
     caps
+}
+
+/// The decoders that say they are hardware ("Hardware" in their class):
+/// VA-API's and NVDEC's. Their plugins register them only for a device
+/// that works, so a listed one decodes here.
+fn hardware(decoders: &[gst::ElementFactory]) -> Vec<gst::ElementFactory> {
+    decoders
+        .iter()
+        .filter(|f| {
+            f.metadata(gst::ELEMENT_METADATA_KLASS)
+                .is_some_and(|klass| klass.split('/').any(|part| part == "Hardware"))
+        })
+        .cloned()
+        .collect()
 }
 
 fn elements(kind: gst::ElementFactoryType) -> Vec<gst::ElementFactory> {
@@ -166,10 +191,22 @@ mod tests {
         assert_eq!(caps.max_video.and_then(|v| v.hdr), Some(Default::default()));
     }
 
+    /// Shown as HDR: HDR10 and HLG, never Dolby Vision, whose profile 5
+    /// is in Dolby's own colours until its RPU is applied, which GTK does
+    /// not do: green and purple. The server converts that to HDR10.
     #[test]
-    fn hdr_on_sets_no_limit() {
+    fn hdr_on_takes_hdr10_and_hlg_but_not_dolby_vision() {
         let caps = with_hdr(Default::default(), true);
-        assert_eq!(caps.max_video.and_then(|v| v.hdr), None);
+        assert_eq!(
+            caps.max_video.and_then(|v| v.hdr),
+            Some(
+                [
+                    spoolframe_types::HdrFormat::Hdr10,
+                    spoolframe_types::HdrFormat::Hlg
+                ]
+                .into()
+            )
+        );
     }
 
     use super::*;
@@ -178,6 +215,42 @@ mod tests {
     fn caps() -> ClientCapabilities {
         gst::init().unwrap();
         capabilities()
+    }
+
+    /// libav decodes H.264 on the CPU: it counts for what plays, not for
+    /// what the GPU decodes (PGPU-06), so the server does not pick a codec
+    /// for a GPU this computer does not have.
+    #[test]
+    fn a_software_decoder_is_not_hardware() {
+        gst::init().unwrap();
+        let avdec = gst::ElementFactory::find("avdec_h264").expect("the dev shell has gst-libav");
+        let decoders = [avdec];
+        assert_eq!(
+            (
+                supported(VIDEO, &decoders).contains(&VideoCodec::H264),
+                supported(VIDEO, &hardware(&decoders)).contains(&VideoCodec::H264)
+            ),
+            (true, false)
+        );
+    }
+
+    /// GStreamer's VA-API decoders say they are hardware; checked where
+    /// this computer has one.
+    #[test]
+    fn a_va_decoder_is_hardware() {
+        gst::init().unwrap();
+        let Some(va) = gst::ElementFactory::find("vah264dec") else {
+            eprintln!("no VA-API H.264 decoder here; nothing to check");
+            return;
+        };
+        assert!(supported(VIDEO, &hardware(&[va])).contains(&VideoCodec::H264));
+    }
+
+    #[test]
+    fn hardware_is_said_and_within_what_plays() {
+        let caps = caps();
+        let hardware = caps.hardware_video.clone().expect("the registry tells");
+        assert!(hardware.is_subset(&caps.video), "{caps:?}");
     }
 
     #[test]
