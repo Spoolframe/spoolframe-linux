@@ -46,6 +46,30 @@ pub trait PinPrompt: Send + Sync {
     /// The action moved on to its next key: what to say on the touch page
     /// from now on.
     fn step(&self, _step: &Step) {}
+    /// The person cancelled the action: whatever the key answers after
+    /// is dropped, never handed to the SDK.
+    fn cancelled(&self) -> bool {
+        false
+    }
+    /// The keys plugged in hold none of what the action needs: say so
+    /// while it waits for another.
+    fn not_ours(&self) {}
+}
+
+/// What a cancelled action's error says, in the SDK's
+/// `SecurityKeyError::Other`; the prompt closes on it without a word.
+pub const CANCELLED: &str = "cancelled";
+
+/// What no key plugged in says, in the SDK's `SecurityKeyError::Other`.
+pub const NO_KEY: &str = "no security key is plugged in";
+
+/// `answer`, unless the person cancelled while the key worked: then the
+/// action ends there, so a touch given after Cancel signs nothing.
+fn unless_cancelled<T>(prompt: &dyn PinPrompt, answer: Result<T, KeyError>) -> Result<T, KeyError> {
+    if prompt.cancelled() {
+        return Err(KeyError::Other(CANCELLED.into()));
+    }
+    answer
 }
 
 /// One key's part in an action of several (Add a key: the new key, then
@@ -84,6 +108,12 @@ impl PinPrompt for Stepped {
     }
     fn step(&self, step: &Step) {
         self.prompt.step(step);
+    }
+    fn cancelled(&self) -> bool {
+        self.prompt.cancelled()
+    }
+    fn not_ours(&self) {
+        self.prompt.not_ours();
     }
 }
 
@@ -153,7 +183,7 @@ impl Fido2SecurityKey {
         let pin = Zeroizing::new(
             self.prompt
                 .pin(&ask)
-                .ok_or_else(|| KeyError::Other("cancelled".into()))?,
+                .ok_or_else(|| KeyError::Other(CANCELLED.into()))?,
         );
         pins.insert(key.path.clone(), pin.clone());
         Ok(pin)
@@ -169,7 +199,7 @@ impl Fido2SecurityKey {
         for _ in 0..PIN_TRIES {
             let pin = self.pin(key, again)?;
             self.prompt.touch(&key.name);
-            match call(&key.path, &pin) {
+            match unless_cancelled(self.prompt.as_ref(), call(&key.path, &pin)) {
                 Err(KeyError::WrongPin) => again = true,
                 other => return other,
             }
@@ -224,11 +254,39 @@ impl Fido2SecurityKey {
     ) -> Result<T, KeyError> {
         let mut tried: Vec<String> = Vec::new();
         loop {
-            let keys = self.wait_for(|k| {
-                !tried.contains(&k.path)
-                    && (allowed.is_empty()
-                        || fido2::holds(&k.path, rp, allowed).map_or(true, |h| !h.is_empty()))
-            })?;
+            // Keys plugged in that all say they hold none of it: said so
+            // while it waits for one that does, not a bare "Plug in your
+            // key". Still waiting, as the right key may be swapped in
+            // (Add a key's second step, on one USB port).
+            // Each key asked once here; the answers both pick the keys to
+            // try and tell whether none of them is the identity's.
+            let mut ready = Vec::new();
+            if !allowed.is_empty() {
+                let mut answers = Vec::new();
+                for key in rooting_keys()?
+                    .into_iter()
+                    .filter(|k| !tried.contains(&k.path))
+                {
+                    let answer = fido2::holds(&key.path, rp, allowed);
+                    if answer.as_ref().map_or(true, |held| !held.is_empty()) {
+                        ready.push(key);
+                    }
+                    answers.push(answer);
+                }
+                if none_hold(&answers) {
+                    self.prompt.not_ours();
+                }
+            }
+            // None to try yet: wait for one to be plugged in.
+            let keys = if ready.is_empty() {
+                self.wait_for(|k| {
+                    !tried.contains(&k.path)
+                        && (allowed.is_empty()
+                            || fido2::holds(&k.path, rp, allowed).map_or(true, |h| !h.is_empty()))
+                })?
+            } else {
+                ready
+            };
             for key in keys {
                 match self.with_pin(&key, &call) {
                     Err(KeyError::NoCredential) => tried.push(key.path),
@@ -245,19 +303,17 @@ impl Fido2SecurityKey {
 impl Fido2SecurityKey {
     /// Deletes the credentials `ids` from every key plugged in that holds
     /// them, under each key's PIN: what removing an identity from its keys
-    /// takes. How many were deleted.
-    pub fn erase(&self, ids: &[Vec<u8>]) -> Result<usize, KeyError> {
-        let mut deleted = 0;
+    /// takes.
+    pub fn erase(&self, ids: &[Vec<u8>]) -> Result<(), KeyError> {
         for key in self.wait_for(|_| true)? {
             for id in ids {
                 match self.with_pin(&key, &|path, pin| fido2::delete_credential(path, id, pin)) {
-                    Ok(()) => deleted += 1,
-                    Err(KeyError::NoCredential) => {}
+                    Ok(()) | Err(KeyError::NoCredential) => {}
                     Err(other) => return Err(other),
                 }
             }
         }
-        Ok(deleted)
+        Ok(())
     }
 }
 
@@ -284,6 +340,15 @@ fn rooting_keys() -> Result<Vec<fido2::KeyDevice>, KeyError> {
         .collect())
 }
 
+/// Whether the keys plugged in, asked which credentials they hold, all
+/// said "none": some answered, and none holds one or could not say.
+fn none_hold(answers: &[Result<Vec<Vec<u8>>, KeyError>]) -> bool {
+    !answers.is_empty()
+        && answers
+            .iter()
+            .all(|a| matches!(a, Ok(held) if held.is_empty()))
+}
+
 /// The transport's error as the SDK's.
 pub fn sdk_error(error: KeyError) -> SdkError {
     let error = match error {
@@ -294,7 +359,7 @@ pub fn sdk_error(error: KeyError) -> SdkError {
         KeyError::NoCredential => SecurityKeyError::NoCredential,
         KeyError::Full => SecurityKeyError::Full,
         KeyError::NotTouched => SecurityKeyError::NotTouched,
-        KeyError::NoKey => SecurityKeyError::Other("no security key is plugged in".into()),
+        KeyError::NoKey => SecurityKeyError::Other(NO_KEY.into()),
         KeyError::Other(why) => SecurityKeyError::Other(why),
     };
     error.into()
@@ -413,6 +478,73 @@ mod tests {
         fn step(&self, step: &Step) {
             self.0.lock().unwrap().push(step.caption.clone());
         }
+        fn not_ours(&self) {
+            self.0.lock().unwrap().push("not ours".into());
+        }
+    }
+
+    #[test]
+    fn a_stepped_prompt_says_a_key_is_not_ours() {
+        let heard = Arc::new(Heard::default());
+        let step = Step {
+            caption: "Step 2 of 2".into(),
+            title: String::new(),
+            line: String::new(),
+        };
+        stepped(heard.clone(), step).not_ours();
+        assert_eq!(*heard.0.lock().unwrap(), ["not ours"]);
+    }
+
+    struct Cancelled;
+    impl PinPrompt for Cancelled {
+        fn pin(&self, _ask: &PinAsk) -> Option<String> {
+            None
+        }
+        fn touch(&self, _key: &str) {}
+        fn cancelled(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn keys_that_all_hold_none_are_not_ours() {
+        assert!(none_hold(&[Ok(Vec::new()), Ok(Vec::new())]));
+    }
+
+    #[test]
+    fn a_key_that_holds_it_is_used() {
+        assert!(!none_hold(&[Ok(Vec::new()), Ok(vec![vec![1]])]));
+    }
+
+    #[test]
+    fn a_key_that_cannot_say_is_tried() {
+        assert!(!none_hold(&[
+            Ok(Vec::new()),
+            Err(KeyError::Other("busy".into()))
+        ]));
+    }
+
+    #[test]
+    fn no_key_plugged_in_asks_for_one() {
+        assert!(!none_hold(&[]));
+    }
+
+    #[test]
+    fn a_touch_after_cancel_signs_nothing() {
+        assert!(matches!(
+            unless_cancelled(&Cancelled, Ok(7)),
+            Err(KeyError::Other(why)) if why == CANCELLED
+        ));
+    }
+
+    #[test]
+    fn a_stepped_prompt_passes_the_cancel_on() {
+        let step = Step {
+            caption: String::new(),
+            title: String::new(),
+            line: String::new(),
+        };
+        assert!(stepped(Arc::new(Cancelled), step).cancelled());
     }
 
     #[test]
@@ -443,7 +575,7 @@ mod tests {
         let SdkError::SecurityKey(SecurityKeyError::Other(why)) = sdk_error(KeyError::NoKey) else {
             panic!("not a key error");
         };
-        assert!(why.starts_with("no security key"), "{why}");
+        assert_eq!(why, NO_KEY);
     }
 
     #[test]

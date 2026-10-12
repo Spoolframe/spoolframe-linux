@@ -6,6 +6,7 @@
 use std::rc::Rc;
 use std::sync::Arc;
 
+use crate::dialog::buttons;
 use adw::prelude::*;
 use gtk::glib;
 use spoolframe_linux_core::backend::{BackendError, Session};
@@ -171,10 +172,7 @@ pub fn open(parent: &impl IsA<gtk::Widget>, needs: Needs) {
     form.append(&one_time.group);
     form.append(&new.group);
     form.append(&again.group);
-    let buttons = gtk::Box::builder()
-        .spacing(8)
-        .halign(gtk::Align::End)
-        .build();
+    let buttons = buttons();
     let sign_out = gtk::Button::builder().label("Sign out").build();
     let go = gtk::Button::builder()
         .label("Continue")

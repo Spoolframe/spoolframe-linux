@@ -14,6 +14,17 @@ pub use spoolframe_test_dir::TestDir;
 
 use crate::reader::Spawn;
 
+/// A key prompt nobody answers: no PIN, and touches go unseen. For tests
+/// on the software key, which asks for neither.
+pub struct NoPrompt;
+
+impl crate::security_key::PinPrompt for NoPrompt {
+    fn pin(&self, _ask: &crate::security_key::PinAsk) -> Option<String> {
+        None
+    }
+    fn touch(&self, _key: &str) {}
+}
+
 /// The value of a future that is ready at once, as the fake backend's
 /// are.
 pub fn ready<T>(future: impl Future<Output = T>) -> T {

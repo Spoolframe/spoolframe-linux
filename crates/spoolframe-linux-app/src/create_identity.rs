@@ -9,13 +9,12 @@
 //! keys at once (each key signs a genesis that names them all).
 
 use std::rc::Rc;
-use std::sync::Arc;
 
 use adw::prelude::*;
 use spoolframe_linux_core::identity::{Identities, KeyLabel};
-use spoolframe_linux_core::security_key::PinPrompt;
 
-use crate::key_prompt::{self, Action, Op};
+use crate::dialog::{buttons, closes, column, dim};
+use crate::key_prompt::{self, Action};
 
 /// The names the keys get, first and backup.
 pub const KEY_NAMES: [&str; 2] = ["Main key", "Backup key"];
@@ -86,10 +85,7 @@ pub fn open(parent: &impl IsA<gtk::Widget>, identities: Identities, done: Rc<dyn
          second key in a drawer fixes that. It needs its own PIN and touch. You can also add one \
          later.",
     ));
-    let buttons = gtk::Box::builder()
-        .spacing(8)
-        .halign(gtk::Align::End)
-        .build();
+    let buttons = buttons();
     let just_one = gtk::Button::builder().label("Just one key").build();
     let with_backup = gtk::Button::builder()
         .label("Use a backup key")
@@ -150,6 +146,7 @@ pub fn open(parent: &impl IsA<gtk::Widget>, identities: Identities, done: Rc<dyn
         next.connect_clicked(move |_| stack.set_visible_child_name("backup"));
     }
     let make = {
+        let made_it = done.clone();
         let (dialog, stack, name, fingerprint, rooted) = (
             dialog.downgrade(),
             stack.clone(),
@@ -162,26 +159,18 @@ pub fn open(parent: &impl IsA<gtk::Widget>, identities: Identities, done: Rc<dyn
                 return;
             };
             let identity_name = name.text().trim().to_owned();
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs() as i64);
+            let now = crate::invite::unix_now();
             let labels = labels(backup, now);
-            let ids = identities.clone();
-            let op: Op<(String, Vec<String>)> = Rc::new(move |prompt: Arc<dyn PinPrompt>| {
-                // One key for the action: it puts each root on a key the
-                // action has not used yet.
+            let op = key_prompt::op_on(&identities, move |ids, prompt| {
+                // One key for the action: it puts each root on a key the action
+                // has not used yet.
                 let key = ids.key(prompt);
                 let keys: Vec<_> = labels.iter().map(|l| (key.clone(), l.clone())).collect();
-                let (name, ids) = (identity_name.clone(), ids.clone());
+                let name = identity_name.clone();
                 Box::pin(async move {
-                    ids.run(move |ids| {
-                        Box::pin(async move {
-                            let id = ids.create(&name, &keys).await?;
-                            let names = keys.iter().map(|(_, l)| l.name.clone()).collect();
-                            Ok((id.fingerprint(), names))
-                        })
-                    })
-                    .await
+                    let id = ids.create(&name, &keys).await?;
+                    let names: Vec<String> = keys.iter().map(|(_, l)| l.name.clone()).collect();
+                    Ok((id.fingerprint(), names))
                 })
             });
             let action = Action {
@@ -199,13 +188,18 @@ pub fn open(parent: &impl IsA<gtk::Widget>, identities: Identities, done: Rc<dyn
                 }),
                 identity: None,
                 other_key: None,
+                not_found: None,
             };
             let (stack, fingerprint, rooted) = (stack.clone(), fingerprint.clone(), rooted.clone());
+            let made_it = made_it.clone();
             key_prompt::act(&dialog, action, op, move |(made, names)| {
                 fingerprint.set_text(&made);
                 let names: Vec<&str> = names.iter().map(String::as_str).collect();
                 rooted.set_text(&rooted_line(&names));
                 stack.set_visible_child_name("ready");
+                // The tab behind shows it now, however this dialog then
+                // closes: Escape on "ready" must not leave Create offered.
+                made_it();
             });
         })
     };
@@ -214,27 +208,8 @@ pub fn open(parent: &impl IsA<gtk::Widget>, identities: Identities, done: Rc<dyn
         just_one.connect_clicked(move |_| make(false));
     }
     with_backup.connect_clicked(move |_| make(true));
-    {
-        let dialog = dialog.downgrade();
-        done_button.connect_clicked(move |_| {
-            if let Some(dialog) = dialog.upgrade() {
-                dialog.close();
-            }
-            done();
-        });
-    }
+    closes(&done_button, &dialog);
     dialog.present(Some(parent));
-}
-
-fn column() -> gtk::Box {
-    gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(12)
-        .margin_top(12)
-        .margin_bottom(24)
-        .margin_start(24)
-        .margin_end(24)
-        .build()
 }
 
 fn step(text: &str) -> gtk::Label {
@@ -251,15 +226,6 @@ fn title(text: &str) -> gtk::Label {
         .xalign(0.0)
         .wrap(true)
         .css_classes(["title-3"])
-        .build()
-}
-
-fn dim(text: &str) -> gtk::Label {
-    gtk::Label::builder()
-        .label(text)
-        .xalign(0.0)
-        .wrap(true)
-        .css_classes(["dim-label"])
         .build()
 }
 

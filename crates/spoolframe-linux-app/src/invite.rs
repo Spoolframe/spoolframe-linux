@@ -711,6 +711,13 @@ fn terms_line(invite: &Invite, now: SystemTime) -> String {
     }
 }
 
+/// Now, in unix seconds.
+pub fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
 /// "Oct 14", in local time.
 pub fn month_day(at: SystemTime) -> String {
     let secs = at

@@ -6,6 +6,7 @@ mod capabilities;
 mod confirm;
 mod create_identity;
 mod denylist;
+mod dialog;
 mod file_helper;
 mod fonts;
 mod icons;
@@ -53,6 +54,8 @@ mod stylesheet;
 mod theme;
 mod tracks;
 mod transport;
+#[cfg(test)]
+mod ui_test;
 mod views;
 mod volume;
 mod wake;

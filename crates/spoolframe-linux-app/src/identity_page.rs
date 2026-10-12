@@ -13,9 +13,9 @@ use gtk::{gio, glib};
 use spoolframe_client_sdk::{RootKey, SdkError, SecurityKey};
 use spoolframe_linux_core::identity::KeyLabel;
 use spoolframe_linux_core::identity::{Device, Identities, IdentityView, KeyRoot};
-use spoolframe_linux_core::security_key::{PinPrompt, Step, stepped};
+use spoolframe_linux_core::security_key::{Step, stepped};
 
-use crate::key_prompt::{self, Action, Op};
+use crate::key_prompt::{self, Action};
 
 /// "Oct 9", from unix seconds.
 fn day(at: i64) -> String {
@@ -38,6 +38,15 @@ pub fn key_name(key: &KeyRoot, index: usize) -> String {
     key.label
         .as_ref()
         .map_or_else(|| format!("Key {}", index + 1), |l| l.name.clone())
+}
+
+/// Each key's name, in order.
+pub fn key_names(view: &IdentityView) -> Vec<String> {
+    view.keys
+        .iter()
+        .enumerate()
+        .map(|(i, k)| key_name(k, i))
+        .collect()
 }
 
 /// "Feitian ePass · added Oct 9".
@@ -88,12 +97,7 @@ pub fn renew_line(ends: i64) -> String {
 
 /// The name a key added here gets: Backup key, unless one has it.
 pub fn added_key_name(view: &IdentityView) -> String {
-    let names: Vec<String> = view
-        .keys
-        .iter()
-        .enumerate()
-        .map(|(i, k)| key_name(k, i))
-        .collect();
+    let names = key_names(view);
     let backup = crate::create_identity::KEY_NAMES[1];
     if !names.iter().any(|n| n == backup) {
         return backup.to_owned();
@@ -106,12 +110,7 @@ pub fn added_key_name(view: &IdentityView) -> String {
 
 /// Add a key's two steps: the new key, then one already a root approves.
 pub fn add_key_steps(view: &IdentityView) -> [Step; 2] {
-    let names: Vec<String> = view
-        .keys
-        .iter()
-        .enumerate()
-        .map(|(i, k)| key_name(k, i))
-        .collect();
+    let names = key_names(view);
     [
         Step {
             caption: "Step 1 of 2".into(),
@@ -127,7 +126,7 @@ pub fn add_key_steps(view: &IdentityView) -> [Step; 2] {
 }
 
 /// An exported record's file extension.
-pub const RECORD_EXTENSION: &str = "spoolframe-identity";
+pub use crate::file_helper::RECORD_EXTENSION;
 
 /// "alice.spoolframe-identity": the identity's name, lower case, with
 /// anything a file name should not hold as a dash.
@@ -234,6 +233,10 @@ pub fn page(
         groups: Default::default(),
     });
     view.load();
+    // The page owns its view; the loads and buttons hold it weakly.
+    page.connect_destroy(move |_| {
+        let _ = &view;
+    });
     page
 }
 
@@ -479,7 +482,7 @@ impl View {
                     identities: view.identities.clone(),
                     client: view.client.clone(),
                     action: View::action(&identity_c, String::new(), None),
-                    identity: identity_c.clone(),
+                    id: identity_c.identity.id,
                     done: Rc::new(move || {
                         if let Some(view) = reload.upgrade() {
                             view.load();
@@ -703,18 +706,10 @@ impl View {
                 let Some(anchor) = anchor_weak.upgrade() else {
                     return;
                 };
-                let identities = view.identities.clone();
-                let op: Op<()> = Rc::new(move |prompt: Arc<dyn PinPrompt>| {
-                    let identities = identities.clone();
+                let op = key_prompt::op_on(&view.identities, move |ids, prompt| {
                     Box::pin(async move {
-                        identities
-                            .run(move |ids| {
-                                Box::pin(async move {
-                                    ids.erase_from_keys(id, prompt).await?;
-                                    ids.forget(id).await
-                                })
-                            })
-                            .await
+                        ids.erase_from_keys(id, prompt).await?;
+                        ids.forget(id).await
                     })
                 });
                 let action = Action {
@@ -722,6 +717,7 @@ impl View {
                     keys: Some("Plug in every key you want it erased from.".into()),
                     identity: Some(name.clone()),
                     other_key: None,
+                    not_found: None,
                 };
                 let reload = Rc::downgrade(&view);
                 key_prompt::act(&anchor, action, op, move |()| {
@@ -839,12 +835,7 @@ impl View {
 
     /// The key prompt's action, for this identity: "Any of your keys: …".
     fn action(identity: &IdentityView, touch: String, except: Option<&RootKey>) -> Action {
-        let names: Vec<String> = identity
-            .keys
-            .iter()
-            .enumerate()
-            .map(|(i, k)| key_name(k, i))
-            .collect();
+        let names = key_names(identity);
         let other_key = identity
             .keys
             .iter()
@@ -860,6 +851,7 @@ impl View {
             }),
             identity: Some(identity.identity.name.clone()),
             other_key,
+            not_found: None,
         }
     }
 
@@ -877,16 +869,9 @@ impl View {
         + 'static,
         toast: &'static str,
     ) {
-        let identities = self.identities.clone();
-        let work = Rc::new(work);
-        let op: Op<()> = Rc::new(move |prompt: Arc<dyn PinPrompt>| {
-            let key = identities.key(prompt);
-            let identities = identities.clone();
-            let work = work.clone();
-            Box::pin(async move {
-                let task = work(identities.clone(), key);
-                identities.run(move |_| task).await
-            })
+        let op = key_prompt::op_on(&self.identities, move |ids, prompt| {
+            let key = ids.key(prompt);
+            work(ids, key)
         });
         let weak = Rc::downgrade(self);
         key_prompt::act(anchor, action, op, move |()| {
@@ -903,24 +888,16 @@ impl View {
         let [first, second] = add_key_steps(identity);
         let (id, view_c) = (identity.identity.id, identity.clone());
         let name = added_key_name(identity);
-        let identities = self.identities.clone();
-        let op: Op<()> = Rc::new(move |prompt: Arc<dyn PinPrompt>| {
-            let new_key = identities.new_key(stepped(prompt.clone(), first.clone()), &view_c);
-            let signer = identities.key(stepped(prompt, second.clone()));
+        let op = key_prompt::op_on(&self.identities, move |ids, prompt| {
+            let new_key = ids.new_key(stepped(prompt.clone(), first.clone()), &view_c);
+            let signer = ids.key(stepped(prompt, second.clone()));
             let label = KeyLabel {
                 name: name.clone(),
                 maker: None,
-                added_at: now(),
+                added_at: crate::invite::unix_now(),
             };
-            let identities = identities.clone();
             Box::pin(async move {
-                identities
-                    .run(move |ids| {
-                        Box::pin(async move {
-                            ids.add_key(id, signer.as_ref(), new_key.as_ref(), label)
-                                .await
-                        })
-                    })
+                ids.add_key(id, signer.as_ref(), new_key.as_ref(), label)
                     .await
             })
         });
@@ -929,6 +906,7 @@ impl View {
             keys: None,
             identity: Some(identity.identity.name.clone()),
             other_key: None,
+            not_found: None,
         };
         let weak = Rc::downgrade(self);
         key_prompt::act(anchor, action, op, move |()| {
@@ -1058,13 +1036,6 @@ impl View {
     }
 }
 
-/// Now, in unix seconds.
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64)
-}
-
 fn row(title: &str, subtitle: &str) -> adw::ActionRow {
     let row = adw::ActionRow::builder().use_markup(false).build();
     row.set_title(title);
@@ -1075,18 +1046,11 @@ fn row(title: &str, subtitle: &str) -> adw::ActionRow {
 #[cfg(test)]
 mod tests {
     use spoolframe_linux_core::identity::{KeyLabel, in_memory};
-    use spoolframe_linux_core::security_key::PinAsk;
     use spoolframe_linux_core::testing::ready;
 
     use super::*;
 
-    struct NoPrompt;
-    impl PinPrompt for NoPrompt {
-        fn pin(&self, _ask: &PinAsk) -> Option<String> {
-            None
-        }
-        fn touch(&self, _key: &str) {}
-    }
+    use spoolframe_linux_core::testing::NoPrompt;
 
     fn alice() -> IdentityView {
         let identities = in_memory();
@@ -1207,6 +1171,25 @@ mod tests {
             (first.caption.as_str(), second.title.as_str()),
             ("Step 1 of 2", "Now touch Keyring key or Drawer key")
         );
+    }
+
+    /// The page keeps its view: once the first load lands, the start rows
+    /// show, though `page` has long returned.
+    #[test]
+    #[ignore = "needs a display; run on its own"]
+    fn the_tab_fills_in_after_it_is_made() {
+        gtk::init().unwrap();
+        adw::init().unwrap();
+        let client: Arc<dyn spoolframe_linux_core::backend::Client> =
+            Arc::new(spoolframe_linux_core::fake::FakeClient::new(None));
+        let page = page(client, &adw::ToastOverlay::new());
+        assert!(crate::ui_test::spin_until(
+            std::time::Duration::from_secs(2),
+            || {
+                crate::ui_test::row_titled(page.upcast_ref(), "Create with a security key")
+                    .is_some()
+            }
+        ));
     }
 
     #[test]

@@ -709,15 +709,16 @@ pub fn delete_credential(path: &str, credential_id: &[u8], pin: &str) -> Result<
 /// can come and go. It speaks one JSON line per request over a socket
 /// pair, and ends when the app does.
 pub mod broker {
-    use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixStream;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::OnceLock;
 
     use serde::{Deserialize, Serialize};
+    use zeroize::Zeroizing;
 
     use super::{KeyDevice, KeyError, KeyInfo, Made, MakeRequest, SignRequest, Signed};
 
-    #[derive(Debug, Serialize, Deserialize)]
+    /// A request: with a PIN in three of them, so it is never printed
+    /// (see its Debug) and its buffers are wiped once sent or read.
+    #[derive(Serialize, Deserialize)]
     enum Request {
         Keys,
         Info {
@@ -729,14 +730,14 @@ pub mod broker {
             user_id: Vec<u8>,
             user_name: String,
             client_data_hash: [u8; 32],
-            pin: String,
+            pin: Zeroizing<String>,
         },
         Sign {
             path: String,
             rp: String,
             client_data_hash: [u8; 32],
             allowed: Vec<Vec<u8>>,
-            pin: String,
+            pin: Zeroizing<String>,
         },
         Tries {
             path: String,
@@ -744,13 +745,42 @@ pub mod broker {
         Delete {
             path: String,
             credential_id: Vec<u8>,
-            pin: String,
+            pin: Zeroizing<String>,
         },
         Holds {
             path: String,
             rp: String,
             ids: Vec<Vec<u8>>,
         },
+    }
+
+    impl std::fmt::Debug for Request {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            // The kind and the device only: never a PIN.
+            let kind = match self {
+                Request::Keys => "Keys",
+                Request::Info { .. } => "Info",
+                Request::Make { .. } => "Make",
+                Request::Sign { .. } => "Sign",
+                Request::Tries { .. } => "Tries",
+                Request::Delete { .. } => "Delete",
+                Request::Holds { .. } => "Holds",
+            };
+            f.debug_struct(kind)
+                .field("path", &path_of(self))
+                .finish_non_exhaustive()
+        }
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn a_request_never_prints_its_pin() {
+        let request = Request::Delete {
+            path: "/dev/hidraw5".into(),
+            credential_id: vec![1],
+            pin: Zeroizing::new("246810".into()),
+        };
+        assert!(!format!("{request:?}").contains("246810"));
     }
 
     #[derive(Debug, Serialize, Deserialize)]
@@ -764,8 +794,8 @@ pub mod broker {
         Done,
     }
 
-    /// The app's end of the helper's socket.
-    pub struct Broker(Mutex<BufReader<UnixStream>>);
+    /// The app's end of the key helper.
+    pub struct Broker(crate::helper::Helper);
 
     static BROKER: OnceLock<Broker> = OnceLock::new();
 
@@ -774,58 +804,43 @@ pub mod broker {
         BROKER.get()
     }
 
-    /// Forks the helper. Call before anything starts a thread, and before
-    /// the app confines itself: the helper runs `confine` (its own, looser
-    /// on /dev) and then serves until the app goes. Returns in the app.
+    /// Forks the key helper (see [`crate::helper::fork`]): it runs
+    /// `confine`, its own, looser on /dev, then serves until the app goes.
     pub fn start(confine: impl FnOnce()) -> std::io::Result<()> {
-        let (app, helper) = UnixStream::pair()?;
-        // SAFETY: called single-threaded (see above); the child only
-        // confines itself and serves, then exits without unwinding into
-        // the app's code.
-        match unsafe { libc::fork() } {
-            -1 => Err(std::io::Error::last_os_error()),
-            0 => {
-                drop(app);
-                // SAFETY: plain prctl; the helper dies with the app.
-                unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
-                confine();
-                serve(helper);
-                // SAFETY: the child's end; no destructors of the app run.
-                unsafe { libc::_exit(0) }
-            }
-            _ => {
-                drop(helper);
-                let _ = BROKER.set(Broker(Mutex::new(BufReader::new(app))));
-                Ok(())
-            }
+        let helper = crate::helper::fork(confine, handle, |e| {
+            KeyError::Other(format!("the key helper could not read: {e}"))
+        })?;
+        let _ = BROKER.set(Broker(helper));
+        Ok(())
+    }
+
+    /// The device a request names, if it names one.
+    fn path_of(request: &Request) -> Option<&str> {
+        match request {
+            Request::Keys => None,
+            Request::Info { path }
+            | Request::Make { path, .. }
+            | Request::Sign { path, .. }
+            | Request::Tries { path }
+            | Request::Delete { path, .. }
+            | Request::Holds { path, .. } => Some(path),
         }
     }
 
-    /// The helper's loop: a request a line, its answer a line, until the
-    /// app's end closes.
-    fn serve(stream: UnixStream) {
-        let Ok(mut out) = stream.try_clone() else {
-            return;
-        };
-        for line in BufReader::new(stream).lines() {
-            let Ok(line) = line else { return };
-            let answer: Result<Reply, KeyError> = match serde_json::from_str(&line) {
-                Ok(request) => handle(request),
-                Err(e) => Err(KeyError::Other(format!(
-                    "the key helper could not read: {e}"
-                ))),
-            };
-            let Ok(mut bytes) = serde_json::to_vec(&answer) else {
-                return;
-            };
-            bytes.push(b'\n');
-            if out.write_all(&bytes).is_err() {
-                return;
-            }
-        }
+    /// Whether `path` is a security key libfido2 lists now. The helper
+    /// may open any device under /dev, so it opens only those: an app
+    /// taken over cannot point it at a keyboard, which the app's own
+    /// sandbox keeps from it.
+    pub(super) fn is_a_key(path: &str, keys: &[KeyDevice]) -> bool {
+        keys.iter().any(|key| key.path == path)
     }
 
     fn handle(request: Request) -> Result<Reply, KeyError> {
+        if let Some(path) = path_of(&request)
+            && !is_a_key(path, &super::keys_here()?)
+        {
+            return Err(KeyError::Other(format!("{path} is not a security key")));
+        }
         Ok(match request {
             Request::Keys => Reply::Keys(super::keys_here()?),
             Request::Info { path } => Reply::Info(super::info_here(&path)?),
@@ -843,7 +858,7 @@ pub mod broker {
                     user_id: &user_id,
                     user_name: &user_name,
                     client_data_hash: &client_data_hash,
-                    pin: &pin,
+                    pin: pin.as_str(),
                 },
             )?),
             Request::Sign {
@@ -858,7 +873,7 @@ pub mod broker {
                     rp: &rp,
                     client_data_hash: &client_data_hash,
                     allowed: &allowed,
-                    pin: &pin,
+                    pin: pin.as_str(),
                 },
             )?),
             Request::Tries { path } => Reply::Tries(super::pin_tries_left_here(&path)?),
@@ -868,7 +883,7 @@ pub mod broker {
                 credential_id,
                 pin,
             } => {
-                super::delete_credential_here(&path, &credential_id, &pin)?;
+                super::delete_credential_here(&path, &credential_id, pin.as_str())?;
                 Reply::Done
             }
         })
@@ -880,15 +895,7 @@ pub mod broker {
 
     impl Broker {
         fn call(&self, request: &Request) -> Result<Reply, KeyError> {
-            let mut stream = self.0.lock().expect("never poisoned");
-            let mut bytes = serde_json::to_vec(request).map_err(|_| gone())?;
-            bytes.push(b'\n');
-            stream.get_mut().write_all(&bytes).map_err(|_| gone())?;
-            let mut line = String::new();
-            if stream.read_line(&mut line).map_err(|_| gone())? == 0 {
-                return Err(gone());
-            }
-            serde_json::from_str::<Result<Reply, KeyError>>(&line).map_err(|_| gone())?
+            self.0.call(request, gone)
         }
 
         pub fn keys(&self) -> Result<Vec<KeyDevice>, KeyError> {
@@ -912,7 +919,7 @@ pub mod broker {
                 user_id: r.user_id.to_vec(),
                 user_name: r.user_name.into(),
                 client_data_hash: *r.client_data_hash,
-                pin: r.pin.into(),
+                pin: Zeroizing::new(r.pin.into()),
             })? {
                 Reply::Made(made) => Ok(made),
                 _ => Err(gone()),
@@ -929,7 +936,7 @@ pub mod broker {
                 rp: r.rp.into(),
                 client_data_hash: *r.client_data_hash,
                 allowed: r.allowed.to_vec(),
-                pin: r.pin.into(),
+                pin: Zeroizing::new(r.pin.into()),
             })? {
                 Reply::Signed(signed) => Ok(signed),
                 _ => Err(gone()),
@@ -968,7 +975,7 @@ pub mod broker {
             match self.call(&Request::Delete {
                 path: path.into(),
                 credential_id: credential_id.to_vec(),
-                pin: pin.into(),
+                pin: Zeroizing::new(pin.into()),
             })? {
                 Reply::Done => Ok(()),
                 _ => Err(gone()),
@@ -980,6 +987,25 @@ pub mod broker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn key(path: &str) -> KeyDevice {
+        KeyDevice {
+            path: path.into(),
+            vendor: 0x096e,
+            product: 0x0858,
+            name: "FT FIDO KB".into(),
+        }
+    }
+
+    #[test]
+    fn the_helper_opens_a_key_it_lists() {
+        assert!(broker::is_a_key("/dev/hidraw5", &[key("/dev/hidraw5")]));
+    }
+
+    #[test]
+    fn the_helper_refuses_a_device_that_is_not_a_listed_key() {
+        assert!(!broker::is_a_key("/dev/hidraw2", &[key("/dev/hidraw5")]));
+    }
 
     #[test]
     fn a_wrong_pin_and_a_locked_key_are_told_apart() {

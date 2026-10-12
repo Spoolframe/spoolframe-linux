@@ -5566,13 +5566,7 @@ mod tests {
     mod portable_sign_in {
         use super::*;
 
-        struct NoPrompt;
-        impl crate::security_key::PinPrompt for NoPrompt {
-            fn pin(&self, _ask: &crate::security_key::PinAsk) -> Option<String> {
-                None
-            }
-            fn touch(&self, _key: &str) {}
-        }
+        use crate::testing::NoPrompt;
 
         #[test]
         fn an_identity_this_computer_lacks_needs_pairing() {

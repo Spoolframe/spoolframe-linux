@@ -13,7 +13,6 @@
 
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use adw::prelude::*;
 use gtk::glib;
@@ -231,12 +230,6 @@ fn auto_login_body(name: &str) -> String {
         "Spoolframe opens {name}’s profile when it starts, without Who’s watching. {name}’s PIN \
          is turned off on this computer, and any other profile stops opening here at start."
     )
-}
-
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64)
 }
 
 /// The page, for `session`, showing toasts on `dialog`.
@@ -561,7 +554,7 @@ impl View {
         // Opening at start needs this computer remembered.
         self.auto_row.set_sensitive(here.trusted);
         self.syncing.set(false);
-        let now = now();
+        let now = crate::invite::unix_now();
         let mut rows = Vec::new();
         for device in devices {
             let row = self.device_row(&device, now);
@@ -1588,7 +1581,7 @@ impl View {
             "Sign in this device?",
             &format!(
                 "It asked {}, from the {platform}.",
-                asked(request.requested_at, now()),
+                asked(request.requested_at, crate::invite::unix_now()),
             ),
         );
         let facts = gtk::ListBox::builder()

@@ -14,11 +14,13 @@ use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 
+use crate::dialog::{buttons, column};
 use adw::prelude::*;
 use gtk::glib;
 use gtk::glib::thread_guard::ThreadGuard;
 use spoolframe_client_sdk::{SdkError, SecurityKeyError};
-use spoolframe_linux_core::security_key::{PinAsk, PinPrompt, Step};
+use spoolframe_linux_core::identity::Identities;
+use spoolframe_linux_core::security_key::{CANCELLED, NO_KEY, PinAsk, PinPrompt, Step};
 
 /// The root action the prompt is for, in its words.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -31,6 +33,10 @@ pub struct Action {
     pub identity: Option<String>,
     /// Another key that can still act, for the locked key's card.
     pub other_key: Option<String>,
+    /// What to say when what the action looked for is not there (the
+    /// SDK's NotFound): recovery's server that knows no identity on the
+    /// key.
+    pub not_found: Option<String>,
 }
 
 /// "Keyring key or Drawer key", "Keyring key, Drawer key or Spare key".
@@ -59,6 +65,8 @@ pub struct Trouble {
     pub title: String,
     pub body: String,
     pub retry: bool,
+    /// The action ends here for good: OK, not Cancel (a locked key).
+    pub for_good: bool,
     pub other_key: Option<String>,
 }
 
@@ -69,6 +77,7 @@ pub fn trouble(error: &SdkError, action: &Action) -> Option<Trouble> {
         title: title.to_owned(),
         body,
         retry,
+        for_good: false,
         other_key: None,
     };
     Some(match error {
@@ -87,8 +96,9 @@ pub fn trouble(error: &SdkError, action: &Action) -> Option<Trouble> {
             ),
             SecurityKeyError::Locked => Trouble {
                 other_key: action.other_key.clone(),
+                for_good: true,
                 ..page(
-                    LOCKED,
+                    "This key is locked",
                     "Too many wrong PINs. Resetting it with its maker’s tool erases it, \
                      including this identity’s root."
                         .to_owned(),
@@ -113,8 +123,8 @@ pub fn trouble(error: &SdkError, action: &Action) -> Option<Trouble> {
                 true,
             ),
             SecurityKeyError::NoCredential => not_ours(action),
-            SecurityKeyError::Other(why) if why == "cancelled" => return None,
-            SecurityKeyError::Other(why) if why.starts_with("no security key") => page(
+            SecurityKeyError::Other(why) if why == CANCELLED => return None,
+            SecurityKeyError::Other(why) if why == NO_KEY => page(
                 "Plug in your key",
                 "No security key found. Plug one in: Spoolframe notices it, and carries on."
                     .to_owned(),
@@ -127,6 +137,11 @@ pub fn trouble(error: &SdkError, action: &Action) -> Option<Trouble> {
             ),
         },
         SdkError::NotARoot => not_ours(action),
+        SdkError::NotFound(_) if action.not_found.is_some() => page(
+            "That didn’t work",
+            action.not_found.clone().unwrap_or_default(),
+            true,
+        ),
         other => page(
             "That didn’t work",
             crate::app::sentence(&other.to_string()),
@@ -147,16 +162,38 @@ fn not_ours(action: &Action) -> Trouble {
             None => "It doesn’t hold a root of this identity.".to_owned(),
         },
         retry: true,
+        for_good: false,
         other_key: None,
     }
 }
 
-/// The locked key's title, whose page closes with OK.
-const LOCKED: &str = "This key is locked";
+/// The plug-in page, while no key is plugged in.
+const PLUG_IN: &str = "Plug in your key";
+const PLUG_IN_LINE: &str =
+    "Plug in a security key. With a backup, plug in the one not used yet, or both.";
 
 /// A root action to run with a key: given the prompt, the work.
 pub type Op<T> =
     Rc<dyn Fn(Arc<dyn PinPrompt>) -> Pin<Box<dyn Future<Output = Result<T, SdkError>>>>>;
+
+/// A root action whose work runs on the SDK's runtime, as every call of
+/// the SDK's client does: `work` gets `identities` and the prompt, here,
+/// and returns the future that runs there.
+pub fn op_on<T: Send + 'static>(
+    identities: &Identities,
+    work: impl Fn(
+        Identities,
+        Arc<dyn PinPrompt>,
+    ) -> spoolframe_linux_core::backend::BoxFuture<'static, Result<T, SdkError>>
+    + 'static,
+) -> Op<T> {
+    let identities = identities.clone();
+    Rc::new(move |prompt| {
+        let task = work(identities.clone(), prompt);
+        let identities = identities.clone();
+        Box::pin(async move { identities.run(move |_| task).await })
+    })
+}
 
 /// Runs `op` behind the prompt over `parent`, offering Try again when it
 /// fails in a way trying again can fix; `done` with what it made. The
@@ -181,6 +218,8 @@ struct View {
     /// "Step 1 of 2", for an action of several keys.
     touch_step: gtk::Label,
     touch_line: gtk::Label,
+    plug_title: gtk::Label,
+    plug_line: gtk::Label,
     pin_title: gtk::Label,
     pin: gtk::PasswordEntry,
     pin_error: gtk::Label,
@@ -203,17 +242,6 @@ fn label(classes: &[&str]) -> gtk::Label {
         .wrap(true)
         .justify(gtk::Justification::Center)
         .css_classes(classes)
-        .build()
-}
-
-fn column() -> gtk::Box {
-    gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(12)
-        .margin_top(12)
-        .margin_bottom(24)
-        .margin_start(24)
-        .margin_end(24)
         .build()
 }
 
@@ -260,12 +288,8 @@ impl View {
                 .build(),
         );
         let plug_title = label(&["title-3"]);
-        plug_title.set_text("Plug in your key");
         plug.append(&plug_title);
         let plug_line = label(&["dim-label"]);
-        plug_line.set_text(
-            "Plug in a security key. With a backup, plug in the one not used yet, or both.",
-        );
         plug.append(&plug_line);
         let plug_cancel = gtk::Button::builder()
             .label("Cancel")
@@ -295,10 +319,7 @@ impl View {
         let pin_note = label(&["dim-label", "caption"]);
         pin_note.set_text("The key’s own PIN, set when you got it. Spoolframe doesn’t keep it.");
         pin_page.append(&pin_note);
-        let pin_buttons = gtk::Box::builder()
-            .spacing(8)
-            .halign(gtk::Align::End)
-            .build();
+        let pin_buttons = buttons();
         let pin_cancel = gtk::Button::builder().label("Cancel").build();
         let pin_go = gtk::Button::builder()
             .label("Continue")
@@ -340,10 +361,7 @@ impl View {
             .build();
         other_key.append(&other_key_line);
         trouble_page.append(&other_key);
-        let trouble_buttons = gtk::Box::builder()
-            .spacing(8)
-            .halign(gtk::Align::End)
-            .build();
+        let trouble_buttons = buttons();
         let cancel_trouble = gtk::Button::builder().label("Cancel").build();
         let retry = gtk::Button::builder()
             .label("Try again")
@@ -376,6 +394,8 @@ impl View {
             touch_title,
             touch_step,
             touch_line,
+            plug_title,
+            plug_line,
             pin_title,
             pin,
             pin_error,
@@ -400,21 +420,9 @@ impl View {
             }
         };
         let give_up = Rc::new(give_up);
-        {
+        for button in [&cancel, &pin_cancel, &plug_cancel, &view.cancel_trouble] {
             let give_up = give_up.clone();
-            cancel.connect_clicked(move |_| give_up());
-        }
-        {
-            let give_up = give_up.clone();
-            pin_cancel.connect_clicked(move |_| give_up());
-        }
-        {
-            let give_up = give_up.clone();
-            plug_cancel.connect_clicked(move |_| give_up());
-        }
-        {
-            let give_up = give_up.clone();
-            view.cancel_trouble.connect_clicked(move |_| give_up());
+            button.connect_clicked(move |_| give_up());
         }
         let weak = Rc::downgrade(&view);
         pin_go.connect_clicked(move |_| {
@@ -433,6 +441,7 @@ impl View {
                 again();
             }
         });
+        crate::dialog::keep_until_closed(&view.dialog, view.clone());
         view
     }
 
@@ -468,6 +477,8 @@ impl View {
             }
         }));
         self.stack.set_visible_child_name("touch");
+        self.plug_title.set_text(PLUG_IN);
+        self.plug_line.set_text(PLUG_IN_LINE);
         self.cancelled.store(false, Ordering::SeqCst);
         let prompt: Arc<dyn PinPrompt> = Arc::new(Prompt {
             view: Arc::new(ThreadGuard::new(Rc::downgrade(self))),
@@ -495,12 +506,8 @@ impl View {
         self.trouble_title.set_text(&trouble.title);
         self.trouble_body.set_text(&trouble.body);
         self.retry.set_visible(trouble.retry);
-        // Only a locked key ends there for good: OK. Otherwise Cancel.
-        self.cancel_trouble.set_label(if trouble.title == LOCKED {
-            "OK"
-        } else {
-            "Cancel"
-        });
+        self.cancel_trouble
+            .set_label(if trouble.for_good { "OK" } else { "Cancel" });
         match &trouble.other_key {
             Some(key) => {
                 self.other_key_line.set_text(&format!(
@@ -555,6 +562,21 @@ impl PinPrompt for Prompt {
         });
     }
 
+    fn cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    fn not_ours(&self) {
+        let view = self.view.clone();
+        glib::MainContext::default().invoke(move || {
+            if let Some(view) = view.get_ref().upgrade() {
+                let page = not_ours(&view.action);
+                view.plug_title.set_text(&page.title);
+                view.plug_line.set_text(&page.body);
+            }
+        });
+    }
+
     fn plug_in(&self) -> bool {
         let view = self.view.clone();
         glib::MainContext::default().invoke(move || {
@@ -576,7 +598,49 @@ mod tests {
             keys: Some(or_list(&["Keyring key".into(), "Drawer key".into()])),
             identity: Some("Alice".into()),
             other_key: Some("Drawer key".into()),
+            not_found: None,
         }
+    }
+
+    /// The prompt keeps its view while it shows: an action that succeeds
+    /// reaches `done`, though `act` has long returned.
+    #[test]
+    #[ignore = "needs a display; run on its own"]
+    fn an_action_that_succeeds_reaches_done() {
+        gtk::init().unwrap();
+        adw::init().unwrap();
+        let window = adw::Window::new();
+        window.present();
+        let reached = Rc::new(std::cell::Cell::new(false));
+        let op: Op<()> = Rc::new(|_prompt| Box::pin(async { Ok(()) }));
+        let seen = reached.clone();
+        act(&window, alice(), op, move |()| seen.set(true));
+        assert!(crate::ui_test::spin_until(
+            std::time::Duration::from_secs(2),
+            || reached.get()
+        ));
+    }
+
+    #[test]
+    fn an_action_says_what_it_did_not_find_in_its_own_words() {
+        let action = Action {
+            not_found: Some("Home Media doesn’t know an identity this key holds.".into()),
+            ..alice()
+        };
+        let trouble = trouble(&SdkError::NotFound("portable identity".into()), &action).unwrap();
+        assert_eq!(
+            trouble.body,
+            "Home Media doesn’t know an identity this key holds."
+        );
+    }
+
+    #[test]
+    fn a_locked_key_ends_the_action_for_good() {
+        assert!(
+            trouble(&SecurityKeyError::Locked.into(), &alice())
+                .unwrap()
+                .for_good
+        );
     }
 
     #[test]
@@ -619,7 +683,7 @@ mod tests {
 
     #[test]
     fn no_key_says_to_plug_one_in_with_cancel_only() {
-        let error = SecurityKeyError::Other("no security key is plugged in".into());
+        let error = SecurityKeyError::Other(NO_KEY.into());
         let trouble = trouble(&error.into(), &alice()).unwrap();
         assert_eq!(
             (trouble.title.as_str(), trouble.retry),
@@ -639,10 +703,7 @@ mod tests {
     #[test]
     fn cancelling_closes_without_a_word() {
         assert_eq!(
-            trouble(
-                &SecurityKeyError::Other("cancelled".into()).into(),
-                &alice()
-            ),
+            trouble(&SecurityKeyError::Other(CANCELLED.into()).into(), &alice()),
             None
         );
     }

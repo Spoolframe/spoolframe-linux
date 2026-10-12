@@ -13,18 +13,40 @@
 //! ([`spoolframe_linux_core::fido2::broker`]). Unconfined
 //! (`SPOOLFRAME_NO_SANDBOX=1`), the app asks the portal itself.
 
-use std::io::{BufRead, BufReader, Read as _, Write};
-use std::os::unix::net::UnixStream;
+use std::io::Read as _;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use gtk::prelude::*;
 use gtk::{gio, glib};
 use serde::{Deserialize, Serialize};
 
-/// The most a file opened here may be: an identity record is a few
-/// kilobytes.
+/// The most a file saved or opened here may be: an identity record is a
+/// few kilobytes.
 const MAX_OPEN: u64 = 1 << 20;
+
+/// The only kind of file the helper saves or opens: an identity record.
+/// The helper checks it itself, so an app that was taken over cannot
+/// offer `../.ssh/authorized_keys` as the name, nor take back whatever
+/// the person was steered to pick.
+pub const RECORD_EXTENSION: &str = "spoolframe-identity";
+
+/// Whether `name` may be offered in the Save dialog: a plain file name,
+/// not hidden, ending in the record's extension.
+pub fn offered_name_ok(name: &str) -> bool {
+    !name.contains('/') && !name.starts_with('.') && is_record(name)
+}
+
+/// Whether a file named `name` is an identity record, by its extension.
+pub fn is_record(name: &str) -> bool {
+    std::path::Path::new(name)
+        .extension()
+        .is_some_and(|ext| ext == RECORD_EXTENSION)
+}
+
+fn not_a_record(name: &str) -> String {
+    format!("{name} isn’t a .{RECORD_EXTENSION} file: Spoolframe saves and opens only those")
+}
 
 /// What to show in the Open dialog's filter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,82 +84,35 @@ enum Reply {
     Opened(Option<Opened>),
 }
 
-static HELPER: OnceLock<Mutex<BufReader<UnixStream>>> = OnceLock::new();
+static HELPER: OnceLock<spoolframe_linux_core::helper::Helper> = OnceLock::new();
 
-/// Forks the helper. Call before anything starts a thread, and before
-/// the app confines itself; the helper runs `confine` then serves.
+/// Forks the helper (see [`spoolframe_linux_core::helper::fork`]): it
+/// runs `confine`, then serves until the app goes.
 pub fn start(confine: impl FnOnce()) -> std::io::Result<()> {
-    let (app, helper) = UnixStream::pair()?;
-    // SAFETY: called single-threaded, as the key helper's start; the
-    // child confines itself and serves, then exits without unwinding
-    // into the app's code.
-    match unsafe { libc::fork() } {
-        -1 => Err(std::io::Error::last_os_error()),
-        0 => {
-            drop(app);
-            // SAFETY: plain prctl; the helper dies with the app.
-            unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
-            confine();
-            serve(helper);
-            // SAFETY: the child's end; no destructors of the app run.
-            unsafe { libc::_exit(0) }
-        }
-        _ => {
-            drop(helper);
-            let _ = HELPER.set(Mutex::new(BufReader::new(app)));
-            Ok(())
-        }
-    }
+    let helper = spoolframe_linux_core::helper::fork(
+        confine,
+        |request: Request| handle(&request),
+        |e| format!("the file helper could not read: {e}"),
+    )?;
+    let _ = HELPER.set(helper);
+    Ok(())
 }
 
-fn serve(stream: UnixStream) {
-    let Ok(mut out) = stream.try_clone() else {
-        return;
-    };
-    for line in BufReader::new(stream).lines() {
-        let Ok(line) = line else { return };
-        let answer: Result<Reply, String> = match serde_json::from_str(&line) {
-            Ok(request) => handle(request),
-            Err(e) => Err(format!("the file helper could not read: {e}")),
-        };
-        let Ok(mut bytes) = serde_json::to_vec(&answer) else {
-            return;
-        };
-        bytes.push(b'\n');
-        if out.write_all(&bytes).is_err() {
-            return;
-        }
-    }
-}
-
-fn handle(request: Request) -> Result<Reply, String> {
-    match request {
-        Request::Save { title, name, bytes } => save_here(&title, &name, &bytes).map(Reply::Saved),
-        Request::Open { title, filter } => open_here(&title, &filter).map(Reply::Opened),
-    }
-}
-
-fn call(request: &Request) -> Result<Reply, String> {
-    let Some(helper) = HELPER.get() else {
-        return handle_unhelped(request);
-    };
-    let gone = || "the file helper stopped; restart Spoolframe".to_owned();
-    let mut stream = helper.lock().expect("never poisoned");
-    let mut bytes = serde_json::to_vec(request).map_err(|_| gone())?;
-    bytes.push(b'\n');
-    stream.get_mut().write_all(&bytes).map_err(|_| gone())?;
-    let mut line = String::new();
-    if stream.read_line(&mut line).map_err(|_| gone())? == 0 {
-        return Err(gone());
-    }
-    serde_json::from_str::<Result<Reply, String>>(&line).map_err(|_| gone())?
-}
-
-/// No helper (unconfined, or it could not start): the app asks itself.
-fn handle_unhelped(request: &Request) -> Result<Reply, String> {
+fn handle(request: &Request) -> Result<Reply, String> {
     match request {
         Request::Save { title, name, bytes } => save_here(title, name, bytes).map(Reply::Saved),
         Request::Open { title, filter } => open_here(title, filter).map(Reply::Opened),
+    }
+}
+
+/// Through the helper; without one (unconfined, or it could not start),
+/// the app asks itself.
+fn call(request: &Request) -> Result<Reply, String> {
+    match HELPER.get() {
+        Some(helper) => helper.call(request, || {
+            "the file helper stopped; restart Spoolframe".to_owned()
+        }),
+        None => handle(request),
     }
 }
 
@@ -168,25 +143,35 @@ pub fn open(title: &str, filter: &Filter) -> Result<Option<Opened>, String> {
 }
 
 fn save_here(title: &str, name: &str, bytes: &[u8]) -> Result<Option<String>, String> {
+    if !offered_name_ok(name) {
+        return Err(not_a_record(name));
+    }
+    if bytes.len() as u64 > MAX_OPEN {
+        return Err("that is too big to be an identity record".into());
+    }
     let options = glib::VariantDict::new(None);
     options.insert("current_name", name);
     let Some(path) = pick("SaveFile", title, options)? else {
         return Ok(None);
     };
+    if !is_record(&file_name(&path)) {
+        return Err(not_a_record(&file_name(&path)));
+    }
     std::fs::write(&path, bytes).map_err(|e| format!("couldn’t save {}: {e}", path.display()))?;
     Ok(Some(file_name(&path)))
 }
 
 fn open_here(title: &str, filter: &Filter) -> Result<Option<Opened>, String> {
     let options = glib::VariantDict::new(None);
-    let filters = vec![
-        (filter.name.clone(), vec![(0u32, filter.pattern.clone())]),
-        ("All files".to_owned(), vec![(0u32, "*".to_owned())]),
-    ];
+    // Only records: the helper opens nothing else.
+    let filters = vec![(filter.name.clone(), vec![(0u32, filter.pattern.clone())])];
     options.insert_value("filters", &filters.to_variant());
     let Some(path) = pick("OpenFile", title, options)? else {
         return Ok(None);
     };
+    if !is_record(&file_name(&path)) {
+        return Err(not_a_record(&file_name(&path)));
+    }
     let file =
         std::fs::File::open(&path).map_err(|e| format!("couldn’t open {}: {e}", path.display()))?;
     let mut bytes = Vec::new();
@@ -239,16 +224,15 @@ fn pick_on(
     let token = format!("spoolframe{}", glib::random_int());
     options.insert("handle_token", token.as_str());
     let path = request_path(bus.unique_name().as_deref().unwrap_or_default(), &token);
-    // Subscribed before asking, so the answer cannot come first.
     let answer: std::rc::Rc<std::cell::RefCell<Option<(u32, glib::Variant)>>> = Default::default();
     let main = glib::MainLoop::new(Some(context), false);
-    let subscription = {
+    let subscribe = |on: &str| {
         let (answer, main) = (answer.clone(), main.clone());
         bus.subscribe_to_signal(
             Some("org.freedesktop.portal.Desktop"),
             Some("org.freedesktop.portal.Request"),
             Some("Response"),
-            Some(&path),
+            Some(on),
             None,
             gio::DBusSignalFlags::NO_MATCH_RULE,
             move |signal| {
@@ -259,21 +243,29 @@ fn pick_on(
             },
         )
     };
+    // Subscribed before asking, so the answer cannot come first.
+    let mut subscription = subscribe(&path);
     let arguments = ("", title, options.end()).to_variant();
-    let asked = bus.call_sync(
-        Some("org.freedesktop.portal.Desktop"),
-        "/org/freedesktop/portal/desktop",
-        "org.freedesktop.portal.FileChooser",
-        method,
-        Some(&arguments),
-        Some(glib::VariantTy::new("(o)").expect("a valid type")),
-        gio::DBusCallFlags::NONE,
-        -1,
-        None::<&gio::Cancellable>,
-    );
-    if let Err(e) = asked {
-        drop(subscription);
-        return Err(format!("the desktop has no file chooser portal: {e}"));
+    let asked = bus
+        .call_sync(
+            Some("org.freedesktop.portal.Desktop"),
+            "/org/freedesktop/portal/desktop",
+            "org.freedesktop.portal.FileChooser",
+            method,
+            Some(&arguments),
+            Some(glib::VariantTy::new("(o)").expect("a valid type")),
+            gio::DBusCallFlags::NONE,
+            -1,
+            None::<&gio::Cancellable>,
+        )
+        .map_err(|e| format!("the desktop has no file chooser portal: {e}"))?;
+    // A portal that ignored the token answers on its own path: follow it,
+    // or this would wait forever. Its answer comes only once the person
+    // picks, long after this.
+    if let Some((answered_on,)) = asked.get::<(glib::variant::ObjectPath,)>()
+        && answered_on.as_str() != path
+    {
+        subscription = subscribe(answered_on.as_str());
     }
     main.run();
     drop(subscription);
@@ -299,6 +291,26 @@ fn pick_on(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_record_name_may_be_offered() {
+        assert!(offered_name_ok("alice.spoolframe-identity"));
+    }
+
+    #[test]
+    fn a_name_that_climbs_out_is_refused() {
+        assert!(!offered_name_ok("../.ssh/authorized_keys"));
+    }
+
+    #[test]
+    fn a_hidden_record_is_refused() {
+        assert!(!offered_name_ok(".spoolframe-identity"));
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_record_is_not_opened() {
+        assert!(!is_record("id_ed25519"));
+    }
 
     #[test]
     fn the_request_path_is_the_bus_name_escaped_then_the_token() {

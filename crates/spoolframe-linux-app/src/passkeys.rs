@@ -10,7 +10,6 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use adw::prelude::*;
 use gtk::glib;
@@ -55,12 +54,6 @@ pub fn ago(at: i64, now: i64) -> String {
         days @ 14..=59 => format!("{} weeks ago", days / 7),
         days => format!("{} months ago", days / 30),
     }
-}
-
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64)
 }
 
 /// "12 Sep", in the local time zone.
@@ -158,7 +151,7 @@ impl View {
         for row in self.rows.take() {
             self.group.remove(&row);
         }
-        let now = now();
+        let now = crate::invite::unix_now();
         let mut rows = Vec::new();
         if passkeys.is_empty() {
             let row = adw::ActionRow::builder()

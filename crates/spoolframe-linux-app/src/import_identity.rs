@@ -4,14 +4,13 @@
 //! devices.
 
 use std::rc::Rc;
-use std::sync::Arc;
 
 use adw::prelude::*;
 use spoolframe_client_sdk::IdentityRecord;
 use spoolframe_linux_core::identity::Identities;
-use spoolframe_linux_core::security_key::PinPrompt;
 
-use crate::key_prompt::{self, Action, Op};
+use crate::dialog::{buttons, closes, column};
+use crate::key_prompt::{self, Action};
 
 /// "Identity R2VN-8KQT-M4XA-H7PD".
 pub fn identity_line(record: &IdentityRecord) -> String {
@@ -31,14 +30,7 @@ pub fn open(
         .title("Import your identity")
         .content_width(460)
         .build();
-    let column = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(12)
-        .margin_top(12)
-        .margin_bottom(24)
-        .margin_start(24)
-        .margin_end(24)
-        .build();
+    let column = column();
     let card = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
         .css_classes(["boxed-list"])
@@ -57,10 +49,7 @@ pub fn open(
             .css_classes(["dim-label"])
             .build(),
     );
-    let buttons = gtk::Box::builder()
-        .spacing(8)
-        .halign(gtk::Align::End)
-        .build();
+    let buttons = buttons();
     let cancel = gtk::Button::builder().label("Cancel").build();
     let go = gtk::Button::builder()
         .label("Continue")
@@ -74,14 +63,7 @@ pub fn open(
     toolbar.set_content(Some(&column));
     dialog.set_child(Some(&toolbar));
     dialog.set_default_widget(Some(&go));
-    {
-        let dialog = dialog.downgrade();
-        cancel.connect_clicked(move |_| {
-            if let Some(dialog) = dialog.upgrade() {
-                dialog.close();
-            }
-        });
-    }
+    closes(&cancel, &dialog);
     let dialog_weak = dialog.downgrade();
     go.connect_clicked(move |_| {
         let Some(dialog) = dialog_weak.upgrade() else {
@@ -89,24 +71,16 @@ pub fn open(
         };
         let (identities, record) = (identities.clone(), record.clone());
         let name = crate::recover_identity::local_name();
-        let op: Op<()> = Rc::new(move |prompt: Arc<dyn PinPrompt>| {
-            let key = identities.key(prompt);
-            let (identities, record, name) = (identities.clone(), record.clone(), name.clone());
-            Box::pin(async move {
-                identities
-                    .run(move |ids| {
-                        Box::pin(async move {
-                            ids.import(record, &name, key.as_ref()).await.map(|_| ())
-                        })
-                    })
-                    .await
-            })
+        let op = key_prompt::op_on(&identities, move |ids, prompt| {
+            let (key, record, name) = (ids.key(prompt), record.clone(), name.clone());
+            Box::pin(async move { ids.import(record, &name, key.as_ref()).await.map(|_| ()) })
         });
         let action = Action {
             touch: "Touch any one of its keys".into(),
             keys: Some("Then its PIN. This computer pairs itself.".into()),
             identity: None,
             other_key: None,
+            not_found: None,
         };
         let (done, closing) = (done.clone(), dialog.downgrade());
         key_prompt::act(&dialog, action, op, move |()| {
@@ -122,18 +96,13 @@ pub fn open(
 #[cfg(test)]
 mod tests {
     use spoolframe_linux_core::identity::{KeyLabel, in_memory};
-    use spoolframe_linux_core::security_key::PinAsk;
     use spoolframe_linux_core::testing::ready;
+
+    use std::sync::Arc;
 
     use super::*;
 
-    struct NoPrompt;
-    impl PinPrompt for NoPrompt {
-        fn pin(&self, _ask: &PinAsk) -> Option<String> {
-            None
-        }
-        fn touch(&self, _key: &str) {}
-    }
+    use spoolframe_linux_core::testing::NoPrompt;
 
     #[test]
     fn an_exported_record_shows_the_identitys_fingerprint() {

@@ -1346,7 +1346,7 @@ fn title(text: &str) -> gtk::Label {
         .build()
 }
 
-fn dim(text: &str) -> gtk::Label {
+pub(crate) fn dim(text: &str) -> gtk::Label {
     gtk::Label::builder()
         .label(text)
         .wrap(true)

@@ -66,9 +66,9 @@ pub type KeyMaker =
     Arc<dyn Fn(Arc<dyn PinPrompt>, Vec<Vec<u8>>) -> Arc<dyn SecurityKey> + Send + Sync>;
 
 /// Deletes credentials (by id) from the keys plugged in, asking through
-/// the prompt; how many it deleted. Blocks. Only real keys have one.
+/// the prompt. Blocks. Only real keys have one.
 pub type KeyEraser =
-    Arc<dyn Fn(Arc<dyn PinPrompt>, Vec<Vec<u8>>) -> Result<usize, SdkError> + Send + Sync>;
+    Arc<dyn Fn(Arc<dyn PinPrompt>, Vec<Vec<u8>>) -> Result<(), SdkError> + Send + Sync>;
 
 /// Which of these credentials (by id) the keys plugged in hold, with no
 /// PIN and no touch. Blocks. Only real keys have one.
@@ -128,10 +128,7 @@ impl Identities {
         let probe = self.probe.clone()?;
         let ids: Vec<Vec<u8>> = keys
             .iter()
-            .map(|root| match root {
-                RootKey::SecurityKey { credential_id, .. } => credential_id.clone(),
-                _ => Vec::new(),
-            })
+            .map(|root| credential_id(root).map_or_else(Vec::new, <[u8]>::to_vec))
             .collect();
         let asked = ids.clone();
         let held = tokio::task::spawn_blocking(move || probe(asked))
@@ -168,12 +165,12 @@ impl Identities {
     }
 
     /// Erases identity `id`'s credentials from the keys plugged in, under
-    /// their PINs; then they can no longer act for it. How many it erased.
+    /// their PINs; then they can no longer act for it.
     pub async fn erase_from_keys(
         &self,
         id: PortableUserId,
         prompt: Arc<dyn PinPrompt>,
-    ) -> Result<usize, SdkError> {
+    ) -> Result<(), SdkError> {
         let erase = self
             .erase
             .clone()
@@ -183,11 +180,8 @@ impl Identities {
             .roots(id)
             .await?
             .members
-            .into_iter()
-            .filter_map(|root| match root {
-                RootKey::SecurityKey { credential_id, .. } => Some(credential_id),
-                _ => None,
-            })
+            .iter()
+            .filter_map(|root| credential_id(root).map(<[u8]>::to_vec))
             .collect();
         tokio::task::spawn_blocking(move || erase(prompt, ids))
             .await
@@ -235,10 +229,7 @@ impl Identities {
         let held = view
             .keys
             .iter()
-            .filter_map(|k| match &k.root {
-                RootKey::SecurityKey { credential_id, .. } => Some(credential_id.clone()),
-                _ => None,
-            })
+            .filter_map(|k| credential_id(&k.root).map(<[u8]>::to_vec))
             .collect();
         (self.key)(prompt, held)
     }
@@ -399,15 +390,6 @@ impl Identities {
             .ok_or_else(|| SdkError::Unavailable("no server here to relay through".into()))
     }
 
-    /// What server `server` keeps of identity `user`, for recovery.
-    pub async fn fetch_record(
-        &self,
-        server: &str,
-        user: PortableUserId,
-    ) -> Result<IdentityRecord, SdkError> {
-        self.client()?.fetch_identity_record(server, user).await
-    }
-
     /// Recovers the identity `key` holds a root of from `server`, which
     /// knows it, as this computer's identity `name`; then pairs this
     /// computer with the same key. Two touches: one finds the identity on
@@ -460,6 +442,32 @@ impl Identities {
         self.client()?.fetch_relay_pairing(server, code).await
     }
 
+    /// The key side, not knowing which server the device used: asks each
+    /// of `servers` at once for the request under `code`. The first that
+    /// holds it (by its place in `servers`), else each one's error, in
+    /// the order of `servers`.
+    pub async fn find_pairing(
+        &self,
+        servers: &[String],
+        code: &str,
+    ) -> Result<(usize, RelayOffer), Vec<SdkError>> {
+        use futures::stream::{FuturesUnordered, StreamExt};
+        let mut asking: FuturesUnordered<_> = servers
+            .iter()
+            .enumerate()
+            .map(|(at, server)| async move { (at, self.fetch_pairing(server, code).await) })
+            .collect();
+        let mut errors = Vec::new();
+        while let Some((at, fetched)) = asking.next().await {
+            match fetched {
+                Ok(offer) => return Ok((at, offer)),
+                Err(e) => errors.push((at, e)),
+            }
+        }
+        errors.sort_by_key(|(at, _)| *at);
+        Err(errors.into_iter().map(|(_, e)| e).collect())
+    }
+
     pub async fn answer_pairing(
         &self,
         offer: &RelayOffer,
@@ -478,13 +486,16 @@ struct Labels {
     map: Mutex<BTreeMap<String, KeyLabel>>,
 }
 
-fn label_key(root: &RootKey) -> Option<String> {
+/// A security-key root's credential id; a phrase root has none.
+fn credential_id(root: &RootKey) -> Option<&[u8]> {
     match root {
-        RootKey::SecurityKey { credential_id, .. } => {
-            Some(credential_id.iter().map(|b| format!("{b:02x}")).collect())
-        }
+        RootKey::SecurityKey { credential_id, .. } => Some(credential_id),
         _ => None,
     }
+}
+
+fn label_key(root: &RootKey) -> Option<String> {
+    credential_id(root).map(|id| id.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 impl Labels {
@@ -575,13 +586,7 @@ mod tests {
     use super::*;
     use crate::testing::ready;
 
-    struct NoPrompt;
-    impl PinPrompt for NoPrompt {
-        fn pin(&self, _ask: &crate::security_key::PinAsk) -> Option<String> {
-            None
-        }
-        fn touch(&self, _key: &str) {}
-    }
+    use crate::testing::NoPrompt;
 
     fn label(name: &str) -> KeyLabel {
         KeyLabel {
@@ -741,6 +746,13 @@ mod tests {
             ready(in_memory().start_pairing("Desk")),
             Err(SdkError::Unavailable(_))
         ));
+    }
+
+    #[test]
+    fn a_code_no_server_holds_gives_each_servers_error_in_order() {
+        let servers = ["a".to_owned(), "b".to_owned()];
+        let errors = ready(in_memory().find_pairing(&servers, "ABCDE-FGHJK")).unwrap_err();
+        assert_eq!(errors.len(), 2);
     }
 
     #[test]

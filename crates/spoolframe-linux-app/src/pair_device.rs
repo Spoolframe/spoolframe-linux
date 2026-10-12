@@ -12,11 +12,12 @@ use adw::prelude::*;
 use gtk::glib;
 use spoolframe_client_sdk::{RelayOffer, SdkError};
 use spoolframe_linux_core::backend::Client;
-use spoolframe_linux_core::identity::{Identities, IdentityView};
-use spoolframe_linux_core::security_key::PinPrompt;
+use spoolframe_linux_core::identity::Identities;
 use spoolframe_protocol::pairing::RelayCode;
+use spoolframe_protocol::portable::PortableUserId;
 
-use crate::key_prompt::{self, Action, Op};
+use crate::dialog::{buttons, closes, column, dim};
+use crate::key_prompt::{self, Action};
 
 /// How long a paired device signs in as you.
 const SIGN_IN_FOR: Duration = Duration::from_secs(90 * 24 * 60 * 60);
@@ -42,7 +43,8 @@ pub fn paired_line(name: &str, now: SystemTime) -> String {
 pub struct Needs {
     pub identities: Identities,
     pub client: Arc<dyn Client>,
-    pub identity: IdentityView,
+    /// The identity the device pairs with.
+    pub id: PortableUserId,
     /// The key prompt's words for this identity.
     pub action: Action,
     pub done: Rc<dyn Fn()>,
@@ -102,10 +104,7 @@ pub fn open(parent: &impl IsA<gtk::Widget>, needs: Needs) {
     check.append(&dim(
         "It gets its own sign-in as you for 90 days. You can revoke it here.",
     ));
-    let check_buttons = gtk::Box::builder()
-        .spacing(8)
-        .halign(gtk::Align::End)
-        .build();
+    let check_buttons = buttons();
     let check_cancel = gtk::Button::builder().label("Cancel").build();
     let pair = gtk::Button::builder()
         .label("Pair")
@@ -190,14 +189,7 @@ pub fn open(parent: &impl IsA<gtk::Widget>, needs: Needs) {
             });
         });
     }
-    {
-        let dialog = dialog.downgrade();
-        check_cancel.connect_clicked(move |_| {
-            if let Some(dialog) = dialog.upgrade() {
-                dialog.close();
-            }
-        });
-    }
+    closes(&check_cancel, &dialog);
     {
         let (needs, dialog, stack) = (needs.clone(), dialog.downgrade(), stack.clone());
         pair.connect_clicked(move |_| {
@@ -205,40 +197,26 @@ pub fn open(parent: &impl IsA<gtk::Widget>, needs: Needs) {
                 return;
             };
             let name = found.name().to_owned();
-            let (identities, id) = (needs.identities.clone(), needs.identity.identity.id);
-            let op: Op<()> = Rc::new(move |prompt: Arc<dyn PinPrompt>| {
-                let key = identities.key(prompt);
-                let (identities, found) = (identities.clone(), found.clone());
-                Box::pin(async move {
-                    identities
-                        .run(move |ids| {
-                            Box::pin(
-                                async move { ids.answer_pairing(&found, id, key.as_ref()).await },
-                            )
-                        })
-                        .await
-                })
+            let id = needs.id;
+            let op = key_prompt::op_on(&needs.identities, move |ids, prompt| {
+                let (key, found) = (ids.key(prompt), found.clone());
+                Box::pin(async move { ids.answer_pairing(&found, id, key.as_ref()).await })
             });
             let action = Action {
                 touch: format!("Touch your key to pair {name}"),
                 ..needs.action.clone()
             };
-            let (stack, paired_until) = (stack.clone(), paired_until.clone());
+            let (stack, paired_until, needs) = (stack.clone(), paired_until.clone(), needs.clone());
             key_prompt::act(&dialog, action, op, move |()| {
                 paired_until.set_text(&paired_line(&name, SystemTime::now()));
                 stack.set_visible_child_name("paired");
+                // The Devices list behind shows it now, however this
+                // dialog then closes.
+                (needs.done)();
             });
         });
     }
-    {
-        let (needs, dialog) = (needs.clone(), dialog.downgrade());
-        done.connect_clicked(move |_| {
-            if let Some(dialog) = dialog.upgrade() {
-                dialog.close();
-            }
-            (needs.done)();
-        });
-    }
+    closes(&done, &dialog);
     dialog.present(Some(parent));
 }
 
@@ -250,51 +228,34 @@ async fn find(needs: &Needs, code: &str) -> Result<(String, RelayOffer), String>
         .servers()
         .await
         .map_err(|e| crate::app::sentence(&e.to_string()))?;
-    let mut trouble = None;
-    for server in servers.into_iter().filter(|s| s.pinned) {
-        let (key, code) = (server.key.0.clone(), code.to_owned());
-        let fetched = needs
-            .identities
-            .run(move |ids| Box::pin(async move { ids.fetch_pairing(&key, &code).await }))
-            .await;
-        match fetched {
-            Ok(offer) => return Ok((server.name, offer)),
-            Err(SdkError::NotFound(_)) => {}
-            // A server that cannot be reached may be the one: said only
-            // if no other has the code.
-            Err(e) => {
-                trouble = Some(format!(
-                    "{}: {}",
-                    server.name,
-                    crate::app::sentence(&e.to_string())
-                ))
-            }
-        }
-    }
+    let servers: Vec<_> = servers.into_iter().filter(|s| s.pinned).collect();
+    let (keys, code): (Vec<String>, String) = (
+        servers.iter().map(|s| s.key.0.clone()).collect(),
+        code.to_owned(),
+    );
+    // Every server at once: one that cannot be reached holds up only
+    // itself.
+    let found = needs
+        .identities
+        .run(move |ids| Box::pin(async move { Ok(ids.find_pairing(&keys, &code).await) }))
+        .await
+        .map_err(|e| crate::app::sentence(&e.to_string()))?;
+    let errors = match found {
+        Ok((at, offer)) => return Ok((servers[at].name.clone(), offer)),
+        Err(errors) => errors,
+    };
+    // A server that could not be asked may be the one: said only when
+    // none had the code; the last of them, as servers are listed.
+    let trouble = servers
+        .iter()
+        .zip(&errors)
+        .rev()
+        .find(|(_, e)| !matches!(e, SdkError::NotFound(_)))
+        .map(|(server, e)| format!("{}: {}", server.name, crate::app::sentence(&e.to_string())));
     Err(match trouble {
         Some(why) => format!("{NOT_WAITING} {why}"),
         None => NOT_WAITING.to_owned(),
     })
-}
-
-fn column() -> gtk::Box {
-    gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(12)
-        .margin_top(12)
-        .margin_bottom(24)
-        .margin_start(24)
-        .margin_end(24)
-        .build()
-}
-
-fn dim(text: &str) -> gtk::Label {
-    gtk::Label::builder()
-        .label(text)
-        .xalign(0.0)
-        .wrap(true)
-        .css_classes(["dim-label"])
-        .build()
 }
 
 #[cfg(test)]

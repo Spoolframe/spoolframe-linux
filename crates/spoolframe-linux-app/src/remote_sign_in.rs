@@ -622,20 +622,6 @@ mod tests {
         );
     }
 
-    /// Runs the main loop until `done` or `limit`.
-    fn run_until(limit: Duration, done: impl Fn() -> bool) -> bool {
-        let context = glib::MainContext::default();
-        let deadline = Instant::now() + limit;
-        while Instant::now() < deadline {
-            if done() {
-                return true;
-            }
-            context.iteration(false);
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        done()
-    }
-
     /// What the screen handed back: the profile, whether it gave up for
     /// want of a web address, and the pages it opened in the browser.
     #[derive(Default)]
@@ -685,9 +671,9 @@ mod tests {
             .default_height(760)
             .build();
         window.present();
-        run_until(Duration::from_secs(5), || window.is_mapped());
+        crate::ui_test::spin_until(Duration::from_secs(5), || window.is_mapped());
         screen.dialog.present(Some(&window));
-        run_until(Duration::from_secs(5), || screen.dialog.is_mapped());
+        crate::ui_test::spin_until(Duration::from_secs(5), || screen.dialog.is_mapped());
         (screen, ended)
     }
 
@@ -696,7 +682,7 @@ mod tests {
     }
 
     fn reaches(screen: &RemoteSignIn, page: &str) -> bool {
-        run_until(Duration::from_secs(5), || {
+        crate::ui_test::spin_until(Duration::from_secs(5), || {
             showing_page(screen).as_deref() == Some(page)
         })
     }
@@ -737,7 +723,9 @@ mod tests {
                 .answering_phone_sign_in(PhoneAnswer::Wait),
             Via::Browser,
         );
-        assert!(run_until(Duration::from_secs(5), || ended.no_web.get()));
+        assert!(crate::ui_test::spin_until(Duration::from_secs(5), || ended
+            .no_web
+            .get()));
         assert!(
             ended.opened.borrow().is_empty() && screen.call.borrow().is_none(),
             "it opened a page, or waits"
@@ -746,7 +734,7 @@ mod tests {
 
     fn an_approval_ends_as_a_password_sign_in() {
         let (_screen, ended) = open(FakeClient::new(None));
-        assert!(run_until(Duration::from_secs(5), || ended
+        assert!(crate::ui_test::spin_until(Duration::from_secs(5), || ended
             .profile
             .borrow()
             .is_some()));
@@ -761,7 +749,7 @@ mod tests {
             ended.profile.borrow().is_none(),
             "opened before it was said"
         );
-        assert!(run_until(Duration::from_secs(5), || ended
+        assert!(crate::ui_test::spin_until(Duration::from_secs(5), || ended
             .profile
             .borrow()
             .is_some()));
@@ -818,10 +806,9 @@ mod tests {
         assert!(screen.qr.is_visible() && screen.page.text().contains("media.example.org"));
         assert!(screen.call.borrow().is_some(), "not waiting");
         screen.dialog.force_close();
-        assert!(run_until(Duration::from_secs(2), || screen
-            .call
-            .borrow()
-            .is_none()));
+        assert!(crate::ui_test::spin_until(Duration::from_secs(2), || {
+            screen.call.borrow().is_none()
+        }));
         assert!(ended.profile.borrow().is_none());
     }
 }

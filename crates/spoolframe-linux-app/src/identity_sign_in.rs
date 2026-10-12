@@ -15,10 +15,11 @@ use adw::prelude::*;
 use gtk::glib;
 use spoolframe_client_sdk::{Pairing, RelayAnswer, RelayPairing, SdkError};
 use spoolframe_linux_core::identity::{Identities, IdentityView};
-use spoolframe_linux_core::security_key::PinPrompt;
 use spoolframe_protocol::portable::PortableUserId;
 
-use crate::key_prompt::{self, Action, Op};
+use crate::dialog::{buttons, column};
+use crate::key_prompt::{self, Action};
+use crate::start::dim;
 
 /// The identity row when sign-ins with other identities are off here.
 pub const OFF_HERE: &str = "Off on this computer. Turn it on in Preferences › Servers.";
@@ -172,7 +173,11 @@ pub fn open(parent: &impl IsA<gtk::Widget>, needs: Needs) {
     ));
     note.add_css_class("caption");
     code_page.append(&note);
-    let code_cancel = pill("Cancel", false);
+    let code_cancel = gtk::Button::builder()
+        .label("Cancel")
+        .halign(gtk::Align::Center)
+        .css_classes(["pill"])
+        .build();
     code_page.append(&code_cancel);
     stack.add_named(&code_page, Some("code"));
 
@@ -235,14 +240,16 @@ pub fn open(parent: &impl IsA<gtk::Widget>, needs: Needs) {
         round: Cell::new(0),
     });
     {
+        // Before the view is let go, below: the pairing stops with it.
         let weak = Rc::downgrade(&view);
         view.dialog.connect_closed(move |_| {
             if let Some(view) = weak.upgrade() {
-                view.round.set(view.round.get() + 1);
+                view.next_round();
                 view.stop_local();
             }
         });
     }
+    crate::dialog::keep_until_closed(&view.dialog, view.clone());
     {
         let weak = Rc::downgrade(&view);
         account.connect_activated(move |_| {
@@ -288,6 +295,18 @@ pub fn open(parent: &impl IsA<gtk::Widget>, needs: Needs) {
 }
 
 impl View {
+    /// Starts a new round: whatever an older one still waits on stops
+    /// once it next looks. The new round's number.
+    fn next_round(&self) -> u64 {
+        let round = self.round.get() + 1;
+        self.round.set(round);
+        round
+    }
+
+    fn is_current(&self, round: u64) -> bool {
+        self.round.get() == round
+    }
+
     /// The key identity on this computer signs in, pairing itself first
     /// if it must; with none, the code.
     fn with_identity(self: &Rc<Self>) {
@@ -309,15 +328,9 @@ impl View {
     /// 1 · One touch: this computer approves itself.
     fn pair_self(self: &Rc<Self>, identity: &IdentityView) {
         let id = identity.identity.id;
-        let identities = self.needs.identities.clone();
-        let op: Op<()> = Rc::new(move |prompt: Arc<dyn PinPrompt>| {
-            let key = identities.key(prompt);
-            let identities = identities.clone();
-            Box::pin(async move {
-                identities
-                    .run(move |ids| Box::pin(async move { ids.pair_self(id, key.as_ref()).await }))
-                    .await
-            })
+        let op = key_prompt::op_on(&self.needs.identities, move |ids, prompt| {
+            let key = ids.key(prompt);
+            Box::pin(async move { ids.pair_self(id, key.as_ref()).await })
         });
         let name = identity.identity.name.clone();
         let action = Action {
@@ -328,6 +341,7 @@ impl View {
             )),
             identity: Some(name),
             other_key: None,
+            not_found: None,
         };
         let weak = Rc::downgrade(self);
         key_prompt::act(&self.dialog, action, op, move |()| {
@@ -339,8 +353,7 @@ impl View {
 
     /// 7 · A new code held on the server, then waiting for its answer.
     fn offer(self: &Rc<Self>) {
-        let round = self.round.get() + 1;
-        self.round.set(round);
+        let round = self.next_round();
         self.stop_local();
         self.dialog.set_title("Sign in with your identity");
         let (identities, server) = (self.needs.identities.clone(), self.needs.server.clone());
@@ -374,7 +387,7 @@ impl View {
             loop {
                 glib::timeout_future(POLL).await;
                 let Some(view) = weak.upgrade() else { return };
-                if view.round.get() != round {
+                if !view.is_current(round) {
                     return;
                 }
                 let left = pairing.expires_in();
@@ -388,7 +401,7 @@ impl View {
                     .run(move |ids| Box::pin(async move { ids.collect_pairing(&asked).await }))
                     .await;
                 let Some(view) = weak.upgrade() else { return };
-                if view.round.get() != round {
+                if !view.is_current(round) {
                     return;
                 }
                 match collected {
@@ -413,7 +426,7 @@ impl View {
                 .await;
             let Some(view) = weak.upgrade() else { return };
             let pairing = match started {
-                Ok(pairing) if view.round.get() == round => pairing,
+                Ok(pairing) if view.is_current(round) => pairing,
                 Ok(pairing) => return pairing.cancel(),
                 Err(e) => return tracing::warn!(error = %e, "no QR beside the pairing code"),
             };
@@ -437,7 +450,7 @@ impl View {
                 .run(move |_| Box::pin(async move { asked.connected().await }))
                 .await;
             let Some(view) = weak.upgrade() else { return };
-            if view.round.get() != round {
+            if !view.is_current(round) {
                 return;
             }
             if let Ok(phone) = &connected {
@@ -448,7 +461,7 @@ impl View {
                 .run(move |_| Box::pin(async move { pairing.wait().await }))
                 .await;
             let Some(view) = weak.upgrade() else { return };
-            if view.round.get() != round {
+            if !view.is_current(round) {
                 return;
             }
             match paired {
@@ -516,66 +529,55 @@ impl View {
     }
 
     fn done(&self, id: PortableUserId) {
-        self.round.set(self.round.get() + 1);
+        self.next_round();
         self.stop_local();
         self.dialog.close();
         (self.needs.sign_in)(id);
     }
 }
 
-fn column() -> gtk::Box {
-    gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(12)
-        .margin_top(12)
-        .margin_bottom(24)
-        .margin_start(24)
-        .margin_end(24)
-        .build()
-}
-
-fn dim(text: &str) -> gtk::Label {
-    gtk::Label::builder()
-        .label(text)
-        .wrap(true)
-        .justify(gtk::Justification::Center)
-        .css_classes(["dim-label"])
-        .build()
-}
-
-fn pill(text: &str, suggested: bool) -> gtk::Button {
-    let button = gtk::Button::builder()
-        .label(text)
-        .halign(gtk::Align::Center)
-        .css_classes(["pill"])
-        .build();
-    if suggested {
-        button.add_css_class("suggested-action");
-    }
-    button
-}
-
-fn buttons() -> gtk::Box {
-    gtk::Box::builder()
-        .spacing(8)
-        .halign(gtk::Align::End)
-        .build()
-}
-
 #[cfg(test)]
 mod tests {
     use spoolframe_linux_core::identity::{KeyLabel, in_memory};
-    use spoolframe_linux_core::security_key::PinAsk;
     use spoolframe_linux_core::testing::ready;
 
     use super::*;
 
-    struct NoPrompt;
-    impl PinPrompt for NoPrompt {
-        fn pin(&self, _ask: &PinAsk) -> Option<String> {
-            None
-        }
-        fn touch(&self, _key: &str) {}
+    use spoolframe_linux_core::testing::NoPrompt;
+
+    /// The chooser keeps its view while it shows: "Sign in with an
+    /// account" still answers once `open` has returned.
+    #[test]
+    #[ignore = "needs a display; run on its own"]
+    fn the_account_row_answers_after_the_chooser_opens() {
+        gtk::init().unwrap();
+        adw::init().unwrap();
+        let window = adw::Window::new();
+        window.present();
+        let chose = Rc::new(Cell::new(false));
+        let seen = chose.clone();
+        open(
+            &window,
+            Needs {
+                identities: in_memory(),
+                server: "k".into(),
+                server_name: "Home Media".into(),
+                sign_in: Rc::new(|_| {}),
+                account: Rc::new(move || seen.set(true)),
+            },
+        );
+        assert!(crate::ui_test::spin_until(
+            std::time::Duration::from_secs(2),
+            || window.visible_dialog().is_some()
+        ));
+        let dialog = window.visible_dialog().unwrap();
+        let row =
+            crate::ui_test::row_titled(dialog.upcast_ref(), "Sign in with an account").unwrap();
+        adw::prelude::ActionRowExt::activate(&row);
+        assert!(crate::ui_test::spin_until(
+            std::time::Duration::from_secs(2),
+            || chose.get()
+        ));
     }
 
     #[test]

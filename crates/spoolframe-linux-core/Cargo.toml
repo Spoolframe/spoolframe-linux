@@ -25,7 +25,7 @@ webauthn-rs-proto = { workspace = true }
 serde_cbor_2 = { workspace = true }
 futures = { workspace = true }
 url = "2"
-zeroize = "1"
+zeroize = { version = "1", features = ["serde"] }
 libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

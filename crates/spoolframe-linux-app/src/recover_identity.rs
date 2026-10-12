@@ -13,12 +13,11 @@ use std::sync::Arc;
 
 use adw::prelude::*;
 use gtk::glib;
-use spoolframe_client_sdk::SdkError;
 use spoolframe_linux_core::backend::{Client, Server};
 use spoolframe_linux_core::identity::Identities;
-use spoolframe_linux_core::security_key::PinPrompt;
 
-use crate::key_prompt::{self, Action, Op};
+use crate::dialog::column;
+use crate::key_prompt::{self, Action};
 
 /// A saved server's line in the list: how it is reached.
 pub fn server_line(server: &Server) -> String {
@@ -59,14 +58,7 @@ pub fn open(
         .title("Recover your identity")
         .content_width(460)
         .build();
-    let column = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(12)
-        .margin_top(12)
-        .margin_bottom(24)
-        .margin_start(24)
-        .margin_end(24)
-        .build();
+    let column = column();
     column.append(
         &gtk::Label::builder()
             .label(
@@ -145,38 +137,18 @@ pub fn open(
             else {
                 return;
             };
-            let identities = identities.clone();
             let name = local_name();
-            let server_name = server.name.clone();
-            let op: Op<()> = Rc::new(move |prompt: Arc<dyn PinPrompt>| {
-                let key = identities.key(prompt);
-                let (identities, server, name, server_name) = (
-                    identities.clone(),
-                    server.key.0.clone(),
-                    name.clone(),
-                    server_name.clone(),
-                );
-                Box::pin(async move {
-                    identities
-                        .run(move |ids| {
-                            Box::pin(async move {
-                                match ids.recover(&server, key.as_ref(), &name).await {
-                                    Ok(_) => Ok(()),
-                                    Err(SdkError::NotFound(_)) => {
-                                        Err(SdkError::Unavailable(unknown_here(&server_name)))
-                                    }
-                                    Err(e) => Err(e),
-                                }
-                            })
-                        })
-                        .await
-                })
+            let not_found = unknown_here(&server.name);
+            let op = key_prompt::op_on(&identities, move |ids, prompt| {
+                let (key, server, name) = (ids.key(prompt), server.key.0.clone(), name.clone());
+                Box::pin(async move { ids.recover(&server, key.as_ref(), &name).await.map(|_| ()) })
             });
             let action = Action {
                 touch: "Touch any one of your keys".into(),
                 keys: Some("Then its PIN. This computer pairs itself.".into()),
                 identity: None,
                 other_key: None,
+                not_found: Some(not_found),
             };
             let (done, closing) = (done.clone(), dialog.downgrade());
             key_prompt::act(&dialog, action, op, move |()| {

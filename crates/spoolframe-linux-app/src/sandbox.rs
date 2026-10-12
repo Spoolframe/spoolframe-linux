@@ -16,6 +16,15 @@
 //!   memory, mounts, namespaces, keyrings, `bpf`, `io_uring`, …
 //!   The network stays open: the app talks to its servers.
 //!
+//! What it does not stop: Landlock cannot refuse connecting to a Unix
+//! socket, and the runtime directory is open for Wayland, PipeWire and
+//! D-Bus. So outside a Flatpak, an app taken over can still reach the
+//! ssh-agent and gpg-agent sockets there, and ask the session bus's
+//! Secret Service for any secret in the desktop's keyring, not only the
+//! app's own. `~/.ssh` and the keyring's files are out of reach; what
+//! their agents hand out is not. In a Flatpak, its own sandbox closes
+//! those.
+//!
 //! Links open through the desktop portal, which starts the browser outside
 //! the app (see [`crate::browser`]).
 //!
