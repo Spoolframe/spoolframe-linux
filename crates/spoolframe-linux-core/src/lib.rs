@@ -9,7 +9,9 @@ pub mod backend;
 // real servers, through the SDK.
 #[cfg(any(test, feature = "testing"))]
 pub mod fake;
+pub mod fido2;
 pub mod format;
+pub mod identity;
 pub mod markers;
 pub mod next_episode;
 pub mod passkey;
@@ -17,6 +19,7 @@ pub mod paths;
 pub mod progressive;
 pub mod reader;
 pub mod sdk;
+pub mod security_key;
 pub mod storage;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;

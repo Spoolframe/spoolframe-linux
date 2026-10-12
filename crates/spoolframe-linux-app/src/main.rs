@@ -4,10 +4,16 @@ mod artwork;
 mod browser;
 mod capabilities;
 mod confirm;
+mod create_identity;
 mod denylist;
+mod file_helper;
 mod fonts;
 mod icons;
+mod identity_page;
+mod identity_sign_in;
+mod import_identity;
 mod invite;
+mod key_prompt;
 mod library;
 mod logo;
 // Text shown as it is where GTK reads markup, and the checks over the
@@ -17,8 +23,10 @@ mod minibar;
 mod mpris;
 mod nowplaying;
 mod pages;
+mod pair_device;
 mod passkey_dialog;
 mod passkeys;
+mod password_change;
 mod pin;
 mod pipeline;
 mod playback;
@@ -29,6 +37,7 @@ mod qr;
 mod quality;
 mod queue;
 mod reachability;
+mod recover_identity;
 mod remote_sign_in;
 mod sandbox;
 mod saved_queue;
@@ -99,6 +108,22 @@ fn main() -> Result<()> {
         .unwrap_or_else(|_| EnvFilter::new(level));
     tracing_subscriber::fmt().with_env_filter(filter).init();
     // Before GTK, GStreamer or the SDK start a thread (C-15).
+    // Security keys (P7-08) through a helper forked now, before the app
+    // confines itself and before any thread: it alone opens keys, with
+    // every device under /dev, so a key plugged in later still works.
+    if std::env::var_os(sandbox::OPT_OUT).is_none_or(|v| v != "1")
+        && let Err(e) = spoolframe_linux_core::fido2::broker::start(sandbox::confine_broker)
+    {
+        tracing::warn!(error = %e, "no key helper: keys must be plugged in before the app starts");
+    }
+    // Files the person picks (the identity record, P7-08), through a
+    // helper that shows the portal's dialog itself: the app may not reach
+    // the home directory once confined.
+    if std::env::var_os(sandbox::OPT_OUT).is_none_or(|v| v != "1")
+        && let Err(e) = file_helper::start(sandbox::confine_file_helper)
+    {
+        tracing::warn!(error = %e, "no file helper: exporting and importing will fail");
+    }
     let confinement = sandbox::confine();
     if let Some(probe) = cli.self_check {
         std::process::exit(if sandbox::self_check(confinement, &probe) {

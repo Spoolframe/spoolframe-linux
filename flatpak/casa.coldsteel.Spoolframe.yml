@@ -40,6 +40,33 @@ build-options:
     CARGO_NET_OFFLINE: 'true'
     LIBCLANG_PATH: /usr/lib/sdk/llvm22/lib
 modules:
+  # libfido2 and its CBOR library (P7-08: a security key as a portable
+  # identity's root); the runtime has neither. OpenSSL, zlib and libudev
+  # come from it.
+  - name: libcbor
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DBUILD_SHARED_LIBS=ON
+      - -DWITH_EXAMPLES=OFF
+    sources:
+      - type: archive
+        url: https://github.com/PJK/libcbor/archive/refs/tags/v0.13.0.tar.gz
+        sha256: 95a7f0dd333fd1dce3e4f92691ca8be38227b27887599b21cd3c4f6d6a7abb10
+  - name: libfido2
+    buildsystem: cmake-ninja
+    # Not Release: libfido2 then adds -D_FORTIFY_SOURCE=2 over the
+    # runtime's =3, and its -Werror fails on the redefinition.
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=None
+      - -DBUILD_EXAMPLES=OFF
+      - -DBUILD_MANPAGES=OFF
+      - -DBUILD_TOOLS=OFF
+      - -DBUILD_TESTS=OFF
+    sources:
+      - type: archive
+        url: https://developers.yubico.com/libfido2/Releases/libfido2-1.17.0.tar.gz
+        sha256: c1012c8871d71b65872fd5ff1a9d6b0838a55683a03e85ba97479ce57129c736
   - name: spoolframe-linux
     buildsystem: simple
     build-commands:

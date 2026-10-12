@@ -49,6 +49,8 @@ pub fn dialog(
     // switcher: four 120×52 tabs, icon over label, the picked one on the
     // surface. Toasts (the profile page's answers) show over the pages.
     let toasts = adw::ToastOverlay::new();
+    // The person's own identity (P7-08), whoever is signed in.
+    let client = servers.client.clone();
     let mut pages = vec![
         appearance(
             theme,
@@ -74,6 +76,7 @@ pub fn dialog(
             pages.push(crate::admin_invites::page(admin, &toasts));
         }
     }
+    pages.push(crate::identity_page::page(client, &toasts));
     let stack = gtk::Stack::builder()
         .transition_type(gtk::StackTransitionType::Crossfade)
         .vexpand(true)
@@ -268,6 +271,7 @@ fn servers_page(servers: Servers) -> adw::PreferencesPage {
     }
     others.set_header_suffix(Some(&add));
     page.add(&others);
+    page.add(&this_computer(servers.client.identities()));
     // The list comes from the client, and who is signed in from each.
     {
         let (servers, others) = (servers.clone(), others.clone());
@@ -290,6 +294,62 @@ fn servers_page(servers: Servers) -> adw::PreferencesPage {
         });
     }
     page
+}
+
+/// This computer's own choices, for every server: whether people with
+/// their own identity may sign in here (LinuxPrefsPortablePolicy).
+fn this_computer(identities: spoolframe_linux_core::identity::Identities) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder()
+        .title("This computer")
+        .description("Applies to every server and every profile here.")
+        .build();
+    let guests = adw::SwitchRow::builder()
+        .use_markup(false)
+        .sensitive(false)
+        .build();
+    guests.set_title("Sign-ins with other identities");
+    guests.set_subtitle(
+        "People who watch with their own identity can sign in here with a code. Right for a \
+         shared living-room PC; leave it off on your own laptop.",
+    );
+    guests.add_prefix(&gtk::Image::from_icon_name(crate::icons::IDENTITY));
+    group.add(&guests);
+    let note = gtk::Label::builder()
+        .label(
+            "Off by default. With it off, this computer shows no code for Sign in with your \
+             identity, and refuses before contacting any server.",
+        )
+        .wrap(true)
+        .xalign(0.0)
+        .margin_top(12)
+        .css_classes(["dim-label", "caption"])
+        .build();
+    group.add(&note);
+    // Read first, then followed: the switch stays off until it is known.
+    let weak = guests.downgrade();
+    gtk::glib::spawn_future_local(async move {
+        let allowed = identities
+            .run(|ids| Box::pin(async move { ids.allow_guests().await }))
+            .await;
+        let Some(guests) = weak.upgrade() else { return };
+        match allowed {
+            Ok(allowed) => guests.set_active(allowed),
+            Err(e) => return tracing::warn!(error = %e, "cannot read the guest sign-in setting"),
+        }
+        guests.set_sensitive(true);
+        guests.connect_active_notify(move |row| {
+            let (identities, allowed) = (identities.clone(), row.is_active());
+            gtk::glib::spawn_future_local(async move {
+                if let Err(e) = identities
+                    .run(move |ids| Box::pin(async move { ids.set_allow_guests(allowed).await }))
+                    .await
+                {
+                    tracing::warn!(error = %e, "cannot change the guest sign-in setting");
+                }
+            });
+        });
+    });
+    group
 }
 
 /// "address · signed in as Alice", or "signed out".

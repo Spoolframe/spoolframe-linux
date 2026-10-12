@@ -5948,6 +5948,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "spoolframe-protocol",
  "spoolframe-types",
  "thiserror 2.0.21",
@@ -6002,8 +6003,13 @@ dependencies = [
  "directories",
  "foyer",
  "futures",
+ "libc",
  "oo7",
+ "pkg-config",
+ "serde",
  "serde_cbor_2",
+ "serde_json",
+ "sha2 0.10.9",
  "spoolframe-client-sdk",
  "spoolframe-policy",
  "spoolframe-protocol",
@@ -6016,6 +6022,7 @@ dependencies = [
  "url",
  "webauthn-authenticator-rs",
  "webauthn-rs-proto",
+ "zeroize",
 ]
 
 [[package]]
@@ -6036,6 +6043,7 @@ dependencies = [
  "ciborium",
  "ciborium-ll",
  "ed25519-dalek",
+ "p256",
  "serde",
  "serde_bytes",
  "sha2 0.10.9",

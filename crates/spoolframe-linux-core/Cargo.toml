@@ -25,13 +25,22 @@ webauthn-rs-proto = { workspace = true }
 serde_cbor_2 = { workspace = true }
 futures = { workspace = true }
 url = "2"
+zeroize = "1"
+libc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 spoolframe-test-dir = { workspace = true, optional = true }
+
+[build-dependencies]
+# libfido2 (P7-08), found through pkg-config.
+pkg-config = "0.3"
 
 [features]
 # TestDir and the fake server, for the app's tests too.
 testing = ["dep:spoolframe-test-dir", "dep:spoolframe-policy"]
 
 [dev-dependencies]
+sha2 = "0.10"
 spoolframe-policy = { workspace = true }
 spoolframe-test-dir = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }

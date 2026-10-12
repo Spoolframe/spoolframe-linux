@@ -37,6 +37,9 @@ in {
       pkgs.systemdLibs
       pkgs.dbus
       pkgs.openssl
+      # A security key as a portable identity's root (P7-08): libfido2
+      # signs CTAP2 over a hash the client chooses.
+      pkgs.libfido2
     ]
     ++ gstPlugins;
 

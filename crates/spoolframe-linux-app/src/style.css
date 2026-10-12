@@ -261,11 +261,19 @@ windowcontrols > button:hover > image {
 }
 
 /* The bars over the video, as in the design: a band along the top (back,
-   title, Minimize) and the controls along the bottom, in the theme's own
-   colours. Not libadwaita's .osd: it redefines the accent as a fixed
-   white, so the play button and the seek bar lost the theme's colour. */
+   title, Minimize) and the controls along the bottom, with the theme's
+   accent. Not libadwaita's .osd: it redefines the accent as a fixed
+   white, so the play button and the seek bar lost the theme's colour.
+   The bars are near-black in every theme, as black is, so their text is a
+   fixed light one too: the theme's own would be near-black under a light
+   theme (plain Adwaita, Latte), and the title, the times and the icon
+   buttons vanished into the bars. The skipped bubble and the diagnostics
+   sit on the theme's own surface, and keep its text. */
 .player-top,
-.player-bottom,
+.player-bottom {
+  color: alpha(white, 0.88);
+}
+
 .player-skipped,
 .diagnostics {
   color: var(--window-fg-color);
@@ -1637,4 +1645,15 @@ popover.scrub-preview > contents {
   background-color: alpha(var(--error-color), 0.12);
   padding: 2px 8px;
   border-radius: 999px;
+}
+
+/* Preferences › Identity (P7-08): the yellow Renew banner. */
+.renew-banner {
+  background-color: alpha(var(--warning-color), 0.1);
+}
+
+/* Erasing an identity from all its keys: the red card (P7-08). */
+.erase-all {
+  background-color: alpha(var(--error-color), 0.1);
+  border: 1px solid alpha(var(--error-color), 0.4);
 }

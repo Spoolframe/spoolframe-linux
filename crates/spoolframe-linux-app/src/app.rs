@@ -247,6 +247,10 @@ pub enum Msg {
     BackToProfiles,
     ForgotPin,
     OpenSignIn,
+    /// Who's watching › Sign in: an account, or your identity (P7-08).
+    OpenSignInChoice,
+    /// Sign in to the server shown as this portable identity.
+    SignInPortable(spoolframe_protocol::portable::PortableUserId),
     /// Sign in again as a profile whose session the server ended.
     SignInAs(String),
     /// Drop a profile kept on this device.
@@ -390,6 +394,12 @@ pub enum Loaded {
     /// username, to sign in again.
     Resumed(Box<Profile>, Result<Profile, BackendError>),
     SignedIn(Result<Profile, BackendError>),
+    /// A sign-in as a portable identity (P7-08).
+    PortableSignedIn(Result<Profile, BackendError>),
+    /// Signed in with a one-time password an admin set (c86e6d3a): the
+    /// user chooses their own before anything else. The one just typed,
+    /// to send as the current one.
+    MustChangePassword(Box<Profile>, Option<Secret>),
     Libraries(Result<Vec<Library>, BackendError>),
     Home(Result<HomeScreen, BackendError>),
     Person(Box<Person>, Result<(Vec<Item>, u32), BackendError>),
@@ -427,6 +437,12 @@ impl Loaded {
     /// can find out; the app then asks the user to sign in again.
     fn sign_in_required(&self) -> bool {
         self.session_error() == Some(&BackendError::SignInRequired)
+    }
+
+    /// Whether the session may do nothing until the password an admin
+    /// reset is changed (c86e6d3a).
+    fn password_change_required(&self) -> bool {
+        self.session_error() == Some(&BackendError::PasswordChangeRequired)
     }
 
     /// Whether the profile turned out locked mid-session (P2-08): another
@@ -1042,6 +1058,11 @@ impl Component for App {
             Msg::ChooseProfile(profile) if profile.sign_in == ProfileSignIn::Passkey => {
                 sender.input(Msg::OpenPasskeySignIn(Some(profile.username), false))
             }
+            // Last in as their identity: in again with no password (P7-08).
+            Msg::ChooseProfile(Profile {
+                sign_in: ProfileSignIn::Portable(identity),
+                ..
+            }) => sender.input(Msg::SignInPortable(identity)),
             // Remembered: opened without a password (P4-01).
             Msg::ChooseProfile(profile) if profile.sign_in == ProfileSignIn::Resume => {
                 let Some(trust) = profile.trust.clone() else {
@@ -1151,6 +1172,40 @@ impl Component for App {
                 });
             }
             Msg::OpenSignIn => sender.input(Msg::SignInAs(String::new())),
+            Msg::OpenSignInChoice => {
+                let Some(server) = &self.server else { return };
+                let sign_in: Rc<dyn Fn(spoolframe_protocol::portable::PortableUserId)> = {
+                    let sender = sender.clone();
+                    Rc::new(move |id| sender.input(Msg::SignInPortable(id)))
+                };
+                let account: Rc<dyn Fn()> = {
+                    let sender = sender.clone();
+                    Rc::new(move || sender.input(Msg::OpenSignIn))
+                };
+                crate::identity_sign_in::open(
+                    root,
+                    crate::identity_sign_in::Needs {
+                        identities: self.client.identities(),
+                        server: server.key.0.clone(),
+                        server_name: server.name.clone(),
+                        sign_in,
+                        account,
+                    },
+                );
+            }
+            Msg::SignInPortable(identity) => {
+                if self.sign_in_in_flight {
+                    return;
+                }
+                let Some(server) = self.server.clone() else {
+                    return;
+                };
+                self.sign_in_in_flight = true;
+                let client = self.client.clone();
+                self.command(&sender, async move {
+                    Loaded::PortableSignedIn(client.sign_in_portable(&server.key, identity).await)
+                });
+            }
             Msg::SignInAs(username) => {
                 let Some(server) = &self.server else { return };
                 let submit: Rc<dyn Fn(String, String, bool)> = {
@@ -1245,11 +1300,20 @@ impl Component for App {
                 }
                 let client = self.client.clone();
                 self.command(&sender, async move {
-                    Loaded::SignedIn(
-                        client
-                            .sign_in(&server.key, &username, &password, remember)
-                            .await,
-                    )
+                    let signed_in = client
+                        .sign_in(&server.key, &username, &password, remember)
+                        .await;
+                    if let Ok(profile) = &signed_in
+                        && client
+                            .session(profile)
+                            .is_ok_and(|s| s.password_change_required())
+                    {
+                        return Loaded::MustChangePassword(
+                            Box::new(profile.clone()),
+                            Some(Secret(password)),
+                        );
+                    }
+                    Loaded::SignedIn(signed_in)
                 });
             }
             Msg::SwitchProfile => {
@@ -1556,9 +1620,20 @@ impl Component for App {
         }
         // The answer is in: the next try may go.
         match &loaded {
-            Loaded::SignedIn(_) => self.sign_in_in_flight = false,
+            Loaded::SignedIn(_) | Loaded::PortableSignedIn(_) | Loaded::MustChangePassword(..) => {
+                self.sign_in_in_flight = false
+            }
             Loaded::Unlocked(..) => self.unlock_in_flight = false,
             _ => {}
+        }
+        if loaded.password_change_required() {
+            let profile = match &loaded {
+                Loaded::Activated(_, profile, _) => Some((**profile).clone()),
+                _ => self.profile.clone(),
+            };
+            if let Some(profile) = profile {
+                return self.must_change_password(profile, None, &sender, root);
+            }
         }
         if loaded.sign_in_required() {
             return self.signed_out(widgets, &sender);
@@ -1792,7 +1867,7 @@ impl Component for App {
                 };
                 let sign_in: Rc<dyn Fn()> = {
                     let sender = sender.clone();
-                    Rc::new(move || sender.input(Msg::OpenSignIn))
+                    Rc::new(move || sender.input(Msg::OpenSignInChoice))
                 };
                 let back: Rc<dyn Fn()> = {
                     let sender = sender.clone();
@@ -1886,6 +1961,12 @@ impl Component for App {
                 server_error(widgets, Some(&server), &e, &sender, root);
                 widgets.screens.set_visible_child_name("servers");
             }
+            Loaded::MustChangePassword(profile, one_time) => {
+                if let Some(dialog) = widgets.sign_in.take() {
+                    dialog.dialog.close();
+                }
+                self.must_change_password(*profile, one_time.map(|Secret(s)| s), &sender, root);
+            }
             Loaded::SignedIn(Ok(profile)) => {
                 if let Some(phone) = widgets.remote_sign_in.take() {
                     phone.dialog.close();
@@ -1897,6 +1978,25 @@ impl Component for App {
                     dialog.dialog.close();
                 }
                 self.enter(profile, widgets, &sender);
+            }
+            Loaded::PortableSignedIn(Ok(profile)) => self.enter(profile, widgets, &sender),
+            Loaded::PortableSignedIn(Err(e)) => {
+                let server = self
+                    .server
+                    .as_ref()
+                    .map_or_else(|| "this server".to_owned(), |s| s.name.clone());
+                let (heading, body) = portable_refusal(&e, &server);
+                let alert = adw::AlertDialog::new(Some(&heading), Some(&body));
+                alert.add_response("ok", "OK");
+                if e == BackendError::NotPaired {
+                    alert.add_response("pair", "Sign in with your identity");
+                    alert.set_response_appearance("pair", adw::ResponseAppearance::Suggested);
+                    let sender = sender.clone();
+                    alert.connect_response(Some("pair"), move |_, _| {
+                        sender.input(Msg::OpenSignInChoice)
+                    });
+                }
+                alert.present(Some(root));
             }
             Loaded::SignedIn(Err(e)) => match &widgets.sign_in {
                 Some(dialog) => dialog.refuse(&e.to_string()),
@@ -2228,6 +2328,48 @@ impl App {
 
     /// Opens the library as `profile`: its own session on the same
     /// connection, a fresh sidebar and Home.
+    /// "Choose a new password" over everything; then the profile opens,
+    /// or Sign out signs it out.
+    fn must_change_password(
+        &self,
+        profile: Profile,
+        one_time: Option<String>,
+        sender: &ComponentSender<Self>,
+        root: &adw::ApplicationWindow,
+    ) {
+        let session = match self.client.session(&profile) {
+            Ok(session) => session,
+            Err(e) => {
+                tracing::warn!(error = %e, "no session to change the password in");
+                return;
+            }
+        };
+        let server = self
+            .server
+            .as_ref()
+            .filter(|s| s.key == profile.server)
+            .map_or_else(|| "this server".to_owned(), |s| s.name.clone());
+        let done: Rc<dyn Fn()> = {
+            let (sender, profile) = (sender.clone(), profile.clone());
+            Rc::new(move || sender.input(Msg::ChooseProfile(profile.clone())))
+        };
+        let sign_out: Rc<dyn Fn()> = {
+            let (sender, profile) = (sender.clone(), profile.clone());
+            Rc::new(move || sender.input(Msg::SignOutProfile(profile.clone())))
+        };
+        crate::password_change::open(
+            root,
+            crate::password_change::Needs {
+                session,
+                name: profile.display_name.clone(),
+                server,
+                one_time,
+                done,
+                sign_out,
+            },
+        );
+    }
+
     fn enter(
         &mut self,
         profile: Profile,
@@ -3149,6 +3291,27 @@ fn error_status(error: &BackendError, retry: Option<Rc<dyn Fn()>>) -> adw::Statu
 }
 
 /// A message as a sentence: capitalised, with a full stop.
+/// Why a sign-in as the identity was refused, as LinuxPortableStates 5
+/// says it: heading and words.
+pub fn portable_refusal(error: &BackendError, server: &str) -> (String, String) {
+    match error {
+        BackendError::WrongCredentials => (
+            format!("No access on {server}"),
+            format!(
+                "Your identity isn’t a guest on {server} and isn’t tied to an account here. Ask \
+                 for an invite."
+            ),
+        ),
+        BackendError::NotPaired => (
+            "Pair this computer again".to_owned(),
+            "Its sign-in with your identity ended or was revoked. Sign in with your identity to \
+             pair it again."
+                .to_owned(),
+        ),
+        other => ("Couldn’t sign in".to_owned(), sentence(&other.to_string())),
+    }
+}
+
 pub(crate) fn sentence(message: &str) -> String {
     let mut chars = message.trim().chars();
     let Some(first) = chars.next() else {
@@ -3333,6 +3496,22 @@ fn server_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_identity_with_no_access_is_told_to_ask_for_an_invite() {
+        assert_eq!(
+            portable_refusal(&BackendError::WrongCredentials, "Home Media").0,
+            "No access on Home Media"
+        );
+    }
+
+    #[test]
+    fn a_computer_whose_pairing_ended_is_told_to_pair_again() {
+        assert_eq!(
+            portable_refusal(&BackendError::NotPaired, "Home Media").0,
+            "Pair this computer again"
+        );
+    }
 
     /// The fake's server stops being dialled for `why`; what the banner
     /// then says.

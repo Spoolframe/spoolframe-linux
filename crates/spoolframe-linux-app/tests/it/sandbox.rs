@@ -49,6 +49,7 @@ fn confined_the_app_reads_none_of_the_home_and_starts_no_program() {
         "exec: refused",
         "data: written",
         "gstreamer: ok",
+        "fido helper: on",
     ] {
         assert!(said.contains(line), "no {line:?} in:\n{said}");
     }

@@ -17,6 +17,7 @@
   libGL,
   systemdLibs,
   dbus,
+  libfido2,
   openssl,
   rustPlatform,
   gst_all_1,
@@ -53,7 +54,8 @@
     # libGL: egl.pc, for the video sink's GL path (see devenv.nix);
     # Passkeys: systemdLibs (libudev) for security keys; dbus (BlueZ) and
     # openssl (the tunnel's TLS) for the phone flow.
-    buildInputs = [gtk4 libadwaita libGL systemdLibs dbus openssl] ++ gstPlugins;
+    # libfido2: a security key as a portable identity's root (P7-08).
+    buildInputs = [gtk4 libadwaita libGL systemdLibs dbus openssl libfido2] ++ gstPlugins;
   };
 
   # Build dependencies separately for caching.

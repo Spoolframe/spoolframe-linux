@@ -175,6 +175,14 @@ pub enum BackendError {
     /// The passkey is the user's last way to sign in, and is kept.
     #[error("this is your only way to sign in")]
     LastSignInMethod,
+    /// This device has no live sign-in for the portable identity (P7-08):
+    /// none here, past its time, or revoked. Pairing it again gives one.
+    #[error("this computer needs to be paired with your identity again")]
+    NotPaired,
+    /// An admin reset the password to a one-time one (c86e6d3a): this
+    /// session may only change it, or sign out.
+    #[error("choose a new password first")]
+    PasswordChangeRequired,
     /// Only the server's admin may do this (PX-44's invites).
     #[error("only the server’s admin can do that")]
     AdminOnly,
@@ -304,6 +312,9 @@ pub enum ProfileSignIn {
     /// No session, but the device is trusted for them (P4-01): it opens
     /// with [`Client::resume_profile`], without a password.
     Resume,
+    /// Its session ended, and it last signed in as this portable identity
+    /// (P7-08): [`Client::sign_in_portable`] opens it again, no password.
+    Portable(spoolframe_protocol::portable::PortableUserId),
 }
 
 /// A sign-in this device began and another approves (P3-05, P3-07): a
@@ -501,6 +512,10 @@ pub trait Client: Send + Sync {
     /// for "Is this the server you were invited to?". Nothing is saved.
     fn connect_invite<'a>(&'a self, link: &'a str) -> BoxFuture<'a, Result<Server, BackendError>>;
 
+    /// This computer's portable identity side (P7-08): its key-rooted
+    /// identity and the root actions.
+    fn identities(&self) -> crate::identity::Identities;
+
     /// What this device knows of reaching server `key`: its addresses,
     /// relays, lookups, last dial and live paths. Never dials.
     /// [`BackendError::NotFound`] for a server it knows nothing of.
@@ -608,6 +623,18 @@ pub trait Client: Send + Sync {
         username: &'a str,
         password: &'a str,
         remember: bool,
+    ) -> BoxFuture<'a, Result<Profile, BackendError>>;
+
+    /// Signs in on `server` as portable identity `identity` (P7-06,
+    /// P7-08), with this device's sign-in for it from a pairing, adding a
+    /// profile: the account the identity is tied to there, or the
+    /// identity as a guest. [`BackendError::WrongCredentials`] where the
+    /// server lets it in as neither; [`BackendError::NotPaired`] with no
+    /// live sign-in for it here.
+    fn sign_in_portable<'a>(
+        &'a self,
+        server: &'a ServerKey,
+        identity: spoolframe_protocol::portable::PortableUserId,
     ) -> BoxFuture<'a, Result<Profile, BackendError>>;
 
     /// The profiles remembered on this device for `server` (P4-01), asked
@@ -1015,6 +1042,22 @@ pub trait Session: Send + Sync {
     /// The user is the server's admin (P2-09): the app offers its admin
     /// pages.
     fn is_admin(&self) -> bool;
+
+    /// This session signed in with a one-time password an admin set
+    /// (c86e6d3a): it must choose a new one before anything else. A
+    /// session found again says so only by refusing its first request
+    /// with [`BackendError::PasswordChangeRequired`].
+    fn password_change_required(&self) -> bool;
+
+    /// Changes the user's password from `current` to `new`. A wrong
+    /// `current` is [`BackendError::WrongCredentials`]; a `new` the server
+    /// does not take (too short, or the same) is
+    /// [`BackendError::InvalidInput`].
+    fn change_password<'a>(
+        &'a self,
+        current: &'a str,
+        new: &'a str,
+    ) -> BoxFuture<'a, Result<(), BackendError>>;
 
     /// Makes an invite (PX-44). Admins only, after a recent confirmation
     /// (`RecentSignInRequired` asks for one).

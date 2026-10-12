@@ -750,6 +750,7 @@ pub fn profile_caption(profile: &Profile) -> (Option<&'static str>, &'static str
         (Some(trust), _) if trust.auto_login => (Some(crate::icons::PLAY), "Opens at start"),
         (_, ProfileSignIn::Password) => (None, "Password"),
         (_, ProfileSignIn::Passkey) => (Some(crate::icons::PASSKEY), "Passkey"),
+        (_, ProfileSignIn::Portable(_)) => (Some(crate::icons::IDENTITY), "Your identity"),
         (Some(trust), _) if trust.pin_required || profile.locked => {
             (Some(crate::icons::LOCK), "Remembered · PIN")
         }
@@ -858,7 +859,7 @@ pub fn profiles(
         let tile = profile_tile(&avatar, &profile.display_name, &detail);
         let ended = matches!(
             profile.sign_in,
-            ProfileSignIn::Password | ProfileSignIn::Passkey
+            ProfileSignIn::Password | ProfileSignIn::Passkey | ProfileSignIn::Portable(_)
         );
         // One whose session ended is only a name here: it can go. One
         // signed in or remembered signs out, which forgets this computer
@@ -1546,6 +1547,16 @@ mod tests {
             .emit_clicked();
         assert!(removed.get(), "Remove server did not remove it");
         window.destroy();
+    }
+
+    #[test]
+    fn a_profile_last_in_as_an_identity_says_so() {
+        let id = spoolframe_protocol::portable::PortableUserId::from_bytes([7; 32]).unwrap();
+        let profile = Profile {
+            trust: None,
+            ..remembered(ProfileSignIn::Portable(id), trust())
+        };
+        assert_eq!(profile_caption(&profile).1, "Your identity");
     }
 
     fn remembered(sign_in: ProfileSignIn, trust: Trust) -> Profile {

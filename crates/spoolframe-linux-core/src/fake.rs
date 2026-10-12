@@ -44,6 +44,10 @@ use crate::backend::{InviteKind, InviteOrigin, InviteSpec, InviteSummary, Minted
 
 /// Every fake account's password.
 pub const FAKE_PASSWORD: &str = "spoolframe";
+/// The one-time password [`FakeClient::reset_password`] sets.
+pub const FAKE_ONE_TIME_PASSWORD: &str = "one-time-7KQ2";
+/// The username the fake's portable identity signs in as (P7-08).
+pub const FAKE_GUEST: &str = "guest";
 
 /// What the fake server asks a passkey to sign (P3-19).
 pub const FAKE_PASSKEY_CHALLENGE: [u8; 32] = [7; 32];
@@ -74,6 +78,10 @@ struct FakeAuth {
     by_passkey: std::collections::HashSet<String>,
     /// Invites admins made from the app (PX-44), oldest first.
     invites: Vec<InviteSummary>,
+    /// Users an admin reset to a one-time password (c86e6d3a), and those
+    /// signed in with it, who must choose a new one.
+    one_time: std::collections::HashSet<String>,
+    must_change: std::collections::HashSet<String>,
 }
 
 struct FakePasskey {
@@ -917,6 +925,9 @@ impl FakeSession {
     }
 
     fn guard(&self) -> Result<(), BackendError> {
+        if self.lock_passkeys().must_change.contains(&self.username) {
+            return Err(BackendError::PasswordChangeRequired);
+        }
         let mut pin = self.pin_state();
         if pin.revoked {
             return Err(BackendError::SignInRequired);
@@ -1782,6 +1793,42 @@ impl Session for FakeSession {
         self.username == FAKE_ADMIN
     }
 
+    fn password_change_required(&self) -> bool {
+        self.lock_passkeys().must_change.contains(&self.username)
+    }
+
+    fn change_password<'a>(
+        &'a self,
+        current: &'a str,
+        new: &'a str,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            let mut auth = self.lock_passkeys();
+            let reset = auth.one_time.contains(&self.username);
+            let right = if reset {
+                current == FAKE_ONE_TIME_PASSWORD
+            } else {
+                current == FAKE_PASSWORD
+            };
+            if !right {
+                return Err(BackendError::WrongCredentials);
+            }
+            if new.chars().count() < 8 {
+                return Err(BackendError::InvalidInput(
+                    "a password is at least 8 characters".into(),
+                ));
+            }
+            if new == current {
+                return Err(BackendError::InvalidInput(
+                    "the new password is the same as the current one".into(),
+                ));
+            }
+            auth.one_time.remove(&self.username);
+            auth.must_change.remove(&self.username);
+            Ok(())
+        })
+    }
+
     fn create_invite(&self, spec: InviteSpec) -> BoxFuture<'_, Result<MintedInvite, BackendError>> {
         Box::pin(async move {
             self.guard()?;
@@ -2178,6 +2225,8 @@ impl FakeSession {
 
 /// The servers and users the mockups show.
 pub struct FakeClient {
+    /// The identity side, in memory with one software key (P7-08).
+    identities: crate::identity::Identities,
     catalog: Arc<Catalog>,
     serving: Serving,
     servers: Mutex<Vec<Server>>,
@@ -2284,6 +2333,7 @@ impl FakeClient {
             trust: None,
         };
         FakeClient {
+            identities: crate::identity::in_memory(),
             catalog: Arc::new(Catalog::new()),
             serving: Serving {
                 file: media,
@@ -2376,6 +2426,8 @@ impl FakeClient {
                 stale: false,
                 by_passkey: Default::default(),
                 invites: Vec::new(),
+                one_time: Default::default(),
+                must_change: Default::default(),
                 trusted: HashMap::new(),
                 tv_untrusted: false,
                 signed_out: Default::default(),
@@ -2415,6 +2467,12 @@ impl FakeClient {
             self.fake_session(profile).pin_state().revoked = true;
         }
         self.sign_outs.send_modify(|n| *n += 1);
+    }
+
+    /// An admin resets `username`'s password to [`FAKE_ONE_TIME_PASSWORD`]:
+    /// signing in with it, they must choose a new one.
+    pub fn reset_password(&self, username: &str) {
+        self.lock_auth().one_time.insert(username.to_owned());
     }
 
     /// Every sign-in on this device is now older than the 10 minutes
@@ -2763,11 +2821,13 @@ impl FakeClient {
             }
             *failed = (0, None);
         }
+        let one_time =
+            password == FAKE_ONE_TIME_PASSWORD && self.lock_auth().one_time.contains(username);
         let Some((_, username, display_name)) = self
             .accounts
             .iter()
             .find(|(s, u, _)| s == server && *u == username)
-            .filter(|_| password == FAKE_PASSWORD)
+            .filter(|_| password == FAKE_PASSWORD || one_time)
         else {
             failed.0 += 1;
             if failed.0 >= SIGN_IN_ATTEMPTS {
@@ -2777,6 +2837,9 @@ impl FakeClient {
         };
         *failed = (0, None);
         drop(failed);
+        if one_time {
+            self.lock_auth().must_change.insert((*username).to_owned());
+        }
         Ok(self.signed_in_as(server, username, display_name))
     }
 
@@ -2974,6 +3037,10 @@ impl Client for FakeClient {
             let (_, server) = self.invited(link)?;
             Ok(self.save_invited(server))
         })
+    }
+
+    fn identities(&self) -> crate::identity::Identities {
+        self.identities.clone()
     }
 
     fn reachability<'a>(
@@ -3300,6 +3367,28 @@ impl Client for FakeClient {
                 self.trust(username);
             }
             Ok(profile)
+        })
+    }
+
+    /// The fake's identity is a guest everywhere: it signs in as
+    /// "Guest", if it is on this computer.
+    fn sign_in_portable<'a>(
+        &'a self,
+        server: &'a ServerKey,
+        identity: spoolframe_protocol::portable::PortableUserId,
+    ) -> BoxFuture<'a, Result<Profile, BackendError>> {
+        Box::pin(async move {
+            self.pinned(server)?;
+            let here = self
+                .identities
+                .current()
+                .await
+                .map_err(|e| BackendError::Other(e.to_string()))?
+                .is_some_and(|view| view.identity.id == identity);
+            if !here {
+                return Err(BackendError::NotPaired);
+            }
+            Ok(self.signed_in_as(server, FAKE_GUEST, "Guest"))
         })
     }
 
@@ -5470,6 +5559,117 @@ mod tests {
                 ready(client.reachability(&ServerKey("f00d".repeat(16)))),
                 Err(BackendError::NotFound(_))
             ));
+        }
+    }
+
+    /// An admin reset a password to a one-time one (c86e6d3a).
+    mod portable_sign_in {
+        use super::*;
+
+        struct NoPrompt;
+        impl crate::security_key::PinPrompt for NoPrompt {
+            fn pin(&self, _ask: &crate::security_key::PinAsk) -> Option<String> {
+                None
+            }
+            fn touch(&self, _key: &str) {}
+        }
+
+        #[test]
+        fn an_identity_this_computer_lacks_needs_pairing() {
+            let client = FakeClient::new(None);
+            let stranger = crate::identity::in_memory();
+            let key = stranger.key(Arc::new(NoPrompt));
+            let label = crate::identity::KeyLabel {
+                name: "Main key".into(),
+                maker: None,
+                added_at: 0,
+            };
+            let id = ready(stranger.create("Alice", &[(key, label)])).unwrap();
+            assert_eq!(
+                ready(client.sign_in_portable(&home_media(), id)).unwrap_err(),
+                BackendError::NotPaired
+            );
+        }
+
+        #[test]
+        fn the_identity_here_signs_in_as_a_guest() {
+            let client = FakeClient::new(None);
+            let identities = client.identities();
+            let key = identities.key(Arc::new(NoPrompt));
+            let label = crate::identity::KeyLabel {
+                name: "Main key".into(),
+                maker: None,
+                added_at: 0,
+            };
+            let id = ready(identities.create("Alice", &[(key, label)])).unwrap();
+            let profile = ready(client.sign_in_portable(&home_media(), id)).unwrap();
+            assert_eq!(profile.username, FAKE_GUEST);
+        }
+    }
+
+    mod password_reset {
+        use super::*;
+
+        fn reset() -> (FakeClient, Profile) {
+            let client = FakeClient::new(None);
+            client.reset_password("andrey");
+            let profile =
+                ready(client.sign_in(&home_media(), "andrey", FAKE_ONE_TIME_PASSWORD, false))
+                    .unwrap();
+            (client, profile)
+        }
+
+        #[test]
+        fn signing_in_with_the_one_time_password_asks_for_a_new_one() {
+            let (client, profile) = reset();
+            assert!(client.session(&profile).unwrap().password_change_required());
+        }
+
+        #[test]
+        fn until_then_everything_else_is_refused() {
+            let (client, profile) = reset();
+            let session = client.session(&profile).unwrap();
+            assert_eq!(
+                ready(session.libraries()).unwrap_err(),
+                BackendError::PasswordChangeRequired
+            );
+        }
+
+        #[test]
+        fn a_new_password_lets_the_session_do_anything_again() {
+            let (client, profile) = reset();
+            let session = client.session(&profile).unwrap();
+            ready(session.change_password(FAKE_ONE_TIME_PASSWORD, "a much better one")).unwrap();
+            assert!(!session.password_change_required());
+            assert!(ready(session.libraries()).is_ok());
+        }
+
+        #[test]
+        fn a_wrong_one_time_password_is_wrong_credentials() {
+            let (client, profile) = reset();
+            let session = client.session(&profile).unwrap();
+            assert_eq!(
+                ready(session.change_password("nope", "a much better one")).unwrap_err(),
+                BackendError::WrongCredentials
+            );
+        }
+
+        #[test]
+        fn a_short_new_password_is_refused_with_why() {
+            let (client, profile) = reset();
+            let session = client.session(&profile).unwrap();
+            assert!(matches!(
+                ready(session.change_password(FAKE_ONE_TIME_PASSWORD, "short")),
+                Err(BackendError::InvalidInput(_))
+            ));
+        }
+
+        #[test]
+        fn a_password_that_was_not_reset_signs_in_as_ever() {
+            let client = FakeClient::new(None);
+            let profile =
+                ready(client.sign_in(&home_media(), "andrey", FAKE_PASSWORD, false)).unwrap();
+            assert!(!client.session(&profile).unwrap().password_change_required());
         }
     }
 }

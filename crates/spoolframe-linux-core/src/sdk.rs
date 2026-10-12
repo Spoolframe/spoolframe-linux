@@ -142,7 +142,11 @@ pub fn backend_error(error: sdk::SdkError) -> BackendError {
         E::InviteExhausted => BackendError::InviteExhausted,
         E::UsernameTaken => BackendError::UsernameTaken,
         E::AdminRequired => BackendError::AdminOnly,
+        E::PasswordChangeRequired => BackendError::PasswordChangeRequired,
         E::UnknownServer(id) => BackendError::NotFound(id),
+        E::UnknownIdentity(_) | E::Credential(_) | E::NotThisDevice | E::DeviceKeyRevoked => {
+            BackendError::NotPaired
+        }
         other => BackendError::Other(other.to_string()),
     }
 }
@@ -333,6 +337,7 @@ pub struct SdkClient {
     states: Mutex<HashMap<ServerKey, watch::Sender<ConnectionState>>>,
     sign_outs: Mutex<HashMap<ServerKey, watch::Sender<u64>>>,
     servers_changed: watch::Sender<()>,
+    identities: crate::identity::Identities,
 }
 
 impl SdkClient {
@@ -346,7 +351,28 @@ impl SdkClient {
                 forward.send_replace(());
             }
         });
+        // Keys on this computer through libfido2, and their names beside
+        // the app's data (P7-08).
+        let identities = crate::identity::Identities::new(
+            client.portable(),
+            Some(client.clone()),
+            crate::paths::data_dir().map(|d| d.join("identity-keys.json")),
+            Arc::new(|prompt, held| {
+                Arc::new(crate::security_key::Fido2SecurityKey::new(prompt).avoiding(held))
+                    as Arc<dyn sdk::SecurityKey>
+            }),
+            Some(handle.clone()),
+        )
+        .with_eraser(Arc::new(|prompt, ids| {
+            crate::security_key::Fido2SecurityKey::new(prompt)
+                .erase(&ids)
+                .map_err(crate::security_key::sdk_error)
+        }))
+        .with_probe(Arc::new(|ids| {
+            crate::security_key::plugged_in_holding(&ids).map_err(crate::security_key::sdk_error)
+        }));
         Self {
+            identities,
             client,
             handle,
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -429,6 +455,10 @@ impl Client for SdkClient {
             .await
             .map(server)
         })
+    }
+
+    fn identities(&self) -> crate::identity::Identities {
+        self.identities.clone()
     }
 
     fn reachability<'a>(
@@ -663,8 +693,11 @@ impl Client for SdkClient {
                 {
                     // Offered the way they last signed in, as far as it
                     // can be offered again here.
-                    let sign_in = match saved.method {
-                        Some(sdk::SignInMethod::Passkey) => ProfileSignIn::Passkey,
+                    let sign_in = match (saved.method, saved.portable) {
+                        (Some(sdk::SignInMethod::Passkey), _) => ProfileSignIn::Passkey,
+                        (Some(sdk::SignInMethod::Portable), Some(identity)) => {
+                            ProfileSignIn::Portable(identity)
+                        }
                         _ => ProfileSignIn::Password,
                     };
                     profiles.push(Profile {
@@ -694,6 +727,21 @@ impl Client for SdkClient {
                 (key.0.clone(), username.to_owned(), password.to_owned());
             let session = on_runtime(&self.handle, async move {
                 client.sign_in(&id, &username, &password, remember).await
+            })
+            .await?;
+            Ok(self.remember(&session))
+        })
+    }
+
+    fn sign_in_portable<'a>(
+        &'a self,
+        key: &'a ServerKey,
+        identity: spoolframe_protocol::portable::PortableUserId,
+    ) -> BoxFuture<'a, Result<Profile, BackendError>> {
+        Box::pin(async move {
+            let (client, id) = (self.client.clone(), key.0.clone());
+            let session = on_runtime(&self.handle, async move {
+                client.sign_in_portable(&id, identity).await
             })
             .await?;
             Ok(self.remember(&session))
@@ -1204,6 +1252,19 @@ impl Session for SdkSession {
 
     fn is_admin(&self) -> bool {
         self.session.user().role.is_admin()
+    }
+
+    fn password_change_required(&self) -> bool {
+        self.session.password_change_required()
+    }
+
+    fn change_password<'a>(
+        &'a self,
+        current: &'a str,
+        new: &'a str,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        let (current, new) = (current.to_owned(), new.to_owned());
+        Box::pin(self.call(move |s| async move { s.change_password(&current, &new).await }))
     }
 
     fn create_invite(&self, spec: InviteSpec) -> BoxFuture<'_, Result<MintedInvite, BackendError>> {

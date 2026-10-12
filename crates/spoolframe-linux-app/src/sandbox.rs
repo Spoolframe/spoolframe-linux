@@ -337,6 +337,37 @@ fn scan_plugins_in_process() {
     unsafe { std::env::set_var("GST_REGISTRY_FORK", "no") };
 }
 
+/// The key helper's confinement (P7-08), run in the helper the app forks
+/// before it confines itself ([`spoolframe_linux_core::fido2::broker`]):
+/// the same seccomp filter, so it starts no program; Landlock with the
+/// system's libraries, /sys and udev's data to find keys, and every
+/// device under /dev, so a key plugged in after the start, or again, can
+/// be opened. Nothing of the home directory. Best effort, as the app's.
+pub fn confine_broker() {
+    let mut places: Vec<(PathBuf, Use)> = SYSTEM.iter().map(|d| (d.into(), Use::Run)).collect();
+    places.push(("/sys".into(), Use::Read));
+    places.push(("/run/udev".into(), Use::Read));
+    places.push(("/dev".into(), Use::Device));
+    if let Ok(abi) = landlock_abi()
+        && abi >= MIN_LANDLOCK_ABI
+    {
+        let _ = restrict(abi, &places);
+    }
+    if let Ok(filters) = filters() {
+        let _ = install(&filters);
+    }
+}
+
+/// The file helper's confinement (P7-08), run in the helper the app forks
+/// before it confines itself ([`crate::file_helper`]): the app's seccomp
+/// filter, so it starts no program. No Landlock: it writes or reads the
+/// one file the person picks in the portal's dialog, wherever that is.
+pub fn confine_file_helper() {
+    if let Ok(filters) = filters() {
+        let _ = install(&filters);
+    }
+}
+
 pub fn confine() -> Confinement {
     let off = Confinement {
         landlock: None,
@@ -766,6 +797,44 @@ pub fn self_check(confinement: Confinement, probe: &Path) -> bool {
             }
         }
         None => say("keyring: the desktop's", true),
+    }
+    // A security key through libfido2 (P7-08), as a root action opens
+    // it: listed through udev, opened, asked what it is. No PIN, no touch.
+    // Having none plugged in is fine; one that cannot be read is not.
+    // Confined, the key helper does it, so keys can come and go.
+    let helper = spoolframe_linux_core::fido2::broker::get().is_some();
+    say(
+        &format!(
+            "fido helper: {}",
+            if helper {
+                "on"
+            } else {
+                "off (the app opens keys)"
+            }
+        ),
+        helper || confinement.landlock.is_none(),
+    );
+    match spoolframe_linux_core::fido2::keys() {
+        Ok(keys) if keys.is_empty() => say("fido: no key", true),
+        Ok(keys) => {
+            for key in keys {
+                match spoolframe_linux_core::fido2::info(&key.path) {
+                    Ok(info) => say(
+                        &format!(
+                            "fido: {} {:04x}:{:04x} {}{}",
+                            key.path,
+                            key.vendor,
+                            key.product,
+                            info.versions.join(","),
+                            if info.can_root() { " (can root)" } else { "" }
+                        ),
+                        true,
+                    ),
+                    Err(e) => say(&format!("fido: {} refused ({e})", key.path), false),
+                }
+            }
+        }
+        Err(e) => say(&format!("fido: cannot list keys ({e})"), false),
     }
     ok
 }

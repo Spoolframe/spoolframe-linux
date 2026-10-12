@@ -10,6 +10,10 @@ cargo run -p spoolframe-linux-app -- --version
 devenv --no-tui tasks run --profile ci ci:static ci:style ci:test
 ```
 
+To see the app in plain libadwaita, as on a desktop where no theme of
+Spoolframe's is chosen, without changing your own settings or desktop
+theme: `scripts/adwaita.sh` (light) or `scripts/adwaita.sh dark`.
+
 ## Installing on NixOS
 
 The foundry flake has a NixOS module for the client:
