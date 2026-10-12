@@ -1,5 +1,5 @@
-//! A portable identity rooted in security keys (P7-08), for Preferences ›
-//! Identity: what this computer knows of it, and the root actions, over
+//! A portable identity rooted in security keys (P7-08), for Settings ›
+//! Your identity: what this computer knows of it, and the root actions, over
 //! the SDK's [`Portable`]. The SDK keeps the identity; this keeps what it
 //! does not: each key's name ("Keyring key"), its maker and when it was
 //! added, for the tab's list.
@@ -48,7 +48,15 @@ pub struct Device {
     pub this_computer: bool,
 }
 
-/// What Preferences › Identity shows.
+/// Someone signed in here with their own identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Guest {
+    pub id: PortableUserId,
+    /// What this computer calls it, when it was told.
+    pub name: Option<String>,
+}
+
+/// What Settings › Your identity shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdentityView {
     pub identity: PortableIdentity,
@@ -216,6 +224,36 @@ impl Identities {
 
     pub async fn set_allow_guests(&self, allowed: bool) -> Result<(), SdkError> {
         self.portable.set_allow_guests(allowed).await
+    }
+
+    /// Who is signed in here with their own identity (Shared computer):
+    /// the identities this computer holds a credential for but not as its
+    /// own. A key identity's root is on its keys, never here, so the SDK
+    /// counts this computer's own among its guests; it is left out.
+    pub async fn guests(&self) -> Result<Vec<Guest>, SdkError> {
+        let known = self.portable.list().await?;
+        let own: Vec<PortableUserId> = known
+            .iter()
+            .filter(|i| i.key_rooted)
+            .map(|i| i.id)
+            .collect();
+        Ok(self
+            .portable
+            .guests()
+            .await?
+            .into_iter()
+            .filter(|id| !own.contains(id))
+            .map(|id| Guest {
+                id,
+                name: known.iter().find(|i| i.id == id).map(|i| i.name.clone()),
+            })
+            .collect())
+    }
+
+    /// Signs guest `id` out of this computer only: the server keeps its
+    /// access.
+    pub async fn forget_guest(&self, id: PortableUserId) -> Result<(), SdkError> {
+        self.portable.forget_guest(id).await
     }
 
     /// A key for one root action, asking through `prompt`.
@@ -707,6 +745,13 @@ mod tests {
             (before, ready(identities.allow_guests()).unwrap()),
             (false, true)
         );
+    }
+
+    #[test]
+    fn this_computers_own_key_identity_is_not_its_guest() {
+        let identities = in_memory();
+        created(&identities);
+        assert_eq!(ready(identities.guests()).unwrap(), Vec::new());
     }
 
     #[test]

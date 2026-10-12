@@ -40,7 +40,7 @@ pub fn choice_names(app_on: bool) -> [String; 3] {
 /// What the choice does, under the picker, in the Apple apps' words.
 pub fn choice_detail(choice: Option<bool>) -> &'static str {
     match choice {
-        None => "Follows Use relays in Preferences › Playback.",
+        None => "Follows Use relays in Settings › Connection.",
         Some(true) => {
             "Reached through its relays when it can't be reached directly, whatever Use relays \
              says."
@@ -54,12 +54,6 @@ pub fn choice_detail(choice: Option<bool>) -> &'static str {
 
 fn on_off(on: bool) -> &'static str {
     if on { "On" } else { "Off" }
-}
-
-/// Whether the server is reached through relays now: its own choice, else
-/// the app's.
-pub fn relays_on(server: &Server, app_on: bool) -> bool {
-    server.use_relays.unwrap_or(app_on)
 }
 
 /// The Relays row's line: "App setting (On) · 2 from the server", "Off",
@@ -76,23 +70,6 @@ pub fn summary(server: &Server, app_on: bool) -> String {
         (n, false) => format!("{n} from the server"),
     };
     format!("{choice} · {list}")
-}
-
-/// The menu entry for another server, with its state: "Relays (Off)…".
-pub fn menu_label(server: &Server, app_on: bool) -> String {
-    format!("Relays ({})…", on_off(relays_on(server, app_on)))
-}
-
-/// What another server's line adds about its relays, if it has a choice
-/// or a list of its own: "relays Off", "relays On, your list".
-pub fn other_line_part(server: &Server) -> Option<String> {
-    match (server.use_relays, server.relays_edited) {
-        (Some(false), _) => Some("relays Off".to_owned()),
-        (Some(true), true) => Some("relays On, your list".to_owned()),
-        (Some(true), false) => Some("relays On".to_owned()),
-        (None, true) => Some("relays: your list".to_owned()),
-        (None, false) => None,
-    }
 }
 
 /// What the list's caption says, by whose list it is.
@@ -453,33 +430,6 @@ mod tests {
         assert_eq!(
             summary(&server(Some(true), &["https://a"], true), true),
             "On · 1 of yours"
-        );
-    }
-
-    #[test]
-    fn the_menu_says_the_servers_state() {
-        assert_eq!(
-            (
-                menu_label(&server(None, &[], false), false),
-                menu_label(&server(Some(true), &[], false), false)
-            ),
-            ("Relays (Off)…".to_owned(), "Relays (On)…".to_owned())
-        );
-    }
-
-    #[test]
-    fn another_servers_line_names_a_choice_of_its_own() {
-        assert_eq!(
-            (
-                other_line_part(&server(None, &[], false)),
-                other_line_part(&server(Some(true), &["https://a"], true)),
-                other_line_part(&server(Some(false), &[], false))
-            ),
-            (
-                None,
-                Some("relays On, your list".to_owned()),
-                Some("relays Off".to_owned())
-            )
         );
     }
 

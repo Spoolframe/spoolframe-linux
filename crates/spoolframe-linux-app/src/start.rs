@@ -120,7 +120,7 @@ pub fn servers(
         .title("Use relays")
         .subtitle(
             "Reach a server through its relays when it can't be reached directly. A \
-             server's own setting in Preferences › Servers wins.",
+             server's own setting in Settings, on its page, wins.",
         )
         .active(relays)
         .build();
@@ -136,7 +136,34 @@ pub fn servers(
     );
     footer.add_css_class("caption");
     column.append(&footer);
-    page(&adw::HeaderBar::new(), &clamp)
+    let header = adw::HeaderBar::new();
+    header.pack_end(&main_menu());
+    page(&header, &clamp)
+}
+
+/// The main menu (LinuxSettingsEntry 1): Settings, with no server and no
+/// sign-in.
+fn main_menu() -> gtk::MenuButton {
+    let menu = gtk::gio::Menu::new();
+    menu.append(Some("Settings"), Some("win.settings"));
+    gtk::MenuButton::builder()
+        .icon_name(crate::icons::MENU)
+        .tooltip_text("Main menu")
+        .menu_model(&menu)
+        .primary(true)
+        .build()
+}
+
+/// The gear in the header of a screen before signing in
+/// (LinuxSettingsEntry 2, 3): Settings.
+fn settings_gear() -> gtk::Button {
+    gtk::Button::builder()
+        .icon_name(crate::icons::SET_UP)
+        .tooltip_text("Settings")
+        .action_name("win.settings")
+        .valign(gtk::Align::Center)
+        .css_classes(["flat"])
+        .build()
 }
 
 /// A small upper-case heading over its cards.
@@ -701,7 +728,7 @@ pub(crate) fn full_keys(keys: &[&str]) -> gtk::Box {
 
 /// Puts `body` in `dialog` under the boards' dialog header: "Cancel" at
 /// the start, the title in the middle, no close button.
-pub fn with_cancel(dialog: &adw::Dialog, body: &impl IsA<gtk::Widget>) {
+pub fn with_cancel(dialog: &adw::Dialog, body: &impl IsA<gtk::Widget>) -> adw::HeaderBar {
     let cancel = gtk::Button::builder()
         .label("Cancel")
         .css_classes(["flat", "dialog-cancel"])
@@ -722,6 +749,7 @@ pub fn with_cancel(dialog: &adw::Dialog, body: &impl IsA<gtk::Widget>) {
     toolbar.add_top_bar(&header);
     toolbar.set_content(Some(body));
     dialog.set_child(Some(&toolbar));
+    header
 }
 
 /// A button as the boards draw them: 44 px, 10 px corners, with an icon
@@ -822,6 +850,7 @@ pub fn profiles(
     }
     where_.append(&chip);
     let header = adw::HeaderBar::builder().title_widget(&where_).build();
+    header.pack_end(&settings_gear());
     let back_button = gtk::Button::builder()
         .icon_name(crate::icons::BACK)
         .tooltip_text("Back to servers")
@@ -1125,7 +1154,7 @@ impl SignIn {
             .content_width(420)
             .focus_widget(&username)
             .build();
-        with_cancel(&dialog, &body);
+        with_cancel(&dialog, &body).pack_end(&settings_gear());
         Self {
             dialog,
             username,

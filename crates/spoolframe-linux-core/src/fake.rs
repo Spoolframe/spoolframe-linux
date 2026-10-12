@@ -82,6 +82,10 @@ struct FakeAuth {
     /// signed in with it, who must choose a new one.
     one_time: std::collections::HashSet<String>,
     must_change: std::collections::HashSet<String>,
+    /// Accounts tied to a portable identity (P7-04), by username.
+    ties: HashMap<String, spoolframe_protocol::portable::PortableUserId>,
+    /// The identity [`FAKE_GUEST`] last signed in with (P7-06).
+    guest: Option<spoolframe_protocol::portable::PortableUserId>,
 }
 
 struct FakePasskey {
@@ -493,6 +497,33 @@ pub struct FakeSession {
     /// Which profile used the device's connection last: switching to
     /// another and back locks a profile again (P2-08).
     active: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// The server this session is on, and what the device keeps saved,
+    /// so leaving it (PX-47) forgets it here as the SDK does.
+    server: ServerKey,
+    saved: Saved,
+}
+
+/// What this device keeps saved, shared by the client and its sessions.
+#[derive(Clone)]
+struct Saved {
+    servers: Arc<Mutex<Vec<Server>>>,
+    signed_in: Arc<Mutex<Vec<Profile>>>,
+    changed: Arc<watch::Sender<()>>,
+}
+
+impl Saved {
+    /// Drops `server` and everyone signed in to it, as the SDK's forget.
+    fn forget(&self, server: &ServerKey) {
+        self.servers
+            .lock()
+            .expect("fake state is never poisoned")
+            .retain(|s| &s.key != server);
+        self.signed_in
+            .lock()
+            .expect("fake state is never poisoned")
+            .retain(|p| &p.server != server);
+        self.changed.send_replace(());
+    }
 }
 
 /// Device sign-ins waiting for this user's approval (P3-07).
@@ -632,6 +663,9 @@ impl FakeSession {
         gone: Arc<std::sync::atomic::AtomicBool>,
         active: Arc<Mutex<std::collections::HashSet<String>>>,
         passkeys: Arc<Mutex<FakeAuth>>,
+        // Its server and the device's saved list, together: leaving needs
+        // both.
+        (server, saved): (ServerKey, Saved),
     ) -> Self {
         // Alice has a PIN, asked for here, so the fake opens her locked.
         let pin = match username {
@@ -662,6 +696,8 @@ impl FakeSession {
             pin: Mutex::new(pin),
             sign_ins: Mutex::new(SignIns::default()),
             active,
+            server,
+            saved,
         };
         {
             let mut watch = session.watch();
@@ -1939,6 +1975,97 @@ impl Session for FakeSession {
         })
     }
 
+    fn guest_identity(&self) -> Option<spoolframe_protocol::portable::PortableUserId> {
+        if self.username != FAKE_GUEST {
+            return None;
+        }
+        self.lock_passkeys().guest
+    }
+
+    fn tie_info(
+        &self,
+    ) -> BoxFuture<'_, Result<Option<spoolframe_protocol::portable::PortableUserId>, BackendError>>
+    {
+        Box::pin(async move {
+            self.guard()?;
+            self.not_a_guest()?;
+            Ok(self.lock_passkeys().ties.get(&self.username).copied())
+        })
+    }
+
+    fn tie(
+        &self,
+        identity: spoolframe_protocol::portable::PortableUserId,
+    ) -> BoxFuture<'_, Result<(), BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            self.not_a_guest()?;
+            let mut auth = self.lock_passkeys();
+            // As the server: recency first, then the account, then the
+            // identity.
+            if auth.stale {
+                return Err(BackendError::RecentSignInRequired);
+            }
+            if auth.ties.contains_key(&self.username) {
+                return Err(BackendError::InvalidInput(
+                    "this account is tied to an identity already".into(),
+                ));
+            }
+            if auth.ties.values().any(|tied| *tied == identity) {
+                return Err(BackendError::InvalidInput(
+                    "that identity is tied to another account here".into(),
+                ));
+            }
+            auth.ties.insert(self.username.clone(), identity);
+            Ok(())
+        })
+    }
+
+    fn untie(&self) -> BoxFuture<'_, Result<(), BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            self.not_a_guest()?;
+            let mut auth = self.lock_passkeys();
+            if auth.stale {
+                return Err(BackendError::RecentSignInRequired);
+            }
+            auth.ties
+                .remove(&self.username)
+                .map(|_| ())
+                .ok_or_else(|| BackendError::NotFound("tie".into()))
+        })
+    }
+
+    /// As the server: recency first, then the last admin. The fake's one
+    /// admin is [`FAKE_ADMIN`], so it is always the last.
+    fn leave_server(&self) -> BoxFuture<'_, Result<(), BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            if self.lock_passkeys().stale {
+                return Err(BackendError::RecentSignInRequired);
+            }
+            if self.is_admin() {
+                return Err(BackendError::LastAdmin);
+            }
+            self.saved.forget(&self.server);
+            // And the session ends, as the SDK's does.
+            self.pin_state().revoked = true;
+            Ok(())
+        })
+    }
+
+    /// The fake's one admin is its last, as `leave_server` refuses.
+    fn can_leave(&self) -> bool {
+        !self.is_admin()
+    }
+
+    fn can_leave_now(&self) -> BoxFuture<'_, Result<bool, BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            Ok(self.can_leave())
+        })
+    }
+
     fn begin_passkey_registration(&self) -> BoxFuture<'_, Result<PasskeyCreation, BackendError>> {
         Box::pin(async move {
             self.guard()?;
@@ -2218,6 +2345,16 @@ impl FakeSession {
         self.passkeys.lock().expect("fake state is never poisoned")
     }
 
+    /// A guest has no account here to tie (P7-06), as the server refuses.
+    fn not_a_guest(&self) -> Result<(), BackendError> {
+        if self.username == FAKE_GUEST {
+            return Err(BackendError::Other(
+                "not for a guest from another identity".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn lock_overrides(&self) -> std::sync::MutexGuard<'_, HashMap<MediaId, TrackOverride>> {
         self.overrides.lock().expect("fake state is never poisoned")
     }
@@ -2229,17 +2366,17 @@ pub struct FakeClient {
     identities: crate::identity::Identities,
     catalog: Arc<Catalog>,
     serving: Serving,
-    servers: Mutex<Vec<Server>>,
+    servers: Arc<Mutex<Vec<Server>>>,
     /// Accounts each server has: (server, username, display name).
     accounts: Vec<(ServerKey, &'static str, &'static str)>,
     /// Who is signed in on this device, in sign-in order.
-    signed_in: Mutex<Vec<Profile>>,
+    signed_in: Arc<Mutex<Vec<Profile>>>,
     /// One session per profile, kept so watch state survives switching.
     sessions: Mutex<HashMap<(ServerKey, String), Arc<FakeSession>>>,
     failed_sign_ins: Mutex<(u32, Option<Instant>)>,
     connections: Mutex<HashMap<ServerKey, watch::Sender<ConnectionState>>>,
     /// The fake has no LAN: its list changes only when an address is added.
-    servers_changed: watch::Sender<()>,
+    servers_changed: Arc<watch::Sender<()>>,
     /// Accounts made on Cabin from an invite (P6-01), and whether
     /// [`INVITE_CODE`]'s one use is spent.
     joined: Mutex<(Vec<String>, bool)>,
@@ -2357,7 +2494,7 @@ impl FakeClient {
                 web: true,
                 pending: 0,
             }),
-            servers: Mutex::new(vec![
+            servers: Arc::new(Mutex::new(vec![
                 Server {
                     key: home_media(),
                     name: "Home Media".into(),
@@ -2392,14 +2529,17 @@ impl FakeClient {
                     use_relays: None,
                     relays_edited: false,
                 },
-            ]),
+            ])),
             accounts: vec![
                 (home_media(), "andrey", "Andrey"),
                 (home_media(), "alice", "Alice"),
                 (home_media(), "steve", "Steve"),
                 (cabin(), "alice", "Alice"),
             ],
-            signed_in: Mutex::new(vec![profile("andrey", "Andrey"), profile("alice", "Alice")]),
+            signed_in: Arc::new(Mutex::new(vec![
+                profile("andrey", "Andrey"),
+                profile("alice", "Alice"),
+            ])),
             sessions: Mutex::new(HashMap::new()),
             // Andrey made one in the web UI, and one in an app before each
             // server had its own relying party (PX-14): both listed, no
@@ -2431,11 +2571,13 @@ impl FakeClient {
                 trusted: HashMap::new(),
                 tv_untrusted: false,
                 signed_out: Default::default(),
+                ties: HashMap::new(),
+                guest: None,
             })),
             failed_sign_ins: Mutex::new((0, None)),
             connections: Mutex::new(HashMap::new()),
             sign_outs: watch::Sender::new(0),
-            servers_changed: watch::Sender::new(()),
+            servers_changed: Arc::new(watch::Sender::new(())),
             joined: Mutex::default(),
         }
     }
@@ -2610,6 +2752,14 @@ impl FakeClient {
         self.fake_session(&Self::profile(username)).approvals()
     }
 
+    fn saved(&self) -> Saved {
+        Saved {
+            servers: self.servers.clone(),
+            signed_in: self.signed_in.clone(),
+            changed: self.servers_changed.clone(),
+        }
+    }
+
     /// The session behind `profile`, made on first use and kept, so watch
     /// state and the PIN's lock survive switching.
     fn fake_session(&self, profile: &Profile) -> Arc<FakeSession> {
@@ -2624,6 +2774,7 @@ impl FakeClient {
                     self.gone.clone(),
                     self.active.clone(),
                     self.passkeys.clone(),
+                    (profile.server.clone(), self.saved()),
                 ))
             })
             .clone()
@@ -3255,15 +3406,7 @@ impl Client for FakeClient {
     fn forget<'a>(&'a self, server: &'a ServerKey) -> BoxFuture<'a, Result<(), BackendError>> {
         Box::pin(async move {
             self.pinned(server)?;
-            self.servers
-                .lock()
-                .expect("fake state is never poisoned")
-                .retain(|s| &s.key != server);
-            self.signed_in
-                .lock()
-                .expect("fake state is never poisoned")
-                .retain(|p| &p.server != server);
-            self.servers_changed.send_replace(());
+            self.saved().forget(server);
             Ok(())
         })
     }
@@ -3388,6 +3531,7 @@ impl Client for FakeClient {
             if !here {
                 return Err(BackendError::NotPaired);
             }
+            self.lock_auth().guest = Some(identity);
             Ok(self.signed_in_as(server, FAKE_GUEST, "Guest"))
         })
     }
@@ -5664,6 +5808,218 @@ mod tests {
             let profile =
                 ready(client.sign_in(&home_media(), "andrey", FAKE_PASSWORD, false)).unwrap();
             assert!(!client.session(&profile).unwrap().password_change_required());
+        }
+    }
+
+    /// Tying an account to a portable identity (P7-04), and the guest
+    /// with one (P7-06).
+    mod ties {
+        use super::*;
+        use crate::testing::NoPrompt;
+
+        fn id(byte: u8) -> spoolframe_protocol::portable::PortableUserId {
+            spoolframe_protocol::portable::PortableUserId::from_bytes([byte; 32]).unwrap()
+        }
+
+        #[test]
+        fn an_account_starts_untied() {
+            assert_eq!(ready(andrey().tie_info()).unwrap(), None);
+        }
+
+        #[test]
+        fn a_tie_is_what_the_server_then_says() {
+            let session = andrey();
+            ready(session.tie(id(7))).unwrap();
+            assert_eq!(ready(session.tie_info()).unwrap(), Some(id(7)));
+        }
+
+        #[test]
+        fn tying_after_ten_minutes_wants_a_recent_sign_in() {
+            let client = FakeClient::new(None);
+            client.age_sign_ins();
+            assert_eq!(
+                ready(session_for(&client, "andrey").tie(id(7))).unwrap_err(),
+                BackendError::RecentSignInRequired
+            );
+        }
+
+        #[test]
+        fn confirming_it_is_them_lets_the_tie_through() {
+            let client = FakeClient::new(None);
+            client.age_sign_ins();
+            let session = session_for(&client, "andrey");
+            ready(session.confirm_password(FAKE_PASSWORD)).unwrap();
+            assert!(ready(session.tie(id(7))).is_ok());
+        }
+
+        #[test]
+        fn an_identity_ties_to_one_account_per_server() {
+            let client = FakeClient::new(None);
+            ready(session_for(&client, "andrey").tie(id(7))).unwrap();
+            assert!(matches!(
+                ready(session_for(&client, "bob").tie(id(7))),
+                Err(BackendError::InvalidInput(_))
+            ));
+        }
+
+        #[test]
+        fn severing_leaves_the_account_untied() {
+            let session = andrey();
+            ready(session.tie(id(7))).unwrap();
+            ready(session.untie()).unwrap();
+            assert_eq!(ready(session.tie_info()).unwrap(), None);
+        }
+
+        #[test]
+        fn severing_with_no_tie_finds_none() {
+            assert!(matches!(
+                ready(andrey().untie()),
+                Err(BackendError::NotFound(_))
+            ));
+        }
+
+        #[test]
+        fn severing_after_ten_minutes_wants_a_recent_sign_in() {
+            let client = FakeClient::new(None);
+            let session = session_for(&client, "andrey");
+            ready(session.tie(id(7))).unwrap();
+            client.age_sign_ins();
+            assert_eq!(
+                ready(session.untie()).unwrap_err(),
+                BackendError::RecentSignInRequired
+            );
+        }
+
+        #[test]
+        fn an_account_is_no_guest() {
+            assert_eq!(andrey().guest_identity(), None);
+        }
+
+        #[test]
+        fn a_portable_sign_in_is_a_guest_with_that_identity() {
+            let client = FakeClient::new(None);
+            let identities = client.identities();
+            let key = identities.key(Arc::new(NoPrompt));
+            let label = crate::identity::KeyLabel {
+                name: "Main key".into(),
+                maker: None,
+                added_at: 0,
+            };
+            let made = ready(identities.create("Alice", &[(key, label)])).unwrap();
+            let profile = ready(client.sign_in_portable(&home_media(), made)).unwrap();
+            assert_eq!(
+                client.session(&profile).unwrap().guest_identity(),
+                Some(made)
+            );
+        }
+    }
+
+    /// Leaving a server (PX-47).
+    mod leaving {
+        use super::*;
+        use crate::testing::NoPrompt;
+
+        fn saved(client: &FakeClient) -> bool {
+            ready(client.servers())
+                .unwrap()
+                .iter()
+                .any(|s| s.key == home_media())
+        }
+
+        #[test]
+        fn leaving_forgets_the_server_here() {
+            let client = FakeClient::new(None);
+            ready(session_for(&client, "steve").leave_server()).unwrap();
+            assert!(!saved(&client));
+        }
+
+        #[test]
+        fn leaving_ends_the_session() {
+            let client = FakeClient::new(None);
+            let session = session_for(&client, "steve");
+            ready(session.leave_server()).unwrap();
+            assert_eq!(
+                ready(session.tie_info()).unwrap_err(),
+                BackendError::SignInRequired
+            );
+        }
+
+        #[test]
+        fn the_last_admin_cannot_leave() {
+            let client = FakeClient::new(None);
+            assert_eq!(
+                ready(session_for(&client, FAKE_ADMIN).leave_server()).unwrap_err(),
+                BackendError::LastAdmin
+            );
+        }
+
+        #[test]
+        fn the_last_admin_is_told_ahead_they_cannot_leave() {
+            let client = FakeClient::new(None);
+            assert!(!session_for(&client, FAKE_ADMIN).can_leave());
+        }
+
+        #[test]
+        fn anyone_else_may_leave() {
+            let client = FakeClient::new(None);
+            assert!(ready(session_for(&client, "steve").can_leave_now()).unwrap());
+        }
+
+        #[test]
+        fn the_last_admin_refused_keeps_the_server() {
+            let client = FakeClient::new(None);
+            let _ = ready(session_for(&client, FAKE_ADMIN).leave_server());
+            assert!(saved(&client));
+        }
+
+        #[test]
+        fn leaving_after_ten_minutes_wants_a_recent_sign_in() {
+            let client = FakeClient::new(None);
+            client.age_sign_ins();
+            assert_eq!(
+                ready(session_for(&client, "steve").leave_server()).unwrap_err(),
+                BackendError::RecentSignInRequired
+            );
+        }
+
+        /// Recency is asked before the last admin, as on the server.
+        #[test]
+        fn a_stale_last_admin_is_asked_to_confirm_first() {
+            let client = FakeClient::new(None);
+            client.age_sign_ins();
+            assert_eq!(
+                ready(session_for(&client, FAKE_ADMIN).leave_server()).unwrap_err(),
+                BackendError::RecentSignInRequired
+            );
+        }
+
+        #[test]
+        fn confirming_it_is_them_lets_the_leave_through() {
+            let client = FakeClient::new(None);
+            client.age_sign_ins();
+            let session = session_for(&client, "steve");
+            ready(session.confirm_password(FAKE_PASSWORD)).unwrap();
+            ready(session.leave_server()).unwrap();
+            assert!(!saved(&client));
+        }
+
+        /// A guest has no password: a fresh portable sign-in is recent.
+        #[test]
+        fn a_guest_signed_in_again_can_leave() {
+            let client = FakeClient::new(None);
+            let identities = client.identities();
+            let key = identities.key(Arc::new(NoPrompt));
+            let label = crate::identity::KeyLabel {
+                name: "Main key".into(),
+                maker: None,
+                added_at: 0,
+            };
+            let made = ready(identities.create("Alice", &[(key, label)])).unwrap();
+            ready(client.sign_in_portable(&home_media(), made)).unwrap();
+            client.age_sign_ins();
+            let again = ready(client.sign_in_portable(&home_media(), made)).unwrap();
+            ready(client.session(&again).unwrap().leave_server()).unwrap();
+            assert!(!saved(&client));
         }
     }
 }

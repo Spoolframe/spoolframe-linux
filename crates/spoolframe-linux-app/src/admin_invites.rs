@@ -1,4 +1,4 @@
-//! Preferences › Invites (PX-44), as on the LinuxPrefsInvites and
+//! Settings › a server › Invites (PX-44), as on the LinuxPrefsInvites and
 //! LinuxInviteMint boards: an admin makes invites from the app, as from
 //! the web admin, lists the server's working ones and revokes them, and
 //! copies a link that only finds the server. Making or revoking one needs
@@ -284,26 +284,66 @@ pub struct Admin {
     pub username: String,
 }
 
-/// The Invites page. It hides itself, and so its tab, when the server says
-/// the user is no longer its admin.
-pub fn page(admin: Admin, toasts: &adw::ToastOverlay) -> adw::PreferencesPage {
-    let page = adw::PreferencesPage::builder()
-        .title("Invites")
-        .icon_name(crate::icons::INVITES)
+/// The Invites groups, added to `page` (a server's page in Settings).
+/// They hide themselves when the server says the user is no longer its
+/// admin.
+pub fn fill(page: &adw::PreferencesPage, admin: Admin, toasts: &adw::ToastOverlay) {
+    let view = View::new(admin, toasts);
+    // A heading over the section: a group with no rows shows only its
+    // title.
+    let section = adw::PreferencesGroup::builder()
+        .title("Admin")
+        .description("Only admins see this.")
         .build();
-    let view = View::new(admin, toasts, &page);
+    let share = share_group(&view);
+    let note = adw::PreferencesGroup::builder()
+        .description(
+            "Used-up and expired invites drop off. Revoking stops the unused codes; accounts and \
+             pairings already made stay.",
+        )
+        .build();
+    page.add(&section);
     page.add(&view.group);
-    page.add(&share_group(&view));
-    page.add(
-        &adw::PreferencesGroup::builder()
-            .description(
-                "Used-up and expired invites drop off. Revoking stops the unused codes; accounts \
-                 and pairings already made stay.",
-            )
-            .build(),
-    );
+    page.add(&share);
+    page.add(&note);
+    view.also.borrow_mut().extend([section, share, note]);
+    if let Some(web) = web_admin(view.session.as_ref()) {
+        page.add(&web);
+        view.also.borrow_mut().push(web);
+    }
     view.load();
-    page
+    // The page owns the view: its handlers hold it weakly, so without
+    // this the list never loads. Not one of its groups, which the view
+    // holds itself.
+    let held = std::cell::RefCell::new(Some(view));
+    page.connect_destroy(move |_| {
+        held.borrow_mut().take();
+    });
+}
+
+/// "Web admin": users, libraries, federation and settings are the web
+/// UI's, when the server has a web address a browser can reach.
+fn web_admin(session: &dyn Session) -> Option<adw::PreferencesGroup> {
+    let url = session.web_url().filter(|u| crate::browser::is_web(u))?;
+    let row = adw::ActionRow::builder()
+        .use_markup(false)
+        .title("Web admin")
+        .subtitle("Users, libraries, federation and settings.")
+        .build();
+    row.add_prefix(&gtk::Image::from_icon_name(crate::icons::BROWSER));
+    let open = gtk::Button::builder()
+        .label("Open…")
+        .valign(gtk::Align::Center)
+        .css_classes(["row-button"])
+        .build();
+    open.connect_clicked(move |button| {
+        let window = button.root().and_downcast::<gtk::Window>();
+        crate::browser::open(&url, window.as_ref());
+    });
+    row.add_suffix(&open);
+    let group = adw::PreferencesGroup::new();
+    group.add(&row);
+    Some(group)
 }
 
 /// "Share the server without an account": the code-less link.
@@ -346,13 +386,14 @@ struct View {
     server: Server,
     username: String,
     toasts: glib::WeakRef<adw::ToastOverlay>,
-    page: glib::WeakRef<adw::PreferencesPage>,
     group: adw::PreferencesGroup,
+    /// The section's other groups, hidden with `group`.
+    also: std::cell::RefCell<Vec<adw::PreferencesGroup>>,
     rows: std::cell::RefCell<Vec<gtk::Widget>>,
 }
 
 impl View {
-    fn new(admin: Admin, toasts: &adw::ToastOverlay, page: &adw::PreferencesPage) -> Rc<Self> {
+    fn new(admin: Admin, toasts: &adw::ToastOverlay) -> Rc<Self> {
         let add = gtk::Button::builder()
             .child(
                 &adw::ButtonContent::builder()
@@ -368,7 +409,7 @@ impl View {
                 "Invites on {}",
                 admin.server.name
             )))
-            .description("The same list as the web admin’s. Only admins see this tab.")
+            .description("The same list as the web admin’s.")
             .header_suffix(&add)
             .build();
         let view = Rc::new(View {
@@ -376,7 +417,7 @@ impl View {
             server: admin.server,
             username: admin.username,
             toasts: toasts.downgrade(),
-            page: page.downgrade(),
+            also: Default::default(),
             group,
             rows: Default::default(),
         });
@@ -449,8 +490,9 @@ impl View {
             (None, Some(toasts)) => alert.present(Some(&toasts)),
             (None, None) => {}
         }
-        if let Some(page) = self.page.upgrade() {
-            page.set_visible(false);
+        self.group.set_visible(false);
+        for group in self.also.borrow().iter() {
+            group.set_visible(false);
         }
     }
 
@@ -1206,7 +1248,8 @@ mod tests {
         let session = admin.session.clone();
         let toasts = adw::ToastOverlay::new();
         let page = adw::PreferencesPage::new();
-        let view = View::new(admin, &toasts, &page);
+        let view = View::new(admin, &toasts);
+        page.add(&view.group);
         view.load();
         settle();
         assert_eq!(view.rows.borrow().len(), 1, "the empty row");
@@ -1229,8 +1272,7 @@ mod tests {
         assert_eq!(view.rows.borrow().len(), 1, "the empty row again");
     }
 
-    /// A user who is no longer the admin: the page hides itself, and so
-    /// its tab.
+    /// A user who is no longer the admin: the section hides itself.
     #[test]
     #[ignore = "needs a display; run on its own"]
     fn a_refused_list_takes_the_page_away() {
@@ -1239,9 +1281,36 @@ mod tests {
         let client = FakeClient::new(None);
         let toasts = adw::ToastOverlay::new();
         let page = adw::PreferencesPage::new();
-        let view = View::new(admin(&client, "bob"), &toasts, &page);
+        let view = View::new(admin(&client, "bob"), &toasts);
+        page.add(&view.group);
         view.load();
         settle();
-        assert!(!page.is_visible());
+        assert!(!view.group.is_visible());
+        the_admin_heading_goes_with_the_list();
+    }
+
+    /// Part of the display test above: GTK binds itself to one thread.
+    fn the_admin_heading_goes_with_the_list() {
+        let client = FakeClient::new(None);
+        let toasts = adw::ToastOverlay::new();
+        let page = adw::PreferencesPage::new();
+        fill(&page, admin(&client, "bob"), &toasts);
+        settle();
+        let mut shown = Vec::new();
+        let mut widgets = vec![page.clone().upcast::<gtk::Widget>()];
+        while let Some(widget) = widgets.pop() {
+            if let Some(group) = widget.downcast_ref::<adw::PreferencesGroup>()
+                && group.is_visible()
+                && group.title() == "Admin"
+            {
+                shown.push(group.clone());
+            }
+            let mut child = widget.first_child();
+            while let Some(c) = child {
+                child = c.next_sibling();
+                widgets.push(c);
+            }
+        }
+        assert!(shown.is_empty(), "the Admin heading stayed for a non-admin");
     }
 }

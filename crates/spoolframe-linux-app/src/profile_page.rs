@@ -45,6 +45,10 @@ pub struct Signed {
     /// This computer stopped remembering the profile, which ends its
     /// session here: the app goes back to Who's watching.
     pub left: Rc<dyn Fn()>,
+    /// Switch profile… and Sign out, from the profile's row; Settings
+    /// closes first.
+    pub switch_profile: Rc<dyn Fn()>,
+    pub sign_out: Rc<dyn Fn()>,
 }
 
 /// The web UI's profile page, where a Plex account is linked.
@@ -232,19 +236,21 @@ fn auto_login_body(name: &str) -> String {
     )
 }
 
-/// The page, for `session`, showing toasts on `dialog`.
-pub fn page(signed: Signed, dialog: &adw::ToastOverlay) -> adw::PreferencesPage {
-    let page = adw::PreferencesPage::builder()
-        .title("Profile")
-        .icon_name(crate::icons::PROFILE)
-        .build();
-    let passkeys = crate::passkeys::group(
-        crate::passkeys::Needs {
-            server: signed.server,
-            session: signed.session.clone(),
-        },
-        dialog,
-    );
+/// The profile's groups on a server's page in Settings, for the page to
+/// place in the board's order: the profile's row, Sign-in & security, and
+/// Plex.
+pub struct Parts {
+    /// Who is signed in, with Switch profile… and Sign out.
+    pub header: adw::PreferencesGroup,
+    /// "Sign-in & security", then passkeys, the PIN, this computer, the
+    /// devices and signing in another device.
+    pub security: Vec<adw::PreferencesGroup>,
+    /// The Plex account, when the server has a web address to link it on.
+    pub plex: Option<adw::PreferencesGroup>,
+}
+
+/// The profile's groups, for `session`, showing toasts on `dialog`.
+pub fn parts(signed: Signed, dialog: &adw::ToastOverlay) -> Parts {
     let view = Rc::new(View {
         session: signed.session,
         server_key: signed.server_key,
@@ -327,7 +333,7 @@ pub fn page(signed: Signed, dialog: &adw::ToastOverlay) -> adw::PreferencesPage 
     );
     names.append(
         &gtk::Label::builder()
-            .label(format!("{} · {}", signed.username, view.server_name))
+            .label(&signed.username)
             .xalign(0.0)
             .css_classes(["dim-label", "small-text"])
             .build(),
@@ -335,10 +341,52 @@ pub fn page(signed: Signed, dialog: &adw::ToastOverlay) -> adw::PreferencesPage 
     let who = gtk::Box::builder().spacing(14).build();
     who.append(&avatar);
     who.append(&names);
+    // The server's admin, as the board marks them.
+    if view.session.is_admin() {
+        who.append(
+            &gtk::Label::builder()
+                .label("Admin")
+                .valign(gtk::Align::Center)
+                .css_classes(["chip", "invite-chip", "invite-account"])
+                .build(),
+        );
+    }
+    let ends = gtk::Box::builder()
+        .spacing(8)
+        .hexpand(true)
+        .halign(gtk::Align::End)
+        .valign(gtk::Align::Center)
+        .build();
+    let switch = gtk::Button::builder()
+        .label("Switch profile…")
+        .css_classes(["row-button"])
+        .build();
+    let sign_out = gtk::Button::builder()
+        .label("Sign out")
+        .css_classes(["row-button"])
+        .build();
+    {
+        let go = signed.switch_profile.clone();
+        switch.connect_clicked(move |button| {
+            crate::settings_window::close(button);
+            go();
+        });
+        let go = signed.sign_out.clone();
+        sign_out.connect_clicked(move |button| {
+            crate::settings_window::close(button);
+            go();
+        });
+    }
+    ends.append(&switch);
+    ends.append(&sign_out);
+    who.append(&ends);
     let header = adw::PreferencesGroup::new();
     header.add(&who);
-    page.add(&header);
-    page.add(&passkeys);
+    // A heading over the groups that follow it: a group with no rows
+    // shows only its title.
+    let section = adw::PreferencesGroup::builder()
+        .title("Sign-in & security")
+        .build();
 
     let pin = adw::PreferencesGroup::builder()
         .title("Profile PIN")
@@ -363,7 +411,6 @@ pub fn page(signed: Signed, dialog: &adw::ToastOverlay) -> adw::PreferencesPage 
     view.pin_row.add_suffix(&view.set_button);
     view.pin_row.add_suffix(&view.remove_button);
     pin.add(&view.pin_row);
-    page.add(&pin);
     let this_computer = adw::PreferencesGroup::builder()
         .title("This computer")
         .build();
@@ -383,8 +430,6 @@ pub fn page(signed: Signed, dialog: &adw::ToastOverlay) -> adw::PreferencesPage 
             }
         });
     }
-    page.add(&this_computer);
-    page.add(&view.devices);
     let others = adw::PreferencesGroup::builder()
         .title("Sign in another device")
         .build();
@@ -406,26 +451,57 @@ pub fn page(signed: Signed, dialog: &adw::ToastOverlay) -> adw::PreferencesPage 
         });
     }
     others.add(&approve);
-    page.add(&others);
     // Linking a Plex account is the web UI's (P3-12): the row opens it,
     // when the server has a web address a browser can reach.
-    if let Some(web) = view.session.web_url().filter(|u| crate::browser::is_web(u)) {
-        let plex = adw::PreferencesGroup::builder().title("Plex").build();
-        let row = view.plex_row.clone();
-        row.set_subtitle("…");
-        row.add_prefix(&gtk::Image::from_icon_name(crate::icons::LINK));
-        row.add_suffix(&gtk::Image::from_icon_name(crate::icons::EXTERNAL));
-        let url = profile_url(&web);
-        row.connect_activated(move |row| open_in_browser(row, &url));
-        plex.add(&row);
-        page.add(&plex);
+    let plex = view
+        .session
+        .web_url()
+        .filter(|u| crate::browser::is_web(u))
+        .map(|web| {
+            let plex = adw::PreferencesGroup::builder().title("Plex").build();
+            let row = view.plex_row.clone();
+            row.set_subtitle("…");
+            row.add_prefix(&gtk::Image::from_icon_name(crate::icons::LINK));
+            row.add_suffix(&gtk::Image::from_icon_name(crate::icons::EXTERNAL));
+            let url = profile_url(&web);
+            row.connect_activated(move |row| open_in_browser(row, &url));
+            plex.add(&row);
+            plex
+        });
+    // A guest with their identity has no account here (P7-06): no
+    // password, PIN, passkeys or devices, and no Plex account to link.
+    if view.session.guest_identity().is_some() {
+        return Parts {
+            header,
+            security: Vec::new(),
+            plex: None,
+        };
     }
+    let passkeys = crate::passkeys::group(
+        crate::passkeys::Needs {
+            server: signed.server,
+            session: view.session.clone(),
+        },
+        dialog,
+    );
+    let security = vec![
+        section,
+        passkeys,
+        pin,
+        this_computer,
+        view.devices.clone(),
+        others,
+    ];
     view.load();
-    // The page owns its view.
-    page.connect_destroy(move |_| {
+    // The profile's row owns the view, and goes with the page.
+    header.connect_destroy(move |_| {
         let _ = &view;
     });
-    page
+    Parts {
+        header,
+        security,
+        plex,
+    }
 }
 
 struct View {
@@ -802,13 +878,8 @@ impl View {
             move |this, result| match result {
                 // Not remembered, the session here is over.
                 Ok(()) if !trusted => {
-                    if let Some(dialog) = this
-                        .dialog
-                        .upgrade()
-                        .and_then(|d| d.ancestor(adw::Dialog::static_type()))
-                        .and_downcast::<adw::Dialog>()
-                    {
-                        dialog.close();
+                    if let Some(toasts) = this.dialog.upgrade() {
+                        crate::settings_window::close(&toasts);
                     }
                     (this.left)();
                 }
@@ -1822,6 +1893,16 @@ mod tests {
         done()
     }
 
+    /// The profile's groups on `page`, in the order a server's page has
+    /// them.
+    fn fill(page: &adw::PreferencesPage, signed: Signed, toasts: &adw::ToastOverlay) {
+        let parts = parts(signed, toasts);
+        page.add(&parts.header);
+        for group in parts.security.iter().chain(&parts.plex) {
+            page.add(group);
+        }
+    }
+
     /// Every widget of type `T` under `widget`.
     fn all<T: IsA<gtk::Widget>>(widget: &gtk::Widget) -> Vec<T> {
         let mut found = Vec::new();
@@ -1868,7 +1949,9 @@ mod tests {
             use_relays: None,
             relays_edited: false,
         };
-        let page = page(
+        let page = adw::PreferencesPage::new();
+        fill(
+            &page,
             Signed {
                 session: client.session(&profile).unwrap(),
                 server_key: server.key.0.clone(),
@@ -1877,6 +1960,8 @@ mod tests {
                 display_name: "Andrey".into(),
                 username: "andrey".into(),
                 left: Rc::new(|| {}),
+                switch_profile: Rc::new(|| {}),
+                sign_out: Rc::new(|| {}),
             },
             &adw::ToastOverlay::new(),
         );
@@ -1928,7 +2013,9 @@ mod tests {
             relays_edited: false,
         };
         let toasts = adw::ToastOverlay::new();
-        let page = page(
+        let page = adw::PreferencesPage::new();
+        fill(
+            &page,
             Signed {
                 session: client.session(&profile).unwrap(),
                 server_key: server.key.0.clone(),
@@ -1937,6 +2024,8 @@ mod tests {
                 display_name: "Andrey".into(),
                 username: "andrey".into(),
                 left: Rc::new(|| {}),
+                switch_profile: Rc::new(|| {}),
+                sign_out: Rc::new(|| {}),
             },
             &toasts,
         );

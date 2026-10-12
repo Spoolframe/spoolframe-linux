@@ -102,6 +102,17 @@ fn invite_summary(invite: sdk::InviteSummary) -> InviteSummary {
     }
 }
 
+/// The identity a session is a guest with (P7-06). The server names a
+/// guest's session by its identity, `portable:` and its hex, and an
+/// account's by `local:`; `portable` alone is no guide, as a tied account
+/// shows its identity there too.
+fn guest_identity(
+    user: &sdk::UserSummary,
+) -> Option<spoolframe_protocol::portable::PortableUserId> {
+    user.portable
+        .filter(|_| user.user_id.starts_with("portable:"))
+}
+
 /// The SDK's errors, in the kinds the UI acts on.
 pub fn backend_error(error: sdk::SdkError) -> BackendError {
     use sdk::SdkError as E;
@@ -142,6 +153,7 @@ pub fn backend_error(error: sdk::SdkError) -> BackendError {
         E::InviteExhausted => BackendError::InviteExhausted,
         E::UsernameTaken => BackendError::UsernameTaken,
         E::AdminRequired => BackendError::AdminOnly,
+        E::LastAdmin => BackendError::LastAdmin,
         E::PasswordChangeRequired => BackendError::PasswordChangeRequired,
         E::UnknownServer(id) => BackendError::NotFound(id),
         E::UnknownIdentity(_) | E::Credential(_) | E::NotThisDevice | E::DeviceKeyRevoked => {
@@ -1289,6 +1301,41 @@ impl Session for SdkSession {
         Box::pin(self.call(move |s| async move { s.revoke_invite(&id).await }))
     }
 
+    fn guest_identity(&self) -> Option<spoolframe_protocol::portable::PortableUserId> {
+        guest_identity(self.session.user())
+    }
+
+    fn tie_info(
+        &self,
+    ) -> BoxFuture<'_, Result<Option<spoolframe_protocol::portable::PortableUserId>, BackendError>>
+    {
+        Box::pin(self.call(|s| async move { s.tie_info().await }))
+    }
+
+    fn tie(
+        &self,
+        identity: spoolframe_protocol::portable::PortableUserId,
+    ) -> BoxFuture<'_, Result<(), BackendError>> {
+        Box::pin(self.call(move |s| async move { s.tie(identity).await }))
+    }
+
+    fn untie(&self) -> BoxFuture<'_, Result<(), BackendError>> {
+        Box::pin(self.call(|s| async move { s.untie().await }))
+    }
+
+    fn leave_server(&self) -> BoxFuture<'_, Result<(), BackendError>> {
+        // The SDK forgets the server itself once the server has let go.
+        Box::pin(self.call(|s| async move { s.leave_server().await }))
+    }
+
+    fn can_leave(&self) -> bool {
+        self.session.can_leave()
+    }
+
+    fn can_leave_now(&self) -> BoxFuture<'_, Result<bool, BackendError>> {
+        Box::pin(self.call(|s| async move { s.can_leave_now().await }))
+    }
+
     fn begin_passkey_registration(&self) -> BoxFuture<'_, Result<PasskeyCreation, BackendError>> {
         Box::pin(self.call(|s| async move { s.begin_passkey_registration().await }))
     }
@@ -1383,6 +1430,31 @@ impl Session for SdkSession {
 mod tests {
     use super::*;
 
+    fn user(user_id: &str, portable: Option<u8>) -> sdk::UserSummary {
+        sdk::UserSummary {
+            user_id: user_id.into(),
+            username: "alice".into(),
+            display_name: "Alice".into(),
+            role: spoolframe_types::Role::Consumer,
+            locked: false,
+            pin: None,
+            portable: portable.map(|b| {
+                spoolframe_protocol::portable::PortableUserId::from_bytes([b; 32]).unwrap()
+            }),
+        }
+    }
+
+    #[test]
+    fn a_session_signed_in_as_the_identity_is_a_guest_with_it() {
+        let guest = user(&format!("portable:{}", "07".repeat(32)), Some(7));
+        assert_eq!(guest_identity(&guest), guest.portable);
+    }
+
+    #[test]
+    fn an_account_tied_to_an_identity_is_no_guest() {
+        assert_eq!(guest_identity(&user("local:0192f1c4", Some(7))), None);
+    }
+
     /// PX-46: off the home network, the server plays only so many at once.
     #[test]
     fn too_many_streams_outside_the_home_says_how_many_and_what_to_do() {
@@ -1442,6 +1514,15 @@ mod tests {
         assert_eq!(
             backend_error(sdk::SdkError::AdminRequired),
             BackendError::AdminOnly
+        );
+    }
+
+    /// Not an Other: the app greys Leave out for it rather than toasting.
+    #[test]
+    fn the_last_admin_leaving_is_last_admin() {
+        assert_eq!(
+            backend_error(sdk::SdkError::LastAdmin),
+            BackendError::LastAdmin
         );
     }
 

@@ -1,4 +1,4 @@
-//! Preferences › Identity (P7-08), as on the LinuxIdentity board: this
+//! Settings › Your identity (P7-08), as on the LinuxIdentity board: this
 //! computer's portable identity rooted in security keys. Its fingerprint
 //! and keys, the devices it paired, a Renew banner in this computer's
 //! last 14 days; or, with none yet, where to start. Every root action

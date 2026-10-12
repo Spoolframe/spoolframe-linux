@@ -1,4 +1,4 @@
-//! Preferences › Identity › Pair a device (P7-08), as on the
+//! Settings › Your identity › Pair a device (P7-08), as on the
 //! LinuxIdentityPair board (3–6): the code the device shows, the device's
 //! name and key fetched under it to check, one touch, then how long it
 //! signs in as you. The code is held on whichever server the device

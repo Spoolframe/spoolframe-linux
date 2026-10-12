@@ -1,18 +1,14 @@
-//! The Preferences dialog, as on the LinuxPreferences and LinuxPrefs*
-//! boards: Appearance (the theme and the player's behaviour, on this
-//! device), Playback (the bitrate limit and skipping intros on this
-//! device, P2-06 and P2-10, and, when signed in, the user's audio and
-//! subtitle preferences, kept on the server for every device, P1-20),
-//! Servers (the fingerprint of the server in use, P1-21), Profile (the
-//! PIN and where it is asked for, P2-08) and, for the server's admin,
-//! Invites (PX-44).
+//! The pages of Settings ([`crate::settings_window`]), as on the
+//! LinuxSettingsDevice and LinuxSettingsServer boards: This computer's
+//! Appearance, Playback, Connection, Shared computer and About, and each
+//! saved server's page.
 
 use std::rc::Rc;
 use std::sync::Arc;
 
 use adw::prelude::*;
 use spoolframe_linux_core::backend::TrackPreferencesInfo;
-use spoolframe_linux_core::backend::{Client, ConnectionPath, Server};
+use spoolframe_linux_core::backend::{Client, Reachability, Server, ServerKey};
 use spoolframe_linux_core::format;
 use spoolframe_linux_core::theme::Theme;
 use spoolframe_types::{
@@ -36,134 +32,6 @@ const SDH: [(SdhPreference, &str); 3] = [
     (SdhPreference::Avoid, "Avoid SDH"),
 ];
 
-pub fn dialog(
-    theme: Theme,
-    tracks: Option<TrackPreferencesInfo>,
-    servers: Servers,
-    set_theme: Rc<dyn Fn(Theme)>,
-    set_tracks: SetTracks,
-    device: Device,
-    signed: Option<crate::profile_page::Signed>,
-) -> adw::Dialog {
-    // The pages under the board's own tab strip, not libadwaita's
-    // switcher: four 120×52 tabs, icon over label, the picked one on the
-    // surface. Toasts (the profile page's answers) show over the pages.
-    let toasts = adw::ToastOverlay::new();
-    // The person's own identity (P7-08), whoever is signed in.
-    let client = servers.client.clone();
-    let mut pages = vec![
-        appearance(
-            theme,
-            set_theme,
-            device.show_diagnostics,
-            device.set_show_diagnostics.clone(),
-        ),
-        playback(tracks.map(|tracks| (tracks, set_tracks)), &device),
-        servers_page(servers),
-    ];
-    if let Some(signed) = signed {
-        // An admin's own tab (PX-44): the server's invites.
-        let admin = signed
-            .session
-            .is_admin()
-            .then(|| crate::admin_invites::Admin {
-                session: signed.session.clone(),
-                server: signed.server.clone(),
-                username: signed.username.clone(),
-            });
-        pages.push(crate::profile_page::page(signed, &toasts));
-        if let Some(admin) = admin {
-            pages.push(crate::admin_invites::page(admin, &toasts));
-        }
-    }
-    pages.push(crate::identity_page::page(client, &toasts));
-    let stack = gtk::Stack::builder()
-        .transition_type(gtk::StackTransitionType::Crossfade)
-        .vexpand(true)
-        .build();
-    let tabs = gtk::Box::builder()
-        .spacing(4)
-        .halign(gtk::Align::Center)
-        .css_classes(["pref-tabs"])
-        .build();
-    let mut first: Option<gtk::ToggleButton> = None;
-    for page in &pages {
-        stack.add_child(page);
-        let face = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .spacing(3)
-            .valign(gtk::Align::Center)
-            .build();
-        face.append(&gtk::Image::from_icon_name(
-            page.icon_name().as_deref().unwrap_or_default(),
-        ));
-        face.append(&gtk::Label::new(Some(&page.title())));
-        let tab = gtk::ToggleButton::builder()
-            .child(&face)
-            .width_request(120)
-            .hexpand(false)
-            .css_classes(["pref-tab"])
-            .build();
-        match &first {
-            Some(first) => tab.set_group(Some(first)),
-            None => {
-                tab.set_active(true);
-                first = Some(tab.clone());
-            }
-        }
-        // A page that goes (Invites, when the user is no longer the
-        // admin) takes its tab, and shows the first page if it was open.
-        page.bind_property("visible", &tab, "visible")
-            .sync_create()
-            .build();
-        if let Some(first) = &first {
-            let first = first.downgrade();
-            tab.connect_visible_notify(move |tab| {
-                if !tab.is_visible()
-                    && tab.is_active()
-                    && let Some(first) = first.upgrade()
-                {
-                    first.set_active(true);
-                }
-            });
-        }
-        let (stack, page) = (stack.clone(), page.clone());
-        tab.connect_toggled(move |tab| {
-            if tab.is_active() {
-                stack.set_visible_child(&page);
-            }
-        });
-        tabs.append(&tab);
-    }
-    toasts.set_child(Some(&stack));
-    // The strip's colour runs the dialog's width; the tabs sit centred.
-    let tab_bar = gtk::Box::builder()
-        .hexpand(true)
-        .css_classes(["pref-tabs-bar"])
-        .build();
-    tabs.set_hexpand(true);
-    tab_bar.append(&tabs);
-    let header = adw::HeaderBar::builder()
-        .show_start_title_buttons(false)
-        .title_widget(
-            &gtk::Label::builder()
-                .label("Preferences")
-                .xalign(0.0)
-                .hexpand(true)
-                .css_classes(["title", "pref-title"])
-                .build(),
-        )
-        .css_classes(["pref-header"])
-        .build();
-    let toolbar = crate::views::toolbar(&header, &[tab_bar.upcast_ref()], &toasts);
-    adw::Dialog::builder()
-        .title("Preferences")
-        .content_width(720)
-        .content_height(680)
-        .child(&toolbar)
-        .build()
-}
-
 /// What the Servers page needs: the client, to list and change saved
 /// servers, the one in use and who is signed in on it, and what the app
 /// does to verify, use or add one. Those close Preferences first.
@@ -174,6 +42,8 @@ pub struct Servers {
     pub verify: Rc<dyn Fn(Server)>,
     pub use_server: Rc<dyn Fn(Server)>,
     pub add: Rc<dyn Fn()>,
+    /// A server was forgotten: the app lets go of it if it was in use.
+    pub forgotten: Rc<dyn Fn(ServerKey)>,
     /// The app's "Use relays", which a server follows unless it has its
     /// own choice.
     pub app_relays: bool,
@@ -234,68 +104,6 @@ fn open_relays(
     dialog.present(Some(anchor));
 }
 
-/// The server in use, its fingerprint always shown (P1-21) so it can be
-/// checked again at any time, and every other saved server, as on the
-/// LinuxPrefsServers board.
-fn servers_page(servers: Servers) -> adw::PreferencesPage {
-    let page = adw::PreferencesPage::builder()
-        .title("Servers")
-        .icon_name(crate::icons::SERVER)
-        .build();
-    let servers = Rc::new(servers);
-    if let Some(current) = &servers.current {
-        page.add(&in_use(current, servers.user.as_deref(), &servers));
-    }
-    let others = adw::PreferencesGroup::builder()
-        .title("Other servers")
-        .description(
-            "Saved on this computer. Forgetting one signs you out of it and drops its fingerprint.",
-        )
-        .build();
-    let add = gtk::Button::builder()
-        .child(
-            &adw::ButtonContent::builder()
-                .icon_name(crate::icons::ADD)
-                .label("Add a server…")
-                .build(),
-        )
-        .valign(gtk::Align::End)
-        .css_classes(["row-button"])
-        .build();
-    {
-        let servers = servers.clone();
-        add.connect_clicked(move |button| {
-            close_dialog(button);
-            (servers.add)();
-        });
-    }
-    others.set_header_suffix(Some(&add));
-    page.add(&others);
-    page.add(&this_computer(servers.client.identities()));
-    // The list comes from the client, and who is signed in from each.
-    {
-        let (servers, others) = (servers.clone(), others.clone());
-        gtk::glib::spawn_future_local(async move {
-            let current = servers.current.as_ref().map(|s| s.key.clone());
-            let saved = match servers.client.servers().await {
-                Ok(list) => list,
-                Err(e) => return tracing::warn!(error = %e, "cannot list servers"),
-            };
-            for server in saved
-                .into_iter()
-                .filter(|s| s.pinned && Some(&s.key) != current.as_ref())
-            {
-                let user = match servers.client.profiles(&server.key).await {
-                    Ok(profiles) => profiles.first().map(|p| p.display_name.clone()),
-                    Err(_) => None,
-                };
-                others.add(&other_row(&server, user, &servers, &others));
-            }
-        });
-    }
-    page
-}
-
 /// This computer's own choices, for every server: whether people with
 /// their own identity may sign in here (LinuxPrefsPortablePolicy).
 fn this_computer(identities: spoolframe_linux_core::identity::Identities) -> adw::PreferencesGroup {
@@ -352,306 +160,14 @@ fn this_computer(identities: spoolframe_linux_core::identity::Identities) -> adw
     group
 }
 
-/// "address · signed in as Alice", or "signed out".
-fn whereabouts(server: &Server, user: Option<&str>) -> String {
-    let signed = match user {
-        Some(user) => format!("signed in as {user}"),
-        None => "signed out".to_owned(),
-    };
-    match server.shown_address() {
-        Some(address) => format!("{} · {signed}", crate::start::host(address)),
-        None => signed,
-    }
-}
-
-fn in_use(server: &Server, user: Option<&str>, servers: &Rc<Servers>) -> adw::PreferencesGroup {
-    let group = adw::PreferencesGroup::builder().title("In use").build();
-    let row = adw::ActionRow::builder().use_markup(false).build();
-    row.set_title(&server.name);
-    row.set_subtitle(&whereabouts(server, user));
-    row.add_prefix(
-        &gtk::Image::builder()
-            .icon_name(crate::icons::SERVER)
-            .width_request(40)
-            .height_request(40)
-            .css_classes(["server-tile", "tint-accent"])
-            .build(),
-    );
-    row.add_suffix(
-        &gtk::Label::builder()
-            .label("In use")
-            .valign(gtk::Align::Center)
-            .css_classes(["in-use-chip"])
-            .build(),
-    );
-    group.add(&row);
-
-    let (icon, tint, state) = if server.verified {
-        (crate::icons::VERIFIED, "verified", "Verified")
-    } else {
-        (crate::icons::UNVERIFIED, "unverified", "Not verified")
-    };
-    let fingerprint = adw::ActionRow::builder()
-        .use_markup(false)
-        .subtitle_selectable(true)
-        .css_classes(["property", "fingerprint-row", tint])
-        .build();
-    fingerprint.set_title(&match server.verified_at.filter(|_| server.verified) {
-        Some(at) => format!("Fingerprint · {state} {}", crate::start::day(at)),
-        None => format!("Fingerprint · {state}"),
-    });
-    fingerprint.set_subtitle(&server.fingerprint);
-    fingerprint.add_prefix(&gtk::Image::from_icon_name(icon));
-    let check = gtk::Button::builder()
-        .label(if server.verified {
-            "Verify again"
-        } else {
-            "Verify now"
-        })
-        .valign(gtk::Align::Center)
-        .css_classes(["flat", "dialog-text-button"])
-        .build();
-    {
-        let (server, verify) = (server.clone(), servers.verify.clone());
-        check.connect_clicked(move |button| {
-            close_dialog(button);
-            verify(server.clone());
-        });
-    }
-    fingerprint.add_suffix(&check);
-    group.add(&fingerprint);
-    let keys = crate::start::full_keys(&[&server.key.0]);
-    keys.set_halign(gtk::Align::Start);
-    keys.set_margin_top(8);
-    group.add(&keys);
-    if let Some(site) = server.passkey_site() {
-        let line = crate::start::passkey_site(&site);
-        line.set_margin_top(4);
-        group.add(&line);
-    }
-    group.add(&relays_row(server, servers));
-    // What the server says about where it can be reached (protocol 7),
-    // the address in use marked; nothing until it has said.
-    if !server.advertised.is_empty() {
-        let in_use = match servers.client.connection_path(&server.key) {
-            ConnectionPath::Lan(at) | ConnectionPath::Direct(at) => Some(at),
-            ConnectionPath::Relay | ConnectionPath::Unknown => None,
-        };
-        let mut lines = vec![
-            format!("Addresses: {}", address_list(&server.advertised, in_use)),
-            format!("Relays: {}", relay_list(&server.relays)),
-        ];
-        if let Some(at) = server.advertised_at {
-            lines.push(format!("as of {}", crate::start::day(at)));
-        }
-        group.add(
-            &gtk::Label::builder()
-                .label(lines.join("\n"))
-                .selectable(true)
-                .wrap(true)
-                .xalign(0.0)
-                .margin_top(4)
-                .css_classes(["monospace", "dim-label", "caption"])
-                .build(),
-        );
-    }
-    group
-}
-
-/// The server's advertised addresses, in its order, the one this
-/// connection uses marked.
-fn address_list(advertised: &[String], in_use: Option<std::net::SocketAddr>) -> String {
-    advertised
-        .iter()
-        .map(|address| {
-            let used = in_use.is_some_and(|at| address.parse() == Ok(at));
-            if used {
-                format!("{address} (in use)")
-            } else {
-                address.clone()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// The relays the server says it can be reached through, or none.
-fn relay_list(relays: &[String]) -> String {
-    if relays.is_empty() {
-        "none".to_owned()
-    } else {
-        relays.join(", ")
-    }
-}
-
-/// Another saved server's line: where it is, who is signed in, where its
-/// passkeys are kept (PX-14), and whether its fingerprint was checked.
-fn other_line(server: &Server, user: Option<&str>) -> String {
-    let state = if server.verified {
-        "Verified"
-    } else {
-        "Not verified"
-    };
-    let mut parts = vec![whereabouts(server, user)];
-    if let Some(site) = server.passkey_site() {
-        parts.push(format!("passkeys {site}"));
-    }
-    parts.extend(crate::server_relays::other_line_part(server));
-    parts.push(state.to_owned());
-    parts.join(" · ")
-}
-
-/// A saved server not in use: where it is and who is signed in, whether
-/// its fingerprint was checked, Use, and a menu to verify, sign out or
-/// forget it.
-fn other_row(
-    server: &Server,
-    user: Option<String>,
-    servers: &Rc<Servers>,
-    group: &adw::PreferencesGroup,
-) -> adw::ActionRow {
-    let row = adw::ActionRow::builder().use_markup(false).build();
-    row.set_title(&server.name);
-    row.set_subtitle(&other_line(server, user.as_deref()));
-    row.add_prefix(
-        &gtk::Image::builder()
-            .icon_name(if server.verified {
-                crate::icons::VERIFIED
-            } else {
-                crate::icons::UNVERIFIED
-            })
-            .css_classes(["dim-label"])
-            .build(),
-    );
-    let use_button = gtk::Button::builder()
-        .label("Use")
-        .valign(gtk::Align::Center)
-        .css_classes(["row-button"])
-        .build();
-    {
-        let (server, servers) = (server.clone(), servers.clone());
-        use_button.connect_clicked(move |button| {
-            close_dialog(button);
-            (servers.use_server)(server.clone());
-        });
-    }
-    row.add_suffix(&use_button);
-
-    let verify = {
-        let (server, servers, anchor) = (server.clone(), servers.clone(), row.downgrade());
-        crate::views::MenuEntry::new("Verify now", crate::icons::VERIFIED, move || {
-            if let Some(anchor) = anchor.upgrade() {
-                close_dialog(&anchor);
-            }
-            (servers.verify)(server.clone());
-        })
-    };
-    let sign_out = {
-        let (server, servers, row) = (server.clone(), servers.clone(), row.downgrade());
-        crate::views::MenuEntry::new("Sign out", crate::icons::SIGN_OUT, move || {
-            let (server, client, row) = (server.clone(), servers.client.clone(), row.clone());
-            gtk::glib::spawn_future_local(async move {
-                match client.sign_out(&server.key).await {
-                    Ok(()) => {
-                        if let Some(row) = row.upgrade() {
-                            row.set_subtitle(&format!(
-                                "{} · {}",
-                                whereabouts(&server, None),
-                                if server.verified {
-                                    "Verified"
-                                } else {
-                                    "Not verified"
-                                }
-                            ));
-                        }
-                    }
-                    Err(e) => tracing::warn!(error = %e, "cannot sign out"),
-                }
-            });
-        })
-    };
-    let forget = {
-        let (server, servers, row, group) = (
-            server.clone(),
-            servers.clone(),
-            row.downgrade(),
-            group.downgrade(),
-        );
-        crate::views::MenuEntry {
-            destructive: true,
-            ..crate::views::MenuEntry::new("Forget server…", crate::icons::FORGET, move || {
-                let Some(anchor) = row.upgrade() else { return };
-                let confirm = adw::AlertDialog::builder()
-                    .heading(format!("Forget {}?", server.name))
-                    .body(
-                        "You are signed out of it and its fingerprint is dropped. To use it \
-                         again, add it and check its code.",
-                    )
-                    .default_response("cancel")
-                    .close_response("cancel")
-                    .build();
-                confirm.add_response("cancel", "Cancel");
-                confirm.add_response("forget", "Forget");
-                confirm.set_response_appearance("forget", adw::ResponseAppearance::Destructive);
-                let (server, client, row, group) = (
-                    server.clone(),
-                    servers.client.clone(),
-                    row.clone(),
-                    group.clone(),
-                );
-                confirm.connect_response(Some("forget"), move |_, _| {
-                    let (server, client, row, group) =
-                        (server.clone(), client.clone(), row.clone(), group.clone());
-                    gtk::glib::spawn_future_local(async move {
-                        match client.forget(&server.key).await {
-                            Ok(()) => {
-                                if let (Some(row), Some(group)) = (row.upgrade(), group.upgrade()) {
-                                    group.remove(&row);
-                                }
-                            }
-                            Err(e) => tracing::warn!(error = %e, "cannot forget the server"),
-                        }
-                    });
-                });
-                confirm.present(Some(&anchor));
-            })
-        }
-    };
-    let relays = {
-        let (server, servers, row) = (server.clone(), servers.clone(), row.downgrade());
-        let label = crate::server_relays::menu_label(&server, servers.app_relays);
-        crate::views::MenuEntry::new(&label, crate::icons::BROWSER, move || {
-            if let Some(anchor) = row.upgrade() {
-                open_relays(&anchor, &server, &servers, gtk::glib::WeakRef::new());
-            }
-        })
-    };
-    let mut first = vec![verify, relays];
-    if user.is_some() {
-        first.push(sign_out);
-    }
-    let menu = crate::views::menu_popover(vec![first, vec![forget]]);
-    row.add_suffix(&crate::views::menu_button(
-        &menu,
-        &format!("More for {}", server.name),
-    ));
-    row
-}
-
-/// Closes the Preferences dialog `widget` is in, so what comes next shows
-/// over the window.
+/// Closes Settings, from `widget` in it, so what comes next shows over the
+/// app's window.
 fn close_dialog(widget: &impl IsA<gtk::Widget>) {
-    if let Some(dialog) = widget.ancestor(adw::Dialog::static_type()) {
-        dialog.downcast::<adw::Dialog>().expect("a dialog").close();
-    }
+    crate::settings_window::close(widget);
 }
 
-fn appearance(
-    current: Theme,
-    set_theme: Rc<dyn Fn(Theme)>,
-    show_diagnostics: bool,
-    set_show_diagnostics: SetSkipIntros,
-) -> adw::PreferencesPage {
+/// Appearance: the theme, and the player, which stays dark.
+pub(crate) fn appearance(current: Theme, set_theme: Rc<dyn Fn(Theme)>) -> adw::PreferencesPage {
     // The themes as swatches, five across, the picked one ringed.
     let grid = gtk::Box::builder().spacing(12).homogeneous(true).build();
     let hint = gtk::Label::builder()
@@ -698,23 +214,16 @@ fn appearance(
             .css_classes(["fixed-chip"])
             .build(),
     );
-    let diagnostics = adw::SwitchRow::builder()
-        .use_markup(false)
-        .title("Show playback diagnostics")
-        .subtitle("Decoder, buffer and network details over the video")
-        .active(show_diagnostics)
-        .build();
-    diagnostics.connect_active_notify(move |row| set_show_diagnostics(row.is_active()));
-    let behavior = adw::PreferencesGroup::builder().title("Behavior").build();
-    behavior.add(&dark_player);
-    behavior.add(&diagnostics);
+    let player = adw::PreferencesGroup::builder().title("Player").build();
+    player.add(&dark_player);
 
     let page = adw::PreferencesPage::builder()
         .title("Appearance")
+        .description("On this computer.")
         .icon_name(crate::icons::APPEARANCE)
         .build();
     page.add(&group);
-    page.add(&behavior);
+    page.add(&player);
     page
 }
 
@@ -926,9 +435,10 @@ fn streaming(current: Option<u64>, set: SetBitrate) -> adw::PreferencesGroup {
     let names: Vec<&str> = names.iter().map(String::as_str).collect();
     let row = adw::ComboRow::builder()
         .use_markup(false)
-        .title("Bitrate limit")
+        .title("Quality limit")
         .subtitle(
-            "Above it, the server converts the video to fit. Applies when Spoolframe next starts.",
+            "This computer only. The server converts anything above it. Applies when Spoolframe \
+             next starts.",
         )
         .model(&gtk::StringList::new(&names))
         .selected(nearest_limit(current) as u32)
@@ -1003,69 +513,614 @@ pub struct Device {
     pub set_show_diagnostics: SetSkipIntros,
 }
 
-/// The bitrate limit and skipping intros, on this device, and the user's
-/// track preferences when the server gave them.
-fn playback(
-    tracks: Option<(TrackPreferencesInfo, SetTracks)>,
-    device: &Device,
-) -> adw::PreferencesPage {
-    let skip = adw::SwitchRow::builder()
-        .use_markup(false)
-        .title("Skip intros automatically")
-        .subtitle("On this computer only. Otherwise a Skip intro button shows.")
-        .active(device.skip_intros)
-        .build();
-    let set_skip_intros = device.set_skip_intros.clone();
-    skip.connect_active_notify(move |row| set_skip_intros(row.is_active()));
-    let markers = adw::PreferencesGroup::builder().title("Intros").build();
-    markers.add(&skip);
-
+/// Playback, on this computer for every server and profile: the quality
+/// limit and HDR, then what happens while playing. Audio and subtitle
+/// languages are the profile's, on each server's page.
+pub(crate) fn playback(device: &Device) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::builder()
         .title("Playback")
+        .description("On this computer, for every server and profile.")
         .icon_name(crate::icons::PLAYBACK_PAGE)
         .build();
     let streaming = streaming(device.bitrate, device.set_bitrate.clone());
     let hdr = adw::SwitchRow::builder()
         .use_markup(false)
         .title("Show HDR")
-        .subtitle(
-            "Off: the server converts HDR films to SDR, even for an HDR monitor. \
-             Applies from the next thing you play.",
-        )
+        .subtitle("Off: the server converts HDR to SDR, even for an HDR monitor.")
         .active(device.show_hdr)
         .build();
     let set_show_hdr = device.set_show_hdr.clone();
     hdr.connect_active_notify(move |row| set_show_hdr(row.is_active()));
     streaming.add(&hdr);
-    // P6-03: one switch, no per-server choice; the relays are the
-    // server's own.
+    page.add(&streaming);
+
+    let skip = adw::SwitchRow::builder()
+        .use_markup(false)
+        .title("Skip intros automatically")
+        .subtitle("When the server knows where the intro is.")
+        .active(device.skip_intros)
+        .build();
+    let set_skip_intros = device.set_skip_intros.clone();
+    skip.connect_active_notify(move |row| set_skip_intros(row.is_active()));
+    let diagnostics = adw::SwitchRow::builder()
+        .use_markup(false)
+        .title("Show playback diagnostics")
+        .subtitle("Decoder, buffer and network over the video.")
+        .active(device.show_diagnostics)
+        .build();
+    let set_show_diagnostics = device.set_show_diagnostics.clone();
+    diagnostics.connect_active_notify(move |row| set_show_diagnostics(row.is_active()));
+    let playing = adw::PreferencesGroup::builder()
+        .title("While playing")
+        .description(
+            "Audio and subtitle languages belong to your profile: they’re on each server’s page.",
+        )
+        .build();
+    playing.add(&skip);
+    playing.add(&diagnostics);
+    page.add(&playing);
+    page
+}
+
+/// Connection: this computer's Use relays, the default every server
+/// follows unless it has its own choice.
+pub(crate) fn connection(device: &Device) -> adw::PreferencesPage {
+    let page = adw::PreferencesPage::builder()
+        .title("Connection")
+        .description("On this computer.")
+        .icon_name(crate::icons::CONNECTION)
+        .build();
     let relays = adw::SwitchRow::builder()
         .use_markup(false)
         .title("Use relays")
-        .subtitle(
-            "Reach a server through its relays when it can't be reached directly. \
-             Applies when Spoolframe next starts.",
-        )
+        .subtitle("Reach a server through its relays when it can’t be reached directly.")
         .active(device.use_relays)
         .build();
     let set_use_relays = device.set_use_relays.clone();
     relays.connect_active_notify(move |row| set_use_relays(row.is_active()));
-    streaming.add(&relays);
-    page.add(&streaming);
-    page.add(&markers);
-    if let Some((info, set_tracks)) = tracks {
-        let (audio, subtitles) = track_groups(info, set_tracks);
-        page.add(&audio);
-        page.add(&subtitles);
+    let group = adw::PreferencesGroup::builder()
+        .title("Relays")
+        .description(
+            "This computer’s default. Each server can choose its own in its page. Applies when \
+             Spoolframe next starts.",
+        )
+        .build();
+    group.add(&relays);
+    page.add(&group);
+    page
+}
+
+/// Shared computer: whether people with their own identity may sign in
+/// here.
+pub(crate) fn shared(
+    identities: spoolframe_linux_core::identity::Identities,
+) -> adw::PreferencesPage {
+    let page = adw::PreferencesPage::builder()
+        .title("Shared computer")
+        .description("On this computer.")
+        .icon_name(crate::icons::SHARED)
+        .build();
+    page.add(&this_computer(identities.clone()));
+    let signed_in = adw::PreferencesGroup::builder()
+        .title("Signed in here with their identity")
+        .description("Signing one out changes nothing on the server.")
+        .build();
+    page.add(&signed_in);
+    list_guests(identities, &signed_in, Rc::default());
+    page
+}
+
+/// A guest's name: what this computer calls them, else their fingerprint.
+pub fn guest_title(guest: &spoolframe_linux_core::identity::Guest) -> String {
+    guest
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("Identity {}", guest.id.fingerprint()))
+}
+
+/// The rows Shared computer lists its guests in.
+type GuestRows = Rc<std::cell::RefCell<Vec<adw::ActionRow>>>;
+
+/// Fills `group` with who is signed in here with their identity, each
+/// with Sign out, in place of `rows`; listed again after one goes.
+fn list_guests(
+    identities: spoolframe_linux_core::identity::Identities,
+    group: &adw::PreferencesGroup,
+    rows: GuestRows,
+) {
+    let group = group.downgrade();
+    gtk::glib::spawn_future_local(async move {
+        let listed = identities
+            .run(|ids| Box::pin(async move { ids.guests().await }))
+            .await;
+        let Some(group) = group.upgrade() else { return };
+        for row in rows.borrow_mut().drain(..) {
+            group.remove(&row);
+        }
+        let guests = match listed {
+            Ok(guests) => guests,
+            Err(e) => return tracing::warn!(error = %e, "cannot list the guests here"),
+        };
+        if guests.is_empty() {
+            let row = adw::ActionRow::builder().use_markup(false).build();
+            row.set_title("Nobody");
+            row.set_subtitle("No one is signed in here with their own identity.");
+            group.add(&row);
+            rows.borrow_mut().push(row);
+        }
+        for guest in guests {
+            let row = adw::ActionRow::builder().use_markup(false).build();
+            row.set_title(&guest_title(&guest));
+            row.set_subtitle("Signed in here with their identity");
+            let sign_out = gtk::Button::builder()
+                .label("Sign out")
+                .valign(gtk::Align::Center)
+                .css_classes(["row-button"])
+                .build();
+            let (identities, id, weak, again) = (
+                identities.clone(),
+                guest.id,
+                group.downgrade(),
+                rows.clone(),
+            );
+            sign_out.connect_clicked(move |button| {
+                button.set_sensitive(false);
+                let (identities, weak, again) = (identities.clone(), weak.clone(), again.clone());
+                gtk::glib::spawn_future_local(async move {
+                    let forgot = identities
+                        .run(move |ids| Box::pin(async move { ids.forget_guest(id).await }))
+                        .await;
+                    if let Err(e) = forgot {
+                        tracing::warn!(error = %e, "cannot sign the guest out");
+                    }
+                    if let Some(group) = weak.upgrade() {
+                        list_guests(identities, &group, again);
+                    }
+                });
+            });
+            row.add_suffix(&sign_out);
+            group.add(&row);
+            rows.borrow_mut().push(row);
+        }
+    });
+}
+
+/// "Version 0.6.1 · protocol 14".
+pub fn version_line() -> String {
+    format!(
+        "Version {} · protocol {}",
+        env!("CARGO_PKG_VERSION"),
+        spoolframe_protocol::PROTOCOL_VERSION
+    )
+}
+
+/// About: the version, to copy into a bug report.
+pub(crate) fn about() -> adw::PreferencesPage {
+    let page = adw::PreferencesPage::builder()
+        .title("About")
+        .icon_name(crate::icons::ABOUT)
+        .build();
+    let row = adw::ActionRow::builder().use_markup(false).build();
+    row.set_title("Spoolframe");
+    row.set_subtitle(&version_line());
+    let copy = gtk::Button::builder()
+        .label("Copy")
+        .valign(gtk::Align::Center)
+        .css_classes(["row-button"])
+        .build();
+    copy.connect_clicked(|button| button.clipboard().set_text(&version_line()));
+    row.add_suffix(&copy);
+    let group = adw::PreferencesGroup::new();
+    group.add(&row);
+    page.add(&group);
+    page
+}
+
+/// What a server's page shows of the profile signed in to it, when it is
+/// the server in use.
+pub(crate) struct Signed {
+    pub profile: crate::profile_page::Signed,
+    pub tracks: Option<(TrackPreferencesInfo, SetTracks)>,
+}
+
+/// How a server can be reached now, from its reachability report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    /// A connection is open.
+    Connected,
+    /// The last dial failed.
+    Unreachable,
+    /// Not tried in this run, or tried and closed since.
+    Unknown,
+}
+
+/// What the report says of reaching it.
+pub fn reach(report: &Reachability) -> Reach {
+    if !report.live.is_empty() {
+        Reach::Connected
+    } else if report
+        .last_dial
+        .as_ref()
+        .is_some_and(|dial| !dial.connected)
+    {
+        Reach::Unreachable
+    } else {
+        Reach::Unknown
+    }
+}
+
+/// The line under a server's name: where it is and how it is reached
+/// ("192.168.1.20 · Direct · LAN"), or when it last answered.
+pub fn reach_line(
+    server: &Server,
+    reach: Reach,
+    path: Option<&str>,
+    report: Option<&Reachability>,
+    now: u64,
+) -> String {
+    let mut parts: Vec<String> = server
+        .shown_address()
+        .map(|address| crate::start::host(address).to_owned())
+        .into_iter()
+        .collect();
+    match reach {
+        Reach::Connected => parts.extend(path.map(str::to_owned)),
+        Reach::Unreachable | Reach::Unknown => {
+            if let Some(at) = report.and_then(|r| r.last_connected_at) {
+                parts.push(format!(
+                    "last connected {}",
+                    crate::reachability::ago(at, now)
+                ));
+            }
+        }
+    }
+    parts.join(" · ")
+}
+
+/// "K6EQ-ZXKC-HT6H-AJ4F · Verified Sep 12", or "· Not verified".
+pub fn fingerprint_line(server: &Server) -> String {
+    match server.verified_at.filter(|_| server.verified) {
+        Some(at) => format!(
+            "{} · Verified {}",
+            server.fingerprint,
+            crate::start::day(at)
+        ),
+        None if server.verified => format!("{} · Verified", server.fingerprint),
+        None => format!("{} · Not verified", server.fingerprint),
+    }
+}
+
+/// What a server's page needs besides the server.
+pub(crate) struct ServerPage {
+    pub servers: Rc<Servers>,
+    /// The profile signed in to it, when it is the server in use.
+    pub signed: Option<Signed>,
+    /// Forgotten: Settings drops its page and row.
+    pub dropped: Rc<dyn Fn()>,
+    /// Opens This computer › Your identity, to make one.
+    pub open_identity: Rc<dyn Fn()>,
+}
+
+/// A saved server's page, as on LinuxSettingsServer: the server, which
+/// needs no sign-in, then the profile signed in to it: who, its identity
+/// here, audio and subtitles, sign-in and security, Plex, Admin for its
+/// admin, and Leave.
+pub(crate) fn server_page(
+    server: &Server,
+    needs: ServerPage,
+    toasts: &adw::ToastOverlay,
+) -> adw::PreferencesPage {
+    // Untitled: Settings heads it with the server's name, as plain text.
+    let page = adw::PreferencesPage::new();
+    let servers = needs.servers;
+    // The name, where it is, and whether it answers.
+    let head = adw::PreferencesGroup::new();
+    let name = adw::ActionRow::builder().use_markup(false).build();
+    name.set_title(&server.name);
+    name.add_prefix(
+        &gtk::Image::builder()
+            .icon_name(crate::icons::SERVER)
+            .width_request(40)
+            .height_request(40)
+            .css_classes(["server-tile", "tint-accent"])
+            .build(),
+    );
+    let chip = gtk::Label::builder()
+        .valign(gtk::Align::Center)
+        .visible(false)
+        .css_classes(["status-chip"])
+        .build();
+    name.add_suffix(&chip);
+    head.add(&name);
+    page.add(&head);
+
+    let part = adw::PreferencesGroup::builder()
+        .title("Server")
+        .description("On this computer; no sign-in needed.")
+        .build();
+    // Can't be reached: what was tried, Details… and Try again.
+    let unreachable = adw::ActionRow::builder()
+        .use_markup(false)
+        .title("Can’t be reached")
+        .visible(false)
+        .css_classes(["warning"])
+        .build();
+    let details = gtk::Button::builder()
+        .label("Details…")
+        .valign(gtk::Align::Center)
+        .css_classes(["flat", "dialog-text-button"])
+        .build();
+    let again = gtk::Button::builder()
+        .label("Try again")
+        .valign(gtk::Align::Center)
+        .css_classes(["row-button"])
+        .build();
+    unreachable.add_suffix(&details);
+    unreachable.add_suffix(&again);
+    {
+        let (server, servers) = (server.clone(), servers.clone());
+        again.connect_clicked(move |button| {
+            close_dialog(button);
+            (servers.use_server)(server.clone());
+        });
+    }
+    part.add(&unreachable);
+
+    let fingerprint = adw::ActionRow::builder()
+        .use_markup(false)
+        .title("Fingerprint")
+        .subtitle_selectable(true)
+        .build();
+    fingerprint.set_subtitle(&fingerprint_line(server));
+    let verify = gtk::Button::builder()
+        .label(if server.verified {
+            "Verify again"
+        } else {
+            "Verify now"
+        })
+        .valign(gtk::Align::Center)
+        .css_classes(["flat", "dialog-text-button"])
+        .build();
+    {
+        let (server, verify_with) = (server.clone(), servers.verify.clone());
+        verify.connect_clicked(move |button| {
+            close_dialog(button);
+            verify_with(server.clone());
+        });
+    }
+    fingerprint.add_suffix(&verify);
+    part.add(&fingerprint);
+    part.add(&relays_row(server, &servers));
+    part.add(&forget_row(server, &servers, needs.dropped.clone()));
+    page.add(&part);
+
+    // How it is reached, from its report: asked, never dialled.
+    {
+        let (client, key, server_c) = (servers.client.clone(), server.key.clone(), server.clone());
+        let (name, chip, unreachable, details) = (
+            name.downgrade(),
+            chip.downgrade(),
+            unreachable.downgrade(),
+            details.downgrade(),
+        );
+        let servers = servers.clone();
+        gtk::glib::spawn_future_local(async move {
+            let report = client.reachability(&key).await.ok();
+            let path = format::path_chip(client.connection_path(&key));
+            let (Some(name), Some(chip), Some(unreachable), Some(details)) = (
+                name.upgrade(),
+                chip.upgrade(),
+                unreachable.upgrade(),
+                details.upgrade(),
+            ) else {
+                return;
+            };
+            let state = report.as_ref().map_or(Reach::Unknown, reach);
+            let now = crate::invite::unix_now().max(0) as u64;
+            name.set_subtitle(&reach_line(&server_c, state, path, report.as_ref(), now));
+            match state {
+                Reach::Connected => {
+                    chip.set_label("Connected");
+                    chip.set_visible(true);
+                }
+                Reach::Unreachable => {
+                    chip.set_label("Can’t be reached");
+                    chip.set_visible(true);
+                    if let Some(report) = report {
+                        unreachable.set_subtitle(&crate::reachability::tried_line(&report, now));
+                        unreachable.set_visible(true);
+                        let server = server_c.clone();
+                        details.connect_clicked(move |button| {
+                            let relays: Rc<dyn Fn()> = {
+                                let (button, server, servers) =
+                                    (button.downgrade(), server.clone(), servers.clone());
+                                Rc::new(move || {
+                                    if let Some(button) = button.upgrade() {
+                                        open_relays(
+                                            &button,
+                                            &server,
+                                            &servers,
+                                            gtk::glib::WeakRef::new(),
+                                        );
+                                    }
+                                })
+                            };
+                            let try_again: Rc<dyn Fn()> = {
+                                let (button, server, servers) =
+                                    (button.downgrade(), server.clone(), servers.clone());
+                                Rc::new(move || {
+                                    if let Some(button) = button.upgrade() {
+                                        close_dialog(&button);
+                                    }
+                                    (servers.use_server)(server.clone());
+                                })
+                            };
+                            crate::reachability::dialog(
+                                &report,
+                                servers.app_relays,
+                                crate::reachability::Actions { relays, try_again },
+                            )
+                            .present(Some(button));
+                        });
+                    }
+                }
+                Reach::Unknown => {}
+            }
+        });
+    }
+
+    let in_use = servers.current.as_ref().map(|s| &s.key) == Some(&server.key);
+    match needs.signed.filter(|_| in_use) {
+        Some(signed) => {
+            let admin = signed
+                .profile
+                .session
+                .is_admin()
+                .then(|| crate::admin_invites::Admin {
+                    session: signed.profile.session.clone(),
+                    server: signed.profile.server.clone(),
+                    username: signed.profile.username.clone(),
+                });
+            // In the board's order: who, your identity here, audio and
+            // subtitles, sign-in and security, Plex, admin, then leave.
+            let identity = crate::identity_here::group(
+                crate::identity_here::Needs {
+                    session: signed.profile.session.clone(),
+                    identities: servers.client.identities(),
+                    server_name: signed.profile.server_name.clone(),
+                    username: signed.profile.username.clone(),
+                    open_identity: needs.open_identity,
+                },
+                toasts,
+            );
+            let leave = crate::leave_server::group(
+                crate::leave_server::Needs {
+                    session: signed.profile.session.clone(),
+                    client: servers.client.clone(),
+                    server: server.key.clone(),
+                    server_name: signed.profile.server_name.clone(),
+                    dropped: needs.dropped.clone(),
+                    forgotten: servers.forgotten.clone(),
+                },
+                toasts,
+            );
+            let parts = crate::profile_page::parts(signed.profile, toasts);
+            page.add(&parts.header);
+            page.add(&identity);
+            if let Some((info, set_tracks)) = signed.tracks {
+                for group in track_groups(info, set_tracks) {
+                    page.add(&group);
+                }
+            }
+            for group in parts.security.iter().chain(&parts.plex) {
+                page.add(group);
+            }
+            if let Some(admin) = admin {
+                crate::admin_invites::fill(&page, admin, toasts);
+            }
+            page.add(&leave);
+        }
+        None => page.add(&profiles_here(server, &servers)),
     }
     page
 }
 
-/// Audio and Subtitles, kept on the server for all the user's devices.
-fn track_groups(
-    info: TrackPreferencesInfo,
-    set_tracks: SetTracks,
-) -> (adw::PreferencesGroup, adw::PreferencesGroup) {
+/// "Forget this server", with its confirmation; `dropped` once it is.
+fn forget_row(server: &Server, servers: &Rc<Servers>, dropped: Rc<dyn Fn()>) -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .use_markup(false)
+        .title("Forget this server")
+        .subtitle("Signs every profile out of it here and drops its fingerprint.")
+        .build();
+    let forget = gtk::Button::builder()
+        .label("Forget…")
+        .valign(gtk::Align::Center)
+        .css_classes(["row-button", "destructive-action"])
+        .build();
+    let (server, servers) = (server.clone(), servers.clone());
+    forget.connect_clicked(move |button| {
+        let confirm = adw::AlertDialog::builder()
+            .heading(format!("Forget {}?", server.name))
+            .body(
+                "Every profile here is signed out of it and its fingerprint is dropped. To use it \
+                 again, add it and check its code.",
+            )
+            .default_response("cancel")
+            .close_response("cancel")
+            .build();
+        confirm.add_response("cancel", "Cancel");
+        confirm.add_response("forget", "Forget");
+        confirm.set_response_appearance("forget", adw::ResponseAppearance::Destructive);
+        let (server, servers, dropped) = (server.clone(), servers.clone(), dropped.clone());
+        confirm.connect_response(Some("forget"), move |_, _| {
+            let (server, servers, dropped) = (server.clone(), servers.clone(), dropped.clone());
+            gtk::glib::spawn_future_local(async move {
+                match servers.client.forget(&server.key).await {
+                    Ok(()) => {
+                        dropped();
+                        (servers.forgotten)(server.key.clone());
+                    }
+                    Err(e) => tracing::warn!(error = %e, "cannot forget the server"),
+                }
+            });
+        });
+        confirm.present(Some(button));
+    });
+    row.add_suffix(&forget);
+    row
+}
+
+/// The profile part of a server this computer is not using: the profiles
+/// it remembers or is signed in as there, and Sign in.
+fn profiles_here(server: &Server, servers: &Rc<Servers>) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder()
+        .title("Profile")
+        .description("Not in use on this computer.")
+        .build();
+    let sign_in = adw::ActionRow::builder().use_markup(false).build();
+    sign_in.set_title(&format!("Sign in to {}…", server.name));
+    let open = gtk::Button::builder()
+        .label("Sign in…")
+        .valign(gtk::Align::Center)
+        .css_classes(["row-button", "suggested-action"])
+        .build();
+    {
+        let (server, servers) = (server.clone(), servers.clone());
+        open.connect_clicked(move |button| {
+            close_dialog(button);
+            (servers.use_server)(server.clone());
+        });
+    }
+    sign_in.add_suffix(&open);
+    group.add(&sign_in);
+    // Who: signed in there, or remembered on this computer.
+    let (client, key, weak) = (
+        servers.client.clone(),
+        server.key.clone(),
+        group.downgrade(),
+    );
+    gtk::glib::spawn_future_local(async move {
+        let profiles = client.profiles(&key).await.unwrap_or_default();
+        let Some(group) = weak.upgrade() else { return };
+        if profiles.is_empty() {
+            group.set_description(Some("Not signed in."));
+        } else {
+            group.set_description(Some("Profiles on this computer:"));
+        }
+        for profile in profiles {
+            let row = adw::ActionRow::builder().use_markup(false).build();
+            row.set_title(&profile.display_name);
+            row.set_subtitle(crate::start::profile_caption(&profile).1);
+            row.add_prefix(&adw::Avatar::new(32, Some(&profile.display_name), true));
+            group.add(&row);
+        }
+    });
+    group
+}
+
+/// "Audio & subtitles", kept on the server for all the user's devices,
+/// then its Audio and Subtitles groups.
+fn track_groups(info: TrackPreferencesInfo, set_tracks: SetTracks) -> [adw::PreferencesGroup; 3] {
     let TrackPreferencesInfo {
         preferences,
         ocr_offered,
@@ -1096,7 +1151,7 @@ fn track_groups(
     let audio = adw::PreferencesGroup::builder()
         .title("Audio")
         .description(
-            "Kept on the server, for all your devices. Preferred languages in order, such as “original, eng”: the first one a file has is picked.",
+            "Preferred languages in order, such as “original, eng”: the first one a file has is picked.",
         )
         .build();
     audio.add(&audio_languages);
@@ -1182,51 +1237,82 @@ fn track_groups(
         let save = save.clone();
         combo.connect_selected_notify(move |_| save());
     }
-    (audio, subtitles)
+    // A heading over both: a group with no rows shows only its title.
+    let section = adw::PreferencesGroup::builder()
+        .title("Audio & subtitles")
+        .description("Kept on the server for all your devices.")
+        .build();
+    [section, audio, subtitles]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn the_address_in_use_is_marked_among_the_advertised() {
-        assert_eq!(
-            address_list(
-                &["10.10.0.6:7430".into(), "192.168.86.10:7430".into()],
-                Some("192.168.86.10:7430".parse().unwrap())
-            ),
-            "10.10.0.6:7430, 192.168.86.10:7430 (in use)"
-        );
-    }
+    use crate::reachability::tests::{NOW, cabin};
 
-    #[test]
-    fn no_relays_reads_none() {
-        assert_eq!(relay_list(&[]), "none");
-    }
-
-    #[test]
-    fn another_servers_line_names_its_passkey_site() {
-        let server = Server {
-            key: spoolframe_linux_core::backend::ServerKey("k".into()),
+    fn cabin_server() -> Server {
+        Server {
+            key: ServerKey("c4b1".repeat(16)),
             name: "Cabin".into(),
             addresses: vec!["10.10.0.6:7430".into()],
             pinned: true,
-            fingerprint: String::new(),
+            fingerprint: "Q6D2-W5NB-3KX7-M4RA".into(),
             verified: true,
             on_network: false,
             verified_at: None,
             last_connected_at: None,
-            server_id: Some("q2d2w5nb3kx7m4ra".into()),
+            server_id: None,
             advertised: Vec::new(),
             relays: Vec::new(),
             advertised_at: None,
             use_relays: None,
             relays_edited: false,
+        }
+    }
+
+    #[test]
+    fn a_server_whose_last_dial_failed_cannot_be_reached() {
+        assert_eq!(reach(&cabin()), Reach::Unreachable);
+    }
+
+    #[test]
+    fn a_server_not_dialled_yet_is_not_called_unreachable() {
+        let report = Reachability {
+            last_dial: None,
+            ..cabin()
         };
+        assert_eq!(reach(&report), Reach::Unknown);
+    }
+
+    #[test]
+    fn an_unreachable_servers_line_says_when_it_last_answered() {
+        let report = cabin();
+        let server = cabin_server();
+        assert!(
+            reach_line(&server, Reach::Unreachable, None, Some(&report), NOW)
+                .ends_with("last connected 3 days ago"),
+            "{}",
+            reach_line(&server, Reach::Unreachable, None, Some(&report), NOW)
+        );
+    }
+
+    #[test]
+    fn a_fingerprint_not_checked_says_so() {
+        let server = Server {
+            verified: false,
+            ..cabin_server()
+        };
+        assert!(fingerprint_line(&server).ends_with(" · Not verified"));
+    }
+
+    #[test]
+    fn a_guest_with_no_name_here_goes_by_their_fingerprint() {
+        let id = spoolframe_protocol::portable::PortableUserId::from_bytes([7; 32]).unwrap();
+        let guest = spoolframe_linux_core::identity::Guest { id, name: None };
         assert_eq!(
-            other_line(&server, Some("Alice")),
-            "10.10.0.6 · signed in as Alice · passkeys q2d2w5nb3kx7m4ra.spoolframe.app · Verified"
+            guest_title(&guest),
+            format!("Identity {}", id.fingerprint())
         );
     }
 

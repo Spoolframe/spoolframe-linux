@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- @license lucide-static v1.50.0 - ISC -->
+
+<svg
+   class="lucide lucide-users"
+   width="24"
+   height="24"
+   viewBox="0 0 24 24"
+   version="1.1"
+   id="svg3"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <defs
+     id="defs3" />
+  <path
+     style="baseline-shift:baseline;display:inline;overflow:visible;vector-effect:none;fill:#000000;stroke:none;stroke-linecap:butt;stroke-linejoin:miter;enable-background:accumulate;stop-color:#000000;stop-opacity:1;opacity:1"
+     d="m 6,14 c -2.7495791,0 -5,2.250421 -5,5 v 2 a 1,1 0 0 0 1,1 1,1 0 0 0 1,-1 v -2 c 0,-1.668699 1.3313011,-3 3,-3 h 6 c 1.668699,0 3,1.331301 3,3 v 2 a 1,1 0 0 0 1,1 1,1 0 0 0 1,-1 v -2 c 0,-2.749579 -2.250421,-5 -5,-5 z"
+     id="path1" />
+  <path
+     style="baseline-shift:baseline;display:inline;overflow:visible;vector-effect:none;fill:#000000;stroke:none;stroke-linecap:butt;stroke-linejoin:miter;enable-background:accumulate;stop-color:#000000;stop-opacity:1;opacity:1"
+     d="M 16.25,2.1601563 A 1,1 0 0 0 15.03125,2.8769531 1,1 0 0 0 15.75,4.0957031 C 17.318145,4.5022386 17.996094,5.7199297 17.996094,7 c 0,1.2800703 -0.677949,2.4977614 -2.246094,2.9042969 A 1,1 0 0 0 15.03125,11.123047 1,1 0 0 0 16.25,11.839844 C 18.676787,11.210709 19.996094,9.0740945 19.996094,7 19.996094,4.9259055 18.676787,2.7892912 16.25,2.1601563 Z"
+     id="path2" />
+  <path
+     style="baseline-shift:baseline;display:inline;overflow:visible;vector-effect:none;fill:#000000;stroke:none;stroke-linecap:butt;stroke-linejoin:miter;enable-background:accumulate;stop-color:#000000;stop-opacity:1;opacity:1"
+     d="m 19.25,14.162109 a 1,1 0 0 0 -1.21875,0.71875 1,1 0 0 0 0.71875,1.216797 C 20.078577,16.440693 20.998977,17.627852 21,19 v 2 a 1,1 0 0 0 1,1 1,1 0 0 0 1,-1 v -2 c -0.0017,-2.273617 -1.548579,-4.269487 -3.75,-4.837891 z"
+     id="path3" />
+  <path
+     style="baseline-shift:baseline;display:inline;overflow:visible;vector-effect:none;fill:#000000;stroke:none;stroke-linecap:butt;stroke-linejoin:miter;enable-background:accumulate;stop-color:#000000;stop-opacity:1;opacity:1"
+     d="M 9,2 C 6.2504209,2 4,4.2504209 4,7 4,9.7495791 6.2504209,12 9,12 11.749579,12 14,9.7495791 14,7 14,4.2504209 11.749579,2 9,2 Z m 0,2 c 1.668699,0 3,1.3313011 3,3 0,1.6686989 -1.331301,3 -3,3 C 7.3313011,10 6,8.6686989 6,7 6,5.3313011 7.3313011,4 9,4 Z"
+     id="circle3" />
+</svg>

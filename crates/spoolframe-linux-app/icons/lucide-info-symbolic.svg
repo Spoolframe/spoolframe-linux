@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- @license lucide-static v1.50.0 - ISC -->
+
+<svg
+   class="lucide lucide-info"
+   width="24"
+   height="24"
+   viewBox="0 0 24 24"
+   version="1.1"
+   id="svg2"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <defs
+     id="defs2" />
+  <path
+     style="baseline-shift:baseline;display:inline;overflow:visible;vector-effect:none;fill:#000000;stroke:none;stroke-linecap:butt;stroke-linejoin:miter;enable-background:accumulate;stop-color:#000000;stop-opacity:1;opacity:1"
+     d="M 12,1 C 5.9367124,1 1,5.9367124 1,12 1,18.063288 5.9367124,23 12,23 18.063288,23 23,18.063288 23,12 23,5.9367124 18.063288,1 12,1 Z m 0,2 c 4.982407,0 9,4.0175926 9,9 0,4.982407 -4.017593,9 -9,9 C 7.0175926,21 3,16.982407 3,12 3,7.0175926 7.0175926,3 12,3 Z"
+     id="circle1" />
+  <path
+     style="baseline-shift:baseline;display:inline;overflow:visible;vector-effect:none;fill:#000000;stroke:none;stroke-linecap:butt;stroke-linejoin:miter;enable-background:accumulate;stop-color:#000000;stop-opacity:1;opacity:1"
+     d="m 12,11 a 1,1 0 0 0 -1,1 v 4 a 1,1 0 0 0 1,1 1,1 0 0 0 1,-1 v -4 a 1,1 0 0 0 -1,-1 z"
+     id="path1" />
+  <path
+     style="baseline-shift:baseline;display:inline;overflow:visible;vector-effect:none;fill:#000000;stroke:none;stroke-linecap:butt;stroke-linejoin:miter;enable-background:accumulate;stop-color:#000000;stop-opacity:1;opacity:1"
+     d="m 12,7 a 1,1 0 0 0 -1,1 1,1 0 0 0 1,1 h 0.0098 a 1,1 0 0 0 1,-1 1,1 0 0 0 -1,-1 z"
+     id="path2" />
+</svg>

@@ -1,4 +1,4 @@
-//! Preferences › Identity › Recover from a server (P7-08), as on the
+//! Settings › Your identity › Recover from a server (P7-08), as on the
 //! LinuxIdentityRoots board (7–8): a computer that lost its identity, or
 //! never had it, picks a saved server that knows it, then touches any one
 //! of its keys. The key names the identity; the server sends its record;
@@ -76,7 +76,7 @@ pub fn open(
         .build();
     column.append(&list);
     let empty = gtk::Label::builder()
-        .label("No servers saved on this computer. Add one in Preferences › Servers first.")
+        .label("No servers saved on this computer. Add one with Settings › Add a server… first.")
         .xalign(0.0)
         .wrap(true)
         .visible(false)

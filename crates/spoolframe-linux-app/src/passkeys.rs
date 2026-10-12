@@ -1,4 +1,4 @@
-//! Preferences › Profile › Passkeys (P3-19), as the design's
+//! Settings › a server › Passkeys (P3-19), as the design's
 //! LinuxPrefsProfile and LinuxPasskeyManage boards have them: the user's
 //! passkeys, the web UI's too, with Rename and Remove, and Add a passkey…
 //! on a security key in three steps.

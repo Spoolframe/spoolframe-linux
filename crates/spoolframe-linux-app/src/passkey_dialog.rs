@@ -164,7 +164,7 @@ impl KeyState {
                     "warning",
                     &format!("No passkey for {server} on this phone"),
                     "Your phone has no passkey for this server. Sign in another way and add one \
-                     in Preferences › Profile."
+                     in Settings, on this server’s page."
                         .into(),
                     "Try again",
                 ),
@@ -172,7 +172,7 @@ impl KeyState {
                     "warning",
                     &format!("No passkey for {server} on this key"),
                     "This key has no passkey for this server. Try another key, or sign in \
-                     another way and add this one in Preferences › Profile."
+                     another way and add this one in Settings, on this server’s page."
                         .into(),
                     "Try another key",
                 ),

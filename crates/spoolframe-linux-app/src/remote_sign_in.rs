@@ -8,7 +8,7 @@
 //!
 //! - With your phone: laid out as the design's LinuxPhoneSignIn board, a QR
 //!   code of the page. No Spoolframe app is needed on the phone; a
-//!   signed-in one can take the code too (Preferences › Sign In a
+//!   signed-in one can take the code too (Settings › Sign In a
 //!   Device… here).
 //! - With the browser: the page opens in the system browser (through the
 //!   portal), and the screen shows the code and a Cancel. A server without
@@ -384,7 +384,7 @@ impl RemoteSignIn {
                     lead(
                         "This server has no web address, so there's no QR. On a phone or \
                      computer that's already signed in, open",
-                        "Preferences › Sign In a Device…",
+                        "Settings › Sign In a Device…",
                         "and type:",
                     )
                     .escaped(),
@@ -534,7 +534,7 @@ fn approval(name: &str, remembered: bool) -> (String, String) {
         (
             format!("Signed in as {name}, just this once"),
             "The approver didn’t remember this device, so after signing out it needs a \
-             sign-in again. You can turn it on in Preferences › Profile."
+             sign-in again. You can turn it on in Settings, on this server’s page."
                 .to_owned(),
         )
     }
@@ -611,7 +611,7 @@ mod tests {
     fn a_device_not_remembered_says_it_is_just_this_once() {
         let (title, body) = approval("Alice", false);
         assert_eq!(title, "Signed in as Alice, just this once");
-        assert!(body.contains("Preferences › Profile"));
+        assert!(body.contains("Settings, on this server’s page"));
     }
 
     #[test]

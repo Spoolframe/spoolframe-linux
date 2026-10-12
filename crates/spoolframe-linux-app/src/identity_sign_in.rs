@@ -22,7 +22,7 @@ use crate::key_prompt::{self, Action};
 use crate::start::dim;
 
 /// The identity row when sign-ins with other identities are off here.
-pub const OFF_HERE: &str = "Off on this computer. Turn it on in Preferences › Servers.";
+pub const OFF_HERE: &str = "Off on this computer. Turn it on in Settings › Shared computer.";
 
 /// Under the QR (LinuxIdentityPair 7).
 pub const SCAN: &str = "Or scan it with your iPhone.";
@@ -142,7 +142,7 @@ pub fn open(parent: &impl IsA<gtk::Widget>, needs: Needs) {
     // 7 · The code, on this computer as the device.
     let code_page = column();
     code_page.append(&dim(
-        "On the computer with your key, open Preferences › Identity › Pair a device and type:",
+        "On the computer with your key, open Settings › Your identity › Pair a device and type:",
     ));
     let code = gtk::Label::builder()
         .selectable(true)

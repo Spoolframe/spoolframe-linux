@@ -101,7 +101,7 @@ pub fn page(playback: &Rc<Playback>, actions: Actions) -> adw::NavigationPage {
 
     let diagnostics = Diagnostics::new();
     video.add_overlay(&diagnostics.panel);
-    // Open as Preferences › Appearance says; the button toggles them after.
+    // Open as Settings › Playback says; the button toggles them after.
     controls
         .diagnostics
         .set_active(crate::settings::Settings::load().show_diagnostics());

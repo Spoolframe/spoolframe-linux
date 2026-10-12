@@ -105,6 +105,8 @@ pub struct App {
     server: Option<Server>,
     /// The profile in use, once one is entered.
     profile: Option<Profile>,
+    /// Settings, while open: opening it again brings it forward.
+    settings_window: Option<glib::WeakRef<adw::Window>>,
     /// The locked profile whose PIN the pad asks for (P2-08).
     unlocking: Option<Profile>,
     /// A PIN or a sign-in is with the server: another is not sent.
@@ -218,6 +220,8 @@ pub struct AppWidgets {
 #[derive(Debug)]
 pub enum Msg {
     ShowServers,
+    /// Settings forgot a saved server.
+    ServerForgotten(ServerKey),
     ChooseServer(Server),
     /// Why a server can't be reached: the Details dialog.
     ReachabilityDetails(Server),
@@ -291,7 +295,10 @@ pub enum Msg {
     ConnectionChanged(ConnectionState),
     /// The client's server list changed (a server heard on the LAN).
     ServersChanged,
-    OpenPreferences,
+    /// Settings, on This computer or a server's page.
+    OpenSettings(crate::settings_window::Open),
+    /// Settings on the page of the server in use (the account menu).
+    OpenServerSettings,
     SetTheme(Theme),
     /// The streaming bitrate limit (P2-06), for the next start.
     SetMaxBitrate(Option<u64>),
@@ -303,7 +310,7 @@ pub enum Msg {
     /// The session ended under the screen (signed out elsewhere, or its
     /// password changed): back to "Who's watching".
     SessionEnded,
-    /// Preferences › Profile stopped remembering this computer, which
+    /// Settings › a server stopped remembering this computer, which
     /// ended the session here (P4-01).
     StoppedRemembering,
     SetShowDiagnostics(bool),
@@ -426,7 +433,11 @@ pub enum Loaded {
     /// A change the user does not need to hear about unless it failed.
     Saved(Result<(), BackendError>),
     TracksForgotten(Box<Item>, Result<(), BackendError>),
-    Preferences(Result<TrackPreferencesInfo, BackendError>),
+    /// The user's track preferences, for Settings opening on `Open`.
+    Preferences(
+        crate::settings_window::Open,
+        Result<TrackPreferencesInfo, BackendError>,
+    ),
     /// What the server said to the PIN typed for a locked profile.
     Unlocked(Box<Profile>, Result<(), BackendError>),
     Activated(u64, Box<Profile>, Result<(), BackendError>),
@@ -480,7 +491,7 @@ impl Loaded {
             | Loaded::Enqueued(_, Err(e))
             | Loaded::Saved(Err(e))
             | Loaded::TracksForgotten(_, Err(e))
-            | Loaded::Preferences(Err(e)) => Some(e),
+            | Loaded::Preferences(_, Err(e)) => Some(e),
             _ => None,
         }
     }
@@ -567,12 +578,12 @@ impl Component for App {
             .tooltip_text("Account")
             .css_classes(["flat", "sidebar-profile"])
             .build();
-        // Preferences, beside who is watching: the boards have no menu in
+        // Settings, beside who is watching: the boards have no menu in
         // the header.
         let preferences_button = gtk::Button::builder()
             .icon_name(crate::icons::SET_UP)
-            .tooltip_text("Preferences")
-            .action_name("win.preferences")
+            .tooltip_text("Settings")
+            .action_name("win.settings")
             .valign(gtk::Align::Center)
             .css_classes(["flat", "circular"])
             .build();
@@ -591,13 +602,10 @@ impl Component for App {
                     crate::views::MenuEntry::new("Switch profile", crate::icons::DOWN, move || {
                         switch.input(Msg::SwitchProfile)
                     }),
-                    crate::views::MenuEntry::new("Preferences", crate::icons::SET_UP, {
-                        let button = profile_button.downgrade();
-                        move || {
-                            if let Some(button) = button.upgrade() {
-                                let _ = button.activate_action("win.preferences", None);
-                            }
-                        }
+                    // On this server's page (LinuxSettingsEntry 4).
+                    crate::views::MenuEntry::new("Settings", crate::icons::SET_UP, {
+                        let sender = sender.clone();
+                        move || sender.input(Msg::OpenServerSettings)
                     }),
                 ],
                 vec![crate::views::MenuEntry {
@@ -636,12 +644,17 @@ impl Component for App {
 
         // The main menu, as in every libadwaita app; its items are window
         // actions.
-        let preferences = gtk::gio::SimpleAction::new("preferences", None);
+        let settings_action = gtk::gio::SimpleAction::new("settings", None);
         {
             let sender = sender.clone();
-            preferences.connect_activate(move |_, _| sender.input(Msg::OpenPreferences));
+            settings_action.connect_activate(move |_, _| {
+                sender.input(Msg::OpenSettings(
+                    crate::settings_window::Open::ThisComputer,
+                ))
+            });
         }
-        root.add_action(&preferences);
+        root.add_action(&settings_action);
+        relm4::main_application().set_accels_for_action("win.settings", &["<Control>comma"]);
         // The page's title at the start, as designed, not centred: a
         // title widget that fills the header, its text at the left.
         let root_title = gtk::Label::builder()
@@ -825,6 +838,7 @@ impl Component for App {
             session: None,
             server: None,
             profile: None,
+            settings_window: None,
             unlocking: None,
             unlock_in_flight: false,
             profile_scope: spoolframe_client_sdk::ProfileScope::default(),
@@ -923,6 +937,16 @@ impl Component for App {
                 self.invalidate_session();
                 widgets.screens.set_visible_child_name("servers");
                 self.load_servers(&sender);
+            }
+            // The one in use: back to choosing a server. Another: the
+            // picker lists without it.
+            Msg::ServerForgotten(key) => {
+                if self.server.as_ref().is_some_and(|s| s.key == key) {
+                    self.server = None;
+                    sender.input(Msg::ShowServers);
+                } else {
+                    sender.input(Msg::ServersChanged);
+                }
             }
             // Listed again only while the picker shows; elsewhere the
             // list is fetched fresh when the picker opens.
@@ -1520,14 +1544,26 @@ impl Component for App {
                     Loaded::Saved(session.set_track_preferences(&preferences).await)
                 });
             }
-            Msg::OpenPreferences => match self.session.clone() {
-                // The Playback page shows the user's preferences, from the
-                // server.
-                Some(session) => self.command(&sender, async move {
-                    Loaded::Preferences(session.track_preferences().await)
-                }),
-                None => self.preferences_dialog(None, &sender).present(Some(root)),
-            },
+            Msg::OpenServerSettings => {
+                let open = match &self.server {
+                    Some(server) => crate::settings_window::Open::Server(server.key.clone()),
+                    None => crate::settings_window::Open::ThisComputer,
+                };
+                sender.input(Msg::OpenSettings(open));
+            }
+            Msg::OpenSettings(open) => {
+                if let Some(window) = self.settings_window.as_ref().and_then(|w| w.upgrade()) {
+                    return window.present();
+                }
+                match self.session.clone() {
+                    // The server's page shows the user's track preferences,
+                    // from the server.
+                    Some(session) => self.command(&sender, async move {
+                        Loaded::Preferences(open, session.track_preferences().await)
+                    }),
+                    None => self.open_settings(None, open, &sender, root),
+                }
+            }
             Msg::SetTheme(theme) => {
                 self.theme.apply(theme);
                 self.settings.set_theme(theme);
@@ -2224,24 +2260,26 @@ impl Component for App {
                 self.open_item(*item, &sender);
             }
             Loaded::TracksForgotten(_, Err(e)) => toast(widgets, &e),
-            Loaded::Preferences(result) => {
-                // Without the server's preferences, the dialog still has
-                // Appearance.
+            Loaded::Preferences(open, result) => {
+                // Without the server's preferences, Settings still opens.
                 let tracks = result
                     .inspect_err(|e| tracing::warn!(error = %e, "no track preferences"))
                     .ok();
-                self.preferences_dialog(tracks, &sender).present(Some(root));
+                self.open_settings(tracks, open, &sender, root);
             }
         }
     }
 }
 
 impl App {
-    fn preferences_dialog(
-        &self,
+    /// Settings, built and shown, open on `open`.
+    fn open_settings(
+        &mut self,
         tracks: Option<TrackPreferencesInfo>,
+        open: crate::settings_window::Open,
         sender: &ComponentSender<Self>,
-    ) -> adw::Dialog {
+        root: &adw::ApplicationWindow,
+    ) {
         let set_theme: Rc<dyn Fn(Theme)> = {
             let sender = sender.clone();
             Rc::new(move |theme| sender.input(Msg::SetTheme(theme)))
@@ -2266,6 +2304,10 @@ impl App {
                 let sender = sender.clone();
                 Rc::new(move || sender.input(Msg::ShowServers))
             },
+            forgotten: {
+                let sender = sender.clone();
+                Rc::new(move |key| sender.input(Msg::ServerForgotten(key)))
+            },
             app_relays: self.settings.use_relays(),
         };
         let set_bitrate: preferences::SetBitrate = {
@@ -2288,26 +2330,34 @@ impl App {
             let sender = sender.clone();
             Rc::new(move |on| sender.input(Msg::SetShowDiagnostics(on)))
         };
-        preferences::dialog(
-            self.settings.theme(),
-            tracks,
-            servers,
-            set_theme,
-            set_tracks,
-            preferences::Device {
-                bitrate: self.settings.max_bitrate(),
-                set_bitrate,
-                show_hdr: self.settings.show_hdr(),
-                set_show_hdr,
-                use_relays: self.settings.use_relays(),
-                set_use_relays,
-                skip_intros: self.settings.skip_intros(),
-                set_skip_intros,
-                show_diagnostics: self.settings.show_diagnostics(),
-                set_show_diagnostics,
+        let signed = self.signed(sender).map(|profile| preferences::Signed {
+            profile,
+            tracks: tracks.map(|tracks| (tracks, set_tracks)),
+        });
+        let window = crate::settings_window::window(
+            root,
+            crate::settings_window::Needs {
+                theme: self.settings.theme(),
+                set_theme,
+                servers,
+                signed,
+                device: preferences::Device {
+                    bitrate: self.settings.max_bitrate(),
+                    set_bitrate,
+                    show_hdr: self.settings.show_hdr(),
+                    set_show_hdr,
+                    use_relays: self.settings.use_relays(),
+                    set_use_relays,
+                    skip_intros: self.settings.skip_intros(),
+                    set_skip_intros,
+                    show_diagnostics: self.settings.show_diagnostics(),
+                    set_show_diagnostics,
+                },
             },
-            self.signed(sender),
-        )
+            open,
+        );
+        window.present();
+        self.settings_window = Some(window.downgrade());
     }
 
     fn load_servers(&self, sender: &ComponentSender<Self>) {
@@ -2691,6 +2741,14 @@ impl App {
             left: {
                 let sender = sender.clone();
                 Rc::new(move || sender.input(Msg::StoppedRemembering))
+            },
+            switch_profile: {
+                let sender = sender.clone();
+                Rc::new(move || sender.input(Msg::SwitchProfile))
+            },
+            sign_out: {
+                let sender = sender.clone();
+                Rc::new(move || sender.input(Msg::AskSignOut(None)))
             },
         })
     }

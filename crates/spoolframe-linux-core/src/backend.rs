@@ -186,6 +186,10 @@ pub enum BackendError {
     /// Only the server's admin may do this (PX-44's invites).
     #[error("only the server’s admin can do that")]
     AdminOnly,
+    /// Leaving the server (PX-47) is refused to its last enabled admin:
+    /// someone else has to be made an admin first.
+    #[error("You’re the only admin. Make someone else an admin first.")]
+    LastAdmin,
     #[error("{0}")]
     Other(String),
 }
@@ -1068,6 +1072,50 @@ pub trait Session: Send + Sync {
 
     /// Stops an invite working. Admins only, after a recent confirmation.
     fn revoke_invite<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), BackendError>>;
+
+    /// The portable identity this session is a guest with (P7-06): it
+    /// signed in as the identity itself, and has no account here. `None`
+    /// for an account, tied to an identity or not. Asks nothing.
+    fn guest_identity(&self) -> Option<spoolframe_protocol::portable::PortableUserId>;
+
+    /// The portable identity this account is tied to (P7-04), as the
+    /// server says now.
+    fn tie_info(
+        &self,
+    ) -> BoxFuture<'_, Result<Option<spoolframe_protocol::portable::PortableUserId>, BackendError>>;
+
+    /// Ties this account to portable identity `identity` (P7-04): devices
+    /// that sign in with the identity open the account. This device proves
+    /// the identity with its own credential for it; with none, or one past
+    /// its time, [`BackendError::NotPaired`]. Only soon after signing in
+    /// ([`BackendError::RecentSignInRequired`]).
+    fn tie(
+        &self,
+        identity: spoolframe_protocol::portable::PortableUserId,
+    ) -> BoxFuture<'_, Result<(), BackendError>>;
+
+    /// Severs the account's tie (P7-04); the account, its password and its
+    /// history stay. Only soon after signing in, as for [`Session::tie`];
+    /// no tie is [`BackendError::NotFound`].
+    fn untie(&self) -> BoxFuture<'_, Result<(), BackendError>>;
+
+    /// Leaves the server (PX-47): a local account is disabled (its owner
+    /// can restore it), a guest's access ends for good. Once it has, the
+    /// server is forgotten on this device as [`Client::forget`] does, and
+    /// this session ends. Only soon after signing in
+    /// ([`BackendError::RecentSignInRequired`]); the server's last admin
+    /// is refused with [`BackendError::LastAdmin`]. A refused leave changes
+    /// nothing.
+    fn leave_server(&self) -> BoxFuture<'_, Result<(), BackendError>>;
+
+    /// Whether the user may leave the server, as it said when this
+    /// session was made: false only for its last admin. An older server
+    /// that does not say reads as true; [`Session::leave_server`]'s
+    /// refusal is the backstop.
+    fn can_leave(&self) -> bool;
+
+    /// [`Session::can_leave`], asked of the server again.
+    fn can_leave_now(&self) -> BoxFuture<'_, Result<bool, BackendError>>;
 }
 
 #[cfg(test)]

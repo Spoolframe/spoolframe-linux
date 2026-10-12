@@ -87,6 +87,13 @@ pub const EXTERNAL: &str = "lucide-external-link-symbolic";
 pub const LAPTOP: &str = "lucide-laptop-symbolic";
 pub const MONITOR: &str = "lucide-monitor-symbolic";
 pub const SEASON: &str = "lucide-layers-2-symbolic";
+/// The main menu, on Choose a server.
+pub const MENU: &str = "lucide-menu-symbolic";
+// Settings' This computer pages.
+pub const CONNECTION: &str = "lucide-globe-symbolic";
+pub const DOWNLOADS: &str = "lucide-download-symbolic";
+pub const SHARED: &str = "lucide-users-symbolic";
+pub const ABOUT: &str = "lucide-info-symbolic";
 // Search.
 pub const HISTORY: &str = "lucide-history-symbolic";
 pub const CLEAR_RECENT: &str = "lucide-list-x-symbolic";
@@ -154,6 +161,11 @@ const ALL: &[&str] = &[
     LAPTOP,
     MONITOR,
     SEASON,
+    MENU,
+    CONNECTION,
+    DOWNLOADS,
+    SHARED,
+    ABOUT,
     HISTORY,
     CLEAR_RECENT,
     CALENDAR,

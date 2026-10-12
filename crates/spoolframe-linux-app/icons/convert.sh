@@ -23,6 +23,7 @@ ICONS=(
   monitor-play user-round log-out trash-2 external-link link laptop monitor layers-2
   mic-vocal disc-3 key-round usb clipboard user-plus
   ticket fingerprint copy
+  download users info
 )
 
 here="$(cd "$(dirname "$0")" && pwd)"

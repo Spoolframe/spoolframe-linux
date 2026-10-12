@@ -581,14 +581,16 @@ fn pill(text: &str, class: &str) -> gtk::Label {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use spoolframe_linux_core::backend::{DialReport, LookupResult};
 
     use super::*;
 
-    const NOW: u64 = 1_800_000_000;
+    pub(crate) const NOW: u64 = 1_800_000_000;
 
-    fn cabin() -> Reachability {
+    /// Cabin, last dialled 30 s ago and not reached: what other tests
+    /// build on.
+    pub(crate) fn cabin() -> Reachability {
         Reachability {
             endpoint_id: "c4b1".repeat(16),
             name: Some("Cabin".into()),
