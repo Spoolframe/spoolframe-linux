@@ -16,7 +16,7 @@
     </p>
   </description>
   <launchable type="desktop-id">casa.coldsteel.Spoolframe.desktop</launchable>
-  <url type="homepage">https://git.coldsteel.casa/Coldsteel/foundry</url>
+  <url type="homepage">https://git.coldsteel.casa/Spoolframe/spoolframe-linux</url>
   <content_rating type="oars-1.1"/>
   <releases>
     <release version="0.6.1" date="2026-10-10"/>

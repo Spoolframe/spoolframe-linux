@@ -1,10 +1,10 @@
 # Flatpak of the Spoolframe Linux client, built as a bundle to install with
 # `flatpak install`: see flatpak/README.md.
 #
-# The sources are this project and the server workspace beside it, as the
-# client takes spoolframe-types and the SDK as path dependencies on
-# ../spoolframe. Crates come from cargo-sources.json, made from Cargo.lock
-# by flatpak-cargo-generator, as the build has no network.
+# The source is this repository. Crates come from cargo-sources.json, made
+# from Cargo.lock by flatpak-cargo-generator and flatpak/coldsteel-sources.py
+# (the SDK crates are on the Coldsteel registry), as the build has no
+# network.
 app-id: casa.coldsteel.Spoolframe
 runtime: org.gnome.Platform
 # GNOME 49 is the first with GTK 4.20, which gst-plugin-gtk4's gtk_v4_20
@@ -82,9 +82,5 @@ modules:
       - type: dir
         path: ..
         dest: spoolframe-linux
-        skip: [target, .devenv, .direnv, .flatpak-builder]
-      - type: dir
-        path: ../../spoolframe
-        dest: spoolframe
         skip: [target, .devenv, .direnv, .flatpak-builder]
       - cargo-sources.json

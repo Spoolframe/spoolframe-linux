@@ -13,7 +13,7 @@ authors = ["Andrey Cherkashin <andoriyu@gmail.com>"]
 # is free software that stays free, and it links only the permissive
 # spoolframe crates (ARCHITECTURE §56).
 license = "GPL-3.0-or-later"
-repository = "https://git.coldsteel.casa/Coldsteel/foundry"
+repository = "https://git.coldsteel.casa/Spoolframe/spoolframe-linux"
 
 [workspace.dependencies]
 # The app's global allocator, the one mainframe and the server use. Built
@@ -26,18 +26,17 @@ snmalloc-rs = { version = "0.7.5", default-features = false, features = ["build_
 # Internal crates
 spoolframe-linux-core = { path = "crates/spoolframe-linux-core" }
 
-# The client-facing media model. A path dependency until the permissive
-# spoolframe crates are published to the coldsteel registry. Until then the
-# nix build cannot see it: a subflake is copied to the store without its
-# siblings, so spoolframe-linux has no nix package yet (see the root
-# flake.nix).
-spoolframe-types = { path = "../spoolframe/crates/spoolframe-types" }
+# The client-facing media model. The permissive spoolframe crates come from
+# the Coldsteel cargo registry (named in .cargo/config.toml), where
+# Spoolframe/spoolframe-server publishes them; reads are anonymous. The
+# five move together: one version for all of them, the server's release.
+spoolframe-types = { version = "0.7.0", registry = "coldsteel" }
 # The client protocol's types (home screen, playback plans and handles,
-# artwork sizes), which the SDK returns too. Same arrangement as above.
-spoolframe-protocol = { path = "../spoolframe/crates/spoolframe-protocol" }
+# artwork sizes), which the SDK returns too.
+spoolframe-protocol = { version = "0.7.0", registry = "coldsteel" }
 # The client side of the protocol: Iroh transport, saved servers, sessions.
-spoolframe-client-sdk = { path = "../spoolframe/crates/spoolframe-client-sdk", features = ["media-readers"] }
-spoolframe-policy = { path = "../spoolframe/crates/spoolframe-policy" }
+spoolframe-client-sdk = { version = "0.7.0", registry = "coldsteel", features = ["media-readers"] }
+spoolframe-policy = { version = "0.7.0", registry = "coldsteel" }
 # The SDK's Storage trait is an async-trait one.
 async-trait = "0.1"
 
@@ -73,7 +72,7 @@ qrcode = { version = "0.14", default-features = false }
 mpris-server = "0.10"
 # A test's own directory under a random name, removed with it, so tests
 # running at once never share one (core's `testing` feature).
-spoolframe-test-dir = { path = "../spoolframe/crates/spoolframe-test-dir" }
+spoolframe-test-dir = { version = "0.7.0", registry = "coldsteel" }
 # The play queue saved per profile (P1-23), as JSON beside the SDK's data.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

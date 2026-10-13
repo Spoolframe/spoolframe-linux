@@ -1,12 +1,12 @@
 # Flatpak
 
 `casa.coldsteel.Spoolframe.yml` builds the client as a Flatpak on the GNOME
-runtime, for a bundle installed with `flatpak install`. Not on Flathub: it
-takes public sources, and foundry is private.
+runtime, for a bundle installed with `flatpak install`. Not on Flathub: the
+SDK crates come from the Coldsteel cargo registry, not crates.io.
 
 ## Build a bundle
 
-From `spoolframe-linux/`, with the runtime installed once:
+From the repository root, with the runtime installed once:
 
 ```sh
 flatpak --user remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
@@ -38,7 +38,12 @@ Make it again after any change to `Cargo.lock`, with
 
 ```sh
 python3 flatpak-cargo-generator.py Cargo.lock -o flatpak/cargo-sources.json
+python3 flatpak/coldsteel-sources.py Cargo.lock flatpak/cargo-sources.json
 ```
+
+The generator takes every registry crate from crates.io; the second step
+points the Spoolframe SDK crates at the Coldsteel registry they come from,
+and lets the offline build use them from the vendored sources too.
 
 ## Permissions
 
