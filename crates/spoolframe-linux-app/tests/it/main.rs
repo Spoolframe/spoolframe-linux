@@ -1,5 +1,5 @@
-//! The app's integration tests, in one binary (see
-//! docs/agent_guide/integration_test_binaries.md).
+//! The app's integration tests, in one binary: one link instead of one per
+//! file.
 
 mod cli;
 mod sandbox;

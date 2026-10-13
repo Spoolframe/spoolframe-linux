@@ -2,13 +2,39 @@
 
 Spoolframe Linux client: Relm4, libadwaita, GStreamer.
 
-## Development
+## Building
+
+The Spoolframe SDK crates (`spoolframe-types`, `-protocol`, `-client-sdk`,
+`-policy`, `-test-dir`) come from the Coldsteel cargo registry, named in
+`.cargo/config.toml`; reading it needs no account. Everything else comes
+from crates.io.
+
+With Nix, the package (the app, its launcher and icons):
+
+```bash
+nix build
+./result/bin/spoolframe-linux --version
+```
+
+In the dev shell, which has the Rust toolchain, GTK 4, libadwaita and
+GStreamer:
 
 ```bash
 devenv shell
 cargo run -p spoolframe-linux-app -- --version
-devenv --no-tui tasks run --profile ci ci:static ci:style ci:test
 ```
+
+CI runs the same phases in the `ci` profile:
+
+```bash
+devenv --no-tui tasks run --profile ci ci:style ci:static ci:test
+```
+
+`ci:static` runs the license check (below) and clippy; `ci:test` runs the
+tests with nextest. Tests that need a display, GStreamer's plugins or a
+running server are `#[ignore]`d; each says what it needs.
+
+A Flatpak bundle builds from `flatpak/` (see `flatpak/README.md`).
 
 To see the app in plain libadwaita, as on a desktop where no theme of
 Spoolframe's is chosen, without changing your own settings or desktop
@@ -16,11 +42,13 @@ theme: `scripts/adwaita.sh` (light) or `scripts/adwaita.sh dark`.
 
 ## Installing on NixOS
 
-The foundry flake has a NixOS module for the client:
+This flake has a NixOS module for the client:
 
 ```nix
 {
-  imports = [inputs.foundry.nixosModules.spoolframe-linux];
+  inputs.spoolframe-linux.url = "git+https://git.coldsteel.casa/Spoolframe/spoolframe-linux.git";
+  # ...
+  imports = [inputs.spoolframe-linux.nixosModules.default];
   programs.spoolframe.enable = true;
 }
 ```

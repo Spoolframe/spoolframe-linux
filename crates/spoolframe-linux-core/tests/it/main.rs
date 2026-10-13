@@ -1,4 +1,4 @@
-//! The core crate's integration tests, in one binary (see
-//! docs/agent_guide/integration_test_binaries.md).
+//! The core crate's integration tests, in one binary: one link instead of
+//! one per file.
 
 mod live_server;
