@@ -1,7 +1,9 @@
 //! A server's page › Leave, as on LinuxSettingsServer: the last group of
 //! the profile's part. Leaving (PX-47) disables a local account (the owner
-//! can restore it) or ends a guest's access for good; either way the server
-//! is forgotten on this computer.
+//! can restore it) or ends a guest's access for good; either way the
+//! profile is removed from this computer. The server is forgotten here
+//! with it only when no other profile is kept for it (C7); otherwise it
+//! stays, signed out, for the others, and the question names them.
 //!
 //! Leaving needs a sign-in in the last 10 minutes. An account confirms it
 //! is them ([`crate::confirm`]); a guest has no password, so it signs in
@@ -14,7 +16,9 @@ use std::sync::Arc;
 
 use adw::prelude::*;
 use gtk::glib;
-use spoolframe_linux_core::backend::{BackendError, BoxFuture, Client, ServerKey, Session};
+use spoolframe_linux_core::backend::{
+    BackendError, BoxFuture, Client, Profile, ServerKey, Session,
+};
 use spoolframe_protocol::portable::PortableUserId;
 
 /// What the group needs.
@@ -24,10 +28,17 @@ pub struct Needs {
     pub client: Arc<dyn Client>,
     pub server: ServerKey,
     pub server_name: String,
-    /// Settings drops the server's row and page.
+    /// Who is leaving, to tell the others kept here from them.
+    pub username: String,
+    /// The server is forgotten: Settings drops its row and page.
     pub dropped: Rc<dyn Fn()>,
-    /// The app lets go of the server, if it was in use.
+    /// The server is forgotten: the app lets go of it, if it was in use.
     pub forgotten: Rc<dyn Fn(ServerKey)>,
+    /// Other profiles keep the server: Settings shows its page signed out.
+    pub signed_out: Rc<dyn Fn()>,
+    /// Other profiles keep the server: the app lets go of the profile that
+    /// left, whose session has ended.
+    pub left: Rc<dyn Fn(ServerKey)>,
 }
 
 /// What leaving says when the server refuses it.
@@ -70,20 +81,62 @@ pub fn subtitle(guest: bool) -> &'static str {
     }
 }
 
-/// What the question says leaving does.
-pub fn question_body(guest: bool) -> &'static str {
-    if guest {
-        "Your watch history and settings there are deleted and the server is removed from this \
-         device. To come back you’ll need a new invite."
-    } else {
-        "You’re signed out everywhere and the server is removed from this device. The owner can \
-         restore your account."
+/// `names` as a sentence says them: "Sam", "Sam and Alice", "Sam, Alice
+/// and Bob"; "the others" with none.
+pub fn joined(names: &[String]) -> String {
+    match names {
+        [] => "the others".to_owned(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
     }
 }
 
-/// The toast once the user has left.
+/// The names of the profiles kept here for the server besides
+/// `username`'s; `None` when there are none, and the server goes with it.
+/// Empty when one has no name: naming only some would leave one out, so
+/// the question says "the others" instead.
+pub fn others(profiles: &[Profile], username: &str) -> Option<Vec<String>> {
+    let others: Vec<&Profile> = profiles.iter().filter(|p| p.username != username).collect();
+    if others.is_empty() {
+        return None;
+    }
+    if others.iter().any(|p| p.display_name.is_empty()) {
+        return Some(Vec::new());
+    }
+    Some(others.iter().map(|p| p.display_name.clone()).collect())
+}
+
+/// What the question says leaving does: the server is removed from this
+/// device with the last profile, or `stays` for the others' names.
+pub fn question_body(guest: bool, server_name: &str, stays: Option<&[String]>) -> String {
+    match stays {
+        None if guest => "Your watch history and settings there are deleted and the server is \
+                          removed from this device. To come back you’ll need a new invite."
+            .to_owned(),
+        None => "You’re signed out everywhere and the server is removed from this device. The \
+                 owner can restore your account."
+            .to_owned(),
+        Some(names) if guest => format!(
+            "Your watch history and settings there are deleted and you’re removed from this \
+             device; {server_name} stays here for {}. To come back you’ll need a new invite.",
+            joined(names)
+        ),
+        Some(names) => format!(
+            "You’re signed out everywhere and removed from this device; {server_name} stays here \
+             for {}. The owner can restore your account.",
+            joined(names)
+        ),
+    }
+}
+
+/// The toast once the user has left, and the server is no longer saved.
 pub fn left_line(server_name: &str) -> String {
     format!("You left {server_name}. It’s no longer saved here.")
+}
+
+/// The toast once the user has left a server others keep here.
+pub fn kept_line(server_name: &str) -> String {
+    format!("You left {server_name}.")
 }
 
 /// "Leave", for the session in `needs`.
@@ -111,20 +164,10 @@ pub fn group(needs: Needs, toasts: &adw::ToastOverlay) -> adw::PreferencesGroup 
     });
     {
         let weak = Rc::downgrade(&view);
-        view.button.connect_clicked(move |button| {
-            let Some(view) = weak.upgrade() else { return };
-            let weak = Rc::downgrade(&view);
-            ask(
-                button,
-                &view.needs.server_name,
-                view.guest.is_some(),
-                Rc::new(move || {
-                    if let Some(view) = weak.upgrade() {
-                        let session = view.needs.session.clone();
-                        view.leave(session, false);
-                    }
-                }),
-            );
+        view.button.connect_clicked(move |_| {
+            if let Some(view) = weak.upgrade() {
+                view.ask();
+            }
         });
     }
     // The last admin, as the session was told: greyed out from the start,
@@ -186,17 +229,69 @@ impl View {
         });
     }
 
+    /// "Leave <server>?", naming the profiles that keep the server here.
+    fn ask(self: &Rc<Self>) {
+        // Sensitivity left alone: the last admin's greying holds.
+        let (client, server) = (self.needs.client.clone(), self.needs.server.clone());
+        self.run(
+            Box::pin(async move { client.profiles(&server).await }),
+            |view, profiles| {
+                // Not known: asked as the last, which says the most.
+                let stays = match profiles {
+                    Ok(profiles) => others(&profiles, &view.needs.username),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "cannot list the profiles kept here");
+                        None
+                    }
+                };
+                let weak = Rc::downgrade(view);
+                ask(
+                    &view.button,
+                    &view.needs.server_name,
+                    &question_body(
+                        view.guest.is_some(),
+                        &view.needs.server_name,
+                        stays.as_deref(),
+                    ),
+                    Rc::new(move || {
+                        if let Some(view) = weak.upgrade() {
+                            let session = view.needs.session.clone();
+                            view.leave(session, false);
+                        }
+                    }),
+                );
+            },
+        );
+    }
+
     /// Leaves on `session`: the page's own, or a guest's new one once it
-    /// has `signed_in_again`.
+    /// has `signed_in_again`. Then whether the server is still saved here.
     fn leave(self: &Rc<Self>, session: Arc<dyn Session>, signed_in_again: bool) {
         self.button.set_sensitive(false);
-        let leaving = session.clone();
+        let (leaving, client, server) = (
+            session.clone(),
+            self.needs.client.clone(),
+            self.needs.server.clone(),
+        );
         self.run(
-            Box::pin(async move { leaving.leave_server().await }),
+            Box::pin(async move {
+                leaving.leave_server().await?;
+                // Forgotten with the last profile kept here only (C7).
+                Ok::<_, BackendError>(match client.servers().await {
+                    Ok(servers) => servers.iter().any(|s| s.key == server),
+                    // Not known: taken as gone, as every leave was before.
+                    Err(e) => {
+                        tracing::warn!(error = %e, "cannot list servers after leaving");
+                        false
+                    }
+                })
+            }),
             move |view, answer| {
                 view.button.set_sensitive(true);
-                let Err(e) = answer else {
-                    return view.left();
+                let e = match answer {
+                    Ok(true) => return view.signed_out(),
+                    Ok(false) => return view.left(),
+                    Err(e) => e,
                 };
                 match refused(&e, view.guest, signed_in_again) {
                     Refused::Confirm => view.confirm(session),
@@ -249,6 +344,20 @@ impl View {
         );
     }
 
+    /// Gone from the server, which others keep here: Settings shows it
+    /// signed out, the app lets go of the profile, and says so.
+    fn signed_out(&self) {
+        // The page, and this view with it, may go in `signed_out`: keep
+        // what comes after.
+        let (left, server) = (self.needs.left.clone(), self.needs.server.clone());
+        let (toasts, line) = (self.toasts.clone(), kept_line(&self.needs.server_name));
+        (self.needs.signed_out)();
+        left(server);
+        if let Some(toasts) = toasts.upgrade() {
+            toasts.add_toast(crate::markup::toast(&line));
+        }
+    }
+
     /// Gone from the server and from this computer: Settings drops it, the
     /// app lets go of it, and says so.
     fn left(&self) {
@@ -292,11 +401,11 @@ impl View {
     }
 }
 
-/// "Leave <server>?", over `anchor`; `leave` on Leave.
-fn ask(anchor: &impl IsA<gtk::Widget>, server_name: &str, guest: bool, leave: Rc<dyn Fn()>) {
+/// "Leave <server>?", saying `body`, over `anchor`; `leave` on Leave.
+fn ask(anchor: &impl IsA<gtk::Widget>, server_name: &str, body: &str, leave: Rc<dyn Fn()>) {
     let alert = adw::AlertDialog::builder()
         .heading(format!("Leave {server_name}?"))
-        .body(question_body(guest))
+        .body(body)
         .default_response("cancel")
         .close_response("cancel")
         .build();
@@ -327,12 +436,102 @@ mod tests {
 
     #[test]
     fn a_guest_needs_a_new_invite_to_come_back() {
-        assert!(question_body(true).contains("new invite"));
+        assert!(question_body(true, "Home Media", None).contains("new invite"));
+    }
+
+    #[test]
+    fn the_last_profile_is_told_the_server_goes() {
+        assert_eq!(
+            question_body(false, "Home Media", None),
+            "You’re signed out everywhere and the server is removed from this device. The owner \
+             can restore your account."
+        );
+    }
+
+    #[test]
+    fn an_account_is_told_who_keeps_the_server() {
+        assert_eq!(
+            question_body(false, "Home Media", Some(&["Sam".into(), "Alice".into()])),
+            "You’re signed out everywhere and removed from this device; Home Media stays here \
+             for Sam and Alice. The owner can restore your account."
+        );
+    }
+
+    #[test]
+    fn a_guest_is_told_who_keeps_the_server() {
+        assert_eq!(
+            question_body(true, "Home Media", Some(&["Sam".into()])),
+            "Your watch history and settings there are deleted and you’re removed from this \
+             device; Home Media stays here for Sam. To come back you’ll need a new invite."
+        );
+    }
+
+    #[test]
+    fn others_with_no_names_are_the_others() {
+        assert!(
+            question_body(false, "Home Media", Some(&[])).contains("stays here for the others.")
+        );
+    }
+
+    fn names(names: &[&str]) -> Vec<String> {
+        names.iter().map(|&n| n.to_owned()).collect()
+    }
+
+    #[test]
+    fn one_name_is_said_alone() {
+        assert_eq!(joined(&names(&["Sam"])), "Sam");
+    }
+
+    #[test]
+    fn two_names_are_joined_with_and() {
+        assert_eq!(joined(&names(&["Sam", "Alice"])), "Sam and Alice");
+    }
+
+    #[test]
+    fn three_names_take_commas_then_and() {
+        assert_eq!(
+            joined(&names(&["Sam", "Alice", "Bob"])),
+            "Sam, Alice and Bob"
+        );
+    }
+
+    #[test]
+    fn the_leaving_profile_is_not_among_the_others() {
+        use spoolframe_linux_core::fake::FakeClient;
+        let profiles = [FakeClient::profile("steve"), FakeClient::profile("alice")];
+        assert_eq!(others(&profiles, "steve"), Some(names(&["alice"])));
+    }
+
+    #[test]
+    fn one_unnamed_other_makes_them_all_the_others() {
+        use spoolframe_linux_core::fake::FakeClient;
+        let mut unnamed = FakeClient::profile("sam");
+        unnamed.display_name.clear();
+        let profiles = [
+            FakeClient::profile("steve"),
+            FakeClient::profile("alice"),
+            unnamed,
+        ];
+        assert_eq!(others(&profiles, "steve"), Some(Vec::new()));
+    }
+
+    #[test]
+    fn the_last_profile_has_no_others() {
+        use spoolframe_linux_core::fake::FakeClient;
+        assert_eq!(others(&[FakeClient::profile("steve")], "steve"), None);
     }
 
     #[test]
     fn the_left_line_names_the_server() {
-        assert!(left_line("Home Media").starts_with("You left Home Media."));
+        assert_eq!(
+            left_line("Home Media"),
+            "You left Home Media. It’s no longer saved here."
+        );
+    }
+
+    #[test]
+    fn the_kept_line_names_the_server() {
+        assert_eq!(kept_line("Home Media"), "You left Home Media.");
     }
 
     #[test]
@@ -398,23 +597,43 @@ mod tests {
         None
     }
 
-    /// The window the group shows in, its row, how often Settings was told
-    /// to drop the server, and the servers the app was told of.
+    /// The window the group shows in, its row, the question's body, how
+    /// often Settings was told to drop the server or show it signed out,
+    /// and the servers the app was told were forgotten or left.
     struct Left {
         window: adw::Window,
         row: adw::ActionRow,
+        asked: String,
         dropped: Rc<std::cell::Cell<u32>>,
         forgotten: Rc<RefCell<Vec<ServerKey>>>,
+        signed_out: Rc<std::cell::Cell<u32>>,
+        left: Rc<RefCell<Vec<ServerKey>>>,
     }
 
-    /// `username`'s Leave group on the fake, in a window, with Leave…
+    /// A fake with `username` the only profile kept for Home Media.
+    fn last_here(username: &str) -> Arc<spoolframe_linux_core::fake::FakeClient> {
+        let client = Arc::new(spoolframe_linux_core::fake::FakeClient::new(None));
+        let home = spoolframe_linux_core::fake::FakeClient::profile(username).server;
+        let context = glib::MainContext::default();
+        for profile in context.block_on(client.profiles(&home)).unwrap() {
+            if profile.username != username {
+                context
+                    .block_on(client.forget_profile(&home, &profile.username))
+                    .unwrap();
+            }
+        }
+        client
+    }
+
+    /// `username`'s Leave group on `client`, in a window, with Leave…
     /// pressed and the question answered Leave.
-    fn left_as(username: &str) -> Left {
+    fn left_as(client: Arc<spoolframe_linux_core::fake::FakeClient>, username: &str) -> Left {
         use spoolframe_linux_core::fake::FakeClient;
-        let client = Arc::new(FakeClient::new(None));
         let profile = FakeClient::profile(username);
         let dropped = Rc::new(std::cell::Cell::new(0));
         let forgotten = Rc::new(RefCell::new(Vec::new()));
+        let signed_out = Rc::new(std::cell::Cell::new(0));
+        let left = Rc::new(RefCell::new(Vec::new()));
         let toasts = adw::ToastOverlay::new();
         let window = adw::Window::builder().content(&toasts).build();
         let page = adw::PreferencesPage::new();
@@ -425,6 +644,7 @@ mod tests {
                 client: client.clone(),
                 server: profile.server.clone(),
                 server_name: "Home Media".into(),
+                username: username.into(),
                 dropped: {
                     let dropped = dropped.clone();
                     Rc::new(move || dropped.set(dropped.get() + 1))
@@ -432,6 +652,14 @@ mod tests {
                 forgotten: {
                     let forgotten = forgotten.clone();
                     Rc::new(move |key| forgotten.borrow_mut().push(key))
+                },
+                signed_out: {
+                    let signed_out = signed_out.clone();
+                    Rc::new(move || signed_out.set(signed_out.get() + 1))
+                },
+                left: {
+                    let left = left.clone();
+                    Rc::new(move |key| left.borrow_mut().push(key))
                 },
             },
             &toasts,
@@ -449,14 +677,22 @@ mod tests {
             || window.visible_dialog().is_some()
         ));
         let dialog = window.visible_dialog().unwrap();
+        let asked = dialog
+            .downcast_ref::<adw::AlertDialog>()
+            .expect("the question")
+            .body()
+            .to_string();
         button_labelled(dialog.upcast_ref(), "Leave")
             .expect("the question has Leave")
             .emit_clicked();
         Left {
             window,
             row,
+            asked,
             dropped,
             forgotten,
+            signed_out,
+            left,
         }
     }
 
@@ -467,23 +703,79 @@ mod tests {
         gtk::init().unwrap();
         adw::init().unwrap();
         leaving_drops_the_server_and_lets_the_app_go_of_it();
+        leaving_a_server_others_keep_signs_out_and_keeps_it();
         the_last_admin_is_greyed_out_before_trying();
         the_last_admin_is_told_and_greyed_out();
     }
 
+    /// The last profile kept here: the question says the server goes, and
+    /// it does.
     fn leaving_drops_the_server_and_lets_the_app_go_of_it() {
         let Left {
             window,
+            asked,
             dropped,
             forgotten,
+            signed_out,
             ..
-        } = left_as("steve");
+        } = left_as(last_here("steve"), "steve");
         assert!(crate::ui_test::spin_until(
             std::time::Duration::from_secs(5),
             || dropped.get() == 1
         ));
         let home = spoolframe_linux_core::fake::FakeClient::profile("steve").server;
-        assert_eq!(*forgotten.borrow(), vec![home]);
+        assert_eq!(
+            (asked, forgotten.borrow().clone(), signed_out.get()),
+            (question_body(false, "Home Media", None), vec![home], 0)
+        );
+        window.close();
+    }
+
+    /// Andrey and Alice are kept here too: the question names them, the
+    /// server stays, Settings shows it signed out and the app lets go of
+    /// Steve.
+    fn leaving_a_server_others_keep_signs_out_and_keeps_it() {
+        use spoolframe_linux_core::fake::FakeClient;
+        let client = Arc::new(FakeClient::new(None));
+        let Left {
+            window,
+            asked,
+            dropped,
+            forgotten,
+            signed_out,
+            left,
+            ..
+        } = left_as(client.clone(), "steve");
+        assert!(crate::ui_test::spin_until(
+            std::time::Duration::from_secs(5),
+            || signed_out.get() == 1
+        ));
+        let home = FakeClient::profile("steve").server;
+        let saved = glib::MainContext::default()
+            .block_on(client.servers())
+            .unwrap()
+            .iter()
+            .any(|s| s.key == home);
+        assert_eq!(
+            (
+                asked,
+                left.borrow().clone(),
+                dropped.get(),
+                forgotten.borrow().len(),
+                saved
+            ),
+            (
+                question_body(
+                    false,
+                    "Home Media",
+                    Some(&["Andrey".into(), "Alice".into()])
+                ),
+                vec![home],
+                0,
+                0,
+                true
+            )
+        );
         window.close();
     }
 
@@ -500,8 +792,11 @@ mod tests {
                 client: client.clone(),
                 server: profile.server.clone(),
                 server_name: "Home Media".into(),
+                username: FAKE_ADMIN.into(),
                 dropped: Rc::new(|| {}),
                 forgotten: Rc::new(|_| {}),
+                signed_out: Rc::new(|| {}),
+                left: Rc::new(|_| {}),
             },
             &toasts,
         );
@@ -519,7 +814,10 @@ mod tests {
             row,
             dropped,
             ..
-        } = left_as(spoolframe_linux_core::fake::FAKE_ADMIN);
+        } = left_as(
+            Arc::new(spoolframe_linux_core::fake::FakeClient::new(None)),
+            spoolframe_linux_core::fake::FAKE_ADMIN,
+        );
         // Said at once, not only on the greyed-out row: the row is greyed
         // out from the start, so wait for the refusal's dialog itself.
         let said = || {

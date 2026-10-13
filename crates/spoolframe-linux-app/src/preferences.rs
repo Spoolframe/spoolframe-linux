@@ -44,6 +44,9 @@ pub struct Servers {
     pub add: Rc<dyn Fn()>,
     /// A server was forgotten: the app lets go of it if it was in use.
     pub forgotten: Rc<dyn Fn(ServerKey)>,
+    /// The profile in use left a server others keep here: the app lets
+    /// go of it, back to Who's watching.
+    pub left: Rc<dyn Fn(ServerKey)>,
     /// The app's "Use relays", which a server follows unless it has its
     /// own choice.
     pub app_relays: bool,
@@ -618,6 +621,20 @@ pub fn guest_title(guest: &spoolframe_linux_core::identity::Guest) -> String {
         .unwrap_or_else(|| format!("Identity {}", guest.id.fingerprint()))
 }
 
+/// What a guest's row says under their name: "Signed in 8 Oct with their
+/// identity · Home Media", each part left out when it is not known.
+/// `day` is when they were paired here, as [`crate::start::day`] says it.
+pub fn guest_line(day: Option<&str>, server: Option<&str>) -> String {
+    let signed_in = match day {
+        Some(day) => format!("Signed in {day} with their identity"),
+        None => "Signed in with their identity".to_owned(),
+    };
+    match server {
+        Some(server) => format!("{signed_in} · {server}"),
+        None => signed_in,
+    }
+}
+
 /// The rows Shared computer lists its guests in.
 type GuestRows = Rc<std::cell::RefCell<Vec<adw::ActionRow>>>;
 
@@ -651,7 +668,18 @@ fn list_guests(
         for guest in guests {
             let row = adw::ActionRow::builder().use_markup(false).build();
             row.set_title(&guest_title(&guest));
-            row.set_subtitle("Signed in here with their identity");
+            let day = guest.paired_at.map(|secs| {
+                crate::start::day(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+            });
+            row.set_subtitle(&guest_line(day.as_deref(), guest.server.as_deref()));
+            // As Your identity marks a portable one.
+            row.add_suffix(
+                &gtk::Label::builder()
+                    .label("Portable")
+                    .valign(gtk::Align::Center)
+                    .css_classes(["chip", "invite-chip", "invite-identity"])
+                    .build(),
+            );
             let sign_out = gtk::Button::builder()
                 .label("Sign out")
                 .valign(gtk::Align::Center)
@@ -797,6 +825,8 @@ pub(crate) struct ServerPage {
     pub signed: Option<Signed>,
     /// Forgotten: Settings drops its page and row.
     pub dropped: Rc<dyn Fn()>,
+    /// Left by its profile, kept for others: Settings shows it signed out.
+    pub signed_out: Rc<dyn Fn()>,
     /// Opens This computer › Your identity, to make one.
     pub open_identity: Rc<dyn Fn()>,
 }
@@ -999,8 +1029,11 @@ pub(crate) fn server_page(
                     client: servers.client.clone(),
                     server: server.key.clone(),
                     server_name: signed.profile.server_name.clone(),
+                    username: signed.profile.username.clone(),
                     dropped: needs.dropped.clone(),
                     forgotten: servers.forgotten.clone(),
+                    signed_out: needs.signed_out.clone(),
+                    left: servers.left.clone(),
                 },
                 toasts,
             );
@@ -1239,7 +1272,7 @@ fn track_groups(info: TrackPreferencesInfo, set_tracks: SetTracks) -> [adw::Pref
     }
     // A heading over both: a group with no rows shows only its title.
     let section = adw::PreferencesGroup::builder()
-        .title("Audio & subtitles")
+        .title("Audio &amp; subtitles")
         .description("Kept on the server for all your devices.")
         .build();
     [section, audio, subtitles]
@@ -1309,11 +1342,45 @@ mod tests {
     #[test]
     fn a_guest_with_no_name_here_goes_by_their_fingerprint() {
         let id = spoolframe_protocol::portable::PortableUserId::from_bytes([7; 32]).unwrap();
-        let guest = spoolframe_linux_core::identity::Guest { id, name: None };
+        let guest = spoolframe_linux_core::identity::Guest {
+            id,
+            name: None,
+            server: None,
+            paired_at: None,
+        };
         assert_eq!(
             guest_title(&guest),
             format!("Identity {}", id.fingerprint())
         );
+    }
+
+    #[test]
+    fn a_guest_line_says_when_and_for_which_server() {
+        assert_eq!(
+            guest_line(Some("8 Oct"), Some("Home Media")),
+            "Signed in 8 Oct with their identity · Home Media"
+        );
+    }
+
+    #[test]
+    fn a_guest_line_with_no_server_ends_at_the_identity() {
+        assert_eq!(
+            guest_line(Some("8 Oct"), None),
+            "Signed in 8 Oct with their identity"
+        );
+    }
+
+    #[test]
+    fn a_guest_line_with_no_date_leaves_it_out() {
+        assert_eq!(
+            guest_line(None, Some("Home Media")),
+            "Signed in with their identity · Home Media"
+        );
+    }
+
+    #[test]
+    fn a_guest_line_with_neither_says_only_how() {
+        assert_eq!(guest_line(None, None), "Signed in with their identity");
     }
 
     #[test]

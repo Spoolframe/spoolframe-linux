@@ -222,6 +222,8 @@ pub enum Msg {
     ShowServers,
     /// Settings forgot a saved server.
     ServerForgotten(ServerKey),
+    /// The profile in use left a server others keep here (C7).
+    ProfileLeft(ServerKey),
     ChooseServer(Server),
     /// Why a server can't be reached: the Details dialog.
     ReachabilityDetails(Server),
@@ -946,6 +948,16 @@ impl Component for App {
                     sender.input(Msg::ShowServers);
                 } else {
                     sender.input(Msg::ServersChanged);
+                }
+            }
+            // Its session ended with the leave, and the server stays for
+            // the others: back to Who's watching on it. Settings says so.
+            Msg::ProfileLeft(key) => {
+                if let Some(server) = self.server.clone().filter(|s| s.key == key) {
+                    self.invalidate_session();
+                    self.stop_playback(widgets);
+                    self.queued.clear();
+                    self.load_profiles(server, &sender);
                 }
             }
             // Listed again only while the picker shows; elsewhere the
@@ -2307,6 +2319,10 @@ impl App {
             forgotten: {
                 let sender = sender.clone();
                 Rc::new(move |key| sender.input(Msg::ServerForgotten(key)))
+            },
+            left: {
+                let sender = sender.clone();
+                Rc::new(move |key| sender.input(Msg::ProfileLeft(key)))
             },
             app_relays: self.settings.use_relays(),
         };

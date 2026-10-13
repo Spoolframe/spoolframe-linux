@@ -10,14 +10,13 @@
 use std::cell::RefCell;
 use std::future::Future;
 use std::pin::Pin;
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 
 use crate::dialog::{buttons, column};
 use adw::prelude::*;
 use gtk::glib;
-use gtk::glib::thread_guard::ThreadGuard;
 use spoolframe_client_sdk::{SdkError, SecurityKeyError};
 use spoolframe_linux_core::identity::Identities;
 use spoolframe_linux_core::security_key::{CANCELLED, NO_KEY, PinAsk, PinPrompt, Step};
@@ -480,9 +479,25 @@ impl View {
         self.plug_title.set_text(PLUG_IN);
         self.plug_line.set_text(PLUG_IN_LINE);
         self.cancelled.store(false, Ordering::SeqCst);
+        let (shown, mut show) = tokio::sync::mpsc::unbounded_channel();
         let prompt: Arc<dyn PinPrompt> = Arc::new(Prompt {
-            view: Arc::new(ThreadGuard::new(Rc::downgrade(self))),
+            show: shown,
             cancelled: self.cancelled.clone(),
+        });
+        // What the key asks arrives here, on the main loop, until the key
+        // lets go of the prompt.
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            while let Some(shown) = show.recv().await {
+                match weak.upgrade() {
+                    Some(view) => view.show(shown),
+                    None => {
+                        if let Show::Pin(_, answer) = shown {
+                            let _ = answer.send(None);
+                        }
+                    }
+                }
+            }
         });
         let work = op(prompt);
         let weak = Rc::downgrade(self);
@@ -521,45 +536,61 @@ impl View {
     }
 }
 
-/// What the key holds: asks the dialog on the main loop, and waits.
+/// What the key asks of the dialog.
+enum Show {
+    /// The PIN, the answer sent back.
+    Pin(PinAsk, mpsc::Sender<Option<String>>),
+    Touch,
+    Step(Step),
+    NotOurs,
+    PlugIn,
+}
+
+impl View {
+    fn show(&self, shown: Show) {
+        match shown {
+            Show::Pin(ask, answer) => self.ask(&ask, answer),
+            Show::Touch => self.stack.set_visible_child_name("touch"),
+            Show::Step(step) => {
+                self.touch_step.set_text(&step.caption);
+                self.touch_step.set_visible(true);
+                self.touch_title.set_text(&step.title);
+                self.touch_line.set_text(&step.line);
+                self.touch_line.set_visible(!step.line.is_empty());
+            }
+            Show::NotOurs => {
+                let page = not_ours(&self.action);
+                self.plug_title.set_text(&page.title);
+                self.plug_line.set_text(&page.body);
+            }
+            Show::PlugIn => self.stack.set_visible_child_name("plug"),
+        }
+    }
+}
+
+/// What the key holds: it sends to the dialog on the main loop, and waits
+/// for a PIN. It holds nothing of the dialog's, as the key's thread drops
+/// it.
 struct Prompt {
-    view: Arc<ThreadGuard<Weak<View>>>,
+    show: tokio::sync::mpsc::UnboundedSender<Show>,
     cancelled: Arc<AtomicBool>,
 }
 
 impl PinPrompt for Prompt {
     fn pin(&self, ask: &PinAsk) -> Option<String> {
         let (tx, rx) = mpsc::channel();
-        let (view, ask) = (self.view.clone(), ask.clone());
-        glib::MainContext::default().invoke(move || match view.get_ref().upgrade() {
-            Some(view) => view.ask(&ask, tx),
-            None => {
-                let _ = tx.send(None);
-            }
-        });
+        if self.show.send(Show::Pin(ask.clone(), tx)).is_err() {
+            return None;
+        }
         rx.recv().ok().flatten()
     }
 
     fn touch(&self, _key: &str) {
-        let view = self.view.clone();
-        glib::MainContext::default().invoke(move || {
-            if let Some(view) = view.get_ref().upgrade() {
-                view.stack.set_visible_child_name("touch");
-            }
-        });
+        let _ = self.show.send(Show::Touch);
     }
 
     fn step(&self, step: &Step) {
-        let (view, step) = (self.view.clone(), step.clone());
-        glib::MainContext::default().invoke(move || {
-            if let Some(view) = view.get_ref().upgrade() {
-                view.touch_step.set_text(&step.caption);
-                view.touch_step.set_visible(true);
-                view.touch_title.set_text(&step.title);
-                view.touch_line.set_text(&step.line);
-                view.touch_line.set_visible(!step.line.is_empty());
-            }
-        });
+        let _ = self.show.send(Show::Step(step.clone()));
     }
 
     fn cancelled(&self) -> bool {
@@ -567,23 +598,11 @@ impl PinPrompt for Prompt {
     }
 
     fn not_ours(&self) {
-        let view = self.view.clone();
-        glib::MainContext::default().invoke(move || {
-            if let Some(view) = view.get_ref().upgrade() {
-                let page = not_ours(&view.action);
-                view.plug_title.set_text(&page.title);
-                view.plug_line.set_text(&page.body);
-            }
-        });
+        let _ = self.show.send(Show::NotOurs);
     }
 
     fn plug_in(&self) -> bool {
-        let view = self.view.clone();
-        glib::MainContext::default().invoke(move || {
-            if let Some(view) = view.get_ref().upgrade() {
-                view.stack.set_visible_child_name("plug");
-            }
-        });
+        let _ = self.show.send(Show::PlugIn);
         !self.cancelled.load(Ordering::SeqCst)
     }
 }
@@ -613,6 +632,34 @@ mod tests {
         window.present();
         let reached = Rc::new(std::cell::Cell::new(false));
         let op: Op<()> = Rc::new(|_prompt| Box::pin(async { Ok(()) }));
+        let seen = reached.clone();
+        act(&window, alice(), op, move |()| seen.set(true));
+        assert!(crate::ui_test::spin_until(
+            std::time::Duration::from_secs(2),
+            || reached.get()
+        ));
+    }
+
+    /// The key works on another thread, and drops what it holds there:
+    /// that must not take the dialog's view with it.
+    #[test]
+    #[ignore = "needs a display; run on its own"]
+    fn the_key_lets_go_of_the_prompt_on_its_own_thread() {
+        gtk::init().unwrap();
+        adw::init().unwrap();
+        let window = adw::Window::new();
+        window.present();
+        let reached = Rc::new(std::cell::Cell::new(false));
+        let op: Op<()> = Rc::new(|prompt| {
+            Box::pin(async move {
+                std::thread::spawn(move || {
+                    prompt.touch("Keyring key");
+                    drop(prompt);
+                })
+                .join()
+                .map_err(|_| SdkError::Protocol("the key's thread panicked".into()))
+            })
+        });
         let seen = reached.clone();
         act(&window, alice(), op, move |()| seen.set(true));
         assert!(crate::ui_test::spin_until(

@@ -385,7 +385,7 @@ pub fn parts(signed: Signed, dialog: &adw::ToastOverlay) -> Parts {
     // A heading over the groups that follow it: a group with no rows
     // shows only its title.
     let section = adw::PreferencesGroup::builder()
-        .title("Sign-in & security")
+        .title("Sign-in &amp; security")
         .build();
 
     let pin = adw::PreferencesGroup::builder()

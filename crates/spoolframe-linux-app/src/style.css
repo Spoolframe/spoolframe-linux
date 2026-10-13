@@ -1050,6 +1050,20 @@ button.pref-tab:checked {
   font-weight: 600;
 }
 
+/* A server's page › Your identity here (LinuxTies): each tied identity
+   by its fingerprint, in mono and the identities' mauve. */
+.tie-row label.title {
+  font-family: "JetBrains Mono", monospace;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--accent-purple);
+}
+
+/* Tie…'s question: the identity it ties, as a card. */
+.tie-card {
+  padding: 12px;
+}
+
 .fingerprint-row .subtitle {
   font-family: "JetBrains Mono", monospace;
   font-size: 14px;

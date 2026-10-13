@@ -104,13 +104,24 @@ fn invite_summary(invite: sdk::InviteSummary) -> InviteSummary {
 
 /// The identity a session is a guest with (P7-06). The server names a
 /// guest's session by its identity, `portable:` and its hex, and an
-/// account's by `local:`; `portable` alone is no guide, as a tied account
-/// shows its identity there too.
+/// account's by `local:`. A guest's own `portable` list is empty (P7-09),
+/// so the identity is read from the id.
 fn guest_identity(
     user: &sdk::UserSummary,
 ) -> Option<spoolframe_protocol::portable::PortableUserId> {
-    user.portable
-        .filter(|_| user.user_id.starts_with("portable:"))
+    user.user_id
+        .strip_prefix("portable:")
+        .and_then(|hex| hex.parse().ok())
+}
+
+/// A tie as the UI keeps it: the server's Unix seconds as times.
+fn tie(tie: sdk::PortableTie) -> crate::backend::Tie {
+    let at = |secs: i64| std::time::UNIX_EPOCH + Duration::from_secs(secs.max(0) as u64);
+    crate::backend::Tie {
+        id: tie.id,
+        tied_at: at(tie.tied_at),
+        last_used_at: tie.last_used_at.map(at),
+    }
 }
 
 /// The SDK's errors, in the kinds the UI acts on.
@@ -698,11 +709,11 @@ impl Client for SdkClient {
                 .expect("never poisoned")
                 .retain(|(server, _), _| server != key);
             let mut profiles: Vec<Profile> = sessions.iter().map(|s| self.remember(s)).collect();
-            // Ended sessions are kept by name, to sign in again.
+            // Every profile kept here and not among the sessions is offered
+            // to sign in again: ended ones, and one signed in since
+            // `profiles` answered. All count as kept (C7).
             for saved in saved {
-                if saved.sign_in == sdk::ProfileSignIn::Password
-                    && !profiles.iter().any(|p| p.username == saved.username)
-                {
+                if !profiles.iter().any(|p| p.username == saved.username) {
                     // Offered the way they last signed in, as far as it
                     // can be offered again here.
                     let sign_in = match (saved.method, saved.portable) {
@@ -1305,11 +1316,12 @@ impl Session for SdkSession {
         guest_identity(self.session.user())
     }
 
-    fn tie_info(
-        &self,
-    ) -> BoxFuture<'_, Result<Option<spoolframe_protocol::portable::PortableUserId>, BackendError>>
-    {
-        Box::pin(self.call(|s| async move { s.tie_info().await }))
+    fn tie_info(&self) -> BoxFuture<'_, Result<Vec<crate::backend::Tie>, BackendError>> {
+        Box::pin(async move {
+            self.call(|s| async move { s.tie_info().await })
+                .await
+                .map(|ties| ties.into_iter().map(tie).collect())
+        })
     }
 
     fn tie(
@@ -1319,12 +1331,16 @@ impl Session for SdkSession {
         Box::pin(self.call(move |s| async move { s.tie(identity).await }))
     }
 
-    fn untie(&self) -> BoxFuture<'_, Result<(), BackendError>> {
-        Box::pin(self.call(|s| async move { s.untie().await }))
+    fn untie(
+        &self,
+        identity: spoolframe_protocol::portable::PortableUserId,
+    ) -> BoxFuture<'_, Result<(), BackendError>> {
+        Box::pin(self.call(move |s| async move { s.untie(identity).await }))
     }
 
     fn leave_server(&self) -> BoxFuture<'_, Result<(), BackendError>> {
-        // The SDK forgets the server itself once the server has let go.
+        // The SDK drops this profile itself once the server has let go,
+        // and forgets the server with its last profile here.
         Box::pin(self.call(|s| async move { s.leave_server().await }))
     }
 
@@ -1430,6 +1446,10 @@ impl Session for SdkSession {
 mod tests {
     use super::*;
 
+    fn id(byte: u8) -> spoolframe_protocol::portable::PortableUserId {
+        spoolframe_protocol::portable::PortableUserId::from_bytes([byte; 32]).unwrap()
+    }
+
     fn user(user_id: &str, portable: Option<u8>) -> sdk::UserSummary {
         sdk::UserSummary {
             user_id: user_id.into(),
@@ -1438,16 +1458,22 @@ mod tests {
             role: spoolframe_types::Role::Consumer,
             locked: false,
             pin: None,
-            portable: portable.map(|b| {
-                spoolframe_protocol::portable::PortableUserId::from_bytes([b; 32]).unwrap()
-            }),
+            portable: portable
+                .map(|b| sdk::PortableTie {
+                    id: id(b),
+                    tied_at: 0,
+                    last_used_at: None,
+                })
+                .into_iter()
+                .collect(),
         }
     }
 
     #[test]
     fn a_session_signed_in_as_the_identity_is_a_guest_with_it() {
-        let guest = user(&format!("portable:{}", "07".repeat(32)), Some(7));
-        assert_eq!(guest_identity(&guest), guest.portable);
+        // A guest's own list is empty (P7-09): the id names the identity.
+        let guest = user(&format!("portable:{}", "07".repeat(32)), None);
+        assert_eq!(guest_identity(&guest), Some(id(7)));
     }
 
     #[test]

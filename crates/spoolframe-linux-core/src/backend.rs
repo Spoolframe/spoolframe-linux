@@ -495,6 +495,16 @@ pub enum InviteOrigin {
     Unknown,
 }
 
+/// One of an account's ties to a portable identity (P7-09): devices that
+/// sign in with `id` open the account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tie {
+    pub id: spoolframe_protocol::portable::PortableUserId,
+    pub tied_at: std::time::SystemTime,
+    /// The identity's last sign-in into the account; `None` until one.
+    pub last_used_at: Option<std::time::SystemTime>,
+}
+
 /// This device: the servers it knows, and the users signed in on them.
 pub trait Client: Send + Sync {
     /// Servers on this network, and saved ones.
@@ -1078,31 +1088,36 @@ pub trait Session: Send + Sync {
     /// for an account, tied to an identity or not. Asks nothing.
     fn guest_identity(&self) -> Option<spoolframe_protocol::portable::PortableUserId>;
 
-    /// The portable identity this account is tied to (P7-04), as the
-    /// server says now.
-    fn tie_info(
-        &self,
-    ) -> BoxFuture<'_, Result<Option<spoolframe_protocol::portable::PortableUserId>, BackendError>>;
+    /// The portable identities this account is tied to (P7-04, P7-09), as
+    /// the server says now, the oldest tie first.
+    fn tie_info(&self) -> BoxFuture<'_, Result<Vec<Tie>, BackendError>>;
 
     /// Ties this account to portable identity `identity` (P7-04): devices
     /// that sign in with the identity open the account. This device proves
     /// the identity with its own credential for it; with none, or one past
     /// its time, [`BackendError::NotPaired`]. Only soon after signing in
-    /// ([`BackendError::RecentSignInRequired`]).
+    /// ([`BackendError::RecentSignInRequired`]). The account's other ties
+    /// stay (P7-09); an identity tied to it already is `Ok`, changing
+    /// nothing, and one tied to another account here is refused.
     fn tie(
         &self,
         identity: spoolframe_protocol::portable::PortableUserId,
     ) -> BoxFuture<'_, Result<(), BackendError>>;
 
-    /// Severs the account's tie (P7-04); the account, its password and its
-    /// history stay. Only soon after signing in, as for [`Session::tie`];
-    /// no tie is [`BackendError::NotFound`].
-    fn untie(&self) -> BoxFuture<'_, Result<(), BackendError>>;
+    /// Severs the account's tie to `identity` (P7-04, P7-09); its other
+    /// ties, its password, its sessions and its history stay. Only soon
+    /// after signing in, as for [`Session::tie`]; no such tie is
+    /// [`BackendError::NotFound`].
+    fn untie(
+        &self,
+        identity: spoolframe_protocol::portable::PortableUserId,
+    ) -> BoxFuture<'_, Result<(), BackendError>>;
 
     /// Leaves the server (PX-47): a local account is disabled (its owner
-    /// can restore it), a guest's access ends for good. Once it has, the
-    /// server is forgotten on this device as [`Client::forget`] does, and
-    /// this session ends. Only soon after signing in
+    /// can restore it), a guest's access ends for good. Once it has, this
+    /// profile is removed from this device, and this session ends. The
+    /// server is forgotten here, as [`Client::forget`] does, only when no
+    /// other profile is kept for it; [`Client::servers`] says which. Only soon after signing in
     /// ([`BackendError::RecentSignInRequired`]); the server's last admin
     /// is refused with [`BackendError::LastAdmin`]. A refused leave changes
     /// nothing.

@@ -54,6 +54,24 @@ pub struct Guest {
     pub id: PortableUserId,
     /// What this computer calls it, when it was told.
     pub name: Option<String>,
+    /// The name of the server it was paired for. `None` when there was
+    /// none, or it was paired before the SDK kept it.
+    pub server: Option<String>,
+    /// When it was last paired onto this computer, Unix seconds. `None`
+    /// when it was paired before the SDK kept it.
+    pub paired_at: Option<u64>,
+}
+
+impl Guest {
+    /// The guest of `pairing`, which this computer calls `name`.
+    fn paired(pairing: spoolframe_client_sdk::GuestPairing, name: Option<String>) -> Self {
+        Self {
+            id: pairing.id,
+            name,
+            server: pairing.server.map(|s| s.name),
+            paired_at: pairing.paired_at,
+        }
+    }
 }
 
 /// What Settings › Your identity shows.
@@ -228,8 +246,9 @@ impl Identities {
 
     /// Who is signed in here with their own identity (Shared computer):
     /// the identities this computer holds a credential for but not as its
-    /// own. A key identity's root is on its keys, never here, so the SDK
-    /// counts this computer's own among its guests; it is left out.
+    /// own, each with the server it was paired for and when. A key
+    /// identity's root is on its keys, never here, so the SDK counts this
+    /// computer's own among its guests; it is left out.
     pub async fn guests(&self) -> Result<Vec<Guest>, SdkError> {
         let known = self.portable.list().await?;
         let own: Vec<PortableUserId> = known
@@ -239,13 +258,13 @@ impl Identities {
             .collect();
         Ok(self
             .portable
-            .guests()
+            .guest_pairings()
             .await?
             .into_iter()
-            .filter(|id| !own.contains(id))
-            .map(|id| Guest {
-                id,
-                name: known.iter().find(|i| i.id == id).map(|i| i.name.clone()),
+            .filter(|p| !own.contains(&p.id))
+            .map(|p| {
+                let name = known.iter().find(|i| i.id == p.id).map(|i| i.name.clone());
+                Guest::paired(p, name)
             })
             .collect())
     }
@@ -752,6 +771,42 @@ mod tests {
         let identities = in_memory();
         created(&identities);
         assert_eq!(ready(identities.guests()).unwrap(), Vec::new());
+    }
+
+    fn pairing(
+        server: Option<&str>,
+        paired_at: Option<u64>,
+    ) -> spoolframe_client_sdk::GuestPairing {
+        spoolframe_client_sdk::GuestPairing {
+            id: PortableUserId::from_bytes([7; 32]).unwrap(),
+            server: server.map(|name| spoolframe_client_sdk::GuestServer {
+                endpoint_id: "ab".repeat(32),
+                name: name.to_owned(),
+            }),
+            paired_at,
+        }
+    }
+
+    #[test]
+    fn a_guest_carries_the_server_it_was_paired_for_by_name() {
+        let guest = Guest::paired(pairing(Some("Home Media"), Some(1_790_000_000)), None);
+        assert_eq!(guest.server.as_deref(), Some("Home Media"));
+    }
+
+    #[test]
+    fn a_guest_carries_when_it_was_paired() {
+        let guest = Guest::paired(pairing(Some("Home Media"), Some(1_790_000_000)), None);
+        assert_eq!(guest.paired_at, Some(1_790_000_000));
+    }
+
+    /// Paired before the SDK kept where and when: neither is made up.
+    #[test]
+    fn an_older_guest_has_no_server_or_date() {
+        let guest = Guest::paired(pairing(None, None), Some("Carol".into()));
+        assert_eq!(
+            (guest.name.as_deref(), guest.server, guest.paired_at),
+            (Some("Carol"), None, None)
+        );
     }
 
     #[test]

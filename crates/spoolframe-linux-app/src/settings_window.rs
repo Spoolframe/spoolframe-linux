@@ -258,6 +258,14 @@ impl View {
                     }
                 })
             };
+            let signed_out: Rc<dyn Fn()> = {
+                let (weak, name) = (Rc::downgrade(self), name.to_owned());
+                Rc::new(move || {
+                    if let Some(view) = weak.upgrade() {
+                        view.signed_out(&name);
+                    }
+                })
+            };
             let open_identity: Rc<dyn Fn()> = {
                 let weak = Rc::downgrade(self);
                 Rc::new(move || {
@@ -273,6 +281,7 @@ impl View {
                     servers: self.servers.clone(),
                     signed,
                     dropped,
+                    signed_out,
                     open_identity,
                 },
                 &self.toasts,
@@ -313,6 +322,32 @@ impl View {
             self.stack.remove(&page);
         }
         self.select_device("appearance");
+    }
+
+    /// Left by the profile in use, kept for others (C7): its row says Not
+    /// signed in, and its page is made again with no profile, listing
+    /// those kept here.
+    fn signed_out(self: &Rc<Self>, name: &str) {
+        for (row, _, user) in self.rows.borrow_mut().iter_mut() {
+            if row == name {
+                *user = None;
+            }
+        }
+        let mut child = self.servers_list.first_child();
+        while let Some(widget) = child {
+            child = widget.next_sibling();
+            if widget.widget_name() == name
+                && let Some(row) = widget.downcast_ref::<gtk::ListBoxRow>()
+            {
+                set_subtitle(row, &server_line(None));
+            }
+        }
+        // The profile went to the page once; it is not handed out again.
+        self.signed.borrow_mut().take();
+        if let Some(page) = self.stack.child_by_name(name) {
+            self.stack.remove(&page);
+        }
+        self.show(name);
     }
 
     fn select_device(self: &Rc<Self>, name: &str) {
@@ -465,6 +500,7 @@ mod tests {
                 use_server: Rc::new(|_| {}),
                 add: Rc::new(|| {}),
                 forgotten: Rc::new(|_| {}),
+                left: Rc::new(|_| {}),
                 app_relays: true,
             },
             signed: None,

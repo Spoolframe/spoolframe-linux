@@ -82,8 +82,9 @@ struct FakeAuth {
     /// signed in with it, who must choose a new one.
     one_time: std::collections::HashSet<String>,
     must_change: std::collections::HashSet<String>,
-    /// Accounts tied to a portable identity (P7-04), by username.
-    ties: HashMap<String, spoolframe_protocol::portable::PortableUserId>,
+    /// Accounts' ties to portable identities (P7-04, P7-09), by username,
+    /// the oldest first. One identity is tied to one account at most.
+    ties: HashMap<String, Vec<crate::backend::Tie>>,
     /// The identity [`FAKE_GUEST`] last signed in with (P7-06).
     guest: Option<spoolframe_protocol::portable::PortableUserId>,
 }
@@ -498,7 +499,8 @@ pub struct FakeSession {
     /// another and back locks a profile again (P2-08).
     active: Arc<Mutex<std::collections::HashSet<String>>>,
     /// The server this session is on, and what the device keeps saved,
-    /// so leaving it (PX-47) forgets it here as the SDK does.
+    /// so leaving it (PX-47) drops the profile here, and the server with its
+    /// last profile, as the SDK does.
     server: ServerKey,
     saved: Saved,
 }
@@ -523,6 +525,21 @@ impl Saved {
             .expect("fake state is never poisoned")
             .retain(|p| &p.server != server);
         self.changed.send_replace(());
+    }
+
+    /// `username` left `server`, as the SDK's `left` (C7): only its profile
+    /// goes, and the server too once no profile is kept for it here,
+    /// signed in or `remembered`.
+    fn left(&self, server: &ServerKey, username: &str, remembered: bool) {
+        let mut signed_in = self.signed_in.lock().expect("fake state is never poisoned");
+        signed_in.retain(|p| !(&p.server == server && p.username == username));
+        let kept = remembered || signed_in.iter().any(|p| &p.server == server);
+        drop(signed_in);
+        if kept {
+            self.changed.send_replace(());
+        } else {
+            self.forget(server);
+        }
     }
 }
 
@@ -1982,14 +1999,16 @@ impl Session for FakeSession {
         self.lock_passkeys().guest
     }
 
-    fn tie_info(
-        &self,
-    ) -> BoxFuture<'_, Result<Option<spoolframe_protocol::portable::PortableUserId>, BackendError>>
-    {
+    fn tie_info(&self) -> BoxFuture<'_, Result<Vec<crate::backend::Tie>, BackendError>> {
         Box::pin(async move {
             self.guard()?;
             self.not_a_guest()?;
-            Ok(self.lock_passkeys().ties.get(&self.username).copied())
+            Ok(self
+                .lock_passkeys()
+                .ties
+                .get(&self.username)
+                .cloned()
+                .unwrap_or_default())
         })
     }
 
@@ -2001,27 +2020,42 @@ impl Session for FakeSession {
             self.guard()?;
             self.not_a_guest()?;
             let mut auth = self.lock_passkeys();
-            // As the server: recency first, then the account, then the
-            // identity.
+            // As the server: recency first, then the identity. An account
+            // ties any number (P7-09); one tied here already changes
+            // nothing.
             if auth.stale {
                 return Err(BackendError::RecentSignInRequired);
             }
-            if auth.ties.contains_key(&self.username) {
-                return Err(BackendError::InvalidInput(
-                    "this account is tied to an identity already".into(),
-                ));
+            let holder = auth
+                .ties
+                .iter()
+                .find(|(_, ties)| ties.iter().any(|t| t.id == identity))
+                .map(|(username, _)| username.clone());
+            match holder {
+                Some(username) if username == self.username => Ok(()),
+                // As the SDK's PortableIdTaken reaches the UI.
+                Some(_) => Err(BackendError::Other(
+                    "that identity is tied to another account on this server".into(),
+                )),
+                None => {
+                    auth.ties
+                        .entry(self.username.clone())
+                        .or_default()
+                        .push(crate::backend::Tie {
+                            id: identity,
+                            tied_at: std::time::SystemTime::now(),
+                            last_used_at: None,
+                        });
+                    Ok(())
+                }
             }
-            if auth.ties.values().any(|tied| *tied == identity) {
-                return Err(BackendError::InvalidInput(
-                    "that identity is tied to another account here".into(),
-                ));
-            }
-            auth.ties.insert(self.username.clone(), identity);
-            Ok(())
         })
     }
 
-    fn untie(&self) -> BoxFuture<'_, Result<(), BackendError>> {
+    fn untie(
+        &self,
+        identity: spoolframe_protocol::portable::PortableUserId,
+    ) -> BoxFuture<'_, Result<(), BackendError>> {
         Box::pin(async move {
             self.guard()?;
             self.not_a_guest()?;
@@ -2029,15 +2063,20 @@ impl Session for FakeSession {
             if auth.stale {
                 return Err(BackendError::RecentSignInRequired);
             }
-            auth.ties
-                .remove(&self.username)
-                .map(|_| ())
-                .ok_or_else(|| BackendError::NotFound("tie".into()))
+            // Only that tie goes: the account's others and its sessions stay.
+            let ties = auth.ties.entry(self.username.clone()).or_default();
+            let before = ties.len();
+            ties.retain(|t| t.id != identity);
+            if ties.len() == before {
+                return Err(BackendError::NotFound("tie".into()));
+            }
+            Ok(())
         })
     }
 
     /// As the server: recency first, then the last admin. The fake's one
-    /// admin is [`FAKE_ADMIN`], so it is always the last.
+    /// admin is [`FAKE_ADMIN`], so it is always the last. Then, as the
+    /// SDK, this profile goes here, and the server with the last one.
     fn leave_server(&self) -> BoxFuture<'_, Result<(), BackendError>> {
         Box::pin(async move {
             self.guard()?;
@@ -2047,7 +2086,15 @@ impl Session for FakeSession {
             if self.is_admin() {
                 return Err(BackendError::LastAdmin);
             }
-            self.saved.forget(&self.server);
+            // Its trust goes with it; another's keeps the server. The
+            // fake keeps trust by username, not server: any is taken as
+            // kept for this one.
+            let remembered = {
+                let mut auth = self.lock_passkeys();
+                auth.trusted.remove(&self.username);
+                !auth.trusted.is_empty()
+            };
+            self.saved.left(&self.server, &self.username, remembered);
             // And the session ends, as the SDK's does.
             self.pin_state().revoked = true;
             Ok(())
@@ -5821,16 +5868,47 @@ mod tests {
             spoolframe_protocol::portable::PortableUserId::from_bytes([byte; 32]).unwrap()
         }
 
+        fn tied(session: &Arc<dyn Session>) -> Vec<spoolframe_protocol::portable::PortableUserId> {
+            ready(session.tie_info())
+                .unwrap()
+                .into_iter()
+                .map(|t| t.id)
+                .collect()
+        }
+
         #[test]
         fn an_account_starts_untied() {
-            assert_eq!(ready(andrey().tie_info()).unwrap(), None);
+            assert!(ready(andrey().tie_info()).unwrap().is_empty());
         }
 
         #[test]
         fn a_tie_is_what_the_server_then_says() {
             let session = andrey();
             ready(session.tie(id(7))).unwrap();
-            assert_eq!(ready(session.tie_info()).unwrap(), Some(id(7)));
+            assert_eq!(tied(&session), [id(7)]);
+        }
+
+        #[test]
+        fn a_new_tie_is_not_used_yet() {
+            let session = andrey();
+            ready(session.tie(id(7))).unwrap();
+            assert_eq!(ready(session.tie_info()).unwrap()[0].last_used_at, None);
+        }
+
+        #[test]
+        fn an_account_ties_several_identities_oldest_first() {
+            let session = andrey();
+            ready(session.tie(id(7))).unwrap();
+            ready(session.tie(id(8))).unwrap();
+            assert_eq!(tied(&session), [id(7), id(8)]);
+        }
+
+        #[test]
+        fn tying_an_identity_tied_here_already_changes_nothing() {
+            let session = andrey();
+            ready(session.tie(id(7))).unwrap();
+            ready(session.tie(id(7))).unwrap();
+            assert_eq!(tied(&session), [id(7)]);
         }
 
         #[test]
@@ -5858,7 +5936,7 @@ mod tests {
             ready(session_for(&client, "andrey").tie(id(7))).unwrap();
             assert!(matches!(
                 ready(session_for(&client, "bob").tie(id(7))),
-                Err(BackendError::InvalidInput(_))
+                Err(BackendError::Other(_))
             ));
         }
 
@@ -5866,14 +5944,50 @@ mod tests {
         fn severing_leaves_the_account_untied() {
             let session = andrey();
             ready(session.tie(id(7))).unwrap();
-            ready(session.untie()).unwrap();
-            assert_eq!(ready(session.tie_info()).unwrap(), None);
+            ready(session.untie(id(7))).unwrap();
+            assert!(ready(session.tie_info()).unwrap().is_empty());
+        }
+
+        #[test]
+        fn severing_one_tie_leaves_the_others() {
+            let session = andrey();
+            ready(session.tie(id(7))).unwrap();
+            ready(session.tie(id(8))).unwrap();
+            ready(session.untie(id(7))).unwrap();
+            assert_eq!(tied(&session), [id(8)]);
+        }
+
+        #[test]
+        fn severing_leaves_the_session_signed_in() {
+            let session = andrey();
+            ready(session.tie(id(7))).unwrap();
+            ready(session.untie(id(7))).unwrap();
+            assert!(ready(session.tie_info()).is_ok());
+        }
+
+        #[test]
+        fn a_severed_identity_ties_to_another_account() {
+            let client = FakeClient::new(None);
+            let andrey = session_for(&client, "andrey");
+            ready(andrey.tie(id(7))).unwrap();
+            ready(andrey.untie(id(7))).unwrap();
+            assert!(ready(session_for(&client, "bob").tie(id(7))).is_ok());
         }
 
         #[test]
         fn severing_with_no_tie_finds_none() {
             assert!(matches!(
-                ready(andrey().untie()),
+                ready(andrey().untie(id(7))),
+                Err(BackendError::NotFound(_))
+            ));
+        }
+
+        #[test]
+        fn severing_an_identity_not_tied_here_finds_none() {
+            let session = andrey();
+            ready(session.tie(id(7))).unwrap();
+            assert!(matches!(
+                ready(session.untie(id(8))),
                 Err(BackendError::NotFound(_))
             ));
         }
@@ -5885,7 +5999,7 @@ mod tests {
             ready(session.tie(id(7))).unwrap();
             client.age_sign_ins();
             assert_eq!(
-                ready(session.untie()).unwrap_err(),
+                ready(session.untie(id(7))).unwrap_err(),
                 BackendError::RecentSignInRequired
             );
         }
@@ -5926,11 +6040,57 @@ mod tests {
                 .any(|s| s.key == home_media())
         }
 
+        /// Forgets every profile kept for Home Media but `username`'s, so
+        /// it is the last.
+        fn last_here(client: &FakeClient, username: &str) {
+            for profile in ready(client.profiles(&home_media())).unwrap() {
+                if profile.username != username {
+                    ready(client.forget_profile(&home_media(), &profile.username)).unwrap();
+                }
+            }
+        }
+
+        fn kept(client: &FakeClient) -> Vec<String> {
+            ready(client.profiles(&home_media()))
+                .unwrap()
+                .into_iter()
+                .map(|p| p.username)
+                .collect()
+        }
+
         #[test]
-        fn leaving_forgets_the_server_here() {
+        fn the_last_profile_leaving_forgets_the_server_here() {
             let client = FakeClient::new(None);
+            last_here(&client, "steve");
             ready(session_for(&client, "steve").leave_server()).unwrap();
             assert!(!saved(&client));
+        }
+
+        /// Andrey and Alice are signed in here too: the server stays.
+        #[test]
+        fn another_profile_stays_so_the_server_stays() {
+            let client = FakeClient::new(None);
+            ready(session_for(&client, "steve").leave_server()).unwrap();
+            assert!(saved(&client));
+        }
+
+        #[test]
+        fn only_the_leaving_profile_goes() {
+            let client = FakeClient::new(None);
+            ready(client.sign_in(&home_media(), "steve", FAKE_PASSWORD, false)).unwrap();
+            ready(session_for(&client, "steve").leave_server()).unwrap();
+            assert_eq!(kept(&client), vec!["andrey", "alice"]);
+        }
+
+        /// Remembered on this device is kept too: the server stays.
+        #[test]
+        fn a_remembered_profile_keeps_the_server() {
+            let client = FakeClient::new(None);
+            ready(client.sign_in(&home_media(), "andrey", FAKE_PASSWORD, true)).unwrap();
+            // Signed in no more; remembered all the same.
+            last_here(&client, "steve");
+            ready(session_for(&client, "steve").leave_server()).unwrap();
+            assert!(saved(&client));
         }
 
         #[test]
@@ -5999,6 +6159,7 @@ mod tests {
             client.age_sign_ins();
             let session = session_for(&client, "steve");
             ready(session.confirm_password(FAKE_PASSWORD)).unwrap();
+            last_here(&client, "steve");
             ready(session.leave_server()).unwrap();
             assert!(!saved(&client));
         }
@@ -6018,6 +6179,7 @@ mod tests {
             ready(client.sign_in_portable(&home_media(), made)).unwrap();
             client.age_sign_ins();
             let again = ready(client.sign_in_portable(&home_media(), made)).unwrap();
+            last_here(&client, &again.username);
             ready(client.session(&again).unwrap().leave_server()).unwrap();
             assert!(!saved(&client));
         }

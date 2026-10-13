@@ -109,6 +109,16 @@ mod tests {
             .collect()
     }
 
+    /// Whether `text` has an `&` that starts no entity (`&amp;`, `&#39;`).
+    fn bare_ampersand(text: &str) -> bool {
+        text.match_indices('&').any(|(at, _)| {
+            let rest = &text[at + 1..];
+            let name = rest.strip_prefix('#').unwrap_or(rest);
+            let len = name.chars().take_while(char::is_ascii_alphanumeric).count();
+            len == 0 || !name[len..].starts_with(';')
+        })
+    }
+
     /// The length of the string literal `text` starts with.
     fn literal_len(text: &str) -> Option<usize> {
         let mut chars = text.char_indices().skip(1);
@@ -171,7 +181,10 @@ mod tests {
             return escaped(&argument["Some(".len()..argument.len() - 1]);
         }
         if argument.starts_with('"') {
-            return literal_len(argument) == Some(argument.len());
+            // Text in the code is markup too: "Audio & subtitles" fails
+            // to parse, and GTK shows nothing.
+            return literal_len(argument) == Some(argument.len())
+                && !bare_ampersand(&argument[1..argument.len() - 1]);
         }
         // Only [`Markup`] has `escaped()`: a name, or one call that made it,
         // but not text joined to it.
@@ -363,6 +376,13 @@ mod tests {
             .flat_map(|(name, source)| unescaped(name, source))
             .collect();
         assert_eq!(found, Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_literal_with_a_bare_ampersand_is_not_markup() {
+        let source = "let g = adw::PreferencesGroup::builder().title(\"Audio & subtitles\").build();\n\
+                      let h = adw::PreferencesGroup::builder().title(\"Audio &amp; subtitles\").build();";
+        assert_eq!(unescaped("x.rs", source), ["x.rs:1 .title("]);
     }
 
     #[test]
