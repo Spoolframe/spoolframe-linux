@@ -1,11 +1,8 @@
 # spoolframe-linux — Spoolframe Linux client: Relm4, libadwaita, GStreamer.
 #
-# Built with crane. The root flake calls this, not the subflake: the client
-# takes spoolframe-types as a path dependency on ../spoolframe, and only the
-# root sees both directories. `src` is that subset of the repo, with this
-# project at `spoolframe-linux/` and the server workspace at `spoolframe/`.
-# Once spoolframe-types comes from the coldsteel registry, this moves back
-# into the subflake.
+# Built with crane. flake.nix passes `src` (the Rust sources, the fonts and
+# the launcher data) and a craneLib that knows the Coldsteel registry the
+# SDK crates come from.
 {
   craneLib,
   src,
@@ -40,14 +37,6 @@
     strictDeps = true;
     pname = "spoolframe-linux";
     version = "0.6.1";
-    cargoLock = src + "/spoolframe-linux/Cargo.lock";
-    cargoToml = src + "/spoolframe-linux/Cargo.toml";
-    # Build in the project's directory, so the path dependency on
-    # ../spoolframe resolves inside the unpacked source.
-    postUnpack = ''
-      cd "$sourceRoot/spoolframe-linux"
-      sourceRoot="."
-    '';
     # glib: glib-compile-resources, which build.rs runs for the icons.
     # bindgenHook: libclang for fido-hid-rs's bindings.
     nativeBuildInputs = [pkg-config glib wrapGAppsHook4 rustPlatform.bindgenHook];

@@ -11,8 +11,8 @@
 # - Invite links (spoolframe://invite?…, P6-01) open in the app: its
 #   desktop entry handles the scheme, and the module makes it the default.
 #
-# The root flake passes `packageFor`: the package is built there (see
-# nix/package.nix), so the module finds it for the system it is used on.
+# flake.nix passes `packageFor`, so the module finds this flake's package
+# for the system it is used on.
 {packageFor}: {
   config,
   lib,
@@ -27,7 +27,7 @@ in {
     package = lib.mkOption {
       type = lib.types.package;
       default = packageFor pkgs;
-      defaultText = lib.literalMD "the foundry flake's `spoolframe-linux` package";
+      defaultText = lib.literalMD "this flake's `spoolframe-linux` package";
       description = "The Spoolframe Linux client to install.";
     };
 

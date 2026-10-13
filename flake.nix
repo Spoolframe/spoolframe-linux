@@ -1,26 +1,77 @@
 {
   description = "spoolframe-linux — Spoolframe Linux client: Relm4, libadwaita, GStreamer.";
 
+  # Public inputs only: a fresh clone builds with no SSH key. nixpkgs is the
+  # same input devenv.yaml names; keep the two locks on one revision so the
+  # shell and the package share a store.
   inputs = {
-    molds.url = "git+ssh://forgejo@git.coldsteel.casa/Coldsteel/molds.git";
-    nixpkgs.follows = "molds/nixpkgs-unstable";
-    flake-parts.follows = "molds/flake-parts";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    flake-parts = {
+      url = "github:hercules-ci/flake-parts";
+      inputs.nixpkgs-lib.follows = "nixpkgs";
+    };
+    crane.url = "github:ipetkov/crane";
   };
 
   outputs = inputs @ {flake-parts, ...}:
     flake-parts.lib.mkFlake {inherit inputs;} {
+      flake.nixosModules = let
+        module = import ./nix/nixos-module.nix {
+          packageFor = pkgs: inputs.self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+        };
+      in {
+        default = module;
+        spoolframe-linux = module;
+      };
+
+      # GTK, libadwaita and GStreamer from nixpkgs: Linux only.
       systems = [
         "x86_64-linux"
         "aarch64-linux"
-        "x86_64-darwin"
-        "aarch64-darwin"
       ];
 
-      perSystem = {pkgs, ...}: {
-        # No package here: the client builds against ../spoolframe, which a
-        # subflake copied to the store does not have. The root flake builds
-        # it as `.#spoolframe-linux` until spoolframe-types comes from the
-        # coldsteel registry (see nix/package.nix).
+      perSystem = {pkgs, ...}: let
+        # The SDK crates come from the Coldsteel registry (.cargo/config.toml),
+        # everything else from crates.io. The download URL is the registry's
+        # config.json `dl`, written out here: registryFromSparse would fetch
+        # config.json at evaluation time (import from derivation).
+        craneBase = inputs.crane.mkLib pkgs;
+        craneLib = craneBase.appendCrateRegistries [
+          (craneBase.registryFromDownloadUrl {
+            indexUrl = "https://cargo.coldsteel.casa/api/v1/crates/";
+            registryPrefix = "sparse+";
+            dl = "https://cargo.coldsteel.casa:443/api/v1/crates/dl";
+          })
+        ];
+        spoolframe-linux = pkgs.callPackage ./nix/package.nix {
+          inherit craneLib;
+          src = let
+            inherit (pkgs.lib) fileset;
+          in
+            fileset.toSource {
+              root = ./.;
+              fileset = fileset.unions [
+                (fileset.difference
+                  (fileset.fileFilter (
+                      file:
+                        builtins.any file.hasExt ["rs" "toml" "css" "svg"]
+                        || file.name == "Cargo.lock"
+                    )
+                    ./.)
+                  # Build scripts write .rs files under target/.
+                  (fileset.maybeMissing ./target))
+                # Embedded with include_bytes! (the fonts), and installed
+                # (the launcher and its icons).
+                ./crates/spoolframe-linux-app/fonts
+                ./crates/spoolframe-linux-app/data
+              ];
+            };
+        };
+      in {
+        packages = {
+          default = spoolframe-linux;
+          inherit spoolframe-linux;
+        };
         formatter = pkgs.alejandra;
       };
     };
