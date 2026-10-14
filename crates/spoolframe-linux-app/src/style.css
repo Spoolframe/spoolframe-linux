@@ -1562,6 +1562,23 @@ button.search-year image {
   font-weight: 700;
 }
 
+/* A cast member on an item's page: a round portrait, initials on a flat
+   fill until the photo comes, or with none. */
+.cast-fill {
+  border-radius: 9999px;
+  background-color: alpha(var(--accent-bg-color), 0.25);
+}
+
+.cast-initials {
+  font-size: 28px;
+  font-weight: 700;
+  color: var(--window-fg-color);
+}
+
+.cast-member.lift > box > overlay {
+  border-radius: 9999px;
+}
+
 .search-top-person {
   font-size: 2.6em;
 }

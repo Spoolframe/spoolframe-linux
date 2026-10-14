@@ -343,6 +343,7 @@ impl SearchPage {
                     set_watched: None,
                     hide: None,
                     enqueue: needs.cards.enqueue.clone(),
+                    open_person: needs.cards.open_person.clone(),
                 })
             };
             Self {
@@ -777,7 +778,7 @@ impl SearchPage {
     /// they did, and their items to shuffle or list.
     fn top_person(self: &Rc<Self>, person: &Person) -> gtk::Widget {
         let circle = gtk::Label::builder()
-            .label(initials(&person.name))
+            .label(views::initials(&person.name))
             .width_request(TOP_PERSON)
             .height_request(TOP_PERSON)
             .valign(gtk::Align::Center)
@@ -982,7 +983,7 @@ impl SearchPage {
     /// they did, and how many items.
     fn person_card(self: &Rc<Self>, person: &Person) -> gtk::Widget {
         let circle = gtk::Label::builder()
-            .label(initials(&person.name))
+            .label(views::initials(&person.name))
             .width_request(120)
             .height_request(120)
             .css_classes(["search-person"])
@@ -1393,14 +1394,6 @@ fn without_year(query: &str, year: u16) -> String {
         .to_owned()
 }
 
-fn initials(name: &str) -> String {
-    name.split_whitespace()
-        .filter_map(|word| word.chars().next())
-        .take(2)
-        .flat_map(char::to_uppercase)
-        .collect()
-}
-
 fn person_detail(person: &Person) -> String {
     let role = match person.role {
         PersonRole::Actor => "Actor",
@@ -1630,6 +1623,7 @@ mod tests {
                 set_watched: None,
                 hide: None,
                 enqueue: None,
+                open_person: None,
             }),
             play: Rc::new(|_| {}),
             open_person: Rc::new(|_| {}),
@@ -1895,7 +1889,7 @@ mod tests {
             count: Some(3),
         };
         assert_eq!(
-            (initials(&person.name), person_detail(&person)),
+            (views::initials(&person.name), person_detail(&person)),
             ("DV".to_owned(), "Director · 3 items".to_owned())
         );
     }

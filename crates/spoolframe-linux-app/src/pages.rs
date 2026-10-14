@@ -7,7 +7,10 @@ use std::time::Duration;
 use adw::prelude::*;
 use spoolframe_linux_core::backend::{ArtworkSize, ChosenTracks, Selection, TrackReason};
 use spoolframe_linux_core::format;
-use spoolframe_types::{Album, Artist, ArtworkKind, Item, MediaId, MediaTracks, Season, Show};
+use spoolframe_types::{
+    Album, Artist, Artwork, ArtworkKind, CalendarDate, CastMember, Item, MediaId, MediaTracks,
+    Person, PersonRole, Season, Show,
+};
 
 use crate::views::{self, Cards, Enqueue, Facts};
 
@@ -18,6 +21,10 @@ const SQUARE: (i32, i32) = (300, 300);
 const BACKDROP_HEIGHT: i32 = 240;
 /// How far a page's poster reaches up into the backdrop.
 const POSTER_OVER_BACKDROP: i32 = 150;
+/// A cast member's round portrait.
+const PORTRAIT: i32 = 88;
+/// How many of the cast an item's page shows.
+const CAST_SHOWN: usize = 6;
 
 /// Starts playback of the page's item, from a position or the start, with
 /// the tracks picked on the page, or with the server's choice (`None`).
@@ -79,10 +86,10 @@ pub fn playable(
     cards: &Cards,
 ) -> gtk::Widget {
     let facts = Facts::of(item);
-    let (title, summary) = match item {
-        Item::Movie(m) => (m.title.clone(), m.summary.clone()),
-        Item::Episode(e) => (e.title.clone(), e.summary.clone()),
-        _ => (facts.title.clone(), None),
+    let (title, summary, cast) = match item {
+        Item::Movie(m) => (m.title.clone(), m.summary.clone(), m.cast.as_slice()),
+        Item::Episode(e) => (e.title.clone(), e.summary.clone(), e.cast.as_slice()),
+        _ => (facts.title.clone(), None, &[][..]),
     };
 
     let info = gtk::Box::builder()
@@ -109,10 +116,23 @@ pub fn playable(
     title.set_wrap_mode(gtk::pango::WrapMode::WordChar);
     info.append(&title);
 
-    let meta: Vec<String> = [facts.detail.clone(), facts.length.map(format::length)]
-        .into_iter()
-        .flatten()
-        .collect();
+    // An episode says when it aired, or its year where the date is not
+    // known; a movie's year is in its facts already.
+    let aired = match item {
+        Item::Episode(e) => e
+            .air_date
+            .map(air_date)
+            .or_else(|| e.year.map(|y| y.to_string())),
+        _ => None,
+    };
+    let meta: Vec<String> = [
+        facts.detail.clone(),
+        aired,
+        facts.length.map(format::length),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     // The facts as separate spans, as designed, not joined by dots.
     if !meta.is_empty() {
         let row = gtk::Box::builder()
@@ -143,6 +163,9 @@ pub fn playable(
     info.append(&buttons);
     if let Some(pickers) = &pickers {
         info.append(&pickers.column);
+    }
+    if let Some(cast) = cast_row(cast, cards) {
+        info.append(&cast);
     }
     if let Some(next) = next {
         info.append(&next_card(next, cards));
@@ -185,6 +208,155 @@ pub fn playable(
     let overlay = gtk::Overlay::builder().child(&column).build();
     overlay.add_overlay(&poster);
     overlay.upcast()
+}
+
+/// The years a show ran, from its first year and the day its latest
+/// episode aired: "2022" when that was the same year, "2022–" (still
+/// running) when it aired in the twelve months up to `today`, otherwise
+/// "2022–2025". With no first year, the latest episode's year alone.
+pub(crate) fn show_years(
+    year: Option<u16>,
+    last_aired: Option<CalendarDate>,
+    today: CalendarDate,
+) -> Option<String> {
+    let Some(last) = last_aired else {
+        return year.map(|y| y.to_string());
+    };
+    let Some(first) = year else {
+        return Some(last.year().to_string());
+    };
+    if last.year() <= first {
+        return Some(first.to_string());
+    }
+    // A year back from today, compared field by field: there is no
+    // 29 February to land on in most years.
+    let year_ago = (today.year() - 1, today.month(), today.day());
+    if (last.year(), last.month(), last.day()) >= year_ago {
+        Some(format!("{first}\u{2013}"))
+    } else {
+        Some(format!("{first}\u{2013}{}", last.year()))
+    }
+}
+
+/// Today's date here, for how recently a show aired.
+fn today() -> Option<CalendarDate> {
+    let now = gtk::glib::DateTime::now_local().ok()?;
+    CalendarDate::new(
+        u16::try_from(now.year()).ok()?,
+        u8::try_from(now.month()).ok()?,
+        u8::try_from(now.day_of_month()).ok()?,
+    )
+}
+
+/// An air date as the app writes dates: "31 Jan 2025".
+pub(crate) fn air_date(date: CalendarDate) -> String {
+    gtk::glib::DateTime::from_utc(
+        i32::from(date.year()),
+        i32::from(date.month()),
+        i32::from(date.day()),
+        12,
+        0,
+        0.0,
+    )
+    .and_then(|d| d.format("%-d %b %Y"))
+    .map(|s| s.to_string())
+    .unwrap_or_else(|_| date.to_string())
+}
+
+/// The cast an item's page shows: its first actors, in billing order.
+/// Directors are left out.
+pub(crate) fn billed(cast: &[CastMember]) -> impl Iterator<Item = &CastMember> {
+    cast.iter()
+        .filter(|m| m.role == PersonRole::Actor)
+        .take(CAST_SHOWN)
+}
+
+/// The part a cast member plays, for the line under their name; none
+/// where the catalog does not say.
+pub(crate) fn character(member: &CastMember) -> Option<&str> {
+    member
+        .character
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+}
+
+/// "Cast": the first actors, each a round portrait with their name and
+/// part under it, opening their items. None when the item has no actors.
+fn cast_row(cast: &[CastMember], cards: &Cards) -> Option<gtk::Box> {
+    let people: Vec<gtk::Widget> = billed(cast).map(|m| cast_member(m, cards)).collect();
+    // In a scrolled row, so a long cast or a narrow window never widens
+    // the page.
+    (!people.is_empty()).then(|| views::row("Cast", people))
+}
+
+fn cast_member(member: &CastMember, cards: &Cards) -> gtk::Widget {
+    let portrait = portrait(member, cards);
+    portrait.set_halign(gtk::Align::Center);
+    let body = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(4)
+        .build();
+    body.append(&portrait);
+    let name = views::caption_label(&member.name, &["heading"]);
+    name.set_xalign(0.5);
+    name.set_margin_top(6);
+    body.append(&name);
+    let mut tooltip = member.name.clone();
+    if let Some(part) = character(member) {
+        let line = views::caption_label(part, &["dim-label", "caption"]);
+        line.set_xalign(0.5);
+        body.append(&line);
+        tooltip = format!("{tooltip} as {part}");
+    }
+    let button = gtk::Button::builder()
+        .child(&body)
+        .width_request(PORTRAIT + 24)
+        .valign(gtk::Align::Start)
+        .tooltip_text(tooltip)
+        .css_classes(["card-button", "flat", "lift", "cast-member"])
+        .build();
+    if let Some(open_person) = cards.open_person.clone() {
+        let person = Person {
+            id: member.id.clone(),
+            name: member.name.clone(),
+            role: member.role,
+            count: None,
+        };
+        button.connect_clicked(move |_| open_person(person.clone()));
+    }
+    button.upcast()
+}
+
+/// A round portrait: the photo once it loads, the person's initials on a
+/// flat fill until then, or for good when there is none.
+fn portrait(member: &CastMember, cards: &Cards) -> gtk::Overlay {
+    let fill = gtk::Box::builder()
+        .width_request(PORTRAIT)
+        .height_request(PORTRAIT)
+        .css_classes(["tile", "cast-fill"])
+        .build();
+    // "tile-title": the photo hides it once it is painted.
+    let initials = gtk::Label::builder()
+        .label(views::initials(&member.name))
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .css_classes(["tile-title", "cast-initials"])
+        .build();
+    let tile = gtk::Overlay::builder()
+        .child(&fill)
+        .css_classes(["circle"])
+        .overflow(gtk::Overflow::Hidden)
+        .build();
+    tile.add_overlay(&initials);
+    if let Some(photo) = &member.photo {
+        let artwork = [Artwork {
+            id: photo.clone(),
+            kind: ArtworkKind::Thumb,
+        }];
+        cards.art(&tile, &artwork, &[ArtworkKind::Thumb], ArtworkSize::Small);
+    }
+    tile
 }
 
 /// "Severance › Season 2 › Episode 4": the show and season open their
@@ -642,8 +814,9 @@ pub fn show(
         .spacing(14)
         .css_classes(["item-meta"])
         .build();
-    if let Some(year) = show.year {
-        meta.append(&label(&year.to_string(), &[]));
+    let aired = today().and_then(|today| show_years(show.year, show.last_aired, today));
+    if let Some(years) = aired.or_else(|| show.year.map(|y| y.to_string())) {
+        meta.append(&label(&years, &[]));
     }
     let real_seasons = seasons.iter().filter(|(s, _)| s.season > 0).count();
     meta.append(&label(&format::seasons(real_seasons as u32), &[]));
@@ -697,6 +870,9 @@ pub fn show(
     facts.append(&buttons);
     header.append(&facts);
     body.append(&header);
+    if let Some(cast) = cast_row(&show.cast, cards) {
+        body.append(&cast);
+    }
 
     // The tabs, one per season, and the picked season under them.
     let picked = open
@@ -1235,6 +1411,99 @@ mod tests {
             air_date: None,
             cast: Vec::new(),
         })
+    }
+
+    fn date(y: u16, m: u8, d: u8) -> CalendarDate {
+        CalendarDate::new(y, m, d).unwrap()
+    }
+
+    fn member(name: &str, role: PersonRole, character: Option<&str>) -> CastMember {
+        CastMember {
+            id: spoolframe_types::PersonId::new(Namespace::Plex, name).unwrap(),
+            name: name.into(),
+            role,
+            character: character.map(Into::into),
+            photo: None,
+        }
+    }
+
+    const TODAY: (u16, u8, u8) = (2026, 10, 14);
+
+    fn years(year: Option<u16>, last_aired: Option<CalendarDate>) -> Option<String> {
+        let (y, m, d) = TODAY;
+        show_years(year, last_aired, date(y, m, d))
+    }
+
+    #[test]
+    fn a_show_with_no_air_date_shows_its_first_year() {
+        assert_eq!(years(Some(2022), None), Some("2022".into()));
+    }
+
+    #[test]
+    fn a_show_last_aired_in_its_first_year_shows_that_year() {
+        assert_eq!(
+            years(Some(2022), Some(date(2022, 12, 1))),
+            Some("2022".into())
+        );
+    }
+
+    #[test]
+    fn a_show_aired_in_the_last_twelve_months_is_an_open_range() {
+        assert_eq!(
+            years(Some(2022), Some(date(2025, 10, 14))),
+            Some("2022\u{2013}".into())
+        );
+    }
+
+    #[test]
+    fn a_show_last_aired_over_a_year_ago_shows_both_years() {
+        assert_eq!(
+            years(Some(2022), Some(date(2025, 10, 13))),
+            Some("2022\u{2013}2025".into())
+        );
+    }
+
+    #[test]
+    fn a_show_with_no_first_year_shows_when_it_last_aired() {
+        assert_eq!(years(None, Some(date(2019, 3, 2))), Some("2019".into()));
+    }
+
+    #[test]
+    fn an_air_date_reads_day_month_year() {
+        assert_eq!(air_date(date(2025, 1, 31)), "31 Jan 2025");
+    }
+
+    #[test]
+    fn the_page_shows_the_first_six_actors_in_billing_order() {
+        let names = ["A", "B", "C", "D", "E", "F", "G"];
+        let cast: Vec<CastMember> = names
+            .iter()
+            .map(|n| member(n, PersonRole::Actor, None))
+            .collect();
+        let shown: Vec<&str> = billed(&cast).map(|m| m.name.as_str()).collect();
+        assert_eq!(shown, names[..6]);
+    }
+
+    #[test]
+    fn directors_are_left_out_of_the_cast_row() {
+        let cast = vec![
+            member("Sigourney Weaver", PersonRole::Actor, Some("Ripley")),
+            member("Ridley Scott", PersonRole::Director, None),
+        ];
+        let shown: Vec<&str> = billed(&cast).map(|m| m.name.as_str()).collect();
+        assert_eq!(shown, ["Sigourney Weaver"]);
+    }
+
+    #[test]
+    fn an_actor_shows_the_part_they_play() {
+        let ripley = member("Sigourney Weaver", PersonRole::Actor, Some("Ellen Ripley"));
+        assert_eq!(character(&ripley), Some("Ellen Ripley"));
+    }
+
+    #[test]
+    fn a_part_that_is_blank_has_no_line() {
+        let unnamed = member("Tom Skerritt", PersonRole::Actor, Some("  "));
+        assert_eq!(character(&unnamed), None);
     }
 
     #[test]

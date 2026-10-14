@@ -8,7 +8,8 @@ use gtk::prelude::*;
 use spoolframe_linux_core::backend::ArtworkSize;
 use spoolframe_linux_core::format;
 use spoolframe_types::{
-    Album, Artist, Artwork, ArtworkKind, Episode, Item, MediaId, PlaybackState, Season, Show, Track,
+    Album, Artist, Artwork, ArtworkKind, Episode, Item, MediaId, Person, PlaybackState, Season,
+    Show, Track,
 };
 
 use crate::artwork::Art;
@@ -34,6 +35,9 @@ pub struct Cards {
     /// Puts a track, an album or an artist's albums in the play queue
     /// (P1-23), from its card's menu.
     pub enqueue: Option<Rc<dyn Fn(Item, Enqueue)>>,
+    /// Opens a person's page, their items: from a cast member on an item's
+    /// page. None before a session exists.
+    pub open_person: Option<Rc<dyn Fn(Person)>>,
 }
 
 /// Where in the play queue (P1-23) items go.
@@ -310,6 +314,16 @@ pub fn continue_card(item: &Item, cards: &Cards, shelf: Shelf) -> gtk::Widget {
         card_menu(&card, item, shelf, set_watched, hide, &cards.open);
     }
     card
+}
+
+/// "SW" for Sigourney Weaver: the first letters of the first two words,
+/// for a person with no picture.
+pub fn initials(name: &str) -> String {
+    name.split_whitespace()
+        .filter_map(|word| word.chars().next())
+        .take(2)
+        .flat_map(char::to_uppercase)
+        .collect()
 }
 
 /// A library grid's card: as a poster card, with only the title below, as
@@ -1046,5 +1060,20 @@ mod tests {
         let bounds = header.compute_bounds(&view).unwrap();
         window.close();
         assert_eq!(bounds.y(), 0.0);
+    }
+
+    #[test]
+    fn initials_are_the_first_letters_of_the_first_two_words() {
+        assert_eq!(initials("Ellen Louise Ripley"), "EL");
+    }
+
+    #[test]
+    fn initials_are_capitals() {
+        assert_eq!(initials("bong joon-ho"), "BJ");
+    }
+
+    #[test]
+    fn a_single_name_has_one_initial() {
+        assert_eq!(initials("Zendaya"), "Z");
     }
 }

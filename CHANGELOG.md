@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Movie, show and episode pages show the cast: the first six actors, each
+  a round portrait (or their initials) with the part they play; a click
+  opens their items. Cast comes with the server's 0.9.0.
+- A show's page says when it ran: "2022", "2022–" while it is still
+  airing (an episode in the last twelve months), or "2022–2025".
+- An episode's page says the day it aired, or its year where the server
+  does not know the day.
+- The SDK crates are 0.9.0.
+
 ## 0.6.1 — 2026-10-10
 
 Released with the server's 0.6.1 (wire revision 14).

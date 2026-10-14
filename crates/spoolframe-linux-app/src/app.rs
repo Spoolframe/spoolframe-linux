@@ -857,6 +857,7 @@ impl Component for App {
                 set_watched: None,
                 hide: None,
                 enqueue: None,
+                open_person: None,
             }),
             connection_watch: None,
             sign_out_watch: None,
@@ -2488,6 +2489,10 @@ impl App {
             enqueue: Some({
                 let sender = sender.clone();
                 Rc::new(move |item, at| sender.input(Msg::Enqueue(Box::new(item), at)))
+            }),
+            open_person: Some({
+                let sender = sender.clone();
+                Rc::new(move |person| sender.input(Msg::OpenPerson(Box::new(person))))
             }),
         });
         self.library_cache = Some(library::Cache::new(session.clone()));
