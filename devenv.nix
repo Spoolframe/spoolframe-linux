@@ -160,9 +160,12 @@ in {
       # JUnit (nextest's ci profile) at target/nextest/ci/junit.xml and lcov
       # at target/lcov.info; the workflow publishes both. Tests that need a
       # display, GStreamer's plugins or a live server are #[ignore]d.
+      # Registry sources are left out by any path: kache remaps cargo's home
+      # to /kache/.cargo, which llvm-cov's own filter (the real home) misses,
+      # and genhtml then fails on macro code from crates it cannot find.
       "ci:test" = {
         description = "Tests with nextest under llvm-cov (JUnit + lcov)";
-        exec = "cargo llvm-cov nextest --locked --workspace --profile ci --no-tests=warn --lcov --output-path target/lcov.info";
+        exec = "cargo llvm-cov nextest --locked --workspace --profile ci --no-tests=warn --ignore-filename-regex '/\\.cargo/(registry|git)/' --lcov --output-path target/lcov.info";
       };
       "ci:audit" = {
         description = "Audit dependencies for known vulnerabilities";
