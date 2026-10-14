@@ -3001,6 +3001,8 @@ impl App {
                     content_rating: None,
                     genres: Vec::new(),
                     season_count: None,
+                    cast: Vec::new(),
+                    last_aired: None,
                 };
                 let (show, seasons) = show_with_seasons(backend.as_ref(), show).await;
                 Loaded::Show(show, seasons, Some(season.id))
@@ -3714,6 +3716,8 @@ mod tests {
             duration: None,
             artwork: Vec::new(),
             playback: Default::default(),
+            cast: Vec::new(),
+            release_date: None,
         });
         for error in [BackendError::SignInRequired, BackendError::ProfileLocked] {
             let loaded = Loaded::Playable(item.clone(), None, Err(error.clone()), None, None);

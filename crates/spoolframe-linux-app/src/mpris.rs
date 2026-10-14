@@ -763,6 +763,7 @@ mod tests {
             content_rating: None,
             year: None,
             air_date: None,
+            cast: Vec::new(),
         })
     }
 
@@ -776,6 +777,8 @@ mod tests {
             artwork: Vec::new(),
             playback: PlaybackState::default(),
             content_rating: None,
+            cast: Vec::new(),
+            release_date: None,
         })
     }
 

@@ -30,13 +30,13 @@ spoolframe-linux-core = { path = "crates/spoolframe-linux-core" }
 # the Coldsteel cargo registry (named in .cargo/config.toml), where
 # Spoolframe/spoolframe-server publishes them; reads are anonymous. The
 # five move together: one version for all of them, the server's release.
-spoolframe-types = { version = "0.7.0", registry = "coldsteel" }
+spoolframe-types = { version = "0.9.0", registry = "coldsteel" }
 # The client protocol's types (home screen, playback plans and handles,
 # artwork sizes), which the SDK returns too.
-spoolframe-protocol = { version = "0.7.0", registry = "coldsteel" }
+spoolframe-protocol = { version = "0.9.0", registry = "coldsteel" }
 # The client side of the protocol: Iroh transport, saved servers, sessions.
-spoolframe-client-sdk = { version = "0.7.0", registry = "coldsteel", features = ["media-readers"] }
-spoolframe-policy = { version = "0.7.0", registry = "coldsteel" }
+spoolframe-client-sdk = { version = "0.9.0", registry = "coldsteel", features = ["media-readers"] }
+spoolframe-policy = { version = "0.9.0", registry = "coldsteel" }
 # The SDK's Storage trait is an async-trait one.
 async-trait = "0.1"
 
@@ -72,7 +72,7 @@ qrcode = { version = "0.14", default-features = false }
 mpris-server = "0.10"
 # A test's own directory under a random name, removed with it, so tests
 # running at once never share one (core's `testing` feature).
-spoolframe-test-dir = { version = "0.7.0", registry = "coldsteel" }
+spoolframe-test-dir = { version = "0.9.0", registry = "coldsteel" }
 # The play queue saved per profile (P1-23), as JSON beside the SDK's data.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

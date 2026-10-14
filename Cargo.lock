@@ -1436,7 +1436,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1616,7 +1616,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2157,8 +2157,8 @@ dependencies = [
  "libc",
  "log",
  "rustversion",
- "windows-link 0.1.3",
- "windows-result 0.3.4",
+ "windows-link 0.2.1",
+ "windows-result 0.4.1",
 ]
 
 [[package]]
@@ -2247,7 +2247,7 @@ dependencies = [
  "gobject-sys",
  "libc",
  "system-deps 9.0.0",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2410,7 +2410,7 @@ dependencies = [
  "gstreamer-gl-wayland",
  "gstreamer-video",
  "gtk4",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2941,7 +2941,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.61.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -4191,7 +4191,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5348,7 +5348,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5406,7 +5406,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5935,9 +5935,9 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-client-sdk"
-version = "0.7.0"
+version = "0.9.0"
 source = "sparse+https://cargo.coldsteel.casa/api/v1/crates/"
-checksum = "bd86b1a3ea27ffc2a28e4f7fd7cf32804d420f8a525db8f868f4d45c2eeacdac"
+checksum = "8f7437cd8039e68a54987ccb5046cedb977b538f5da1cbe78b00532c2f20445f"
 dependencies = [
  "async-trait",
  "bip39",
@@ -6029,9 +6029,9 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-policy"
-version = "0.7.0"
+version = "0.9.0"
 source = "sparse+https://cargo.coldsteel.casa/api/v1/crates/"
-checksum = "7997ba480676153677b78d633689f73b1444498535c199ff799a679fab3dfc5b"
+checksum = "f857039bb314bc0c5e65a8f3d2210a6ff9fa437698d24cea5128ccd20647d5f0"
 dependencies = [
  "serde",
  "spoolframe-protocol",
@@ -6040,9 +6040,9 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-protocol"
-version = "0.7.0"
+version = "0.9.0"
 source = "sparse+https://cargo.coldsteel.casa/api/v1/crates/"
-checksum = "2476085fef995ab69b3dbdf62c313f7142f6696dc75ea79ef2f6dc737f596238"
+checksum = "556697ed1fa7759d8bad38aa07dc740874c64dc1ce868408e75b524d7266c4f8"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -6060,9 +6060,9 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-test-dir"
-version = "0.7.0"
+version = "0.9.0"
 source = "sparse+https://cargo.coldsteel.casa/api/v1/crates/"
-checksum = "7c244c5c2fbc8f12d078806fbea7a53502e4bb03b0b1dd451dd8c8d1639d695e"
+checksum = "513d2ba401c7c7534d5e4a28c378eac5ce6c9fbbbe3e365ae2ea13e2f6843478"
 dependencies = [
  "tmpdir",
  "tokio",
@@ -6070,9 +6070,9 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-types"
-version = "0.7.0"
+version = "0.9.0"
 source = "sparse+https://cargo.coldsteel.casa/api/v1/crates/"
-checksum = "ce6d9269ed0b91fdd8c3271bc3a69f2ddc133e8e5f663e7dba58c0d37aee341b"
+checksum = "4c70c11d1f8614f38bb0803a8f50eb3d91adb68cb78490932bbc7f679670b37e"
 dependencies = [
  "serde",
  "thiserror 2.0.21",
@@ -6254,7 +6254,7 @@ dependencies = [
  "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7090,7 +7090,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7615,8 +7615,8 @@ dependencies = [
  "log",
  "serde",
  "thiserror 2.0.21",
- "windows 0.61.3",
- "windows-core 0.61.2",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]

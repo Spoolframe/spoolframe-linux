@@ -1693,6 +1693,8 @@ mod tests {
             content_rating: None,
             season_count: None,
             genres: Vec::new(),
+            cast: Vec::new(),
+            last_aired: None,
         });
         let movie = Item::Movie(Movie {
             id: id(MediaKind::Movie, "2"),
@@ -1703,6 +1705,8 @@ mod tests {
             artwork: Vec::new(),
             playback: PlaybackState::default(),
             content_rating: None,
+            cast: Vec::new(),
+            release_date: None,
         });
         assert_eq!(playable(vec![show, movie.clone()]), vec![movie]);
     }

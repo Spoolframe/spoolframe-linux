@@ -169,6 +169,8 @@ fn movie(key: &str, title: &str, year: u16, length: u64) -> Item {
         artwork: Vec::new(),
         playback: PlaybackState::default(),
         content_rating: Some("PG-13".into()),
+        cast: Vec::new(),
+        release_date: None,
     })
 }
 
@@ -350,6 +352,8 @@ impl Catalog {
             content_rating: Some("TV-MA".into()),
             season_count: Some(0),
             genres: vec!["Drama".into(), "Science Fiction".into()],
+            cast: Vec::new(),
+            last_aired: None,
         }));
         self.season(&show, title, &(base + 1).to_string(), season, episodes);
         show
@@ -398,6 +402,7 @@ impl Catalog {
                 content_rating: Some("TV-MA".into()),
                 year: None,
                 air_date: None,
+                cast: Vec::new(),
             }));
         }
         self.children.insert(season_id, ids);

@@ -494,6 +494,8 @@ pub fn show_of(episode: &Episode) -> Item {
         content_rating: None,
         genres: Vec::new(),
         season_count: None,
+        cast: Vec::new(),
+        last_aired: None,
     })
 }
 
@@ -930,6 +932,7 @@ mod tests {
             content_rating: None,
             year: None,
             air_date: None,
+            cast: Vec::new(),
         })
     }
 
