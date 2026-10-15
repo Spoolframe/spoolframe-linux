@@ -51,7 +51,9 @@ jobs:
         run: devenv --no-tui tasks run --profile ci ci:style
 
       # ci:static runs spoolframe-linux:licenses first (cargo deny over the
-      # client's graph, deny.toml), then clippy over every target.
+      # client's graph, deny.toml) and spoolframe-linux:licenses-list (the
+      # app's open source license list is current with Cargo.lock), then
+      # clippy over every target.
       - name: ci:static
         shell: devenv --no-tui shell --profile ci -- bash -eo pipefail {0}
         run: devenv --no-tui tasks run --profile ci ci:static

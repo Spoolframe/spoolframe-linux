@@ -66,6 +66,8 @@ in {
       # A security key as a portable identity's root (P7-08): libfido2
       # signs CTAP2 over a hash the client chooses.
       pkgs.libfido2
+      # scripts/gen-licenses.py, the open source license list.
+      pkgs.python3
     ]
     ++ gstPlugins;
 
@@ -81,7 +83,14 @@ in {
     description = "Check the Linux client license boundary";
     exec = "cargo deny --locked check licenses";
   };
-  tasks."ci:static".after = ["spoolframe-linux:licenses"];
+  # Settings › About › Open source licenses reads a committed list
+  # (crates/spoolframe-linux-app/data/licenses.json); it fails here when
+  # Cargo.lock or the Flatpak manifest moved without it.
+  tasks."spoolframe-linux:licenses-list" = {
+    description = "Check the open source license list is current";
+    exec = "python3 scripts/gen-licenses.py --check";
+  };
+  tasks."ci:static".after = ["spoolframe-linux:licenses" "spoolframe-linux:licenses-list"];
 
   # CI's phases: `devenv --profile ci tasks run ci:style ci:static ci:test`
   # (.forgejo/workflows/ci.yaml runs exactly these). The tools they call
