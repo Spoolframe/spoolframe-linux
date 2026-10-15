@@ -38,7 +38,9 @@ impl Group {
     pub fn blurb(self) -> &'static str {
         match self {
             Group::Sdk => "The connection to your servers, shared by every Spoolframe app.",
-            Group::App => "The window, the player and the desktop’s media keys.",
+            Group::App => {
+                "The window, the player, the desktop’s media keys, and the palette, icons and fonts."
+            }
             Group::Flatpak => "C libraries the security-key prompt needs.",
         }
     }
@@ -717,5 +719,45 @@ mod tests {
             app,
             Some((Group::App, "GPL-3.0-or-later", env!("CARGO_PKG_VERSION")))
         );
+    }
+
+    #[test]
+    fn the_committed_list_names_the_palette_the_icons_and_the_fonts() {
+        let licenses = committed();
+        let found: Vec<(&str, &str)> = licenses
+            .components()
+            .iter()
+            .filter(|c| c.group == Group::App)
+            .filter(|c| {
+                [
+                    "Catppuccin",
+                    "Lucide",
+                    "Figtree",
+                    "Outfit",
+                    "JetBrains Mono",
+                ]
+                .contains(&c.name.as_str())
+                    || c.name == "Bricolage Grotesque"
+            })
+            .map(|c| (c.name.as_str(), c.license.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                ("Bricolage Grotesque", "OFL-1.1"),
+                ("Catppuccin", "MIT"),
+                ("Figtree", "OFL-1.1"),
+                ("JetBrains Mono", "OFL-1.1"),
+                ("Lucide", "ISC AND MIT"),
+                ("Outfit", "OFL-1.1"),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_other_chip_shows_the_fonts() {
+        let licenses = committed();
+        let shown = licenses.shown("figtree", Chip::Other);
+        assert_eq!(shown.len(), 1);
     }
 }

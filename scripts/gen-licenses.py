@@ -18,6 +18,9 @@ What is listed is what the app's binary links, on Linux:
   their code is in the binary), no crates for other platforms. cargo tree
   resolves features as a build of the app would; `cargo metadata`'s resolve
   turns on what dev-dependencies ask for too, and lists more.
+- Fixed entries, read from the repo (fixed_components): the Catppuccin
+  palette, the Lucide icons (icons/LICENSE, VERSION in icons/convert.sh)
+  and the fonts in fonts/ (their name tables and OFL texts).
 - The C libraries the Flatpak manifest builds as modules (FLATPAK below).
 
 GTK, libadwaita, GStreamer and the rest of the GNOME runtime are not
@@ -40,6 +43,7 @@ import argparse
 import json
 import os
 import re
+import struct
 import subprocess
 import sys
 
@@ -47,6 +51,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "crates", "spoolframe-linux-app", "data", "licenses.json")
 SPDX_DIR = os.path.join(ROOT, "scripts", "licenses", "spdx")
 FLATPAK_DIR = os.path.join(ROOT, "scripts", "licenses", "flatpak")
+ICONS_DIR = os.path.join(ROOT, "crates", "spoolframe-linux-app", "icons")
+FONTS_DIR = os.path.join(ROOT, "crates", "spoolframe-linux-app", "fonts")
+CATPPUCCIN_LICENSE = os.path.join(ROOT, "scripts", "licenses", "catppuccin.LICENSE")
 MANIFEST = os.path.join(ROOT, "flatpak", "casa.coldsteel.Spoolframe.yml")
 
 APP = "spoolframe-linux-app"
@@ -60,6 +67,17 @@ SDK_REGISTRY = "cargo.coldsteel.casa"
 FLATPAK = {
     "libcbor": {"version": "0.13.0", "license": "MIT", "file": "libcbor.LICENSE.md"},
     "libfido2": {"version": "1.17.0", "license": "BSD-2-Clause", "file": "libfido2.LICENSE"},
+}
+
+# Fonts in the app's fonts/ folder: file name to the name shown. Each has
+# its own OFL text next to it (<stem>-OFL.txt). --check fails for a .ttf
+# with no entry here, and for one whose name table no longer says OFL 1.1
+# or whose copyright differs from the first line of that text.
+FONTS = {
+    "BricolageGrotesque.ttf": "Bricolage Grotesque",
+    "Figtree.ttf": "Figtree",
+    "JetBrainsMono.ttf": "JetBrains Mono",
+    "Outfit.ttf": "Outfit",
 }
 
 # A license file's id, by its wording. The first that matches wins, so the
@@ -255,6 +273,78 @@ def flatpak_modules():
     return modules
 
 
+def font_names(path):
+    """{nameID: string} of a TTF's `name` table (first record of each id)."""
+    with open(path, "rb") as f:
+        data = f.read()
+    for i in range(struct.unpack(">H", data[4:6])[0]):
+        tag, _, offset, _ = struct.unpack(">4sIII", data[12 + 16 * i:28 + 16 * i])
+        if tag != b"name":
+            continue
+        count, strings = struct.unpack(">HH", data[offset + 2:offset + 6])
+        out = {}
+        for j in range(count):
+            platform, _, _, name_id, length, at = struct.unpack(
+                ">6H", data[offset + 6 + 12 * j:offset + 18 + 12 * j]
+            )
+            raw = data[offset + strings + at:offset + strings + at + length]
+            out.setdefault(name_id, raw.decode("utf-16-be" if platform in (0, 3) else "latin-1"))
+        return out
+    sys.exit(f"gen-licenses: {os.path.relpath(path, ROOT)} has no name table")
+
+
+def fixed_components(text_id):
+    """Catppuccin, Lucide and the fonts: what the app ships besides crates,
+    read from the repo so that --check sees drift."""
+    out = []
+
+    text = read(CATPPUCCIN_LICENSE)
+    if "Copyright (c) 2021 Catppuccin" not in text or classify(text) != ["MIT"]:
+        sys.exit("gen-licenses: scripts/licenses/catppuccin.LICENSE is no longer MIT, "
+                 "Copyright (c) 2021 Catppuccin: update the entry in fixed_components")
+    out.append({"name": "Catppuccin", "version": "palette", "group": "app", "license": "MIT",
+                "copyright": holders([text]), "texts": {"MIT": text_id(text)}})
+
+    with open(os.path.join(ICONS_DIR, "convert.sh"), encoding="utf-8") as f:
+        m = re.search(r"(?m)^VERSION=(\S+)\s*$", f.read())
+    if not m:
+        sys.exit("gen-licenses: icons/convert.sh has no VERSION= line")
+    text = read(os.path.join(ICONS_DIR, "LICENSE"))
+    # Lucide's file holds ISC for Lucide and MIT for the icons from Feather.
+    if classify(text) != ["MIT", "ISC"] or "Lucide Icons and Contributors" not in text:
+        sys.exit("gen-licenses: icons/LICENSE is no longer ISC plus Feather's MIT: "
+                 "read it and update the entry in fixed_components")
+    out.append({"name": "Lucide", "version": m.group(1), "group": "app",
+                "license": "ISC AND MIT", "copyright": holders([text]),
+                "texts": {"ISC": text_id(text), "MIT": text_id(text)}})
+
+    on_disk = sorted(n for n in os.listdir(FONTS_DIR) if n.endswith(".ttf"))
+    for name in on_disk:
+        if name not in FONTS:
+            sys.exit(f"gen-licenses: fonts/{name} has no entry in FONTS in this script: "
+                     "add it, with its OFL text next to it")
+    for name, title in sorted(FONTS.items(), key=lambda kv: kv[1]):
+        if name not in on_disk:
+            sys.exit(f"gen-licenses: FONTS lists {name}, which is not in fonts/: remove it")
+        names = font_names(os.path.join(FONTS_DIR, name))
+        grant = names.get(13, "") + " " + names.get(14, "")
+        if "SIL Open Font License, Version 1.1" not in grant:
+            sys.exit(f"gen-licenses: fonts/{name} no longer says SIL OFL 1.1 in its name "
+                     f"table ({names.get(13)!r}): read its license and update the entry")
+        text = read(os.path.join(FONTS_DIR, name[:-4] + "-OFL.txt"))
+        copyright = names[0].strip()
+        if text.split("\n", 1)[0].strip() != copyright:
+            sys.exit(f"gen-licenses: fonts/{name[:-4]}-OFL.txt does not start with the font's "
+                     f"copyright, {copyright!r}: replace the text")
+        version = re.match(r"Version\s+(\S+?)(?:;|$|\s)", names.get(5, ""))
+        if not version:
+            sys.exit(f"gen-licenses: fonts/{name} has no version in its name table")
+        out.append({"name": title, "version": version.group(1), "group": "app",
+                    "license": "OFL-1.1", "copyright": [copyright],
+                    "texts": {"OFL-1.1": text_id(text)}})
+    return out
+
+
 def generate():
     metadata = json.loads(cargo("metadata", "--locked", "--format-version", "1"))
     workspace = set(metadata["workspace_members"])
@@ -298,6 +388,8 @@ def generate():
             "copyright": lines,
             "texts": {spdx: text_id(text) for spdx, text in by_id.items()},
         })
+
+    components.extend(fixed_components(text_id))
 
     modules = flatpak_modules()
     for name, version in sorted(modules.items()):
