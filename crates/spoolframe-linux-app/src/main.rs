@@ -18,6 +18,8 @@ mod invite;
 mod key_prompt;
 mod leave_server;
 mod library;
+mod licenses;
+mod licenses_page;
 mod logo;
 // Text shown as it is where GTK reads markup, and the checks over the
 // sources that keep it so.

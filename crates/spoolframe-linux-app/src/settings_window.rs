@@ -96,6 +96,8 @@ pub fn window(parent: &impl IsA<gtk::Window>, needs: Needs, open: Open) -> adw::
     let toasts = adw::ToastOverlay::new();
     toasts.set_child(Some(&stack));
     let client = needs.servers.client.clone();
+    // About opens Open source licenses and a license's text over itself.
+    let about = crate::licenses_page::about_view();
     let pages: [(&str, gtk::Widget); 6] = [
         (
             "appearance",
@@ -111,7 +113,7 @@ pub fn window(parent: &impl IsA<gtk::Window>, needs: Needs, open: Open) -> adw::
             crate::identity_page::page(client.clone(), &toasts).upcast(),
         ),
         ("shared", preferences::shared(client.identities()).upcast()),
-        ("about", preferences::about().upcast()),
+        ("about", about.clone().upcast()),
     ];
     for (name, page) in pages {
         stack.add_named(&page, Some(name));
@@ -187,6 +189,18 @@ pub fn window(parent: &impl IsA<gtk::Window>, needs: Needs, open: Open) -> adw::
     narrow.add_setter(&split, "collapsed", Some(&true.to_value()));
     window.add_breakpoint(narrow);
 
+    // The header names About's page in view, as it changes.
+    {
+        let (content, stack) = (content.clone(), stack.clone());
+        about.connect_visible_page_notify(move |about| {
+            if stack.visible_child_name().as_deref() == Some("about")
+                && let Some(page) = about.visible_page()
+            {
+                content.set_title(&page.title());
+            }
+        });
+    }
+
     let view = Rc::new(View {
         stack,
         split,
@@ -203,6 +217,15 @@ pub fn window(parent: &impl IsA<gtk::Window>, needs: Needs, open: Open) -> adw::
         view.device.connect_row_activated(move |_, row| {
             if let Some(view) = weak.upgrade() {
                 view.servers_list.unselect_all();
+                // About from the sidebar is About, not the license last read.
+                if let Some(about) = view
+                    .stack
+                    .child_by_name("about")
+                    .and_downcast::<adw::NavigationView>()
+                    && row.widget_name() == "about"
+                {
+                    crate::licenses_page::back_to_about(&about);
+                }
                 view.show(&row.widget_name());
             }
         });
@@ -297,9 +320,13 @@ impl View {
             .find(|(n, ..)| n == name)
             .map(|(_, server, _)| server.name.clone());
         let title = server_name.or_else(|| {
-            self.stack
-                .visible_child()
-                .and_downcast::<adw::PreferencesPage>()
+            let child = self.stack.visible_child()?;
+            if let Some(about) = child.downcast_ref::<adw::NavigationView>() {
+                return about.visible_page().map(|page| page.title().to_string());
+            }
+            child
+                .downcast::<adw::PreferencesPage>()
+                .ok()
                 .map(|page| page.title().to_string())
         });
         if let Some(title) = title {

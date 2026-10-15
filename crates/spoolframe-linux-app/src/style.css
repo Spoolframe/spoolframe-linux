@@ -1688,3 +1688,33 @@ popover.scrub-preview > contents {
   background-color: alpha(var(--error-color), 0.1);
   border: 1px solid alpha(var(--error-color), 0.4);
 }
+
+/* Settings › About › Open source licenses (LinuxLicenses,
+   LinuxLicenseText): Outfit titles, the license as a mono pill, rows of
+   name · version, and the text in its own dark frame. */
+.license-title {
+  font-family: "Outfit", sans-serif;
+  font-size: 24px;
+  font-weight: 600;
+}
+.license-pill {
+  font-size: 12px;
+  font-weight: 500;
+  padding: 3px 9px;
+}
+.license-row {
+  min-height: 46px;
+  padding: 0 14px 0 16px;
+}
+.license-toggle button {
+  font-size: 12px;
+}
+.license-text-frame {
+  border-radius: 12px;
+  border: 1px solid alpha(currentColor, 0.15);
+}
+textview.license-text,
+textview.license-text text {
+  background-color: var(--sidebar-bg-color);
+  font-size: 12.5px;
+}

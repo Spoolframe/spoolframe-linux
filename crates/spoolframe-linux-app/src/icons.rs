@@ -94,6 +94,7 @@ pub const CONNECTION: &str = "lucide-globe-symbolic";
 pub const DOWNLOADS: &str = "lucide-download-symbolic";
 pub const SHARED: &str = "lucide-users-symbolic";
 pub const ABOUT: &str = "lucide-info-symbolic";
+pub const LICENSES: &str = "lucide-book-open-symbolic";
 // Search.
 pub const HISTORY: &str = "lucide-history-symbolic";
 pub const CLEAR_RECENT: &str = "lucide-list-x-symbolic";
@@ -166,6 +167,7 @@ const ALL: &[&str] = &[
     DOWNLOADS,
     SHARED,
     ABOUT,
+    LICENSES,
     HISTORY,
     CLEAR_RECENT,
     CALENDAR,
