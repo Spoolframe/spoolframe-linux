@@ -56,6 +56,17 @@
   episodes. On a show's page choosing one plays it from your place;
   elsewhere it opens the playlist; right-click does the other. The rows
   are read with the page, so a change shows the next time it opens.
+- Liked and All (PX-43), on a server that has them: hearts on an
+  album's track rows, on a playlist's track entries and beside the title
+  in the bar while a track plays; a tap likes or un-likes at once, and
+  puts it back with a word if the server refuses. An album's page has a
+  heart by Play, full when every track is liked, half when some are: a
+  tap on a full one un-likes the album, on any other likes the rest.
+  Playlists lists Liked and All first, under Music, with their own
+  tiles, and Pinned can hold them. Neither is renamed, shared or
+  deleted; Liked's Edit reorders and removes; All is read-only. Add to
+  playlist shows them greyed: Liked takes tracks by their hearts, and
+  All has every track already.
 - Play history (PX-52), on a server that keeps it: Home has a
   "Recently played music" row, the albums of the tracks played lately on
   any device, newest first. Movie and episode pages say how often they

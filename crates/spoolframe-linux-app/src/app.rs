@@ -14,7 +14,7 @@ use gtk::glib;
 use relm4::{Component, ComponentParts, ComponentSender};
 use spoolframe_linux_core::backend::{
     BackendError, ChosenTracks, Client, ConnectionState, EntryId, HomeScreen, Invite, ItemDetail,
-    Kinds, Person, PlaySettings, PlaylistEdit, PlaylistEvent, PlaylistList, PlaylistNext,
+    Kinds, Liked, Person, PlaySettings, PlaylistEdit, PlaylistEvent, PlaylistList, PlaylistNext,
     PlaylistPage, PlaylistRef, PlaylistSummary, PlaylistUpdate, Profile, ProfileSignIn,
     SearchScope, Selection, Server, ServerKey, Session, TrackPreferencesInfo, Visibility,
 };
@@ -379,6 +379,11 @@ pub enum Msg {
     /// Tracks of a known album to the play queue.
     EnqueueTracks(Vec<Item>, Option<Album>, Enqueue),
     SetWatched(MediaId, bool),
+    /// Likes (`true`) or un-likes tracks or albums (PX-43); the hearts as
+    /// they were before the tap, for a refusal.
+    Like(Vec<MediaId>, bool, Vec<(MediaId, bool)>),
+    /// Asks for a track's heart, for the bar.
+    AskHeart(MediaId),
     /// Remember these tracks for the item (an episode: its series).
     RememberTracks(MediaId, Selection),
     /// Forget them, and reopen the item's page with the server's choice.
@@ -518,12 +523,23 @@ pub enum Loaded {
         Vec<PlaylistRef>,
     ),
     Artist(Artist, Result<Vec<Item>, BackendError>, Vec<PlaylistRef>),
-    /// An album, its artist's name and its tracks.
+    /// An album, its artist's name and its tracks, the playlists holding
+    /// it, and which tracks are liked (PX-43; `None` without Liked).
     Album(
         Album,
         Result<(String, Vec<Item>), BackendError>,
         Vec<PlaylistRef>,
+        Option<Vec<MediaId>>,
     ),
+    /// A like (`true`) or un-like answered, with the hearts as they were
+    /// before it, to put back on a refusal.
+    Liked(
+        bool,
+        Result<PlaylistSummary, BackendError>,
+        Vec<(MediaId, bool)>,
+    ),
+    /// A track's heart the bar asked for.
+    Heart(MediaId, Result<Option<Liked>, BackendError>),
     WatchChanged(Result<(), BackendError>),
     /// A change the user does not need to hear about unless it failed.
     Saved(Result<(), BackendError>),
@@ -604,7 +620,9 @@ impl Loaded {
             | Loaded::Person(_, Err(e))
             | Loaded::Show(_, Err(e), _, _)
             | Loaded::Artist(_, Err(e), _)
-            | Loaded::Album(_, Err(e), _)
+            | Loaded::Album(_, Err(e), _, _)
+            | Loaded::Liked(_, Err(e), _)
+            | Loaded::Heart(_, Err(e))
             | Loaded::WatchChanged(Err(e))
             | Loaded::Hidden(_, _, _, Err(e))
             | Loaded::Enqueued(_, Err(e))
@@ -1000,6 +1018,7 @@ impl Component for App {
                 enqueue: None,
                 open_person: None,
                 add_to_playlist: None,
+                hearts: None,
             }),
             connection_watch: None,
             sign_out_watch: None,
@@ -1920,6 +1939,27 @@ impl Component for App {
             Msg::EnqueueTracks(items, album, at) => {
                 self.enqueue(vec![(items, album)], at, widgets, &sender)
             }
+            Msg::Like(items, likes, before) => {
+                let Some(session) = self.session.clone() else {
+                    return;
+                };
+                self.command(&sender, async move {
+                    let done = match likes {
+                        true => session.like(&items).await,
+                        false => session.unlike(&items).await,
+                    };
+                    Loaded::Liked(likes, done, before)
+                });
+            }
+            Msg::AskHeart(id) => {
+                let Some(session) = self.session.clone() else {
+                    return;
+                };
+                self.command(&sender, async move {
+                    let liked = session.item_detail(&id).await.map(|d| d.liked);
+                    Loaded::Heart(id, liked)
+                });
+            }
             Msg::SetWatched(id, watched) => {
                 let Some(session) = self.session.clone() else {
                     return;
@@ -2628,7 +2668,15 @@ impl Component for App {
                 let title = artist.name.clone();
                 push_error(widgets, &title, &e, Some((Item::Artist(artist), &sender)))
             }
-            Loaded::Album(album, Ok((artist, tracks)), refs) => {
+            Loaded::Album(album, Ok((artist, tracks)), refs, liked) => {
+                // The page's hearts start as the server has them.
+                if let (Some(hearts), Some(liked)) = (&cards.hearts, liked) {
+                    hearts.learn(
+                        tracks
+                            .iter()
+                            .map(|t| (t.id().clone(), liked.contains(t.id()))),
+                    );
+                }
                 let play: pages::PlayTracks = {
                     let (sender, album) = (sender.clone(), album.clone());
                     Rc::new(move |items, index, shuffle| {
@@ -2665,7 +2713,7 @@ impl Component for App {
                     ),
                 );
             }
-            Loaded::Album(album, Err(e), _) => {
+            Loaded::Album(album, Err(e), _, _) => {
                 let title = album.title.clone();
                 push_error(widgets, &title, &e, Some((Item::Album(album), &sender)))
             }
@@ -2866,6 +2914,11 @@ impl Component for App {
             // The entry the server picked plays, from where the user
             // stopped in it; the playback asks the server for each next.
             Loaded::PlaylistStarted(id, name, Ok(Some(next))) => {
+                if let Some(hearts) = &cards.hearts
+                    && matches!(next.item, Item::Track(_))
+                {
+                    hearts.learn([(next.item.id().clone(), next.liked)]);
+                }
                 let from = playlist_rules::resume_from(&next.item);
                 let playing = playlist_rules::Playing {
                     id,
@@ -2881,6 +2934,23 @@ impl Component for App {
                 toast_text(widgets, &format!("Nothing in {name} can play now."))
             }
             Loaded::PlaylistStarted(_, _, Err(e)) => toast(widgets, &e),
+            // Liked changed: its page, if shown, and the list hear of it
+            // by the playlist event that follows.
+            Loaded::Liked(_, Ok(_), _) => {}
+            Loaded::Liked(likes, Err(e), before) => {
+                if let Some(hearts) = &cards.hearts {
+                    hearts.learn(before);
+                }
+                let what = if likes { "Not liked" } else { "Still liked" };
+                toast_text(widgets, &format!("{what}: {e}"));
+            }
+            Loaded::Heart(id, Ok(liked)) => {
+                if let Some(hearts) = &cards.hearts {
+                    hearts.learn([(id, liked == Some(Liked::All))]);
+                }
+            }
+            // The bar's heart stays empty; the track plays on.
+            Loaded::Heart(_, Err(e)) => tracing::debug!(error = %e, "no heart for the bar"),
             Loaded::Preferences(open, result) => {
                 // Without the server's preferences, Settings still opens.
                 let tracks = result
@@ -3106,6 +3176,16 @@ impl App {
             add_to_playlist: session.has_playlists().then(|| -> views::AddToPlaylist {
                 let sender = sender.clone();
                 Rc::new(move |item| sender.input(Msg::AddToPlaylist(Box::new(item))))
+            }),
+            // New for each session: one's hearts are not another's.
+            hearts: session.has_liked().then(|| {
+                let (like, ask) = (sender.clone(), sender.clone());
+                crate::hearts::Hearts::new(
+                    Rc::new(move |items, likes, before| {
+                        like.input(Msg::Like(items, likes, before))
+                    }),
+                    Rc::new(move |id| ask.input(Msg::AskHeart(id))),
+                )
             }),
         });
         self.library_cache = Some(library::Cache::new(session.clone()));
@@ -3817,21 +3897,30 @@ impl App {
                         item: Item::Artist(full),
                         children,
                         playlists,
+                        ..
                     }) => Loaded::Artist(full, Ok(children), playlists),
                     Ok(detail) => Loaded::Artist(artist, Ok(detail.children), detail.playlists),
                     Err(e) => Loaded::Artist(artist, Err(e), Vec::new()),
                 }
             }),
             Item::Album(album) => self.command(sender, async move {
-                let (album, tracks, refs) = match read_item(backend.as_ref(), &album.id).await {
-                    Ok(ItemDetail {
-                        item: Item::Album(full),
-                        children,
-                        playlists,
-                    }) => (full, Ok(children), playlists),
-                    Ok(detail) => (album, Ok(detail.children), detail.playlists),
-                    Err(e) => (album, Err(e), Vec::new()),
-                };
+                let (album, tracks, refs, liked) =
+                    match read_item(backend.as_ref(), &album.id).await {
+                        Ok(ItemDetail {
+                            item: Item::Album(full),
+                            children,
+                            playlists,
+                            liked,
+                            liked_children,
+                        }) => (full, Ok(children), playlists, liked.map(|_| liked_children)),
+                        Ok(detail) => (
+                            album,
+                            Ok(detail.children),
+                            detail.playlists,
+                            detail.liked.map(|_| detail.liked_children),
+                        ),
+                        Err(e) => (album, Err(e), Vec::new(), None),
+                    };
                 let loaded = async {
                     let tracks = tracks?;
                     let artist = match &album.artist_name {
@@ -3844,7 +3933,7 @@ impl App {
                     Ok((artist, tracks))
                 }
                 .await;
-                Loaded::Album(album, loaded, refs)
+                Loaded::Album(album, loaded, refs, liked)
             }),
             // A track found by search plays on its own.
             Item::Track(_) => sender.input(Msg::Play(Box::new(PlayRequest::one(
@@ -3904,6 +3993,7 @@ async fn show_with_seasons(
             item: Item::Show(full),
             children,
             playlists,
+            ..
         }) => (full, children, playlists),
         Ok(detail) => (show, detail.children, detail.playlists),
         Err(e) => return (show, Err(e), Vec::new()),
@@ -3933,6 +4023,8 @@ async fn read_item(session: &dyn Session, id: &MediaId) -> Result<ItemDetail, Ba
         item,
         children,
         playlists: Vec::new(),
+        liked: None,
+        liked_children: Vec::new(),
     })
 }
 

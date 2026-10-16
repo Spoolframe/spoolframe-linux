@@ -1035,6 +1035,8 @@ impl Session for SdkSession {
                 item: detail.item,
                 children: detail.children,
                 playlists: detail.playlists,
+                liked: detail.liked,
+                liked_children: detail.liked_children,
             })
         }))
     }
@@ -1386,6 +1388,22 @@ impl Session for SdkSession {
 
     fn has_liked(&self) -> bool {
         self.session.features().liked
+    }
+
+    fn like<'a>(
+        &'a self,
+        items: &'a [MediaId],
+    ) -> BoxFuture<'a, Result<PlaylistSummary, BackendError>> {
+        let items = items.to_vec();
+        Box::pin(self.call(move |s| async move { s.like(&items).await }))
+    }
+
+    fn unlike<'a>(
+        &'a self,
+        items: &'a [MediaId],
+    ) -> BoxFuture<'a, Result<PlaylistSummary, BackendError>> {
+        let items = items.to_vec();
+        Box::pin(self.call(move |s| async move { s.unlike(&items).await }))
     }
 
     fn has_last_viewed(&self) -> bool {

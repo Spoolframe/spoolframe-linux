@@ -435,6 +435,11 @@ pub struct ItemDetail {
     pub children: Vec<Item>,
     /// Empty when none hold it, or the server has no playlists.
     pub playlists: Vec<PlaylistRef>,
+    /// Its heart (PX-43): a track's `All` or `None`, an album's `All`,
+    /// `Some` or `None`; `None` for anything else, or without Liked.
+    pub liked: Option<Liked>,
+    /// An album's tracks among `children` that are liked.
+    pub liked_children: Vec<MediaId>,
 }
 
 /// What an invite link says (P6-01), read without a word to the server:
@@ -1206,6 +1211,22 @@ pub trait Session: Send + Sync {
     /// `spoolframe:liked`): never without playlists. Without it the
     /// playlists list neither, and no heart is shown.
     fn has_liked(&self) -> bool;
+
+    /// Likes tracks or albums (PX-43): those not liked yet go to the top
+    /// of the user's Liked, an album's tracks in order. 1 to 100 at a
+    /// time, tracks and albums only ([`BackendError::KindNotAllowed`]).
+    /// Liked as it is after. Without [`Session::has_liked`],
+    /// [`BackendError::Unsupported`], unsent.
+    fn like<'a>(
+        &'a self,
+        items: &'a [MediaId],
+    ) -> BoxFuture<'a, Result<PlaylistSummary, BackendError>>;
+
+    /// Takes tracks, or every track of albums, out of the user's Liked.
+    fn unlike<'a>(
+        &'a self,
+        items: &'a [MediaId],
+    ) -> BoxFuture<'a, Result<PlaylistSummary, BackendError>>;
 
     /// Whether items' playback states say when each was last viewed
     /// (`spoolframe:last-viewed`). Data only: without it the field is

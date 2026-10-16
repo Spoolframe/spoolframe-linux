@@ -345,6 +345,7 @@ impl SearchPage {
                     enqueue: needs.cards.enqueue.clone(),
                     add_to_playlist: needs.cards.add_to_playlist.clone(),
                     open_person: needs.cards.open_person.clone(),
+                    hearts: needs.cards.hearts.clone(),
                 })
             };
             Self {
@@ -1632,6 +1633,7 @@ mod tests {
                 enqueue: None,
                 open_person: None,
                 add_to_playlist: None,
+                hearts: None,
             }),
             play: Rc::new(|_| {}),
             open_person: Rc::new(|_| {}),

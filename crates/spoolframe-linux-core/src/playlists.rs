@@ -13,9 +13,9 @@ use std::time::Duration;
 use spoolframe_types::{Item, MediaId, MediaKind};
 
 use crate::backend::{
-    BackendError, EntryId, Kinds, PlaylistChange, PlaylistEdit, PlaylistEntry, PlaylistEvent,
-    PlaylistNext, PlaylistOwnerKind, PlaylistPage, PlaylistShare, PlaylistSummary, Session,
-    Visibility,
+    BackendError, Builtin, EntryId, Kinds, Liked, PlaylistChange, PlaylistEdit, PlaylistEntry,
+    PlaylistEvent, PlaylistNext, PlaylistOwnerKind, PlaylistPage, PlaylistShare, PlaylistSummary,
+    Session, Visibility,
 };
 
 /// The most entries a page of a playlist holds.
@@ -24,6 +24,9 @@ pub const PAGE: u32 = 200;
 /// The Playlists section's groups, each in the server's order.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Sections<'a> {
+    /// Liked and All (PX-43), first, under Music: the server lists them
+    /// first, Liked before All.
+    pub builtin: Vec<&'a PlaylistSummary>,
     pub mine: Vec<&'a PlaylistSummary>,
     pub shared_with_me: Vec<&'a PlaylistSummary>,
     pub server_wide: Vec<&'a PlaylistSummary>,
@@ -34,6 +37,10 @@ pub struct Sections<'a> {
 pub fn sections(list: &[PlaylistSummary]) -> Sections<'_> {
     let mut sections = Sections::default();
     for playlist in list {
+        if playlist.builtin.is_some() {
+            sections.builtin.push(playlist);
+            continue;
+        }
         match playlist.owner_kind {
             PlaylistOwnerKind::Mine => sections.mine.push(playlist),
             PlaylistOwnerKind::ServerWide => sections.server_wide.push(playlist),
@@ -59,6 +66,11 @@ pub fn new_pin_position(list: &[PlaylistSummary]) -> u32 {
 
 /// Whose a playlist is, as its card and row say under its name.
 pub fn owner_line(playlist: &PlaylistSummary) -> String {
+    match playlist.builtin {
+        Some(Builtin::All) => return "Built in · every track".to_owned(),
+        Some(_) => return "Built in".to_owned(),
+        None => {}
+    }
     match (playlist.owner_kind, &playlist.visibility) {
         (PlaylistOwnerKind::Mine, Visibility::Shared { with }) if !with.is_empty() => {
             match with.len() {
@@ -106,6 +118,10 @@ pub enum Offer {
     ReadOnly,
     /// Server-wide, and the user is no admin: listed greyed.
     AdminsEdit,
+    /// Liked (PX-43): a track gets in by its heart, never by an add.
+    UseHeart,
+    /// All: it holds every track already.
+    HasEverything,
 }
 
 impl Offer {
@@ -115,6 +131,8 @@ impl Offer {
             Offer::Adds => None,
             Offer::ReadOnly => Some("Read only"),
             Offer::AdminsEdit => Some("Server-wide · admins edit"),
+            Offer::UseHeart => Some("Use the heart instead"),
+            Offer::HasEverything => Some("Built in · every track already"),
         }
     }
 }
@@ -127,16 +145,34 @@ pub fn add_targets(list: &[PlaylistSummary], kind: MediaKind) -> Vec<(&PlaylistS
         .iter()
         .filter(|p| p.kinds.allows(kind))
         .map(|p| {
-            let offer = match (p.can_edit, p.owner_kind) {
-                (true, _) => Offer::Adds,
-                (false, PlaylistOwnerKind::ServerWide) => Offer::AdminsEdit,
-                (false, _) => Offer::ReadOnly,
+            let offer = match (p.builtin, p.can_edit, p.owner_kind) {
+                (Some(Builtin::Liked), _, _) => Offer::UseHeart,
+                (Some(_), _, _) => Offer::HasEverything,
+                (None, true, _) => Offer::Adds,
+                (None, false, PlaylistOwnerKind::ServerWide) => Offer::AdminsEdit,
+                (None, false, _) => Offer::ReadOnly,
             };
             (p, offer)
         })
         .collect();
     targets.sort_by_key(|(_, offer)| *offer != Offer::Adds);
     targets
+}
+
+/// Whether a tap on a heart showing `liked` likes (true) or un-likes: a
+/// full heart un-likes, a half one likes the rest, an empty one likes.
+pub fn heart_likes(liked: Liked) -> bool {
+    !matches!(liked, Liked::All)
+}
+
+/// An album's heart from which of its `tracks` are `liked`: full when
+/// every one is, half when some are.
+pub fn album_heart(tracks: &[MediaId], liked: &std::collections::HashSet<MediaId>) -> Liked {
+    match tracks.iter().filter(|t| liked.contains(*t)).count() {
+        0 => Liked::None,
+        n if n == tracks.len() => Liked::All,
+        _ => Liked::Some,
+    }
 }
 
 /// A playlist's header line from its page: "7 episodes", "5 films, 2
@@ -704,9 +740,10 @@ mod tests {
         let list = ready(session(&client, "mum").playlists())
             .unwrap()
             .playlists;
+        // Of others' playlists; Liked and All are her own.
         assert_eq!(
             list.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
-            ["New this month"]
+            ["Liked", "All", "New this month"]
         );
     }
 
@@ -1634,6 +1671,278 @@ mod tests {
                 Err("Tick at least one kind it holds."),
                 Ok(("Heists".to_owned(), kinds, Visibility::ServerWide)),
             )
+        );
+    }
+
+    fn album() -> MediaId {
+        media(MediaKind::Album, "31")
+    }
+
+    fn track(n: u32) -> MediaId {
+        media(MediaKind::Track, &format!("4{n}"))
+    }
+
+    fn heart(session: &dyn Session, id: &MediaId) -> Option<Liked> {
+        ready(session.item_detail(id)).unwrap().liked
+    }
+
+    fn builtin(session: &dyn Session, which: Builtin) -> PlaylistSummary {
+        ready(session.playlists())
+            .unwrap()
+            .playlists
+            .into_iter()
+            .find(|p| p.builtin == Some(which))
+            .unwrap()
+    }
+
+    #[test]
+    fn liked_and_all_are_listed_first_apart_from_the_users_own() {
+        let client = FakeClient::new(None);
+        let list = ready(session(&client, "andrey").playlists())
+            .unwrap()
+            .playlists;
+        let groups = sections(&list);
+        assert_eq!(
+            (names(&groups.builtin), names(&groups.mine)),
+            (
+                vec!["Liked".to_owned(), "All".to_owned()],
+                vec!["Andor: the heists".to_owned(), "Movie night".to_owned()]
+            )
+        );
+    }
+
+    #[test]
+    fn liked_and_all_say_they_are_built_in() {
+        let andrey = session(&FakeClient::new(None), "andrey");
+        assert_eq!(
+            [
+                owner_line(&builtin(andrey.as_ref(), Builtin::Liked)),
+                owner_line(&builtin(andrey.as_ref(), Builtin::All)),
+            ],
+            ["Built in", "Built in · every track"]
+        );
+    }
+
+    #[test]
+    fn an_album_is_offered_liked_and_all_greyed_saying_why() {
+        let client = FakeClient::new(None);
+        let list = ready(session(&client, "andrey").playlists())
+            .unwrap()
+            .playlists;
+        let offered: Vec<_> = add_targets(&list, MediaKind::Album)
+            .into_iter()
+            .map(|(p, offer)| (p.name.as_str(), offer.reason()))
+            .collect();
+        assert_eq!(
+            offered,
+            [
+                ("Road trip", None),
+                ("Liked", Some("Use the heart instead")),
+                ("All", Some("Built in · every track already")),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_liked_track_fills_its_heart_and_half_fills_its_albums() {
+        let andrey = session(&FakeClient::new(None), "andrey");
+        ready(andrey.like(&[track(2)])).unwrap();
+        assert_eq!(
+            (
+                heart(andrey.as_ref(), &track(2)),
+                heart(andrey.as_ref(), &album())
+            ),
+            (Some(Liked::All), Some(Liked::Some))
+        );
+    }
+
+    #[test]
+    fn liking_an_album_likes_every_track_and_unliking_takes_them_out() {
+        let andrey = session(&FakeClient::new(None), "andrey");
+        ready(andrey.like(&[track(2)])).unwrap();
+        ready(andrey.like(&[album()])).unwrap();
+        let full = heart(andrey.as_ref(), &album());
+        ready(andrey.unlike(&[album()])).unwrap();
+        assert_eq!(
+            (full, heart(andrey.as_ref(), &album())),
+            (Some(Liked::All), Some(Liked::None))
+        );
+    }
+
+    #[test]
+    fn an_albums_details_name_its_liked_tracks() {
+        let andrey = session(&FakeClient::new(None), "andrey");
+        ready(andrey.like(&[track(4), track(1)])).unwrap();
+        let detail = ready(andrey.item_detail(&album())).unwrap();
+        assert_eq!(detail.liked_children, [track(1), track(4)]);
+    }
+
+    #[test]
+    fn the_newest_liked_is_first_in_liked() {
+        let andrey = session(&FakeClient::new(None), "andrey");
+        ready(andrey.like(&[track(1)])).unwrap();
+        let liked = ready(andrey.like(&[track(5)])).unwrap();
+        let entries: Vec<MediaId> = page(andrey.as_ref(), &liked.id)
+            .entries
+            .into_iter()
+            .map(|e| e.item.id().clone())
+            .collect();
+        assert_eq!(entries, [track(5), track(1)]);
+    }
+
+    #[test]
+    fn liked_entries_carry_their_hearts() {
+        let andrey = session(&FakeClient::new(None), "andrey");
+        let liked = ready(andrey.like(&[track(1)])).unwrap();
+        let hearts: Vec<bool> = page(andrey.as_ref(), &liked.id)
+            .entries
+            .iter()
+            .map(|e| e.liked)
+            .collect();
+        assert_eq!(hearts, [true]);
+    }
+
+    #[test]
+    fn only_tracks_and_albums_are_liked() {
+        let andrey = session(&FakeClient::new(None), "andrey");
+        assert_eq!(
+            ready(andrey.like(&[media(MediaKind::Artist, "30")])),
+            Err(BackendError::KindNotAllowed(
+                crate::backend::ItemKind::Artist
+            ))
+        );
+    }
+
+    #[test]
+    fn liked_and_all_are_never_renamed_or_deleted_and_all_never_edited() {
+        let andrey = session(&FakeClient::new(None), "andrey");
+        let rename = PlaylistUpdate {
+            name: Some("Mine".into()),
+            ..PlaylistUpdate::default()
+        };
+        let (liked, all) = (
+            builtin(andrey.as_ref(), Builtin::Liked),
+            builtin(andrey.as_ref(), Builtin::All),
+        );
+        let first = page(andrey.as_ref(), &all.id).entries[0].entry;
+        assert_eq!(
+            [
+                ready(andrey.update_playlist(&liked.id, rename.clone())).err(),
+                ready(andrey.delete_playlist(&all.id)).err(),
+                ready(andrey.edit_playlist(
+                    &all.id,
+                    all.revision,
+                    vec![PlaylistEdit::Remove { entry: first }]
+                ))
+                .err(),
+            ],
+            [
+                Some(BackendError::PlaylistReadOnly),
+                Some(BackendError::PlaylistReadOnly),
+                Some(BackendError::PlaylistReadOnly),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_track_gets_into_liked_by_its_heart_not_an_add() {
+        let andrey = session(&FakeClient::new(None), "andrey");
+        let liked = builtin(andrey.as_ref(), Builtin::Liked);
+        let added = ready(andrey.edit_playlist(
+            &liked.id,
+            liked.revision,
+            vec![PlaylistEdit::Add {
+                id: track(1),
+                before: None,
+            }],
+        ));
+        assert!(
+            matches!(added, Err(BackendError::InvalidInput(_))),
+            "{added:?}"
+        );
+    }
+
+    #[test]
+    fn liked_is_edited_but_has_no_panel_and_all_is_neither() {
+        let andrey = session(&FakeClient::new(None), "andrey");
+        let controls = |which| editor_controls(&builtin(andrey.as_ref(), which), true);
+        assert_eq!(
+            [controls(Builtin::Liked), controls(Builtin::All)],
+            [
+                EditorControls {
+                    edit: true,
+                    panel: false,
+                    server_wide: false
+                },
+                EditorControls {
+                    edit: false,
+                    panel: false,
+                    server_wide: false
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_album_with_a_liked_track_lists_liked_and_never_all() {
+        let andrey = session(&FakeClient::new(None), "andrey");
+        ready(andrey.like(&[track(3)])).unwrap();
+        let refs: Vec<_> = ready(andrey.item_detail(&album()))
+            .unwrap()
+            .playlists
+            .into_iter()
+            .map(|r| (r.name, r.builtin))
+            .collect();
+        assert_eq!(
+            refs,
+            [
+                ("Liked".to_owned(), Some(Builtin::Liked)),
+                ("Road trip".to_owned(), None)
+            ]
+        );
+    }
+
+    #[test]
+    fn without_liked_there_are_no_builtins_and_no_hearts() {
+        let client = FakeClient::new(None).with_features(crate::backend::Features {
+            playlists: true,
+            ..crate::backend::Features::default()
+        });
+        let andrey = session(&client, "andrey");
+        let list = ready(andrey.playlists()).unwrap().playlists;
+        assert_eq!(
+            (
+                sections(&list).builtin.len(),
+                heart(andrey.as_ref(), &album()),
+                ready(andrey.like(&[track(1)])).err()
+            ),
+            (
+                0,
+                None,
+                Some(BackendError::Unsupported("spoolframe:liked".into()))
+            )
+        );
+    }
+
+    #[test]
+    fn a_full_heart_unlikes_and_any_other_likes() {
+        assert_eq!(
+            [Liked::All, Liked::Some, Liked::None].map(heart_likes),
+            [false, true, true]
+        );
+    }
+
+    #[test]
+    fn an_albums_heart_is_full_half_or_empty_by_its_tracks() {
+        let tracks = [track(1), track(2)];
+        let liked = |ids: &[MediaId]| ids.iter().cloned().collect();
+        assert_eq!(
+            [
+                album_heart(&tracks, &liked(&[track(1), track(2)])),
+                album_heart(&tracks, &liked(&[track(2)])),
+                album_heart(&tracks, &liked(&[])),
+            ],
+            [Liked::All, Liked::Some, Liked::None]
         );
     }
 }

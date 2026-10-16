@@ -41,6 +41,8 @@ pub struct Cards {
     /// "Add to playlist…" for an item (PX-40); none on a server without
     /// playlists, so no menu offers it.
     pub add_to_playlist: Option<AddToPlaylist>,
+    /// Hearts on tracks and albums (PX-43); none without Liked.
+    pub hearts: Option<Rc<crate::hearts::Hearts>>,
 }
 
 /// Opens "Add to playlist" for an item.

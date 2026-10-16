@@ -107,6 +107,13 @@ pub const PLAYLISTS: &str = "lucide-list-music-symbolic";
 pub const PIN: &str = "lucide-pin-symbolic";
 pub const UNPIN: &str = "lucide-pin-off-symbolic";
 pub const EDIT: &str = "lucide-pencil-symbolic";
+// Hearts (PX-43): empty, full, and half for an album with some tracks
+// liked; and All's tile. The full and half hearts are Lucide's, filled
+// by hand (see their files).
+pub const HEART: &str = "lucide-heart-symbolic";
+pub const HEART_FULL: &str = "heart-filled-symbolic";
+pub const HEART_HALF: &str = "heart-half-symbolic";
+pub const ALL_TRACKS: &str = "lucide-infinity-symbolic";
 
 /// Every name above, for the tests.
 #[cfg(test)]
@@ -182,6 +189,10 @@ const ALL: &[&str] = &[
     PIN,
     UNPIN,
     EDIT,
+    HEART,
+    HEART_FULL,
+    HEART_HALF,
+    ALL_TRACKS,
 ];
 
 #[cfg(test)]

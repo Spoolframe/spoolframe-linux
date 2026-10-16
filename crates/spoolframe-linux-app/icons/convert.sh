@@ -25,6 +25,7 @@ ICONS=(
   ticket fingerprint copy
   download users info
   list-music pin pin-off pencil book-open
+  heart infinity
 )
 
 here="$(cd "$(dirname "$0")" && pwd)"

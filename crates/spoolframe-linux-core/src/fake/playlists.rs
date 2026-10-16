@@ -4,6 +4,10 @@
 //! hear. The rules are the server's as the protocol states them: kinds
 //! only widen, an edit on an old revision is redone unless it touches an
 //! entry changed since, and a pin that goes away leaves a note once.
+//! Each user also has Liked and All (PX-43), listed first, made the first
+//! time the user is seen: Liked changes by likes and by removes and
+//! moves, All is every track and read-only, and neither is renamed,
+//! shared or deleted.
 
 use std::collections::{HashMap, HashSet};
 
@@ -11,10 +15,13 @@ use spoolframe_types::{Item, MediaId};
 use tokio::sync::broadcast;
 
 use crate::backend::{
-    BackendError, EntryId, Features, ItemKind, Kinds, PinNote, PinNoteReason, PlaySettings,
-    PlaylistChange, PlaylistEdit, PlaylistEvent, PlaylistList, PlaylistOwnerKind, PlaylistRef,
-    PlaylistShare, PlaylistSummary, PlaylistUpdate, Repeat, Visibility,
+    BackendError, Builtin, EntryId, Features, ItemKind, Kinds, PinNote, PinNoteReason,
+    PlaySettings, PlaylistChange, PlaylistEdit, PlaylistEvent, PlaylistList, PlaylistOwnerKind,
+    PlaylistRef, PlaylistShare, PlaylistSummary, PlaylistUpdate, Repeat, Visibility,
 };
+
+/// The most items one like or unlike takes, as on the server.
+pub const LIKE_LIMIT: usize = 100;
 
 /// The most entries one `GetPlaylist` gives, as on the server.
 pub const PAGE_LIMIT: u32 = 200;
@@ -32,6 +39,8 @@ pub(super) struct Stored {
     /// The entries each revision touched, for redoing an edit made on an
     /// older one.
     pub touched: Vec<(u64, Vec<EntryId>)>,
+    /// Liked or All (PX-43), its owner's alone; `None` for one a user made.
+    pub builtin: Option<Builtin>,
 }
 
 /// Who a user is to the fake server.
@@ -64,6 +73,8 @@ pub(super) struct Store {
     settings: HashMap<(String, String), PlaySettings>,
     /// Items still in the library whose file cannot be read now.
     pub unavailable: HashSet<MediaId>,
+    /// Every track in the library, in order: what each user's All holds.
+    pub all_tracks: Vec<MediaId>,
     events: broadcast::Sender<PlaylistEvent>,
 }
 
@@ -86,6 +97,7 @@ impl Store {
             places: HashMap::new(),
             settings: HashMap::new(),
             unavailable: HashSet::new(),
+            all_tracks: Vec::new(),
             events: broadcast::channel(64).0,
         }
     }
@@ -110,6 +122,134 @@ impl Store {
                 spoolframe_protocol::features::PLAYLISTS.into(),
             ))
         }
+    }
+
+    /// Refuses a like or unlike without the feature, unsent.
+    fn check_liked(&self) -> Result<(), BackendError> {
+        match self.features.liked {
+            true => Ok(()),
+            false => Err(BackendError::Unsupported(
+                spoolframe_protocol::features::LIKED.into(),
+            )),
+        }
+    }
+
+    /// Makes `username`'s Liked (empty) and All the first time they are
+    /// seen, with the feature: the server has them for every user.
+    pub fn builtins_for(&mut self, username: &str) {
+        let has = self
+            .playlists
+            .iter()
+            .any(|p| p.owner == username && p.builtin.is_some());
+        if has || !self.features.liked {
+            return;
+        }
+        let tracks = Kinds {
+            tracks: true,
+            ..Kinds::default()
+        };
+        for (builtin, name) in [(Builtin::Liked, "Liked"), (Builtin::All, "All")] {
+            let id = self.make(username, name, tracks, Visibility::Personal);
+            let items = match builtin {
+                Builtin::All => self.all_tracks.clone(),
+                _ => Vec::new(),
+            };
+            let entries = items
+                .into_iter()
+                .map(|item| {
+                    self.next_entry += 1;
+                    (self.next_entry - 1, item)
+                })
+                .collect();
+            let stored = self.stored_mut(&id).expect("just made");
+            stored.builtin = Some(builtin);
+            stored.entries = entries;
+        }
+    }
+
+    fn liked_mut(&mut self, username: &str) -> &mut Stored {
+        self.playlists
+            .iter_mut()
+            .find(|p| p.owner == username && p.builtin == Some(Builtin::Liked))
+            .expect("made with the user's builtins")
+    }
+
+    /// The tracks in `username`'s Liked; none without the feature.
+    pub fn liked(&self, username: &str) -> HashSet<MediaId> {
+        if !self.features.liked {
+            return HashSet::new();
+        }
+        self.playlists
+            .iter()
+            .filter(|p| p.owner == username && p.builtin == Some(Builtin::Liked))
+            .flat_map(|p| p.entries.iter().map(|(_, item)| item.clone()))
+            .collect()
+    }
+
+    /// Likes `items`, each a track or an album already expanded to its
+    /// tracks by `expand`: those not liked yet go to the top, in order.
+    pub fn like(
+        &mut self,
+        items: &[MediaId],
+        viewer: Viewer<'_>,
+        expand: impl Fn(&MediaId) -> Result<Vec<Item>, BackendError>,
+    ) -> Result<PlaylistSummary, BackendError> {
+        self.check_liked()?;
+        let tracks = likeable(items, expand)?;
+        let liked = self.liked(viewer.username);
+        let mut fresh: Vec<MediaId> = Vec::new();
+        for track in tracks {
+            if !liked.contains(&track) && !fresh.contains(&track) {
+                fresh.push(track);
+            }
+        }
+        let made: Vec<(EntryId, MediaId)> = fresh
+            .into_iter()
+            .map(|item| {
+                self.next_entry += 1;
+                (self.next_entry - 1, item)
+            })
+            .collect();
+        let stored = self.liked_mut(viewer.username);
+        if !made.is_empty() {
+            stored.entries.splice(0..0, made);
+            stored.revision += 1;
+        }
+        let id = stored.id.clone();
+        self.liked_changed(&id, viewer)
+    }
+
+    /// Takes `items` (tracks, or albums' tracks) out of `username`'s Liked.
+    pub fn unlike(
+        &mut self,
+        items: &[MediaId],
+        viewer: Viewer<'_>,
+        expand: impl Fn(&MediaId) -> Result<Vec<Item>, BackendError>,
+    ) -> Result<PlaylistSummary, BackendError> {
+        self.check_liked()?;
+        let tracks: HashSet<MediaId> = likeable(items, expand)?.into_iter().collect();
+        let stored = self.liked_mut(viewer.username);
+        let before = stored.entries.len();
+        stored.entries.retain(|(_, item)| !tracks.contains(item));
+        if stored.entries.len() != before {
+            stored.revision += 1;
+        }
+        let id = stored.id.clone();
+        self.liked_changed(&id, viewer)
+    }
+
+    /// Liked as it is now, told to the user's other devices.
+    fn liked_changed(
+        &mut self,
+        id: &str,
+        viewer: Viewer<'_>,
+    ) -> Result<PlaylistSummary, BackendError> {
+        let (summary, _) = self.seen(id, viewer)?;
+        self.tell(PlaylistChange::Changed {
+            id: id.to_owned(),
+            revision: summary.revision,
+        });
+        Ok(summary)
     }
 
     /// A playlist the fixtures start with, with its entries.
@@ -143,6 +283,7 @@ impl Store {
             revision: 1,
             entries: Vec::new(),
             touched: Vec::new(),
+            builtin: None,
         });
         id
     }
@@ -160,10 +301,12 @@ impl Store {
             });
         }
         if stored.owner == viewer.username {
+            // Liked takes removes and moves; All nothing. Neither is
+            // renamed, shared or deleted.
             return Some(Access {
                 owner_kind: PlaylistOwnerKind::Mine,
-                can_edit: true,
-                can_manage: true,
+                can_edit: stored.builtin != Some(Builtin::All),
+                can_manage: stored.builtin.is_none(),
             });
         }
         match &stored.visibility {
@@ -201,7 +344,7 @@ impl Store {
             can_manage: access.can_manage,
             revision: stored.revision,
             pinned,
-            builtin: None,
+            builtin: stored.builtin,
             owner_name: None,
         })
     }
@@ -220,29 +363,43 @@ impl Store {
     }
 
     pub fn list(&self, viewer: Viewer<'_>) -> PlaylistList {
+        let mut playlists: Vec<PlaylistSummary> = self
+            .playlists
+            .iter()
+            .filter(|p| p.builtin.is_none() || self.features.liked)
+            .filter_map(|p| self.summary(p, viewer))
+            .collect();
+        // Liked, then All, then the rest in the order they were made.
+        playlists.sort_by_key(|p| match p.builtin {
+            Some(Builtin::Liked) => 0,
+            Some(_) => 1,
+            None => 2,
+        });
         PlaylistList {
-            playlists: self
-                .playlists
-                .iter()
-                .filter_map(|p| self.summary(p, viewer))
-                .collect(),
+            playlists,
             pin_notes: self.notes.get(viewer.username).cloned().unwrap_or_default(),
         }
     }
 
     /// The playlists `viewer` sees holding any of `items`.
+    /// All is never among them: it holds every track.
     pub fn holding(&self, items: &HashSet<MediaId>, viewer: Viewer<'_>) -> Vec<PlaylistRef> {
-        self.playlists
+        let mut refs: Vec<PlaylistRef> = self
+            .playlists
             .iter()
+            .filter(|p| p.builtin != Some(Builtin::All))
+            .filter(|p| p.builtin.is_none() || self.features.liked)
             .filter(|p| p.entries.iter().any(|(_, item)| items.contains(item)))
             .filter_map(|p| self.summary(p, viewer))
             .map(|s| PlaylistRef {
                 id: s.id,
                 name: s.name,
                 owner_kind: s.owner_kind,
-                builtin: None,
+                builtin: s.builtin,
             })
-            .collect()
+            .collect();
+        refs.sort_by_key(|r| r.builtin.is_none());
+        refs
     }
 
     pub fn place(&self, id: &str, viewer: Viewer<'_>) -> (Option<EntryId>, PlaySettings) {
@@ -393,6 +550,12 @@ impl Store {
         let mut adds = Vec::new();
         for edit in &edits {
             if let PlaylistEdit::Add { id: item, .. } = edit {
+                // A track gets into Liked only by a like.
+                if summary.builtin.is_some() {
+                    return Err(BackendError::InvalidInput(
+                        "Liked takes tracks by a like".into(),
+                    ));
+                }
                 if !summary.kinds.allows(item.kind()) {
                     return Err(BackendError::KindNotAllowed(ItemKind::from(item.kind())));
                 }
@@ -603,6 +766,29 @@ fn position(entries: &[(EntryId, MediaId)], before: Option<EntryId>) -> usize {
     before
         .and_then(|before| entries.iter().position(|(e, _)| *e == before))
         .unwrap_or(entries.len())
+}
+
+/// The tracks `items` like or unlike: a track itself, an album its
+/// tracks. Anything else is refused, as are none or too many at once.
+fn likeable(
+    items: &[MediaId],
+    expand: impl Fn(&MediaId) -> Result<Vec<Item>, BackendError>,
+) -> Result<Vec<MediaId>, BackendError> {
+    if items.is_empty() || items.len() > LIKE_LIMIT {
+        return Err(BackendError::InvalidInput(format!(
+            "1 to {LIKE_LIMIT} items at a time"
+        )));
+    }
+    let mut tracks = Vec::new();
+    for item in items {
+        match item.kind() {
+            spoolframe_types::MediaKind::Track | spoolframe_types::MediaKind::Album => {
+                tracks.extend(expand(item)?.iter().map(|t| t.id().clone()))
+            }
+            other => return Err(BackendError::KindNotAllowed(ItemKind::from(other))),
+        }
+    }
+    Ok(tracks)
 }
 
 /// A fake user's id as the server gives it.

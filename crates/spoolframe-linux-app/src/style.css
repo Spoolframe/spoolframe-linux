@@ -1700,6 +1700,36 @@ popover.scrub-preview > contents {
   border-radius: 5px;
 }
 
+/* Liked and All (PX-43), as board LinuxPlaylists draws them: Liked's
+   heart on red to pink, All's infinity on teal to blue, in the tiles'
+   dark ink. */
+.builtin-tile {
+  color: var(--accent-fg-color);
+}
+
+.builtin-liked {
+  background-image: linear-gradient(135deg, var(--accent-red), var(--accent-pink));
+}
+
+.builtin-all {
+  background-image: linear-gradient(135deg, var(--accent-teal), var(--accent-blue));
+}
+
+/* A heart: an outline in dimmed text, full or half in red. */
+button.heart {
+  min-width: 32px;
+  min-height: 32px;
+  padding: 0;
+}
+
+button.heart:not(.liked) {
+  opacity: 0.6;
+}
+
+button.heart.liked {
+  color: var(--accent-red);
+}
+
 .app-sidebar .sidebar-group {
   padding: 10px 12px 4px;
   font-size: 11px;

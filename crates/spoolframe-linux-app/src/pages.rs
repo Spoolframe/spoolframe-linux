@@ -1355,6 +1355,17 @@ pub fn album(
     buttons.append(&play_all);
     buttons.append(&shuffle);
     buttons.set_hexpand(true);
+    // The album's heart (PX-43): full, half or empty by its tracks.
+    let buttons = match &cards.hearts {
+        Some(hearts) => {
+            let ids = tracks.iter().map(|t| t.id().clone()).collect();
+            let row = gtk::Box::builder().spacing(10).build();
+            row.append(&buttons);
+            row.append(&hearts.album(&album.id, ids));
+            row
+        }
+        None => buttons,
+    };
     let item = Item::Album(album.clone());
     let buttons = match views::add_entry(&item, cards.add_to_playlist.as_ref()) {
         Some(add) => {
@@ -1399,6 +1410,9 @@ pub fn album(
         // Its plays (PX-52) where the row has no room to say them.
         if let Some(line) = crate::history::played_line(&t.playback, now) {
             row.set_tooltip_text(Some(&line));
+        }
+        if let Some(hearts) = &cards.hearts {
+            row.add_suffix(&hearts.track(&t.id));
         }
         if let Some(length) = t.duration {
             row.add_suffix(&label(

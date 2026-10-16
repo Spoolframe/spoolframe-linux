@@ -1302,6 +1302,29 @@ impl Session for FakeSession {
         Box::pin(async move {
             let (item, children) = self.item(id).await?;
             let store = self.lock_playlists();
+            let liked = store.liked(&self.username);
+            // A heart for a track or an album only, with Liked.
+            let liked_children: Vec<MediaId> = match id.kind() {
+                MediaKind::Album => children
+                    .iter()
+                    .map(|c| c.id().clone())
+                    .filter(|c| liked.contains(c))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let heart = match (store.features.liked, id.kind()) {
+                (false, _) => None,
+                (true, MediaKind::Track) => Some(match liked.contains(id) {
+                    true => crate::backend::Liked::All,
+                    false => crate::backend::Liked::None,
+                }),
+                (true, MediaKind::Album) => Some(match liked_children.len() {
+                    0 => crate::backend::Liked::None,
+                    n if n == children.len() => crate::backend::Liked::All,
+                    _ => crate::backend::Liked::Some,
+                }),
+                (true, _) => None,
+            };
             // Only for a client that listed the feature; none otherwise.
             let playlists = match store.features.playlists {
                 true => {
@@ -1319,6 +1342,8 @@ impl Session for FakeSession {
                 item,
                 children,
                 playlists,
+                liked: heart,
+                liked_children,
             })
         })
     }
@@ -2288,6 +2313,28 @@ impl Session for FakeSession {
         self.features.liked
     }
 
+    fn like<'a>(
+        &'a self,
+        items: &'a [MediaId],
+    ) -> BoxFuture<'a, Result<PlaylistSummary, BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            self.lock_playlists()
+                .like(items, self.viewer(), |item| self.tracks_for(item))
+        })
+    }
+
+    fn unlike<'a>(
+        &'a self,
+        items: &'a [MediaId],
+    ) -> BoxFuture<'a, Result<PlaylistSummary, BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            self.lock_playlists()
+                .unlike(items, self.viewer(), |item| self.tracks_for(item))
+        })
+    }
+
     fn has_last_viewed(&self) -> bool {
         self.features.last_viewed
     }
@@ -2359,6 +2406,7 @@ impl Session for FakeSession {
             store.check()?;
             let viewer = self.viewer();
             let (playlist, stored) = store.seen(id, viewer)?;
+            let liked = store.liked(&self.username);
             let watch = self.watch();
             // An item gone from the library drops out.
             let entries: Vec<_> = stored
@@ -2370,7 +2418,7 @@ impl Session for FakeSession {
                         entry: *entry,
                         item: self.with_state(found, &watch),
                         unavailable: store.unavailable.contains(item),
-                        liked: false,
+                        liked: liked.contains(item),
                     })
                 })
                 .collect();
@@ -2427,11 +2475,7 @@ impl Session for FakeSession {
             self.guard()?;
             self.lock_playlists()
                 .edit(id, revision, edits, self.viewer(), |item| {
-                    let leaves = self.leaves(std::slice::from_ref(item));
-                    match leaves.is_empty() {
-                        true => Err(BackendError::NotFound(item.to_string())),
-                        false => Ok(leaves),
-                    }
+                    self.tracks_for(item)
                 })
         })
     }
@@ -2796,8 +2840,21 @@ impl FakeSession {
         self.overrides.lock().expect("fake state is never poisoned")
     }
 
+    /// The store, with this user's Liked and All made if they are new.
     fn lock_playlists(&self) -> std::sync::MutexGuard<'_, playlists::Store> {
-        self.playlists.lock().expect("fake state is never poisoned")
+        let mut store = self.playlists.lock().expect("fake state is never poisoned");
+        store.builtins_for(&self.username);
+        store
+    }
+
+    /// An item's tracks, for an edit's add or a like: a track itself, an
+    /// album or artist its tracks, in order.
+    fn tracks_for(&self, item: &MediaId) -> Result<Vec<Item>, BackendError> {
+        let leaves = self.leaves(std::slice::from_ref(item));
+        match leaves.is_empty() {
+            true => Err(BackendError::NotFound(item.to_string())),
+            false => Ok(leaves),
+        }
     }
 
     fn viewer(&self) -> playlists::Viewer<'_> {
@@ -2837,7 +2894,7 @@ impl FakeSession {
             entry,
             item: self.with_state(found, &self.watch()),
             markers: self.serving.markers.clone(),
-            liked: false,
+            liked: self.lock_playlists().liked(&self.username).contains(item),
         })
     }
 }
@@ -4235,6 +4292,9 @@ fn seeded_playlists() -> playlists::Store {
         ..Kinds::default()
     };
     let mut store = playlists::Store::new(&home_media().0);
+    store.all_tracks = (0..9)
+        .map(|i| media(MediaKind::Track, &format!("4{i}")))
+        .collect();
     let heists = store.seed(
         FAKE_ADMIN,
         "Andor: the heists",

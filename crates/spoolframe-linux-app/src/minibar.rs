@@ -59,6 +59,10 @@ pub struct MiniBar {
     /// Bumped on each attach and detach, so an old playback's listener
     /// lets go.
     generation: Rc<Cell<u64>>,
+    /// The playing track's heart (PX-43), beside its title; empty for
+    /// video and without Liked.
+    heart: adw::Bin,
+    follow: RefCell<Option<crate::hearts::Follow>>,
 }
 
 impl MiniBar {
@@ -214,8 +218,14 @@ impl MiniBar {
         end.append(&expand_button);
         end.append(&stop_button);
 
+        // The heart is beside the titles, not in their button: a button
+        // in a button takes no clicks of its own.
+        let heart = adw::Bin::builder().valign(gtk::Align::Center).build();
+        let start = gtk::Box::builder().spacing(4).build();
+        start.append(&open);
+        start.append(&heart);
         let bar = gtk::CenterBox::builder()
-            .start_widget(&open)
+            .start_widget(&start)
             // Grows with the window up to the board's 520 px.
             .center_widget(
                 &adw::Clamp::builder()
@@ -255,6 +265,8 @@ impl MiniBar {
             art: RefCell::new(None),
             cover_album: RefCell::new(None),
             generation: Rc::new(Cell::new(0)),
+            heart,
+            follow: RefCell::new(None),
         })
     }
 
@@ -295,6 +307,14 @@ impl MiniBar {
         }
         self.art.replace(cards.art.clone());
         self.cover_album.replace(None);
+        let heart = cards
+            .hearts
+            .as_ref()
+            .filter(|_| !video)
+            .map(|h| h.following());
+        self.heart
+            .set_child(heart.as_ref().map(|(button, _)| button));
+        self.follow.replace(heart.map(|(_, follow)| follow));
         // Video jumps within the film; music skips between tracks, with
         // shuffle and repeat.
         self.video_transport.set_visible(video);
@@ -339,6 +359,8 @@ impl MiniBar {
         self.current.replace(None);
         self.thumb.set_child(None::<&gtk::Widget>);
         self.music_slot.set_child(None::<&gtk::Widget>);
+        self.heart.set_child(None::<&gtk::Widget>);
+        self.follow.replace(None);
         self.music.replace(None);
         self.revealer.set_reveal_child(false);
     }
@@ -369,6 +391,12 @@ impl MiniBar {
             Change::Item(item) => {
                 if !playback.is_video() {
                     self.show_cover(item, playback);
+                }
+                if let Some(follow) = self.follow.borrow().as_ref() {
+                    follow(match item {
+                        Item::Track(t) => Some(t.id.clone()),
+                        _ => None,
+                    });
                 }
                 let facts = crate::views::Facts::of(item);
                 self.title.set_label(&facts.title);

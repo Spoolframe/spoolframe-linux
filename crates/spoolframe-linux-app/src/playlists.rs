@@ -10,8 +10,9 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use spoolframe_linux_core::backend::{
-    ArtworkSize, EntryId, Kinds, PlaySettings, PlaylistEdit, PlaylistEntry, PlaylistOwnerKind,
-    PlaylistPage, PlaylistRef, PlaylistSummary, PlaylistUpdate, Repeat, Visibility,
+    ArtworkSize, Builtin, EntryId, Kinds, PlaySettings, PlaylistEdit, PlaylistEntry,
+    PlaylistOwnerKind, PlaylistPage, PlaylistRef, PlaylistSummary, PlaylistUpdate, Repeat,
+    Visibility,
 };
 use spoolframe_linux_core::playlists::{self, Offer};
 use spoolframe_types::{ArtworkKind, Item, MediaKind};
@@ -59,6 +60,44 @@ pub fn mosaic(id: &str, size: i32) -> gtk::Widget {
         );
     }
     grid.upcast()
+}
+
+/// A playlist's picture: Liked's heart and All's tile (PX-43, board
+/// LinuxPlaylists), or for any other its [`mosaic`].
+pub fn picture(id: &str, builtin: Option<Builtin>, size: i32) -> gtk::Widget {
+    let (icon, class) = match builtin {
+        None => return mosaic(id, size),
+        Some(Builtin::Liked) => (crate::icons::HEART_FULL, "builtin-liked"),
+        Some(_) => (crate::icons::ALL_TRACKS, "builtin-all"),
+    };
+    let tile = gtk::Box::builder()
+        .width_request(size)
+        .height_request(size)
+        .halign(gtk::Align::Start)
+        .valign(gtk::Align::Center)
+        .css_classes(["mosaic", "builtin-tile", class])
+        .build();
+    if size < 40 {
+        tile.add_css_class("small");
+    }
+    tile.append(
+        &gtk::Image::builder()
+            .icon_name(icon)
+            .pixel_size(size * 7 / 16)
+            .hexpand(true)
+            .halign(gtk::Align::Center)
+            .build(),
+    );
+    tile.upcast()
+}
+
+/// What an item page's row says of a playlist holding it: Liked is built
+/// in; any other, whose it is.
+pub fn ref_subtitle(playlist: &PlaylistRef) -> &'static str {
+    match playlist.builtin {
+        Some(_) => "Built in",
+        None => ref_line(playlist.owner_kind),
+    }
 }
 
 /// Whose a playlist an item's page lists is: all a reference says (it
@@ -111,8 +150,8 @@ pub fn refs_section(refs: &[PlaylistRef], show: bool, actions: &RefActions) -> g
             .activatable(true)
             .build();
         row.set_title(&playlist.name);
-        row.set_subtitle(ref_line(playlist.owner_kind));
-        row.add_prefix(&mosaic(&playlist.id, 36));
+        row.set_subtitle(ref_subtitle(playlist));
+        row.add_prefix(&picture(&playlist.id, playlist.builtin, 36));
         let (choose, id) = (actions.choose.clone(), playlist.id.clone());
         row.connect_activated(move |_| choose(id.clone()));
         let (text, icon, run) = &actions.other;
@@ -144,11 +183,13 @@ pub struct ListActions {
     pub pin: Rc<dyn Fn(String, bool)>,
 }
 
-/// The Playlists section: My playlists, Shared with me and Server-wide,
-/// each a row of cards; a group with none is left out.
+/// The Playlists section: Music (Liked and All, PX-43), My playlists,
+/// Shared with me and Server-wide, each a row of cards; a group with none
+/// is left out.
 pub fn section(list: &[PlaylistSummary], actions: &Rc<ListActions>) -> Vec<gtk::Box> {
     let groups = playlists::sections(list);
     let rows: Vec<gtk::Box> = [
+        ("Music", groups.builtin),
         ("My playlists", groups.mine),
         ("Shared with me", groups.shared_with_me),
         ("Server-wide", groups.server_wide),
@@ -176,7 +217,7 @@ pub fn section(list: &[PlaylistSummary], actions: &Rc<ListActions>) -> Vec<gtk::
 /// Play, Shuffle and its pin.
 fn card(playlist: &PlaylistSummary, actions: &Rc<ListActions>) -> gtk::Widget {
     let body = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    body.append(&mosaic(&playlist.id, CARD));
+    body.append(&picture(&playlist.id, playlist.builtin, CARD));
     let caption = gtk::Box::new(gtk::Orientation::Vertical, 2);
     caption.append(&views::caption_label(&playlist.name, &["heading"]));
     caption.append(&views::caption_label(
@@ -396,13 +437,16 @@ impl PlaylistView {
             .visible(false)
             .build();
         if page.total == 0 {
-            widget_for_entries.append(
-                &adw::StatusPage::builder()
-                    .icon_name(crate::icons::PLAYLISTS)
-                    .title(format!("{} is empty", page.playlist.name))
-                    .description("Use Add to playlist on a film, an episode or a season.")
-                    .build(),
-            );
+            let empty = adw::StatusPage::builder()
+                .icon_name(crate::icons::PLAYLISTS)
+                .title(format!("{} is empty", page.playlist.name))
+                .description("Use Add to playlist on a film, an episode or a season.")
+                .build();
+            // Liked fills by hearts, never by Add to playlist.
+            if page.playlist.builtin.is_some() {
+                empty.set_description(Some("Like a track or an album with its heart."));
+            }
+            widget_for_entries.append(&empty);
         } else {
             widget_for_entries.append(&list);
             widget_for_entries.append(&more);
@@ -510,7 +554,7 @@ fn header(
     settings: &Rc<Cell<PlaySettings>>,
 ) -> (gtk::Box, gtk::ToggleButton) {
     let header = gtk::Box::builder().spacing(28).build();
-    header.append(&mosaic(&page.playlist.id, HEADER));
+    header.append(&picture(&page.playlist.id, page.playlist.builtin, HEADER));
     let column = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(8)
@@ -689,6 +733,11 @@ fn entry_row(
     thumb.set_margin_top(6);
     thumb.set_margin_bottom(6);
     row.add_prefix(&thumb);
+    // A track's heart (PX-43), as the server says it is.
+    if let (Some(hearts), Item::Track(track)) = (&cards.hearts, &entry.item) {
+        hearts.learn([(track.id.clone(), entry.liked)]);
+        row.add_suffix(&hearts.track(&track.id));
+    }
     if let Some(note) = playlists::entry_note(entry, up_next) {
         let note = label(&note, &["small-text"]);
         if Some(entry.entry) == up_next {
@@ -732,6 +781,7 @@ fn label(text: &str, classes: &[&str]) -> gtk::Label {
 pub struct AddRow {
     pub id: String,
     pub name: String,
+    pub builtin: Option<Builtin>,
     /// What it holds and whose it is; for a greyed one, why it is.
     pub line: String,
     /// One click adds; otherwise greyed.
@@ -746,6 +796,7 @@ pub fn add_rows(list: &[PlaylistSummary], kind: MediaKind) -> Vec<AddRow> {
         .map(|(playlist, offer)| AddRow {
             id: playlist.id.clone(),
             name: playlist.name.clone(),
+            builtin: playlist.builtin,
             line: offer.reason().map(str::to_owned).unwrap_or_else(|| {
                 format!(
                     "{} · {}",
@@ -811,7 +862,7 @@ pub fn add_dialog(
                 .build();
             line.set_title(&row.name);
             line.set_subtitle(&row.line);
-            line.add_prefix(&mosaic(&row.id, 32));
+            line.add_prefix(&picture(&row.id, row.builtin, 32));
             let (add, closing) = (add.clone(), dialog.downgrade());
             line.connect_activated(move |_| {
                 if let Some(dialog) = closing.upgrade() {
@@ -1050,6 +1101,7 @@ mod tests {
                     .id
                     .clone(),
                 name: "New this month".into(),
+                builtin: None,
                 line: "Server-wide · admins edit".into(),
                 adds: false,
             }]
@@ -1064,7 +1116,14 @@ mod tests {
             .into_iter()
             .map(|row| row.line)
             .collect();
-        assert_eq!(lines, ["Music · Shared with you · you can edit"]);
+        assert_eq!(
+            lines,
+            [
+                "Music · Shared with you · you can edit",
+                "Use the heart instead",
+                "Built in · every track already"
+            ]
+        );
     }
 
     #[test]
@@ -1078,6 +1137,27 @@ mod tests {
             ]
             .map(ref_line),
             ["Yours", "Shared with you", "Server-wide", "Shared with you"]
+        );
+    }
+
+    #[test]
+    fn an_albums_page_says_liked_is_built_in() {
+        let client = FakeClient::new(None);
+        let session = andrey(&client);
+        let id = |kind, key| {
+            spoolframe_types::MediaId::new(spoolframe_types::Namespace::Plex, kind, key).unwrap()
+        };
+        ready(session.like(&[id(MediaKind::Track, "41")])).unwrap();
+        let lines: Vec<_> = refs_of(session.as_ref(), &id(MediaKind::Album, "31"))
+            .iter()
+            .map(|r| (r.name.clone(), ref_subtitle(r)))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                ("Liked".to_owned(), "Built in"),
+                ("Road trip".to_owned(), "Shared with you")
+            ]
         );
     }
 
