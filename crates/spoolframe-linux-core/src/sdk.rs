@@ -1384,6 +1384,22 @@ impl Session for SdkSession {
         self.session.features().playlists
     }
 
+    fn has_liked(&self) -> bool {
+        self.session.features().liked
+    }
+
+    fn has_last_viewed(&self) -> bool {
+        self.session.features().last_viewed
+    }
+
+    fn has_playlist_sharing(&self) -> bool {
+        self.session.features().playlist_sharing
+    }
+
+    fn has_play_history(&self) -> bool {
+        self.session.features().play_history
+    }
+
     fn playlists(&self) -> BoxFuture<'_, Result<PlaylistList, BackendError>> {
         Box::pin(self.call(|s| async move { s.playlists().await }))
     }

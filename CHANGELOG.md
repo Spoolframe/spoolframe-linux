@@ -9,7 +9,12 @@
   airing (an episode in the last twelve months), or "2022–2025".
 - An episode's page says the day it aired, or its year where the server
   does not know the day.
-- The SDK crates are 0.10.0.
+- The SDK crates are 0.11.0. The app now lists the features it handles
+  (playlists, Liked, last viewed, sharing by name, play history) to each
+  server, as the SDK no longer turns any on by itself.
+- A saved server keeps only the addresses it says it answers on, and the
+  path it was last reached by: an old address that another server now
+  answers on is forgotten, so it no longer stops this one being reached.
 - Invites are copied as https links (PX-45): Copy link and Copy invite
   text in Preferences › Invites, and the link that only finds the server,
   give `https://spoolframe.app/i#…`; the QR code keeps the spoolframe://

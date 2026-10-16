@@ -190,9 +190,22 @@ fn main() -> Result<()> {
 fn client_options(settings: &settings::Settings) -> sdk::ClientOptions {
     sdk::ClientOptions {
         relays: settings.use_relays(),
+        features: FEATURES,
         ..sdk::ClientOptions::default()
     }
 }
+
+/// The regular features this app handles, listed to every server: the
+/// SDK turns on none by itself (0.11), and a session has those the
+/// server lists too. Each is shown only where the session has it
+/// (`Session::has_*`).
+const FEATURES: sdk::Features = sdk::Features {
+    playlists: true,
+    liked: true,
+    last_viewed: true,
+    playlist_sharing: true,
+    play_history: true,
+};
 
 /// The artwork cache, or none if it cannot be opened: images are then
 /// fetched each time, which is slower but works.
@@ -253,5 +266,23 @@ mod tests {
         assert!(client_options(&settings).relays);
         settings.set_use_relays(false);
         assert!(!client_options(&settings::Settings::at(&path)).relays);
+    }
+
+    /// The SDK lists no feature an app does not ask for (0.11): playlists
+    /// and the rest are asked for, whatever the settings.
+    #[test]
+    fn the_sdk_opens_with_every_feature_the_app_handles() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = settings::Settings::at(&dir.path().join("settings.ini"));
+        assert_eq!(
+            client_options(&settings).features,
+            sdk::Features {
+                playlists: true,
+                liked: true,
+                last_viewed: true,
+                playlist_sharing: true,
+                play_history: true,
+            }
+        );
     }
 }

@@ -417,12 +417,14 @@ pub use spoolframe_client_sdk::{
     Reachability, SavedAddr,
 };
 /// Playlists (PX-40), in the protocol's and the SDK's own types.
-pub use spoolframe_client_sdk::{PlaylistChange, PlaylistEvent, PlaylistList, PlaylistUpdate};
+pub use spoolframe_client_sdk::{
+    Features, PlaylistChange, PlaylistEvent, PlaylistList, PlaylistUpdate,
+};
 pub use spoolframe_protocol::MAX_READ;
 pub use spoolframe_protocol::playlists::{
-    EntryId, ItemKind, Kinds, PinNote, PinNoteReason, PlaySettings, PlaylistEdit, PlaylistEntry,
-    PlaylistNext, PlaylistOwnerKind, PlaylistPage, PlaylistRef, PlaylistShare, PlaylistSummary,
-    Repeat, Visibility,
+    Builtin, EntryId, ItemKind, Kinds, Liked, PinNote, PinNoteReason, PlaySettings, PlaylistEdit,
+    PlaylistEntry, PlaylistNext, PlaylistOwnerKind, PlaylistPage, PlaylistRef, PlaylistShare,
+    PlaylistSummary, Repeat, ShareCandidate, ShareCandidatePage, UserKind, Visibility,
 };
 
 /// An item, what is under it, and the playlists the user sees that hold
@@ -1199,6 +1201,26 @@ pub trait Session: Send + Sync {
     /// below is [`BackendError::Unsupported`] and nothing is sent, so the
     /// whole feature is hidden.
     fn has_playlists(&self) -> bool;
+
+    /// Whether the session has Liked and All, and hearts (PX-43,
+    /// `spoolframe:liked`): never without playlists. Without it the
+    /// playlists list neither, and no heart is shown.
+    fn has_liked(&self) -> bool;
+
+    /// Whether items' playback states say when each was last viewed
+    /// (`spoolframe:last-viewed`). Data only: without it the field is
+    /// `None` everywhere, and nothing says "Viewed".
+    fn has_last_viewed(&self) -> bool;
+
+    /// Whether playlists are shared by name (`spoolframe:playlist-sharing`):
+    /// [`Session::share_candidates`], and the names of a playlist's owner
+    /// and of whom it is shared with. Never without playlists.
+    fn has_playlist_sharing(&self) -> bool;
+
+    /// Whether the server keeps play history (PX-52,
+    /// `spoolframe:play-history`): [`Session::recently_played`], and play
+    /// counts on item pages.
+    fn has_play_history(&self) -> bool;
 
     /// Every playlist the user sees, with whether and where each is
     /// pinned, and the notes of pins that left their Pinned.

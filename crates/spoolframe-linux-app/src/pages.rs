@@ -1510,6 +1510,7 @@ mod tests {
             playback: PlaybackState {
                 position: position.map(Duration::from_secs),
                 watched,
+                ..PlaybackState::default()
             },
             content_rating: None,
             year: None,

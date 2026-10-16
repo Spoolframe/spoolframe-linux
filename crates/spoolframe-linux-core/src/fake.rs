@@ -37,7 +37,7 @@ use crate::backend::{
     ServerKey, Session, TopResult, TrustedProfile,
 };
 use crate::backend::{
-    EntryId, ItemDetail, Kinds, PlaySettings, PlaylistEdit, PlaylistEvent, PlaylistList,
+    EntryId, Features, ItemDetail, Kinds, PlaySettings, PlaylistEdit, PlaylistEvent, PlaylistList,
     PlaylistNext, PlaylistPage, PlaylistSummary, PlaylistUpdate, Visibility,
 };
 use crate::backend::{
@@ -736,10 +736,12 @@ impl FakeSession {
             let watched = || PlaybackState {
                 position: None,
                 watched: true,
+                ..PlaybackState::default()
             };
             let at = |secs: u64| PlaybackState {
                 position: Some(Duration::from_secs(secs)),
                 watched: false,
+                ..PlaybackState::default()
             };
             // Severance S2 E1–3 watched and E4 half-way, for everyone.
             for key in ["22", "23", "24"] {
@@ -1196,7 +1198,7 @@ impl Session for FakeSession {
             let (item, children) = self.item(id).await?;
             let store = self.lock_playlists();
             // Only for a client that listed the feature; none otherwise.
-            let playlists = match store.enabled {
+            let playlists = match store.features.playlists {
                 true => {
                     let mut held: std::collections::HashSet<MediaId> = self
                         .leaves(std::slice::from_ref(id))
@@ -1595,6 +1597,7 @@ impl Session for FakeSession {
                 PlaybackState {
                     position: None,
                     watched: true,
+                    ..PlaybackState::default()
                 },
             );
             self.unhide(id);
@@ -2158,7 +2161,23 @@ impl Session for FakeSession {
     }
 
     fn has_playlists(&self) -> bool {
-        self.lock_playlists().enabled
+        self.lock_playlists().features.playlists
+    }
+
+    fn has_liked(&self) -> bool {
+        self.lock_playlists().features.liked
+    }
+
+    fn has_last_viewed(&self) -> bool {
+        self.lock_playlists().features.last_viewed
+    }
+
+    fn has_playlist_sharing(&self) -> bool {
+        self.lock_playlists().features.playlist_sharing
+    }
+
+    fn has_play_history(&self) -> bool {
+        self.lock_playlists().features.play_history
     }
 
     fn playlists(&self) -> BoxFuture<'_, Result<PlaylistList, BackendError>> {
@@ -2193,6 +2212,7 @@ impl Session for FakeSession {
                         entry: *entry,
                         item: self.with_state(found, &watch),
                         unavailable: store.unavailable.contains(item),
+                        liked: false,
                     })
                 })
                 .collect();
@@ -2659,6 +2679,7 @@ impl FakeSession {
             entry,
             item: self.with_state(found, &self.watch()),
             markers: self.serving.markers.clone(),
+            liked: false,
         })
     }
 }
@@ -2889,9 +2910,24 @@ impl FakeClient {
     }
 
     /// The server has no playlists (PX-40): an older one, without the
-    /// feature.
+    /// feature, and so without Liked and sharing, which need it.
     pub fn without_playlists(self) -> Self {
-        self.lock_playlists().enabled = false;
+        let features = self.lock_playlists().features;
+        self.with_features(Features {
+            playlists: false,
+            ..features
+        })
+    }
+
+    /// The session has only these features, as when the server or the
+    /// app lists fewer: Liked and sharing go with playlists, as the SDK
+    /// has it.
+    pub fn with_features(self, features: Features) -> Self {
+        self.lock_playlists().features = Features {
+            liked: features.liked && features.playlists,
+            playlist_sharing: features.playlist_sharing && features.playlists,
+            ..features
+        };
         self
     }
 

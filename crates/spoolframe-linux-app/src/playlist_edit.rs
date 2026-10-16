@@ -414,10 +414,7 @@ mod tests {
         Visibility::Shared {
             with: users
                 .iter()
-                .map(|u| PlaylistShare {
-                    user_id: (*u).to_owned(),
-                    can_edit: false,
-                })
+                .map(|u| PlaylistShare::new(*u, false))
                 .collect(),
         }
     }

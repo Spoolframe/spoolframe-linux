@@ -5935,9 +5935,9 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-client-sdk"
-version = "0.10.0"
+version = "0.11.0"
 source = "sparse+https://cargo.coldsteel.casa/api/v1/crates/"
-checksum = "85f117204e4358e54f554092f07659ec0b7a99095bdae1823f8c9719f590d237"
+checksum = "1611032107d3c49b986e0c519ea0938d685ea6fe85ec3798a48c21868f49afe6"
 dependencies = [
  "async-trait",
  "bip39",
@@ -6029,9 +6029,9 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-policy"
-version = "0.10.0"
+version = "0.11.0"
 source = "sparse+https://cargo.coldsteel.casa/api/v1/crates/"
-checksum = "89f975a7e8f04a06b5cc331d406998a57398ff5f26c10d6dddf24000a922a62f"
+checksum = "2395d6844bd43eb8b35f31a50f30e792a6234ef5721dfa8dbe1b19cbc3719cbf"
 dependencies = [
  "serde",
  "spoolframe-protocol",
@@ -6040,9 +6040,9 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-protocol"
-version = "0.10.0"
+version = "0.11.0"
 source = "sparse+https://cargo.coldsteel.casa/api/v1/crates/"
-checksum = "e4d62cbc064a1d70ba61f31c5d6b239a7d67bef7742cc1c089dd9e48b732072b"
+checksum = "914585e3c90a3b53795aad93ae790a2f845bd21386281bc82ba8afc8f3be436a"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -6060,9 +6060,9 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-test-dir"
-version = "0.10.0"
+version = "0.11.0"
 source = "sparse+https://cargo.coldsteel.casa/api/v1/crates/"
-checksum = "6c363c4b91315fac412ea55d42ac51836f8e051db9535a68726697ab20ddd641"
+checksum = "4defbee2871873986cde0bd5f7e01e4c177155a1b8c591c3511469117ae2df15"
 dependencies = [
  "tmpdir",
  "tokio",
@@ -6070,9 +6070,9 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-types"
-version = "0.10.0"
+version = "0.11.0"
 source = "sparse+https://cargo.coldsteel.casa/api/v1/crates/"
-checksum = "44376351c0832e28b5888f6fda8301b8d10400b5a350d4565cab5630c942ab6e"
+checksum = "73df9599d941c4e855257f4879d856e41b939ccf27287d4d72e4830d8780dbd2"
 dependencies = [
  "serde",
  "thiserror 2.0.21",

@@ -11,9 +11,9 @@ use spoolframe_types::{Item, MediaId};
 use tokio::sync::broadcast;
 
 use crate::backend::{
-    BackendError, EntryId, ItemKind, Kinds, PinNote, PinNoteReason, PlaySettings, PlaylistChange,
-    PlaylistEdit, PlaylistEvent, PlaylistList, PlaylistOwnerKind, PlaylistRef, PlaylistShare,
-    PlaylistSummary, PlaylistUpdate, Repeat, Visibility,
+    BackendError, EntryId, Features, ItemKind, Kinds, PinNote, PinNoteReason, PlaySettings,
+    PlaylistChange, PlaylistEdit, PlaylistEvent, PlaylistList, PlaylistOwnerKind, PlaylistRef,
+    PlaylistShare, PlaylistSummary, PlaylistUpdate, Repeat, Visibility,
 };
 
 /// The most entries one `GetPlaylist` gives, as on the server.
@@ -49,7 +49,9 @@ struct Access {
 }
 
 pub(super) struct Store {
-    pub enabled: bool,
+    /// The features the session has: what the app and the fake server
+    /// both list. All of them unless a test turns some off.
+    pub features: Features,
     server: String,
     next_id: u64,
     next_entry: EntryId,
@@ -68,7 +70,13 @@ pub(super) struct Store {
 impl Store {
     pub fn new(server: &str) -> Self {
         Store {
-            enabled: true,
+            features: Features {
+                playlists: true,
+                liked: true,
+                last_viewed: true,
+                playlist_sharing: true,
+                play_history: true,
+            },
             server: server.to_owned(),
             next_id: 1,
             next_entry: 1,
@@ -95,7 +103,7 @@ impl Store {
     }
 
     pub fn check(&self) -> Result<(), BackendError> {
-        if self.enabled {
+        if self.features.playlists {
             Ok(())
         } else {
             Err(BackendError::Unsupported(
@@ -193,6 +201,8 @@ impl Store {
             can_manage: access.can_manage,
             revision: stored.revision,
             pinned,
+            builtin: None,
+            owner_name: None,
         })
     }
 
@@ -230,6 +240,7 @@ impl Store {
                 id: s.id,
                 name: s.name,
                 owner_kind: s.owner_kind,
+                builtin: None,
             })
             .collect()
     }
@@ -610,8 +621,5 @@ fn sees(visibility: &Visibility, username: &str) -> bool {
 
 /// A share with `username`.
 pub fn share(username: &str, can_edit: bool) -> PlaylistShare {
-    PlaylistShare {
-        user_id: user_id(username),
-        can_edit,
-    }
+    PlaylistShare::new(user_id(username), can_edit)
 }
