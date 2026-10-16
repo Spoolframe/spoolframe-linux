@@ -190,8 +190,35 @@ pub enum BackendError {
     /// someone else has to be made an admin first.
     #[error("You’re the only admin. Make someone else an admin first.")]
     LastAdmin,
+    /// The server does not have this feature (PX-16): nothing was sent.
+    /// What needs it is hidden.
+    #[error("this server does not have {0}")]
+    Unsupported(String),
+    /// The user sees the playlist but may not change it this way (PX-40):
+    /// an edit of a read-only share, or a rename, sharing change or
+    /// delete by anyone but its owner (or an admin, for a server-wide
+    /// one).
+    #[error("you can’t change this playlist")]
+    PlaylistReadOnly,
+    /// The playlist does not take items of this kind (PX-40).
+    #[error("this playlist doesn’t take {}", kind_name(*.0))]
+    KindNotAllowed(ItemKind),
+    /// Someone changed the same entries since the revision the edit was
+    /// made on (PX-40); `revision` is the playlist's now. Nothing changed.
+    #[error("Someone changed this playlist; reload.")]
+    PlaylistConflict { revision: u64 },
     #[error("{0}")]
     Other(String),
+}
+
+/// An item kind as a refusal names it: "films", "episodes".
+fn kind_name(kind: ItemKind) -> &'static str {
+    match kind {
+        ItemKind::Movie => "films",
+        ItemKind::Show | ItemKind::Season | ItemKind::Episode => "episodes",
+        ItemKind::Artist | ItemKind::Album | ItemKind::Track => "music",
+        ItemKind::Unknown => "this kind of item",
+    }
 }
 
 /// A server's identity: its endpoint key (§12). Addresses change; this does
@@ -389,7 +416,24 @@ pub use spoolframe_client_sdk::{
     DialReport, DialStage, KnownPath, LivePath, LookupOutcome, LookupResult, PathKind,
     Reachability, SavedAddr,
 };
+/// Playlists (PX-40), in the protocol's and the SDK's own types.
+pub use spoolframe_client_sdk::{PlaylistChange, PlaylistEvent, PlaylistList, PlaylistUpdate};
 pub use spoolframe_protocol::MAX_READ;
+pub use spoolframe_protocol::playlists::{
+    EntryId, ItemKind, Kinds, PinNote, PinNoteReason, PlaySettings, PlaylistEdit, PlaylistEntry,
+    PlaylistNext, PlaylistOwnerKind, PlaylistPage, PlaylistRef, PlaylistShare, PlaylistSummary,
+    Repeat, Visibility,
+};
+
+/// An item, what is under it, and the playlists the user sees that hold
+/// it (PX-40): all of one read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemDetail {
+    pub item: Item,
+    pub children: Vec<Item>,
+    /// Empty when none hold it, or the server has no playlists.
+    pub playlists: Vec<PlaylistRef>,
+}
 
 /// What an invite link says (P6-01), read without a word to the server:
 /// for the "Add a server" summary and the join form.
@@ -728,6 +772,11 @@ pub trait Client: Send + Sync {
     /// forgotten. Discovery takes a moment after opening, so the first
     /// answer is often empty; list again on each change.
     fn servers_changed(&self) -> watch::Receiver<()>;
+
+    /// Playlist changes the servers tell this device of (PX-40), for any
+    /// user signed in on them: read again what is shown. Changes made
+    /// before subscribing, or while not connected, are not seen.
+    fn playlist_events(&self) -> tokio::sync::broadcast::Receiver<PlaylistEvent>;
 }
 
 /// One signed-in user's view of a server: the catalog, their watch state
@@ -782,6 +831,14 @@ pub trait Session: Send + Sync {
         &'a self,
         id: &'a MediaId,
     ) -> BoxFuture<'a, Result<(Item, Vec<Item>), BackendError>>;
+
+    /// [`Session::item`] with the playlists the user sees that hold the
+    /// item (PX-40): a movie, episode or track itself, any of a season's
+    /// or show's episodes, any of an album's or artist's tracks.
+    fn item_detail<'a>(
+        &'a self,
+        id: &'a MediaId,
+    ) -> BoxFuture<'a, Result<ItemDetail, BackendError>>;
 
     /// A search (P3-09): in a scope, or one group for "See all"; the top
     /// match, then groups of shows, movies, people, artists, albums,
@@ -1136,6 +1193,84 @@ pub trait Session: Send + Sync {
 
     /// [`Session::can_leave`], asked of the server again.
     fn can_leave_now(&self) -> BoxFuture<'_, Result<bool, BackendError>>;
+
+    /// Whether the server has playlists (PX-40, `spoolframe:playlists`),
+    /// as it said when this session was made. Without them every call
+    /// below is [`BackendError::Unsupported`] and nothing is sent, so the
+    /// whole feature is hidden.
+    fn has_playlists(&self) -> bool;
+
+    /// Every playlist the user sees, with whether and where each is
+    /// pinned, and the notes of pins that left their Pinned.
+    fn playlists(&self) -> BoxFuture<'_, Result<PlaylistList, BackendError>>;
+
+    /// A playlist and a page of its entries (at most 200), with the
+    /// user's place and play settings.
+    fn playlist<'a>(
+        &'a self,
+        id: &'a str,
+        offset: u32,
+        limit: u32,
+    ) -> BoxFuture<'a, Result<PlaylistPage, BackendError>>;
+
+    /// Makes a playlist the user owns. Server-wide is an admin's.
+    fn create_playlist<'a>(
+        &'a self,
+        name: &'a str,
+        kinds: Kinds,
+        visibility: Visibility,
+    ) -> BoxFuture<'a, Result<PlaylistSummary, BackendError>>;
+
+    /// Renames a playlist, widens its kinds or changes who sees it: its
+    /// owner's, or an admin's for a server-wide one.
+    fn update_playlist<'a>(
+        &'a self,
+        id: &'a str,
+        update: PlaylistUpdate,
+    ) -> BoxFuture<'a, Result<PlaylistSummary, BackendError>>;
+
+    /// Changes a playlist's entries as seen at `revision`: its new
+    /// revision, or [`BackendError::PlaylistConflict`].
+    fn edit_playlist<'a>(
+        &'a self,
+        id: &'a str,
+        revision: u64,
+        edits: Vec<PlaylistEdit>,
+    ) -> BoxFuture<'a, Result<u64, BackendError>>;
+
+    fn delete_playlist<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), BackendError>>;
+
+    /// Pins a playlist at `position` in the user's Pinned (0 first), or
+    /// moves it there.
+    fn pin_playlist<'a>(
+        &'a self,
+        id: &'a str,
+        position: u32,
+    ) -> BoxFuture<'a, Result<(), BackendError>>;
+
+    fn unpin_playlist<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), BackendError>>;
+
+    /// Forgets the pin notes [`Session::playlists`] gave, on every device:
+    /// they were shown.
+    fn dismiss_pin_notes(&self) -> BoxFuture<'_, Result<(), BackendError>>;
+
+    /// Starts or goes on playing a playlist: the entry to play, from
+    /// `from` or else the user's place, or `None` when nothing is left.
+    fn play_playlist<'a>(
+        &'a self,
+        id: &'a str,
+        from: Option<EntryId>,
+        settings: PlaySettings,
+    ) -> BoxFuture<'a, Result<Option<PlaylistNext>, BackendError>>;
+
+    /// What plays after entry `after` ended or was skipped; `None` at the
+    /// end, when the server clears the place so the next play starts at
+    /// the top.
+    fn next_in_playlist<'a>(
+        &'a self,
+        id: &'a str,
+        after: EntryId,
+    ) -> BoxFuture<'a, Result<Option<PlaylistNext>, BackendError>>;
 }
 
 #[cfg(test)]

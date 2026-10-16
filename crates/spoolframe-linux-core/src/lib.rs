@@ -16,6 +16,7 @@ pub mod markers;
 pub mod next_episode;
 pub mod passkey;
 pub mod paths;
+pub mod playlists;
 pub mod progressive;
 pub mod reader;
 pub mod sdk;

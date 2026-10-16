@@ -37,10 +37,17 @@ use crate::backend::{
     ServerKey, Session, TopResult, TrustedProfile,
 };
 use crate::backend::{
+    EntryId, ItemDetail, Kinds, PlaySettings, PlaylistEdit, PlaylistEvent, PlaylistList,
+    PlaylistNext, PlaylistPage, PlaylistSummary, PlaylistUpdate, Visibility,
+};
+use crate::backend::{
     FinishPasskeyRegistration, FinishPasskeySignIn, PasskeyCreation, PasskeyInfo, PasskeyRequest,
     TrackPreferencesInfo,
 };
 use crate::backend::{InviteKind, InviteOrigin, InviteSpec, InviteSummary, MintedInvite};
+
+mod playlists;
+pub use playlists::PAGE_LIMIT as PLAYLIST_PAGE_LIMIT;
 
 /// Every fake account's password.
 pub const FAKE_PASSWORD: &str = "spoolframe";
@@ -508,6 +515,8 @@ pub struct FakeSession {
     /// last profile, as the SDK does.
     server: ServerKey,
     saved: Saved,
+    /// Every user's playlists (PX-40), the client's.
+    playlists: Arc<Mutex<playlists::Store>>,
 }
 
 /// What this device keeps saved, shared by the client and its sessions.
@@ -686,8 +695,8 @@ impl FakeSession {
         active: Arc<Mutex<std::collections::HashSet<String>>>,
         passkeys: Arc<Mutex<FakeAuth>>,
         // Its server and the device's saved list, together: leaving needs
-        // both.
-        (server, saved): (ServerKey, Saved),
+        // both; and the server's playlists.
+        (server, saved, playlists): (ServerKey, Saved, Arc<Mutex<playlists::Store>>),
     ) -> Self {
         // Alice has a PIN, asked for here, so the fake opens her locked.
         let pin = match username {
@@ -720,6 +729,7 @@ impl FakeSession {
             active,
             server,
             saved,
+            playlists,
         };
         {
             let mut watch = session.watch();
@@ -1175,6 +1185,34 @@ impl Session for FakeSession {
             let item = self.with_state(item, &self.watch());
             let children = self.catalog.children.get(id).cloned().unwrap_or_default();
             Ok((item, self.items_with_state(&children)))
+        })
+    }
+
+    fn item_detail<'a>(
+        &'a self,
+        id: &'a MediaId,
+    ) -> BoxFuture<'a, Result<ItemDetail, BackendError>> {
+        Box::pin(async move {
+            let (item, children) = self.item(id).await?;
+            let store = self.lock_playlists();
+            // Only for a client that listed the feature; none otherwise.
+            let playlists = match store.enabled {
+                true => {
+                    let mut held: std::collections::HashSet<MediaId> = self
+                        .leaves(std::slice::from_ref(id))
+                        .iter()
+                        .map(|i| i.id().clone())
+                        .collect();
+                    held.insert(id.clone());
+                    store.holding(&held, self.viewer())
+                }
+                false => Vec::new(),
+            };
+            Ok(ItemDetail {
+                item,
+                children,
+                playlists,
+            })
         })
     }
 
@@ -2119,6 +2157,174 @@ impl Session for FakeSession {
         })
     }
 
+    fn has_playlists(&self) -> bool {
+        self.lock_playlists().enabled
+    }
+
+    fn playlists(&self) -> BoxFuture<'_, Result<PlaylistList, BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            let store = self.lock_playlists();
+            store.check()?;
+            Ok(store.list(self.viewer()))
+        })
+    }
+
+    fn playlist<'a>(
+        &'a self,
+        id: &'a str,
+        offset: u32,
+        limit: u32,
+    ) -> BoxFuture<'a, Result<PlaylistPage, BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            let store = self.lock_playlists();
+            store.check()?;
+            let viewer = self.viewer();
+            let (playlist, stored) = store.seen(id, viewer)?;
+            let watch = self.watch();
+            // An item gone from the library drops out.
+            let entries: Vec<_> = stored
+                .entries
+                .iter()
+                .filter_map(|(entry, item)| {
+                    let found = self.catalog.items.get(item)?;
+                    Some(crate::backend::PlaylistEntry {
+                        entry: *entry,
+                        item: self.with_state(found, &watch),
+                        unavailable: store.unavailable.contains(item),
+                    })
+                })
+                .collect();
+            let total = entries.len() as u32;
+            let playable = entries.iter().filter(|e| !e.unavailable).count() as u32;
+            let (place, settings) = store.place(id, viewer);
+            Ok(PlaylistPage {
+                playlist,
+                entries: entries
+                    .into_iter()
+                    .skip(offset as usize)
+                    .take(limit.min(playlists::PAGE_LIMIT) as usize)
+                    .collect(),
+                offset,
+                total,
+                playable,
+                place,
+                settings,
+            })
+        })
+    }
+
+    fn create_playlist<'a>(
+        &'a self,
+        name: &'a str,
+        kinds: Kinds,
+        visibility: Visibility,
+    ) -> BoxFuture<'a, Result<PlaylistSummary, BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            self.lock_playlists()
+                .create(name, kinds, visibility, self.viewer())
+        })
+    }
+
+    fn update_playlist<'a>(
+        &'a self,
+        id: &'a str,
+        update: PlaylistUpdate,
+    ) -> BoxFuture<'a, Result<PlaylistSummary, BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            self.lock_playlists().update(id, update, self.viewer())
+        })
+    }
+
+    fn edit_playlist<'a>(
+        &'a self,
+        id: &'a str,
+        revision: u64,
+        edits: Vec<PlaylistEdit>,
+    ) -> BoxFuture<'a, Result<u64, BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            self.lock_playlists()
+                .edit(id, revision, edits, self.viewer(), |item| {
+                    let leaves = self.leaves(std::slice::from_ref(item));
+                    match leaves.is_empty() {
+                        true => Err(BackendError::NotFound(item.to_string())),
+                        false => Ok(leaves),
+                    }
+                })
+        })
+    }
+
+    fn delete_playlist<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            self.lock_playlists().delete(id, self.viewer())
+        })
+    }
+
+    fn pin_playlist<'a>(
+        &'a self,
+        id: &'a str,
+        position: u32,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            self.lock_playlists().pin(id, position, self.viewer())
+        })
+    }
+
+    fn unpin_playlist<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            self.lock_playlists().unpin(id, self.viewer())
+        })
+    }
+
+    fn dismiss_pin_notes(&self) -> BoxFuture<'_, Result<(), BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            self.lock_playlists().dismiss_notes(self.viewer())
+        })
+    }
+
+    fn play_playlist<'a>(
+        &'a self,
+        id: &'a str,
+        from: Option<EntryId>,
+        settings: PlaySettings,
+    ) -> BoxFuture<'a, Result<Option<PlaylistNext>, BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            let next = {
+                let watch = self.watch();
+                self.lock_playlists()
+                    .play(id, from, settings, self.viewer(), |item| {
+                        watch.get(item).watched
+                    })?
+            };
+            Ok(next.and_then(|(entry, item)| self.playlist_next(entry, &item)))
+        })
+    }
+
+    fn next_in_playlist<'a>(
+        &'a self,
+        id: &'a str,
+        after: EntryId,
+    ) -> BoxFuture<'a, Result<Option<PlaylistNext>, BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            let next = {
+                let watch = self.watch();
+                self.lock_playlists()
+                    .next(id, after, self.viewer(), |item| watch.get(item).watched)?
+            };
+            Ok(next.and_then(|(entry, item)| self.playlist_next(entry, &item)))
+        })
+    }
+
     fn begin_passkey_registration(&self) -> BoxFuture<'_, Result<PasskeyCreation, BackendError>> {
         Box::pin(async move {
             self.guard()?;
@@ -2411,6 +2617,50 @@ impl FakeSession {
     fn lock_overrides(&self) -> std::sync::MutexGuard<'_, HashMap<MediaId, TrackOverride>> {
         self.overrides.lock().expect("fake state is never poisoned")
     }
+
+    fn lock_playlists(&self) -> std::sync::MutexGuard<'_, playlists::Store> {
+        self.playlists.lock().expect("fake state is never poisoned")
+    }
+
+    fn viewer(&self) -> playlists::Viewer<'_> {
+        playlists::Viewer {
+            username: &self.username,
+            admin: self.is_admin(),
+        }
+    }
+
+    /// What `ids` add to a playlist, in order: a movie, episode or track
+    /// itself; a season's episodes, each of a show's seasons' in turn; an
+    /// album's tracks, each of an artist's albums' in turn.
+    fn leaves(&self, ids: &[MediaId]) -> Vec<Item> {
+        let mut leaves = Vec::new();
+        for id in ids {
+            let Some(item) = self.catalog.items.get(id) else {
+                continue;
+            };
+            match item.id().kind() {
+                MediaKind::Movie | MediaKind::Episode | MediaKind::Track => {
+                    leaves.push(item.clone());
+                }
+                _ => {
+                    let children = self.catalog.children.get(id).cloned().unwrap_or_default();
+                    leaves.extend(self.leaves(&children));
+                }
+            }
+        }
+        leaves
+    }
+
+    /// An entry to play now, with the user's watch state on its item and
+    /// the markers every playback has.
+    fn playlist_next(&self, entry: EntryId, item: &MediaId) -> Option<PlaylistNext> {
+        let found = self.catalog.items.get(item)?;
+        Some(PlaylistNext {
+            entry,
+            item: self.with_state(found, &self.watch()),
+            markers: self.serving.markers.clone(),
+        })
+    }
 }
 
 /// The servers and users the mockups show.
@@ -2441,6 +2691,8 @@ pub struct FakeClient {
     /// Bumped by [`FakeClient::sign_out_elsewhere`].
     sign_outs: watch::Sender<u64>,
     passkeys: Arc<Mutex<FakeAuth>>,
+    /// Every user's playlists (PX-40), as the server keeps them.
+    playlists: Arc<Mutex<playlists::Store>>,
 }
 
 /// How the fake answers a sign-in a phone approves.
@@ -2632,7 +2884,25 @@ impl FakeClient {
             sign_outs: watch::Sender::new(0),
             servers_changed: Arc::new(watch::Sender::new(())),
             joined: Mutex::default(),
+            playlists: Arc::new(Mutex::new(seeded_playlists())),
         }
+    }
+
+    /// The server has no playlists (PX-40): an older one, without the
+    /// feature.
+    pub fn without_playlists(self) -> Self {
+        self.lock_playlists().enabled = false;
+        self
+    }
+
+    /// `item`'s file can no longer be read (a drive offline): it stays in
+    /// playlists, marked unavailable, and is skipped when playing.
+    pub fn make_unavailable(&self, item: &MediaId) {
+        self.lock_playlists().unavailable.insert(item.clone());
+    }
+
+    fn lock_playlists(&self) -> std::sync::MutexGuard<'_, playlists::Store> {
+        self.playlists.lock().expect("fake state is never poisoned")
     }
 
     /// The progress reports `profile`'s session has had, in order.
@@ -2827,7 +3097,7 @@ impl FakeClient {
                     self.gone.clone(),
                     self.active.clone(),
                     self.passkeys.clone(),
-                    (profile.server.clone(), self.saved()),
+                    (profile.server.clone(), self.saved(), self.playlists.clone()),
                 ))
             })
             .clone()
@@ -3755,6 +4025,82 @@ impl Client for FakeClient {
     fn servers_changed(&self) -> watch::Receiver<()> {
         self.servers_changed.subscribe()
     }
+
+    fn playlist_events(&self) -> tokio::sync::broadcast::Receiver<PlaylistEvent> {
+        self.lock_playlists().subscribe()
+    }
+}
+
+/// The playlists the fake server starts with (PX-40), as the boards show
+/// them: Andrey's own, pinned, and shared with Alice to read; his movie
+/// night; Alice's road trip, which Andrey may edit; and a server-wide one.
+fn seeded_playlists() -> playlists::Store {
+    use playlists::share;
+    let episodes = Kinds {
+        episodes: true,
+        ..Kinds::default()
+    };
+    let mut store = playlists::Store::new(&home_media().0);
+    let heists = store.seed(
+        FAKE_ADMIN,
+        "Andor: the heists",
+        episodes,
+        Visibility::Shared {
+            with: vec![share("alice", false)],
+        },
+        &[
+            media(MediaKind::Episode, "64"),
+            media(MediaKind::Episode, "65"),
+            media(MediaKind::Episode, "72"),
+        ],
+    );
+    store.seed(
+        FAKE_ADMIN,
+        "Movie night",
+        Kinds {
+            movies: true,
+            episodes: true,
+            tracks: false,
+        },
+        Visibility::Personal,
+        &[
+            media(MediaKind::Movie, "1"),
+            media(MediaKind::Movie, "3"),
+            media(MediaKind::Episode, "22"),
+        ],
+    );
+    store.seed(
+        "alice",
+        "Road trip",
+        Kinds {
+            tracks: true,
+            ..Kinds::default()
+        },
+        Visibility::Shared {
+            with: vec![share(FAKE_ADMIN, true)],
+        },
+        &[
+            media(MediaKind::Track, "40"),
+            media(MediaKind::Track, "42"),
+            media(MediaKind::Track, "44"),
+        ],
+    );
+    store.seed(
+        FAKE_ADMIN,
+        "New this month",
+        Kinds {
+            movies: true,
+            ..Kinds::default()
+        },
+        Visibility::ServerWide,
+        &[media(MediaKind::Movie, "2"), media(MediaKind::Movie, "8")],
+    );
+    let andrey = playlists::Viewer {
+        username: FAKE_ADMIN,
+        admin: true,
+    };
+    store.pin(&heists, 0, andrey).expect("seeded");
+    store
 }
 
 /// The fake's search (P3-09), shaped as the server answers: a trailing

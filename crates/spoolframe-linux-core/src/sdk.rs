@@ -30,6 +30,10 @@ use crate::backend::{
     ProfileSignIn, SearchRequest, SearchResults, Selection, Server, ServerKey, Session,
 };
 use crate::backend::{
+    EntryId, ItemDetail, Kinds, PlaySettings, PlaylistEdit, PlaylistList, PlaylistNext,
+    PlaylistPage, PlaylistSummary, PlaylistUpdate, Visibility,
+};
+use crate::backend::{
     FinishPasskeyRegistration, FinishPasskeySignIn, PasskeyCreation, PasskeyInfo, PasskeyRequest,
     TrackPreferencesInfo, Trust, TrustedProfile,
 };
@@ -167,6 +171,10 @@ pub fn backend_error(error: sdk::SdkError) -> BackendError {
         E::AdminRequired => BackendError::AdminOnly,
         E::LastAdmin => BackendError::LastAdmin,
         E::PasswordChangeRequired => BackendError::PasswordChangeRequired,
+        E::Unsupported { feature } => BackendError::Unsupported(feature),
+        E::PlaylistReadOnly => BackendError::PlaylistReadOnly,
+        E::KindNotAllowed { kind } => BackendError::KindNotAllowed(kind),
+        E::PlaylistConflict { revision } => BackendError::PlaylistConflict { revision },
         E::UnknownServer(id) => BackendError::NotFound(id),
         E::UnknownIdentity(_) | E::Credential(_) | E::NotThisDevice | E::DeviceKeyRevoked => {
             BackendError::NotPaired
@@ -944,6 +952,10 @@ impl Client for SdkClient {
     fn servers_changed(&self) -> watch::Receiver<()> {
         self.servers_changed.subscribe()
     }
+
+    fn playlist_events(&self) -> tokio::sync::broadcast::Receiver<crate::backend::PlaylistEvent> {
+        self.client.playlist_events()
+    }
 }
 
 pub struct SdkSession {
@@ -1009,6 +1021,21 @@ impl Session for SdkSession {
         Box::pin(self.call(move |s| async move {
             let detail = s.item(&id).await?;
             Ok((detail.item, detail.children))
+        }))
+    }
+
+    fn item_detail<'a>(
+        &'a self,
+        id: &'a MediaId,
+    ) -> BoxFuture<'a, Result<ItemDetail, BackendError>> {
+        let id = id.clone();
+        Box::pin(self.call(move |s| async move {
+            let detail = s.item(&id).await?;
+            Ok(ItemDetail {
+                item: detail.item,
+                children: detail.children,
+                playlists: detail.playlists,
+            })
         }))
     }
 
@@ -1353,6 +1380,97 @@ impl Session for SdkSession {
         Box::pin(self.call(|s| async move { s.can_leave_now().await }))
     }
 
+    fn has_playlists(&self) -> bool {
+        self.session.features().playlists
+    }
+
+    fn playlists(&self) -> BoxFuture<'_, Result<PlaylistList, BackendError>> {
+        Box::pin(self.call(|s| async move { s.playlists().await }))
+    }
+
+    fn playlist<'a>(
+        &'a self,
+        id: &'a str,
+        offset: u32,
+        limit: u32,
+    ) -> BoxFuture<'a, Result<PlaylistPage, BackendError>> {
+        let id = id.to_owned();
+        Box::pin(self.call(move |s| async move { s.playlist(&id, offset, limit).await }))
+    }
+
+    fn create_playlist<'a>(
+        &'a self,
+        name: &'a str,
+        kinds: Kinds,
+        visibility: Visibility,
+    ) -> BoxFuture<'a, Result<PlaylistSummary, BackendError>> {
+        let name = name.to_owned();
+        Box::pin(
+            self.call(move |s| async move { s.create_playlist(&name, kinds, visibility).await }),
+        )
+    }
+
+    fn update_playlist<'a>(
+        &'a self,
+        id: &'a str,
+        update: PlaylistUpdate,
+    ) -> BoxFuture<'a, Result<PlaylistSummary, BackendError>> {
+        let id = id.to_owned();
+        Box::pin(self.call(move |s| async move { s.update_playlist(&id, update).await }))
+    }
+
+    fn edit_playlist<'a>(
+        &'a self,
+        id: &'a str,
+        revision: u64,
+        edits: Vec<PlaylistEdit>,
+    ) -> BoxFuture<'a, Result<u64, BackendError>> {
+        let id = id.to_owned();
+        Box::pin(self.call(move |s| async move { s.edit_playlist(&id, revision, edits).await }))
+    }
+
+    fn delete_playlist<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), BackendError>> {
+        let id = id.to_owned();
+        Box::pin(self.call(move |s| async move { s.delete_playlist(&id).await }))
+    }
+
+    fn pin_playlist<'a>(
+        &'a self,
+        id: &'a str,
+        position: u32,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        let id = id.to_owned();
+        Box::pin(self.call(move |s| async move { s.pin_playlist(&id, position).await }))
+    }
+
+    fn unpin_playlist<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), BackendError>> {
+        let id = id.to_owned();
+        Box::pin(self.call(move |s| async move { s.unpin_playlist(&id).await }))
+    }
+
+    fn dismiss_pin_notes(&self) -> BoxFuture<'_, Result<(), BackendError>> {
+        Box::pin(self.call(|s| async move { s.dismiss_pin_notes().await }))
+    }
+
+    fn play_playlist<'a>(
+        &'a self,
+        id: &'a str,
+        from: Option<EntryId>,
+        settings: PlaySettings,
+    ) -> BoxFuture<'a, Result<Option<PlaylistNext>, BackendError>> {
+        let id = id.to_owned();
+        Box::pin(self.call(move |s| async move { s.play_playlist(&id, from, settings).await }))
+    }
+
+    fn next_in_playlist<'a>(
+        &'a self,
+        id: &'a str,
+        after: EntryId,
+    ) -> BoxFuture<'a, Result<Option<PlaylistNext>, BackendError>> {
+        let id = id.to_owned();
+        Box::pin(self.call(move |s| async move { s.next_in_playlist(&id, after).await }))
+    }
+
     fn begin_passkey_registration(&self) -> BoxFuture<'_, Result<PasskeyCreation, BackendError>> {
         Box::pin(self.call(|s| async move { s.begin_passkey_registration().await }))
     }
@@ -1641,6 +1759,30 @@ mod tests {
         assert_eq!(
             backend_error(sdk::SdkError::Unavailable("Plex is down".into())),
             BackendError::Unavailable("Plex is down".into())
+        );
+    }
+
+    #[test]
+    fn playlist_refusals_keep_their_kind() {
+        use spoolframe_protocol::playlists::ItemKind;
+        assert_eq!(
+            [
+                sdk::SdkError::Unsupported {
+                    feature: "spoolframe:playlists".into()
+                },
+                sdk::SdkError::PlaylistReadOnly,
+                sdk::SdkError::KindNotAllowed {
+                    kind: ItemKind::Movie
+                },
+                sdk::SdkError::PlaylistConflict { revision: 9 },
+            ]
+            .map(backend_error),
+            [
+                BackendError::Unsupported("spoolframe:playlists".into()),
+                BackendError::PlaylistReadOnly,
+                BackendError::KindNotAllowed(ItemKind::Movie),
+                BackendError::PlaylistConflict { revision: 9 },
+            ]
         );
     }
 
