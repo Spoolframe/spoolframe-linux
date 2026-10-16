@@ -1238,6 +1238,20 @@ pub trait Session: Send + Sync {
     /// and of whom it is shared with. Never without playlists.
     fn has_playlist_sharing(&self) -> bool;
 
+    /// Whom playlist `id` can be shared with (`spoolframe:playlist-sharing`):
+    /// a page from `offset` of at most `limit` (200), by display name,
+    /// and how many match in all; with a `query`, only those whose name
+    /// or username holds it. Everyone but the user. Only whoever manages
+    /// the playlist may ask ([`BackendError::PlaylistReadOnly`]); without
+    /// [`Session::has_playlist_sharing`], [`BackendError::Unsupported`].
+    fn share_candidates<'a>(
+        &'a self,
+        id: &'a str,
+        query: &'a str,
+        offset: u32,
+        limit: u32,
+    ) -> BoxFuture<'a, Result<ShareCandidatePage, BackendError>>;
+
     /// Whether the server keeps play history (PX-52,
     /// `spoolframe:play-history`): [`Session::recently_played`], and play
     /// counts on item pages.

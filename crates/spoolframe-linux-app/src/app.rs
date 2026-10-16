@@ -2791,7 +2791,7 @@ impl Component for App {
                     };
                     let view = PlaylistView::new(
                         &page,
-                        playlist_actions(&id, &sender),
+                        playlist_actions(&id, &sender, self.session.as_ref()),
                         self.cards.clone(),
                         mode,
                     );
@@ -2807,7 +2807,7 @@ impl Component for App {
                 self.opening_playlist = None;
                 let view = PlaylistView::new(
                     &page,
-                    playlist_actions(&id, &sender),
+                    playlist_actions(&id, &sender, self.session.as_ref()),
                     self.cards.clone(),
                     Mode::View,
                 );
@@ -4163,8 +4163,29 @@ async fn recent_albums(session: &dyn Session) -> Vec<Album> {
 }
 
 /// What playlist `id`'s page does: its buttons, pin and Show more.
-fn playlist_actions(id: &str, sender: &ComponentSender<App>) -> playlists::PageActions {
+/// How many people the share picker asks for at a time.
+const PEOPLE_PAGE: u32 = 50;
+
+fn playlist_actions(
+    id: &str,
+    sender: &ComponentSender<App>,
+    session: Option<&Arc<dyn Session>>,
+) -> playlists::PageActions {
     playlists::PageActions {
+        // Only where the server shares by name.
+        people: session.filter(|s| s.has_playlist_sharing()).map(
+            |session| -> crate::share_picker::People {
+                let (session, id) = (session.clone(), id.to_owned());
+                Rc::new(move |query, offset| {
+                    let (session, id) = (session.clone(), id.clone());
+                    relm4::spawn(async move {
+                        session
+                            .share_candidates(&id, &query, offset, PEOPLE_PAGE)
+                            .await
+                    })
+                })
+            },
+        ),
         play: {
             let (sender, id) = (sender.clone(), id.to_owned());
             Rc::new(move |from, settings| {

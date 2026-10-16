@@ -1730,6 +1730,14 @@ button.heart.liked {
   color: var(--accent-red);
 }
 
+/* Whose account someone a playlist can be shared with is: Local or
+   Portable, quiet, as the rating badge is. */
+.user-kind {
+  border: 1px solid alpha(currentColor, 0.45);
+  border-radius: 999px;
+  padding: 1px 8px;
+}
+
 .app-sidebar .sidebar-group {
   padding: 10px 12px 4px;
   font-size: 11px;

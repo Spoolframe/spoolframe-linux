@@ -2347,6 +2347,20 @@ impl Session for FakeSession {
         self.features.play_history
     }
 
+    fn share_candidates<'a>(
+        &'a self,
+        id: &'a str,
+        query: &'a str,
+        offset: u32,
+        limit: u32,
+    ) -> BoxFuture<'a, Result<crate::backend::ShareCandidatePage, BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            self.lock_playlists()
+                .candidates(id, query, offset, limit, self.viewer())
+        })
+    }
+
     fn recently_played(
         &self,
         kinds: Option<Kinds>,
@@ -4294,6 +4308,23 @@ fn seeded_playlists() -> playlists::Store {
     let mut store = playlists::Store::new(&home_media().0);
     store.all_tracks = (0..9)
         .map(|i| media(MediaKind::Track, &format!("4{i}")))
+        .collect();
+    // The fake's accounts on Home Media, and a portable user granted it.
+    let account = |username: &str| crate::backend::ShareCandidate {
+        user_id: playlists::user_id(username),
+        display_name: display_name(username),
+        username: Some(username.to_owned()),
+        kind: crate::backend::UserKind::Local,
+    };
+    store.people = ["andrey", "alice", "steve", "mum"]
+        .map(account)
+        .into_iter()
+        .chain([crate::backend::ShareCandidate {
+            user_id: format!("portable:{}", "7e".repeat(32)),
+            display_name: "Kim".into(),
+            username: None,
+            kind: crate::backend::UserKind::Portable,
+        }])
         .collect();
     let heists = store.seed(
         FAKE_ADMIN,

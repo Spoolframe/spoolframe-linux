@@ -341,6 +341,9 @@ pub struct PageActions {
     /// Its kinds or who sees it.
     pub update: Rc<dyn Fn(PlaylistUpdate)>,
     pub delete: Rc<dyn Fn()>,
+    /// Whom it can be shared with, for the editor's Add someone; none
+    /// where the server does not share by name.
+    pub people: Option<crate::share_picker::People>,
 }
 
 /// How a playlist's page shows.
@@ -1119,7 +1122,7 @@ mod tests {
         assert_eq!(
             lines,
             [
-                "Music · Shared with you · you can edit",
+                "Music · Alice’s · you can edit",
                 "Use the heart instead",
                 "Built in · every track already"
             ]

@@ -17,8 +17,12 @@ use tokio::sync::broadcast;
 use crate::backend::{
     BackendError, Builtin, EntryId, Features, ItemKind, Kinds, PinNote, PinNoteReason,
     PlaySettings, PlaylistChange, PlaylistEdit, PlaylistEvent, PlaylistList, PlaylistOwnerKind,
-    PlaylistRef, PlaylistShare, PlaylistSummary, PlaylistUpdate, Repeat, Visibility,
+    PlaylistRef, PlaylistShare, PlaylistSummary, PlaylistUpdate, Repeat, ShareCandidate,
+    ShareCandidatePage, Visibility,
 };
+
+/// The most share candidates one page gives, as on the server.
+pub const PEOPLE_LIMIT: u32 = 200;
 
 /// The most items one like or unlike takes, as on the server.
 pub const LIKE_LIMIT: usize = 100;
@@ -75,6 +79,9 @@ pub(super) struct Store {
     pub unavailable: HashSet<MediaId>,
     /// Every track in the library, in order: what each user's All holds.
     pub all_tracks: Vec<MediaId>,
+    /// Everyone a playlist can be shared with, by display name: the
+    /// accounts here and the portable users granted access.
+    pub people: Vec<ShareCandidate>,
     events: broadcast::Sender<PlaylistEvent>,
 }
 
@@ -98,6 +105,7 @@ impl Store {
             settings: HashMap::new(),
             unavailable: HashSet::new(),
             all_tracks: Vec::new(),
+            people: Vec::new(),
             events: broadcast::channel(64).0,
         }
     }
@@ -324,11 +332,21 @@ impl Store {
 
     fn summary(&self, stored: &Stored, viewer: Viewer<'_>) -> Option<PlaylistSummary> {
         let access = Self::access(stored, viewer)?;
+        let named = self.features.playlist_sharing;
         let visibility = match &stored.visibility {
             // Listed only to whoever manages it.
             Visibility::Shared { .. } if !access.can_manage => Visibility::Shared { with: vec![] },
+            // With their names and kinds, for a client that has sharing
+            // by name.
+            Visibility::Shared { with } if named => Visibility::Shared {
+                with: with.iter().map(|share| self.named(share)).collect(),
+            },
             other => other.clone(),
         };
+        let owner_name = named
+            .then(|| self.person(&user_id(&stored.owner)))
+            .flatten()
+            .map(|p| p.display_name.clone());
         let pinned = self
             .pins
             .get(viewer.username)
@@ -345,7 +363,64 @@ impl Store {
             revision: stored.revision,
             pinned,
             builtin: stored.builtin,
-            owner_name: None,
+            owner_name,
+        })
+    }
+
+    fn person(&self, user_id: &str) -> Option<&ShareCandidate> {
+        self.people.iter().find(|p| p.user_id == user_id)
+    }
+
+    /// `share` with the name and kind of whom it is with; none for
+    /// someone no longer here.
+    fn named(&self, share: &PlaylistShare) -> PlaylistShare {
+        let person = self.person(&share.user_id);
+        PlaylistShare {
+            display_name: person.map(|p| p.display_name.clone()),
+            kind: person.map(|p| p.kind),
+            ..share.clone()
+        }
+    }
+
+    /// Whom playlist `id` can be shared with: everyone but `viewer`, by
+    /// display name, those whose name or username holds `query` in any
+    /// case. Only for whoever manages it.
+    pub fn candidates(
+        &self,
+        id: &str,
+        query: &str,
+        offset: u32,
+        limit: u32,
+        viewer: Viewer<'_>,
+    ) -> Result<ShareCandidatePage, BackendError> {
+        if !self.features.playlist_sharing {
+            return Err(BackendError::Unsupported(
+                spoolframe_protocol::features::PLAYLIST_SHARING.into(),
+            ));
+        }
+        let (summary, _) = self.seen(id, viewer)?;
+        if !summary.can_manage {
+            return Err(BackendError::PlaylistReadOnly);
+        }
+        let query = query.to_lowercase();
+        let me = user_id(viewer.username);
+        let holds = |text: &str| text.to_lowercase().contains(&query);
+        let mut matching: Vec<&ShareCandidate> = self
+            .people
+            .iter()
+            .filter(|p| p.user_id != me)
+            .filter(|p| holds(&p.display_name) || p.username.as_deref().is_some_and(holds))
+            .collect();
+        matching.sort_by_key(|p| p.display_name.to_lowercase());
+        Ok(ShareCandidatePage {
+            total: matching.len() as u32,
+            candidates: matching
+                .into_iter()
+                .skip(offset as usize)
+                .take(limit.min(PEOPLE_LIMIT) as usize)
+                .cloned()
+                .collect(),
+            offset,
         })
     }
 

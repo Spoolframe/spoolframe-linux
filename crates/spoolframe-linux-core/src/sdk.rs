@@ -31,7 +31,7 @@ use crate::backend::{
 };
 use crate::backend::{
     EntryId, ItemDetail, Kinds, PlaySettings, PlaylistEdit, PlaylistList, PlaylistNext,
-    PlaylistPage, PlaylistSummary, PlaylistUpdate, Visibility,
+    PlaylistPage, PlaylistSummary, PlaylistUpdate, ShareCandidatePage, Visibility,
 };
 use crate::backend::{
     FinishPasskeyRegistration, FinishPasskeySignIn, PasskeyCreation, PasskeyInfo, PasskeyRequest,
@@ -1416,6 +1416,19 @@ impl Session for SdkSession {
 
     fn has_play_history(&self) -> bool {
         self.session.features().play_history
+    }
+
+    fn share_candidates<'a>(
+        &'a self,
+        id: &'a str,
+        query: &'a str,
+        offset: u32,
+        limit: u32,
+    ) -> BoxFuture<'a, Result<ShareCandidatePage, BackendError>> {
+        let (id, query) = (id.to_owned(), query.to_owned());
+        Box::pin(
+            self.call(move |s| async move { s.share_candidates(&id, &query, offset, limit).await }),
+        )
     }
 
     fn recently_played(

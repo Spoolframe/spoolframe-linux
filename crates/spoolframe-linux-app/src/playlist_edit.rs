@@ -2,7 +2,9 @@
 //! Cancel and Done over the entries, each with a handle to drag and a
 //! Remove; beside them, for whoever manages the playlist, its name, the
 //! kinds it holds, who sees it, and Delete. Each change to the entries,
-//! kinds or sharing is sent as it is made; the name goes with Done.
+//! kinds or sharing is sent as it is made; the name goes with Done. Where
+//! the server shares by name, Add someone opens the picker
+//! (`crate::share_picker`) and each share shows its name.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -10,7 +12,8 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::{gdk, glib};
 use spoolframe_linux_core::backend::{
-    EntryId, Kinds, PlaylistEdit, PlaylistEntry, PlaylistPage, PlaylistUpdate, Visibility,
+    EntryId, Kinds, PlaylistEdit, PlaylistEntry, PlaylistPage, PlaylistShare, PlaylistUpdate,
+    Visibility,
 };
 use spoolframe_linux_core::playlists::{self, ShareChange};
 
@@ -240,30 +243,52 @@ pub fn panel(
 
     panel.append(&label("SHARING", &["picker-label"]));
     panel.append(&sharing_controls(&playlist.visibility, actions, admin));
+    let shared: Vec<String> = match &playlist.visibility {
+        Visibility::Shared { with } => with.iter().map(|s| s.user_id.clone()).collect(),
+        _ => Vec::new(),
+    };
     if let Visibility::Shared { with } = &playlist.visibility
         && !with.is_empty()
     {
         let people = boxed_list();
         for share in with {
-            people.append(&share_row(
-                &share.user_id,
-                share.can_edit,
-                &playlist.visibility,
-                actions,
-            ));
+            people.append(&share_row(share, &playlist.visibility, actions));
         }
         panel.append(&people);
         panel.append(&dim("Each sees only the items they may see."));
     }
-    panel.append(
-        &gtk::Button::builder()
-            .label("Add someone")
-            .sensitive(false)
-            .halign(gtk::Align::Start)
-            .tooltip_text("The server can’t list its users to this app yet.")
-            .css_classes(["action", "compact", "outlined"])
-            .build(),
-    );
+    let add = gtk::Button::builder()
+        .label("Add someone")
+        .halign(gtk::Align::Start)
+        .css_classes(["action", "compact", "outlined"])
+        .build();
+    match actions.people.clone() {
+        Some(people) => {
+            let (update, now) = (actions.update.clone(), playlist.visibility.clone());
+            add.connect_clicked(move |button| {
+                let (update, now) = (update.clone(), now.clone());
+                crate::share_picker::present(
+                    button,
+                    people.clone(),
+                    shared.clone(),
+                    Rc::new(move |user, can_edit| {
+                        update(PlaylistUpdate {
+                            visibility: Some(playlists::share_change(
+                                &now,
+                                &ShareChange::Add(user, can_edit),
+                            )),
+                            ..PlaylistUpdate::default()
+                        })
+                    }),
+                );
+            });
+        }
+        None => {
+            add.set_sensitive(false);
+            add.set_tooltip_text(Some("The server can’t list its users to this app."));
+        }
+    }
+    panel.append(&add);
 
     let delete = gtk::Button::builder()
         .label("Delete playlist")
@@ -303,11 +328,10 @@ fn sharing_controls(visibility: &Visibility, actions: &Rc<PageActions>, admin: b
             .active(offered.on == who)
             .css_classes(["season-tab"])
             .build();
+        // Shared is made by adding someone, not picked on its own.
         if who == Who::Shared && !offered.shared {
             button.set_sensitive(false);
-            button.set_tooltip_text(Some(
-                "The server can’t list its users to this app yet, so no one can be added.",
-            ));
+            button.set_tooltip_text(Some("Add someone to share it with them."));
         }
         if let Some(change) = change {
             let (update, now) = (actions.update.clone(), visibility.clone());
@@ -337,16 +361,20 @@ fn sharing_controls(visibility: &Visibility, actions: &Rc<PageActions>, admin: b
     group
 }
 
-/// Someone the playlist is shared with: their user id (the server gives
-/// no names), whether they may edit, and Stop sharing.
+/// Someone the playlist is shared with: their name (their user id where
+/// the server gives none), whether they may edit, and Stop sharing.
 fn share_row(
-    user: &str,
-    can_edit: bool,
+    share: &PlaylistShare,
     visibility: &Visibility,
     actions: &Rc<PageActions>,
 ) -> adw::ActionRow {
+    let (user, can_edit) = (share.user_id.as_str(), share.can_edit);
+    let name = playlists::share_name(share).to_owned();
     let row = adw::ActionRow::builder().use_markup(false).build();
-    row.set_title(user);
+    row.set_title(&name);
+    if let Some(badge) = share.kind.and_then(playlists::user_kind_badge) {
+        row.set_subtitle(badge);
+    }
     let access = gtk::DropDown::from_strings(&["Read only", "Can edit"]);
     access.set_selected(u32::from(can_edit));
     access.set_valign(gtk::Align::Center);
@@ -363,7 +391,7 @@ fn share_row(
     row.add_suffix(&access);
     let stop = gtk::Button::builder()
         .icon_name(crate::icons::CLOSE)
-        .tooltip_text(format!("Stop sharing with {user}"))
+        .tooltip_text(format!("Stop sharing with {name}"))
         .valign(gtk::Align::Center)
         .css_classes(["flat", "circular"])
         .build();
@@ -406,8 +434,6 @@ fn dim(text: &str) -> gtk::Label {
 
 #[cfg(test)]
 mod tests {
-    use spoolframe_linux_core::backend::PlaylistShare;
-
     use super::*;
 
     fn shared_with(users: &[&str]) -> Visibility {

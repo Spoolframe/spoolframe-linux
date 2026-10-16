@@ -55,6 +55,7 @@ mod search;
 mod server_relays;
 mod settings;
 mod settings_window;
+mod share_picker;
 mod sidebar;
 mod source;
 mod srt_markup;

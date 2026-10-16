@@ -15,7 +15,7 @@ use spoolframe_types::{Item, MediaId, MediaKind};
 use crate::backend::{
     BackendError, Builtin, EntryId, Kinds, Liked, PlaylistChange, PlaylistEdit, PlaylistEntry,
     PlaylistEvent, PlaylistNext, PlaylistOwnerKind, PlaylistPage, PlaylistShare, PlaylistSummary,
-    Session, Visibility,
+    Session, ShareCandidate, UserKind, Visibility,
 };
 
 /// The most entries a page of a playlist holds.
@@ -79,10 +79,17 @@ pub fn owner_line(playlist: &PlaylistSummary) -> String {
             }
         }
         (PlaylistOwnerKind::Mine, _) => "Yours".to_owned(),
-        (PlaylistOwnerKind::SharedWithMe, _) if playlist.can_edit => {
-            "Shared with you · you can edit".to_owned()
+        // Whose it is, by name, where the server says (sharing by name).
+        (PlaylistOwnerKind::SharedWithMe, _) => {
+            let whose = match &playlist.owner_name {
+                Some(owner) => format!("{owner}’s"),
+                None => "Shared with you".to_owned(),
+            };
+            match playlist.can_edit {
+                true => format!("{whose} · you can edit"),
+                false => format!("{whose} · read only"),
+            }
         }
-        (PlaylistOwnerKind::SharedWithMe, _) => "Shared with you · read only".to_owned(),
         (PlaylistOwnerKind::ServerWide, _) if playlist.can_manage => {
             "Server-wide · you can edit".to_owned()
         }
@@ -575,6 +582,9 @@ pub enum ShareChange {
     /// Whether this user may edit the entries.
     CanEdit(String, bool),
     StopSharing(String),
+    /// Someone picked to share with, read only or able to edit; someone
+    /// it is shared with already keeps their place, with this access.
+    Add(String, bool),
 }
 
 /// Who sees the playlist after `change`, from `now`. Shared with nobody
@@ -601,10 +611,43 @@ pub fn share_change(now: &Visibility, change: &ShareChange) -> Visibility {
             .into_iter()
             .filter(|share| share.user_id != *user)
             .collect(),
+        ShareChange::Add(user, can_edit) => {
+            let mut with = shares(now);
+            match with.iter_mut().find(|share| share.user_id == *user) {
+                Some(share) => share.can_edit = *can_edit,
+                None => with.push(PlaylistShare::new(user.clone(), *can_edit)),
+            }
+            with
+        }
     };
     match with.is_empty() {
         true => Visibility::Personal,
         false => Visibility::Shared { with },
+    }
+}
+
+/// Who someone a playlist is shared with is shown as: their name where
+/// the server says it (sharing by name), else their user id.
+pub fn share_name(share: &PlaylistShare) -> &str {
+    share.display_name.as_deref().unwrap_or(&share.user_id)
+}
+
+/// Whose account someone is, as a badge: an account here or a portable
+/// user; nothing for a kind this build does not know.
+pub fn user_kind_badge(kind: UserKind) -> Option<&'static str> {
+    match kind {
+        UserKind::Local => Some("Local"),
+        UserKind::Portable => Some("Portable"),
+        UserKind::Unknown => None,
+    }
+}
+
+/// The line under a share candidate's name: "@alice", or for a portable
+/// user, who has no username here, what they are.
+pub fn candidate_line(candidate: &ShareCandidate) -> String {
+    match &candidate.username {
+        Some(username) => format!("@{username}"),
+        None => "Portable identity".to_owned(),
     }
 }
 
@@ -768,8 +811,8 @@ mod tests {
             [
                 "Yours · shared with 1 person",
                 "Yours",
-                "Shared with you · you can edit",
-                "Shared with you · read only",
+                "Alice’s · you can edit",
+                "Andrey’s · read only",
                 "Server-wide",
                 "Server-wide · you can edit",
             ]
@@ -1943,6 +1986,212 @@ mod tests {
                 album_heart(&tracks, &liked(&[])),
             ],
             [Liked::All, Liked::Some, Liked::None]
+        );
+    }
+
+    fn movie_night(session: &dyn Session) -> String {
+        let list = ready(session.playlists()).unwrap().playlists;
+        named(&list, "Movie night").id.clone()
+    }
+
+    fn candidates(
+        session: &dyn Session,
+        query: &str,
+        offset: u32,
+        limit: u32,
+    ) -> (Vec<String>, u32) {
+        let id = movie_night(session);
+        let page = ready(session.share_candidates(&id, query, offset, limit)).unwrap();
+        (
+            page.candidates
+                .into_iter()
+                .map(|c| c.display_name)
+                .collect(),
+            page.total,
+        )
+    }
+
+    #[test]
+    fn without_sharing_by_name_a_shared_playlist_names_no_owner() {
+        let client = FakeClient::new(None).with_features(crate::backend::Features {
+            playlists: true,
+            ..crate::backend::Features::default()
+        });
+        let list = ready(session(&client, "andrey").playlists())
+            .unwrap()
+            .playlists;
+        assert_eq!(
+            owner_line(named(&list, "Road trip")),
+            "Shared with you · you can edit"
+        );
+    }
+
+    #[test]
+    fn everyone_but_the_user_can_be_shared_with_by_name() {
+        let andrey = session(&FakeClient::new(None), "andrey");
+        assert_eq!(
+            candidates(andrey.as_ref(), "", 0, 50),
+            (
+                vec!["Alice".into(), "Kim".into(), "Mum".into(), "Steve".into()],
+                4
+            )
+        );
+    }
+
+    #[test]
+    fn a_search_finds_a_name_or_a_username_in_any_case() {
+        let andrey = session(&FakeClient::new(None), "andrey");
+        assert_eq!(
+            [
+                candidates(andrey.as_ref(), "AL", 0, 50).0,
+                candidates(andrey.as_ref(), "steve", 0, 50).0
+            ],
+            [vec!["Alice".to_owned()], vec!["Steve".to_owned()]]
+        );
+    }
+
+    #[test]
+    fn candidates_come_a_page_at_a_time() {
+        let andrey = session(&FakeClient::new(None), "andrey");
+        assert_eq!(
+            candidates(andrey.as_ref(), "", 1, 2),
+            (vec!["Kim".into(), "Mum".into()], 4)
+        );
+    }
+
+    #[test]
+    fn only_whoever_manages_a_playlist_sees_whom_it_can_go_to() {
+        let client = FakeClient::new(None);
+        let alice = session(&client, "alice");
+        let list = ready(alice.playlists()).unwrap().playlists;
+        let heists = named(&list, "Andor: the heists").id.clone();
+        assert_eq!(
+            ready(alice.share_candidates(&heists, "", 0, 50)),
+            Err(BackendError::PlaylistReadOnly)
+        );
+    }
+
+    #[test]
+    fn without_sharing_by_name_no_one_is_listed() {
+        let client = FakeClient::new(None).with_features(crate::backend::Features {
+            playlists: true,
+            ..crate::backend::Features::default()
+        });
+        let andrey = session(&client, "andrey");
+        let id = movie_night(andrey.as_ref());
+        assert_eq!(
+            ready(andrey.share_candidates(&id, "", 0, 50)),
+            Err(BackendError::Unsupported(
+                "spoolframe:playlist-sharing".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn whom_a_playlist_is_shared_with_is_named() {
+        let andrey = session(&FakeClient::new(None), "andrey");
+        let list = ready(andrey.playlists()).unwrap().playlists;
+        let Visibility::Shared { with } = &named(&list, "Andor: the heists").visibility else {
+            panic!("the heists are shared")
+        };
+        assert_eq!(
+            (share_name(&with[0]), with[0].kind),
+            ("Alice", Some(UserKind::Local))
+        );
+    }
+
+    #[test]
+    fn someone_picked_is_shared_with_at_the_access_chosen() {
+        let client = FakeClient::new(None);
+        let andrey = session(&client, "andrey");
+        let id = movie_night(andrey.as_ref());
+        let now = ready(andrey.playlist(&id, 0, 1))
+            .unwrap()
+            .playlist
+            .visibility;
+        ready(andrey.update_playlist(
+            &id,
+            PlaylistUpdate {
+                visibility: Some(share_change(
+                    &now,
+                    &ShareChange::Add("local:mum".into(), true),
+                )),
+                ..PlaylistUpdate::default()
+            },
+        ))
+        .unwrap();
+        let mums = ready(session(&client, "mum").playlists())
+            .unwrap()
+            .playlists;
+        assert_eq!(
+            owner_line(named(&mums, "Movie night")),
+            "Andrey’s · you can edit"
+        );
+    }
+
+    #[test]
+    fn adding_someone_shared_with_already_changes_only_their_access() {
+        let now = Visibility::Shared {
+            with: vec![
+                PlaylistShare::new("local:alice", false),
+                PlaylistShare::new("local:bob", true),
+            ],
+        };
+        assert_eq!(
+            share_change(&now, &ShareChange::Add("local:alice".into(), true)),
+            Visibility::Shared {
+                with: vec![
+                    PlaylistShare::new("local:alice", true),
+                    PlaylistShare::new("local:bob", true),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn someone_new_goes_last_after_those_shared_with() {
+        assert_eq!(
+            share_change(
+                &Visibility::Personal,
+                &ShareChange::Add("local:alice".into(), false)
+            ),
+            Visibility::Shared {
+                with: vec![PlaylistShare::new("local:alice", false)],
+            }
+        );
+    }
+
+    #[test]
+    fn a_share_with_no_name_shows_its_user_id() {
+        assert_eq!(
+            share_name(&PlaylistShare::new("local:gone", false)),
+            "local:gone"
+        );
+    }
+
+    #[test]
+    fn a_candidate_says_their_username_or_that_they_are_portable() {
+        let candidate = |username: Option<&str>, kind| ShareCandidate {
+            user_id: "local:alice".into(),
+            display_name: "Alice".into(),
+            username: username.map(str::to_owned),
+            kind,
+        };
+        assert_eq!(
+            [
+                (
+                    candidate_line(&candidate(Some("alice"), UserKind::Local)),
+                    user_kind_badge(UserKind::Local)
+                ),
+                (
+                    candidate_line(&candidate(None, UserKind::Portable)),
+                    user_kind_badge(UserKind::Portable)
+                ),
+            ],
+            [
+                ("@alice".to_owned(), Some("Local")),
+                ("Portable identity".to_owned(), Some("Portable"))
+            ]
         );
     }
 }

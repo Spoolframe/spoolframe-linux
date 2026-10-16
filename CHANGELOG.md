@@ -56,6 +56,13 @@
   episodes. On a show's page choosing one plays it from your place;
   elsewhere it opens the playlist; right-click does the other. The rows
   are read with the page, so a change shows the next time it opens.
+- Sharing by name, on a server that has it: the editor's Add someone
+  opens a picker of the people the playlist can go to, searched by name
+  or username, a page at a time, each with their @username (or, for a
+  portable user, that they are one) and a Local or Portable badge; a
+  Can edit switch picks their access. Those it is shared with show by
+  name, and playlists shared with you say whose they are ("Alice’s ·
+  read only") in place of "Shared with you".
 - Liked and All (PX-43), on a server that has them: hearts on an
   album's track rows, on a playlist's track entries and beside the title
   in the bar while a track plays; a tap likes or un-likes at once, and
