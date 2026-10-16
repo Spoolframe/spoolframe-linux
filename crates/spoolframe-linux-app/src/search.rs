@@ -343,6 +343,7 @@ impl SearchPage {
                     set_watched: None,
                     hide: None,
                     enqueue: needs.cards.enqueue.clone(),
+                    add_to_playlist: needs.cards.add_to_playlist.clone(),
                     open_person: needs.cards.open_person.clone(),
                 })
             };
@@ -1071,22 +1072,28 @@ impl SearchPage {
                 cover.set_valign(gtk::Align::Center);
                 row.add_prefix(&cover);
             }
-            // An episode's menu goes to its show or season.
+            // An episode's menu goes to its show or season; a track's, as
+            // on the album page, queues it too; either adds to a playlist.
+            let mut groups = Vec::new();
             if let Item::Episode(episode) = item {
-                let menu = crate::views::menu_popover(vec![crate::views::go_to_entries(
-                    episode,
-                    &self.cards.open,
-                )]);
-                crate::views::context_menu(row.upcast_ref(), &menu);
+                groups.push(crate::views::go_to_entries(episode, &self.cards.open));
             }
-            // A track's menu on right-click, as on the album page.
             if let (Item::Track(track), Some(enqueue)) = (item, &self.cards.enqueue) {
                 let (enqueue, queued) = (enqueue.clone(), item.clone());
-                let menu = crate::views::menu_popover(vec![
-                    crate::views::enqueue_entries(move |at| enqueue(queued.clone(), at)),
-                    crate::views::track_go_to_entries(track, &self.cards.open, true),
-                ]);
-                crate::views::context_menu(row.upcast_ref(), &menu);
+                groups.push(crate::views::enqueue_entries(move |at| {
+                    enqueue(queued.clone(), at)
+                }));
+                groups.push(crate::views::track_go_to_entries(
+                    track,
+                    &self.cards.open,
+                    true,
+                ));
+            }
+            groups.extend(
+                crate::views::add_entry(item, self.cards.add_to_playlist.as_ref()).map(|e| vec![e]),
+            );
+            if !groups.is_empty() {
+                crate::views::context_menu(row.upcast_ref(), &crate::views::menu_popover(groups));
             }
             let (open, item) = (self.cards.open.clone(), item.clone());
             row.connect_activated(move |_| open(item.clone()));
@@ -1624,6 +1631,7 @@ mod tests {
                 hide: None,
                 enqueue: None,
                 open_person: None,
+                add_to_playlist: None,
             }),
             play: Rc::new(|_| {}),
             open_person: Rc::new(|_| {}),

@@ -105,6 +105,7 @@ pub const ALBUM: &str = "lucide-disc-3-symbolic";
 pub const PLAYLISTS: &str = "lucide-list-music-symbolic";
 pub const PIN: &str = "lucide-pin-symbolic";
 pub const UNPIN: &str = "lucide-pin-off-symbolic";
+pub const EDIT: &str = "lucide-pencil-symbolic";
 
 /// Every name above, for the tests.
 #[cfg(test)]
@@ -178,6 +179,7 @@ const ALL: &[&str] = &[
     PLAYLISTS,
     PIN,
     UNPIN,
+    EDIT,
 ];
 
 #[cfg(test)]

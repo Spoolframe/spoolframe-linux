@@ -156,9 +156,13 @@ pub fn playable(
     let series = matches!(item, Item::Episode(_));
     let pickers = tracks.map(|t| TrackPickers::new(t, chosen, series, &actions.forget));
     let buttons = playback_buttons(&facts, &actions, pickers.clone());
+    let mut more = Vec::new();
     if let Item::Episode(e) = item {
-        let menu = views::menu_popover(vec![views::go_to_entries(e, &cards.open)]);
-        buttons.append(&views::menu_button(&menu, "More"));
+        more.push(views::go_to_entries(e, &cards.open));
+    }
+    more.extend(views::add_entry(item, cards.add_to_playlist.as_ref()).map(|e| vec![e]));
+    if !more.is_empty() {
+        buttons.append(&views::menu_button(&views::menu_popover(more), "More"));
     }
     info.append(&buttons);
     if let Some(pickers) = &pickers {
@@ -867,6 +871,12 @@ pub fn show(
         mark.connect_clicked(move |_| (actions.set_watched)(id.clone(), !all_watched));
     }
     buttons.append(&mark);
+    if let Some(add) = views::add_entry(&Item::Show(show.clone()), cards.add_to_playlist.as_ref()) {
+        buttons.append(&views::menu_button(
+            &views::menu_popover(vec![vec![add]]),
+            "More",
+        ));
+    }
     facts.append(&buttons);
     header.append(&facts);
     body.append(&header);
@@ -911,6 +921,18 @@ pub fn show(
     watched_count.set_hexpand(true);
     season_line.append(&watched_count);
     season_line.append(&mark_season);
+    // The season's own More: "Add Season N to a playlist…", for the one
+    // picked.
+    let season_more = cards.add_to_playlist.as_ref().map(|_| {
+        let button = gtk::MenuButton::builder()
+            .icon_name(crate::icons::MORE)
+            .tooltip_text("More")
+            .valign(gtk::Align::Center)
+            .css_classes(["flat", "circular"])
+            .build();
+        season_line.append(&button);
+        button
+    });
     let bar = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(10)
@@ -922,12 +944,13 @@ pub fn show(
     body.append(&list_slot);
 
     let open_season: Rc<dyn Fn(usize)> = {
-        let (model, current, actions, cards_open, art) = (
+        let (model, current, actions, cards_open, art, add) = (
             model.clone(),
             current.clone(),
             actions.clone(),
             cards.open.clone(),
             cards.art.clone(),
+            cards.add_to_playlist.clone(),
         );
         let (watched_count, mark_season, list_slot) = (
             watched_count.clone(),
@@ -965,11 +988,19 @@ pub fn show(
             mark_handler.replace(Some(
                 mark_season.connect_clicked(move |_| (actions_.set_watched)(id.clone(), !all)),
             ));
+            if let Some(more) = &season_more
+                && let Some(entry) = views::add_entry(&Item::Season(season.clone()), add.as_ref())
+            {
+                let popover = views::menu_popover(vec![vec![entry]]);
+                popover.set_halign(gtk::Align::Fill);
+                more.set_popover(Some(&popover));
+            }
             list_slot.set_child(Some(&episode_list(
                 episodes,
                 &actions,
                 &cards_open,
                 art.as_ref(),
+                add.as_ref(),
             )));
         })
     };
@@ -1024,6 +1055,7 @@ fn episode_list(
     actions: &Rc<ShowActions>,
     open: &views::Open,
     art: Option<&Rc<crate::artwork::Art>>,
+    add: Option<&views::AddToPlaylist>,
 ) -> gtk::ListBox {
     let list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
@@ -1113,7 +1145,9 @@ fn episode_list(
                 move || (actions.set_watched)(id.clone(), !watched),
             )
         };
-        let menu = views::menu_popover(vec![first, vec![mark]]);
+        let mut groups = vec![first, vec![mark]];
+        groups.extend(views::add_entry(episode, add).map(|e| vec![e]));
+        let menu = views::menu_popover(groups);
         views::context_menu(row.upcast_ref(), &menu);
         let (episode, open) = (episode.clone(), open.clone());
         row.connect_activated(move |_| open(episode.clone()));
@@ -1125,7 +1159,18 @@ fn episode_list(
 /// An artist: their albums as a grid.
 pub fn artist(artist: &Artist, albums: &[Item], cards: &Cards) -> gtk::Widget {
     let body = content();
-    body.append(&label(&artist.name, &["title-1"]));
+    let heading = gtk::Box::builder().spacing(12).build();
+    let name = label(&artist.name, &["title-1"]);
+    name.set_hexpand(true);
+    heading.append(&name);
+    let item = Item::Artist(artist.clone());
+    if let Some(add) = views::add_entry(&item, cards.add_to_playlist.as_ref()) {
+        heading.append(&views::menu_button(
+            &views::menu_popover(vec![vec![add]]),
+            "More",
+        ));
+    }
+    body.append(&heading);
     body.append(&views::grid(
         "Albums",
         albums.iter().map(|a| views::poster_card(a, cards)),
@@ -1262,6 +1307,19 @@ pub fn album(
     buttons.append(&play_all);
     buttons.append(&shuffle);
     buttons.set_hexpand(true);
+    let item = Item::Album(album.clone());
+    let buttons = match views::add_entry(&item, cards.add_to_playlist.as_ref()) {
+        Some(add) => {
+            let row = gtk::Box::builder().spacing(10).build();
+            row.append(&buttons);
+            row.append(&views::menu_button(
+                &views::menu_popover(vec![vec![add]]),
+                "More",
+            ));
+            row
+        }
+        None => buttons,
+    };
     let actions = buttons;
     side.append(&actions);
     body.append(&side);
@@ -1295,11 +1353,14 @@ pub fn album(
         // Right-click (or a long press) for the track's menu, as designed:
         // no button on every row.
         let menu = {
+            let added = views::add_entry(track, cards.add_to_playlist.as_ref());
             let (enqueue, track) = (enqueue.clone(), track.clone());
-            views::menu_popover(vec![
+            let mut groups = vec![
                 views::enqueue_entries(move |at| enqueue(vec![track.clone()], at)),
                 views::track_go_to_entries(t, &cards.open, false),
-            ])
+            ];
+            groups.extend(added.map(|e| vec![e]));
+            views::menu_popover(groups)
         };
         views::context_menu(row.upcast_ref(), &menu);
         let (play, tracks) = (play.clone(), tracks.to_vec());

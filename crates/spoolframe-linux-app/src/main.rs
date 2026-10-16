@@ -34,6 +34,7 @@ mod pin;
 mod pipeline;
 mod playback;
 mod player;
+mod playlist_edit;
 mod playlists;
 mod preferences;
 mod profile_page;

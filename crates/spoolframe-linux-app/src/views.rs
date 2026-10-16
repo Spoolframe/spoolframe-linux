@@ -38,6 +38,26 @@ pub struct Cards {
     /// Opens a person's page, their items: from a cast member on an item's
     /// page. None before a session exists.
     pub open_person: Option<Rc<dyn Fn(Person)>>,
+    /// "Add to playlist…" for an item (PX-40); none on a server without
+    /// playlists, so no menu offers it.
+    pub add_to_playlist: Option<AddToPlaylist>,
+}
+
+/// Opens "Add to playlist" for an item.
+pub type AddToPlaylist = Rc<dyn Fn(Item)>;
+
+/// "Add to playlist…" for `item`, where the server has playlists; a
+/// season's says which season.
+pub fn add_entry(item: &Item, add: Option<&AddToPlaylist>) -> Option<MenuEntry> {
+    let add = add?.clone();
+    let label = match item {
+        Item::Season(season) => format!("Add {} to a playlist…", season.title),
+        _ => "Add to playlist…".to_owned(),
+    };
+    let item = item.clone();
+    Some(MenuEntry::new(label, crate::icons::PLAYLISTS, move || {
+        add(item.clone())
+    }))
 }
 
 /// Where in the play queue (P1-23) items go.
@@ -311,7 +331,15 @@ pub fn continue_card(item: &Item, cards: &Cards, shelf: Shelf) -> gtk::Widget {
     let card = card(item, &tile, &below, LANDSCAPE.0, &cards.open);
     card.add_css_class("continue-card");
     if let (Some(set_watched), Some(hide)) = (&cards.set_watched, &cards.hide) {
-        card_menu(&card, item, shelf, set_watched, hide, &cards.open);
+        card_menu(
+            &card,
+            item,
+            shelf,
+            set_watched,
+            hide,
+            &cards.open,
+            cards.add_to_playlist.as_ref(),
+        );
     }
     card
 }
@@ -380,10 +408,14 @@ fn poster(item: &Item, cards: &Cards, detail: bool) -> gtk::Widget {
         caption.append(&caption_label(&facts.title, &["card-caption"]));
     }
     let card = card(item, &tile, &caption, size.0, &cards.open);
+    let mut groups = Vec::new();
     if music && let Some(enqueue) = &cards.enqueue {
         let (item, enqueue) = (item.clone(), enqueue.clone());
-        let popover = menu_popover(vec![enqueue_entries(move |at| enqueue(item.clone(), at))]);
-        context_menu(&card, &popover);
+        groups.push(enqueue_entries(move |at| enqueue(item.clone(), at)));
+    }
+    groups.extend(add_entry(item, cards.add_to_playlist.as_ref()).map(|e| vec![e]));
+    if !groups.is_empty() {
+        context_menu(&card, &menu_popover(groups));
     }
     card
 }
@@ -449,6 +481,7 @@ fn card_menu(
     set_watched: &Rc<dyn Fn(MediaId, bool)>,
     hide: &Rc<dyn Fn(Item, Shelf)>,
     open: &Open,
+    add: Option<&AddToPlaylist>,
 ) {
     let watch = |label, icon, watched| {
         let (id, set_watched) = (item.id().clone(), set_watched.clone());
@@ -472,6 +505,7 @@ fn card_menu(
     if let Item::Episode(episode) = item {
         groups.push(go_to_entries(episode, open));
     }
+    groups.extend(add_entry(item, add).map(|e| vec![e]));
     groups.push(vec![remove]);
     let popover = menu_popover(groups);
     context_menu(card, &popover);
@@ -1060,6 +1094,43 @@ mod tests {
         let bounds = header.compute_bounds(&view).unwrap();
         window.close();
         assert_eq!(bounds.y(), 0.0);
+    }
+
+    #[test]
+    fn without_playlists_no_menu_offers_to_add_to_one() {
+        assert!(add_entry(&episode(Some("Andor")), None).is_none());
+    }
+
+    #[test]
+    fn with_playlists_an_episode_and_its_season_offer_to_add_themselves() {
+        let asked = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let add: AddToPlaylist = {
+            let asked = asked.clone();
+            Rc::new(move |item: Item| asked.borrow_mut().push(item.id().clone()))
+        };
+        let episode = episode(Some("Andor"));
+        let Item::Episode(e) = &episode else {
+            unreachable!()
+        };
+        let season = season_of(e);
+        let labels: Vec<String> = [&episode, &season]
+            .into_iter()
+            .map(|item| {
+                let entry = add_entry(item, Some(&add)).unwrap();
+                (entry.run)();
+                entry.label
+            })
+            .collect();
+        assert_eq!(
+            (labels, asked.borrow().clone()),
+            (
+                vec![
+                    "Add to playlist…".to_owned(),
+                    "Add Season 1 to a playlist…".to_owned()
+                ],
+                vec![episode.id().clone(), season.id().clone()]
+            )
+        );
     }
 
     #[test]

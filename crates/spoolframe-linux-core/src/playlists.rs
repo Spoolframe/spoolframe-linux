@@ -10,12 +10,15 @@
 
 use std::time::Duration;
 
-use spoolframe_types::{Item, MediaKind};
+use spoolframe_types::{Item, MediaId, MediaKind};
 
 use crate::backend::{
     BackendError, EntryId, Kinds, PlaylistChange, PlaylistEdit, PlaylistEntry, PlaylistEvent,
-    PlaylistOwnerKind, PlaylistPage, PlaylistSummary, Session, Visibility,
+    PlaylistOwnerKind, PlaylistPage, PlaylistShare, PlaylistSummary, Session, Visibility,
 };
+
+/// The most entries a page of a playlist holds.
+pub const PAGE: u32 = 200;
 
 /// The Playlists section's groups, each in the server's order.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -420,6 +423,152 @@ pub fn new_playlist(
         false => Visibility::Personal,
     };
     Ok((name.to_owned(), kinds, visibility))
+}
+
+/// Adds `item` to the end of playlist `id` (a season its episodes, an
+/// album its tracks), retrying once on a conflict: the entries the add
+/// made, for Undo. They are told apart from the ones before by id, so an
+/// item already in the playlist, or one added twice, is counted right.
+pub async fn add_item(
+    session: &dyn Session,
+    id: &str,
+    item: &MediaId,
+) -> Result<Vec<EntryId>, BackendError> {
+    let head = session.playlist(id, 0, 1).await?;
+    // The last page before, and everything from it on after: an add
+    // appends, so its entries are past what was there.
+    let from = head.total.saturating_sub(PAGE);
+    let before = match head.total {
+        0 => Vec::new(),
+        _ => entry_ids(&session.playlist(id, from, PAGE).await?),
+    };
+    let add = vec![PlaylistEdit::Add {
+        id: item.clone(),
+        before: None,
+    }];
+    edit_retrying(session, id, head.playlist.revision, add).await?;
+    let mut after = Vec::new();
+    let mut offset = from;
+    loop {
+        let page = session.playlist(id, offset, PAGE).await?;
+        after.extend(entry_ids(&page));
+        offset += page.entries.len() as u32;
+        if page.entries.is_empty() || offset >= page.total {
+            break;
+        }
+    }
+    Ok(added_entries(&before, &after))
+}
+
+fn entry_ids(page: &PlaylistPage) -> Vec<EntryId> {
+    page.entries.iter().map(|e| e.entry).collect()
+}
+
+/// The entries in `after` that were not in `before`, in order.
+fn added_entries(before: &[EntryId], after: &[EntryId]) -> Vec<EntryId> {
+    after
+        .iter()
+        .filter(|e| !before.contains(e))
+        .copied()
+        .collect()
+}
+
+/// Takes `entries` out of playlist `id`: Undo of an add.
+pub async fn remove_entries(
+    session: &dyn Session,
+    id: &str,
+    entries: &[EntryId],
+) -> Result<u64, BackendError> {
+    let revision = session.playlist(id, 0, 1).await?.playlist.revision;
+    let edits = entries
+        .iter()
+        .map(|&entry| PlaylistEdit::Remove { entry })
+        .collect();
+    edit_retrying(session, id, revision, edits).await
+}
+
+/// What a refused add says, for `item` and the playlist `playlist`.
+pub fn add_refusal(error: &BackendError, item: &Item, playlist: &str) -> String {
+    match error {
+        BackendError::KindNotAllowed(_) => format!("{} can’t go in {playlist}", title(item)),
+        BackendError::PlaylistReadOnly => "You can’t change this playlist".to_owned(),
+        other => other.to_string(),
+    }
+}
+
+/// The kinds a playlist made from an item's "New playlist…" starts with:
+/// those that take the item.
+pub fn kinds_for(kind: MediaKind) -> Kinds {
+    Kinds {
+        movies: kind == MediaKind::Movie,
+        episodes: matches!(
+            kind,
+            MediaKind::Episode | MediaKind::Season | MediaKind::Show
+        ),
+        tracks: matches!(
+            kind,
+            MediaKind::Track | MediaKind::Album | MediaKind::Artist
+        ),
+    }
+}
+
+/// What the editor shows of a playlist: Edit itself, the entries' handles
+/// and Remove, and the side panel (name, kinds, sharing, Delete).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EditorControls {
+    pub edit: bool,
+    pub panel: bool,
+    /// Server-wide among the sharing choices: an admin's.
+    pub server_wide: bool,
+}
+
+pub fn editor_controls(playlist: &PlaylistSummary, admin: bool) -> EditorControls {
+    EditorControls {
+        edit: playlist.can_edit || playlist.can_manage,
+        panel: playlist.can_manage,
+        server_wide: playlist.can_manage && admin,
+    }
+}
+
+/// A change made in the editor's Sharing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShareChange {
+    Personal,
+    ServerWide,
+    /// Whether this user may edit the entries.
+    CanEdit(String, bool),
+    StopSharing(String),
+}
+
+/// Who sees the playlist after `change`, from `now`. Shared with nobody
+/// is Personal.
+pub fn share_change(now: &Visibility, change: &ShareChange) -> Visibility {
+    let shares = |now: &Visibility| match now {
+        Visibility::Shared { with } => with.clone(),
+        _ => Vec::new(),
+    };
+    let with: Vec<PlaylistShare> = match change {
+        ShareChange::Personal => return Visibility::Personal,
+        ShareChange::ServerWide => return Visibility::ServerWide,
+        ShareChange::CanEdit(user, can_edit) => shares(now)
+            .into_iter()
+            .map(|share| match share.user_id == *user {
+                true => PlaylistShare {
+                    can_edit: *can_edit,
+                    ..share
+                },
+                false => share,
+            })
+            .collect(),
+        ShareChange::StopSharing(user) => shares(now)
+            .into_iter()
+            .filter(|share| share.user_id != *user)
+            .collect(),
+    };
+    match with.is_empty() {
+        true => Visibility::Personal,
+        false => Visibility::Shared { with },
+    }
 }
 
 #[cfg(test)]
@@ -1130,6 +1279,176 @@ mod tests {
             ready(alice.dismiss_pin_notes()).unwrap();
         }
         assert!(ready(alice.playlists()).unwrap().pin_notes.is_empty());
+    }
+
+    fn entries_of(session: &dyn Session, id: &str) -> Vec<MediaId> {
+        page(session, id)
+            .entries
+            .iter()
+            .map(|e| e.item.id().clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_season_added_reports_each_entry_it_made_even_one_already_there() {
+        let client = FakeClient::new(None);
+        let andrey = session(&client, "andrey");
+        let list = ready(andrey.playlists()).unwrap().playlists;
+        let heists = named(&list, "Andor: the heists").id.clone();
+        let added = ready(add_item(
+            andrey.as_ref(),
+            &heists,
+            &media(MediaKind::Season, "70"),
+        ))
+        .unwrap();
+        let shown = page(andrey.as_ref(), &heists);
+        let items: Vec<_> = shown
+            .entries
+            .iter()
+            .filter(|e| added.contains(&e.entry))
+            .map(|e| e.item.id().clone())
+            .collect();
+        assert_eq!(
+            items,
+            ["71", "72", "73"].map(|k| media(MediaKind::Episode, k))
+        );
+    }
+
+    #[test]
+    fn undo_of_an_add_leaves_the_playlist_as_it_was() {
+        let client = FakeClient::new(None);
+        let andrey = session(&client, "andrey");
+        let list = ready(andrey.playlists()).unwrap().playlists;
+        let heists = named(&list, "Andor: the heists").id.clone();
+        let before = entries_of(andrey.as_ref(), &heists);
+        let added = ready(add_item(
+            andrey.as_ref(),
+            &heists,
+            &media(MediaKind::Season, "70"),
+        ))
+        .unwrap();
+        ready(remove_entries(andrey.as_ref(), &heists, &added)).unwrap();
+        assert_eq!(entries_of(andrey.as_ref(), &heists), before);
+    }
+
+    #[test]
+    fn a_refused_add_says_why_in_the_boards_words() {
+        let client = FakeClient::new(None);
+        let andrey = session(&client, "andrey");
+        let list = ready(andrey.playlists()).unwrap().playlists;
+        let heists = named(&list, "Andor: the heists").id.clone();
+        let film = ready(andrey.item(&media(MediaKind::Movie, "1"))).unwrap().0;
+        let refused = ready(add_item(andrey.as_ref(), &heists, film.id())).unwrap_err();
+        assert_eq!(
+            add_refusal(&refused, &film, "the Heists"),
+            format!("{} can’t go in the Heists", title(&film))
+        );
+    }
+
+    #[test]
+    fn a_new_playlist_from_an_item_takes_its_kind() {
+        assert_eq!(
+            [
+                kinds_for(MediaKind::Season),
+                kinds_for(MediaKind::Album),
+                kinds_for(MediaKind::Movie)
+            ],
+            [
+                episodes(),
+                Kinds {
+                    tracks: true,
+                    ..Kinds::default()
+                },
+                Kinds {
+                    movies: true,
+                    ..Kinds::default()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn the_editor_shows_what_each_user_may_change() {
+        let client = FakeClient::new(None);
+        let andrey = ready(session(&client, "andrey").playlists())
+            .unwrap()
+            .playlists;
+        let alice = ready(session(&client, "alice").playlists())
+            .unwrap()
+            .playlists;
+        let controls = |p: &PlaylistSummary, admin| {
+            let c = editor_controls(p, admin);
+            (c.edit, c.panel, c.server_wide)
+        };
+        assert_eq!(
+            [
+                // The owner, an admin.
+                controls(named(&andrey, "Movie night"), true),
+                // An editor of Alice's.
+                controls(named(&andrey, "Road trip"), true),
+                // Read only.
+                controls(named(&alice, "Andor: the heists"), false),
+                // Server-wide, seen by a user.
+                controls(named(&alice, "New this month"), false),
+                // Server-wide, for its admin.
+                controls(named(&andrey, "New this month"), true),
+            ],
+            [
+                (true, true, true),
+                (true, false, false),
+                (false, false, false),
+                (false, false, false),
+                (true, true, true),
+            ]
+        );
+    }
+
+    fn shares(users: &[(&str, bool)]) -> Visibility {
+        Visibility::Shared {
+            with: users
+                .iter()
+                .map(|(user, can_edit)| PlaylistShare {
+                    user_id: (*user).to_owned(),
+                    can_edit: *can_edit,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_share_can_be_made_an_editor_or_stopped() {
+        let now = shares(&[("local:a", false), ("local:b", true)]);
+        assert_eq!(
+            (
+                share_change(&now, &ShareChange::CanEdit("local:a".into(), true)),
+                share_change(&now, &ShareChange::StopSharing("local:b".into())),
+            ),
+            (
+                shares(&[("local:a", true), ("local:b", true)]),
+                shares(&[("local:a", false)]),
+            )
+        );
+    }
+
+    #[test]
+    fn stopping_the_last_share_makes_it_personal() {
+        let now = shares(&[("local:a", false)]);
+        assert_eq!(
+            share_change(&now, &ShareChange::StopSharing("local:a".into())),
+            Visibility::Personal
+        );
+    }
+
+    #[test]
+    fn personal_and_server_wide_drop_the_shares() {
+        let now = shares(&[("local:a", false)]);
+        assert_eq!(
+            (
+                share_change(&now, &ShareChange::Personal),
+                share_change(&now, &ShareChange::ServerWide)
+            ),
+            (Visibility::Personal, Visibility::ServerWide)
+        );
     }
 
     #[test]

@@ -14,9 +14,9 @@ use gtk::glib;
 use relm4::{Component, ComponentParts, ComponentSender};
 use spoolframe_linux_core::backend::{
     BackendError, ChosenTracks, Client, ConnectionState, EntryId, HomeScreen, Invite, Kinds,
-    Person, PlaySettings, PlaylistEvent, PlaylistList, PlaylistNext, PlaylistPage, PlaylistSummary,
-    Profile, ProfileSignIn, SearchScope, Selection, Server, ServerKey, Session,
-    TrackPreferencesInfo, Visibility,
+    Person, PlaySettings, PlaylistEdit, PlaylistEvent, PlaylistList, PlaylistNext, PlaylistPage,
+    PlaylistSummary, PlaylistUpdate, Profile, ProfileSignIn, SearchScope, Selection, Server,
+    ServerKey, Session, TrackPreferencesInfo, Visibility,
 };
 use spoolframe_linux_core::next_episode::next_episode;
 use spoolframe_linux_core::playlists::{self as playlist_rules, PinNotesShown};
@@ -30,7 +30,7 @@ use crate::minibar::MiniBar;
 use crate::mpris::Mpris;
 use crate::passkey_dialog::{self, PasskeySignIn};
 use crate::playback::{Change, Playback, Playlist};
-use crate::playlists::PlaylistView;
+use crate::playlists::{Mode, PlaylistView};
 use crate::queue::Queued;
 use crate::remote_sign_in::{self, RemoteSignIn, Via};
 use crate::saved_queue::SavedQueue;
@@ -180,6 +180,8 @@ pub struct App {
     shown_playlist: Option<ShownPlaylist>,
     /// What a pinned row's menu and a drag in Pinned do.
     pinned_actions: Rc<PinnedActions>,
+    /// The item "Add to playlist" was asked for while the list loads.
+    pending_add: Option<Box<Item>>,
 }
 
 /// A playlist's page on the stack: its view, refilled in place when the
@@ -188,6 +190,8 @@ struct ShownPlaylist {
     view: Rc<PlaylistView>,
     body: adw::Bin,
     page: adw::NavigationPage,
+    /// Shown in the editor.
+    editing: bool,
 }
 
 /// How a playlist is asked to play.
@@ -205,7 +209,7 @@ pub enum PlaylistPlay {
 }
 
 /// The most entries the server sends at once.
-const PLAYLIST_PAGE: u32 = 200;
+const PLAYLIST_PAGE: u32 = playlist_rules::PAGE;
 
 /// The tag of a playlist's page on the stack.
 const PLAYLIST_TAG: &str = "playlist";
@@ -341,8 +345,22 @@ pub enum Msg {
     PinPlaylist(String, bool),
     /// The pinned one at the first index dropped on the second's row.
     DropPin(usize, usize),
-    NewPlaylist,
-    CreatePlaylist(String, Kinds, Visibility),
+    /// "New playlist", from the section or for an item to go in.
+    NewPlaylist(Option<Box<Item>>),
+    CreatePlaylist(String, Kinds, Visibility, Option<Box<Item>>),
+    /// "Add to playlist…" on an item's menu.
+    AddToPlaylist(Box<Item>),
+    /// Add the item to the playlist with this id and name.
+    AddItemTo(String, String, Box<Item>),
+    /// Undo: take out the entries an add made.
+    UndoAdd(String, Vec<EntryId>),
+    /// The shown playlist into the editor (`true`) or out of it.
+    EditPlaylist(bool),
+    /// Done in the editor, with a new name if one was typed.
+    FinishEdit(Option<String>),
+    EditEntries(String, u64, Vec<PlaylistEdit>),
+    UpdatePlaylist(String, PlaylistUpdate),
+    DeletePlaylist(String),
     PlaylistChanged(Box<PlaylistEvent>),
     /// Playlist changes were missed: read everything shown again.
     PlaylistsLagged,
@@ -510,7 +528,20 @@ pub enum Loaded {
     PlaylistPage(String, bool, Result<PlaylistPage, BackendError>),
     /// A further page of its entries.
     PlaylistMore(String, Result<PlaylistPage, BackendError>),
-    PlaylistCreated(Result<PlaylistSummary, BackendError>),
+    /// A playlist made, and the item to add to it, if it was made for one.
+    PlaylistCreated(Result<PlaylistSummary, BackendError>, Option<Box<Item>>),
+    /// An item added to a playlist (id, name): the entries it made.
+    Added(
+        String,
+        String,
+        Box<Item>,
+        Result<Vec<EntryId>, BackendError>,
+    ),
+    /// A playlist's entries changed: its new revision.
+    PlaylistEdited(String, Result<u64, BackendError>),
+    PlaylistUpdated(String, Result<PlaylistSummary, BackendError>),
+    /// A playlist deleted, by name.
+    PlaylistDeleted(String, Result<(), BackendError>),
     PinChanged(Result<(), BackendError>),
     /// What the server picked to play from a playlist.
     PlaylistStarted(Result<Option<PlaylistNext>, BackendError>),
@@ -568,7 +599,11 @@ impl Loaded {
             | Loaded::Playlists(Err(e))
             | Loaded::PlaylistPage(_, _, Err(e))
             | Loaded::PlaylistMore(_, Err(e))
-            | Loaded::PlaylistCreated(Err(e))
+            | Loaded::PlaylistCreated(Err(e), _)
+            | Loaded::Added(_, _, _, Err(e))
+            | Loaded::PlaylistEdited(_, Err(e))
+            | Loaded::PlaylistUpdated(_, Err(e))
+            | Loaded::PlaylistDeleted(_, Err(e))
             | Loaded::PinChanged(Err(e))
             | Loaded::PlaylistStarted(Err(e)) => Some(e),
             _ => None,
@@ -754,7 +789,7 @@ impl Component for App {
             .build();
         {
             let sender = sender.clone();
-            new_playlist.connect_clicked(move |_| sender.input(Msg::NewPlaylist));
+            new_playlist.connect_clicked(move |_| sender.input(Msg::NewPlaylist(None)));
         }
         header.pack_end(&new_playlist);
         let content = gtk::Box::builder()
@@ -949,6 +984,7 @@ impl Component for App {
                 hide: None,
                 enqueue: None,
                 open_person: None,
+                add_to_playlist: None,
             }),
             connection_watch: None,
             sign_out_watch: None,
@@ -969,6 +1005,7 @@ impl Component for App {
             opening_playlist: None,
             shown_playlist: None,
             pinned_actions,
+            pending_add: None,
         };
         model.load_servers(&sender);
         // Invite links the desktop opened before the window was up.
@@ -1610,25 +1647,121 @@ impl Component for App {
                     Loaded::PinChanged(session.pin_playlist(&id, position).await)
                 });
             }
-            Msg::NewPlaylist => {
+            Msg::NewPlaylist(item) => {
                 let Some(session) = self.playlist_session() else {
                     return;
                 };
+                // Made for an item: its kind ticked to begin with.
+                let preset = item
+                    .as_ref()
+                    .map(|i| playlist_rules::kinds_for(i.id().kind()))
+                    .unwrap_or_default();
                 let create: Rc<dyn Fn(String, Kinds, Visibility)> = {
                     let sender = sender.clone();
                     Rc::new(move |name, kinds, visibility| {
-                        sender.input(Msg::CreatePlaylist(name, kinds, visibility))
+                        sender.input(Msg::CreatePlaylist(name, kinds, visibility, item.clone()))
                     })
                 };
-                playlists::new_playlist_dialog(root, session.is_admin(), create);
+                playlists::new_playlist_dialog(root, session.is_admin(), preset, create);
             }
-            Msg::CreatePlaylist(name, kinds, visibility) => {
+            Msg::CreatePlaylist(name, kinds, visibility, item) => {
                 let Some(session) = self.playlist_session() else {
                     return;
                 };
                 self.command(&sender, async move {
                     let made = session.create_playlist(&name, kinds, visibility).await;
-                    Loaded::PlaylistCreated(made)
+                    Loaded::PlaylistCreated(made, item)
+                });
+            }
+            Msg::AddToPlaylist(item) => {
+                if self.playlist_session().is_none() {
+                    return;
+                }
+                match &self.playlists {
+                    Some(_) => self.add_dialog(*item, &sender, root),
+                    // Asked for before the list came: it opens when it does.
+                    None => {
+                        self.pending_add = Some(item);
+                        self.load_playlists(&sender);
+                    }
+                }
+            }
+            Msg::AddItemTo(id, name, item) => {
+                let Some(session) = self.playlist_session() else {
+                    return;
+                };
+                self.command(&sender, async move {
+                    let added = playlist_rules::add_item(session.as_ref(), &id, item.id()).await;
+                    Loaded::Added(id, name, item, added)
+                });
+            }
+            Msg::UndoAdd(id, entries) => {
+                let Some(session) = self.playlist_session() else {
+                    return;
+                };
+                self.command(&sender, async move {
+                    let done =
+                        playlist_rules::remove_entries(session.as_ref(), &id, &entries).await;
+                    Loaded::PlaylistEdited(id, done)
+                });
+            }
+            Msg::EditPlaylist(on) => {
+                let Some(id) = self.shown_playlist_id(widgets) else {
+                    return;
+                };
+                if let Some(shown) = &mut self.shown_playlist {
+                    shown.editing = on;
+                }
+                self.reload_playlist(id, &sender);
+            }
+            Msg::FinishEdit(name) => {
+                if let (Some(name), Some(id)) = (name, self.shown_playlist_id(widgets)) {
+                    sender.input(Msg::UpdatePlaylist(
+                        id,
+                        PlaylistUpdate {
+                            name: Some(name),
+                            ..PlaylistUpdate::default()
+                        },
+                    ));
+                }
+                sender.input(Msg::EditPlaylist(false));
+            }
+            Msg::EditEntries(id, revision, edits) => {
+                let Some(session) = self.playlist_session() else {
+                    return;
+                };
+                self.command(&sender, async move {
+                    let done =
+                        playlist_rules::edit_retrying(session.as_ref(), &id, revision, edits).await;
+                    Loaded::PlaylistEdited(id, done)
+                });
+            }
+            Msg::UpdatePlaylist(id, update) => {
+                let Some(session) = self.playlist_session() else {
+                    return;
+                };
+                self.command(&sender, async move {
+                    let done = session.update_playlist(&id, update).await;
+                    Loaded::PlaylistUpdated(id, done)
+                });
+            }
+            Msg::DeletePlaylist(id) => {
+                let Some(session) = self.playlist_session() else {
+                    return;
+                };
+                // Left at once; its Gone event then finds no page to leave.
+                let name = match self.shown_playlist.take() {
+                    Some(shown) if shown.view.id == id => {
+                        widgets.stack.pop_to_page(&widgets.root_page);
+                        shown.view.name.clone()
+                    }
+                    other => {
+                        self.shown_playlist = other;
+                        String::new()
+                    }
+                };
+                self.command(&sender, async move {
+                    Loaded::PlaylistDeleted(name, session.delete_playlist(&id).await)
                 });
             }
             Msg::PlaylistChanged(event) => {
@@ -2526,6 +2659,9 @@ impl Component for App {
                 if self.root == Root::Playlists {
                     self.show_playlists(widgets, &sender);
                 }
+                if let Some(item) = self.pending_add.take() {
+                    self.add_dialog(*item, &sender, root);
+                }
             }
             Loaded::Playlists(Err(e)) => {
                 if self.root == Root::Playlists {
@@ -2540,10 +2676,17 @@ impl Component for App {
                 if let Some(shown) = &mut self.shown_playlist
                     && shown.view.id == id
                 {
+                    let mode = match shown.editing {
+                        true => Mode::Edit {
+                            admin: self.session.as_ref().is_some_and(|s| s.is_admin()),
+                        },
+                        false => Mode::View,
+                    };
                     let view = PlaylistView::new(
                         &page,
                         playlist_actions(&id, &sender),
                         self.cards.clone(),
+                        mode,
                     );
                     shown.body.set_child(Some(&view.widget));
                     shown.page.set_title(&page.playlist.name);
@@ -2555,8 +2698,12 @@ impl Component for App {
                     return;
                 }
                 self.opening_playlist = None;
-                let view =
-                    PlaylistView::new(&page, playlist_actions(&id, &sender), self.cards.clone());
+                let view = PlaylistView::new(
+                    &page,
+                    playlist_actions(&id, &sender),
+                    self.cards.clone(),
+                    Mode::View,
+                );
                 let body = adw::Bin::builder().child(&view.widget).build();
                 let nav_page = pages::page(&page.playlist.name, &body);
                 nav_page.set_tag(Some(PLAYLIST_TAG));
@@ -2567,6 +2714,7 @@ impl Component for App {
                     view,
                     body,
                     page: nav_page,
+                    editing: false,
                 });
             }
             Loaded::PlaylistPage(id, refresh, Err(e)) => {
@@ -2583,11 +2731,69 @@ impl Component for App {
                 }
             }
             Loaded::PlaylistMore(_, Err(e)) => toast(widgets, &e),
-            Loaded::PlaylistCreated(Ok(made)) => {
+            Loaded::PlaylistCreated(Ok(made), item) => {
                 self.load_playlists(&sender);
-                self.open_playlist(made.id, &sender);
+                match item {
+                    // Made from an item's "Add to playlist": it goes in.
+                    Some(item) => sender.input(Msg::AddItemTo(made.id, made.name, item)),
+                    None => self.open_playlist(made.id, &sender),
+                }
             }
-            Loaded::PlaylistCreated(Err(e)) => toast(widgets, &e),
+            Loaded::PlaylistCreated(Err(e), _) => toast(widgets, &e),
+            Loaded::Added(id, name, _, Ok(entries)) => {
+                let toast = adw::Toast::builder()
+                    .use_markup(false)
+                    .button_label("Undo")
+                    .build();
+                toast.set_title(&format!("Added to {name}"));
+                let sender = sender.clone();
+                toast.connect_button_clicked(move |_| {
+                    sender.input(Msg::UndoAdd(id.clone(), entries.clone()))
+                });
+                widgets.toasts.add_toast(toast);
+            }
+            Loaded::Added(_, name, item, Err(e)) => {
+                toast_text(widgets, &playlist_rules::add_refusal(&e, &item, &name))
+            }
+            Loaded::PlaylistEdited(id, done) => {
+                match done {
+                    // The retry was refused too: only the user can sort it
+                    // out, with what the server has now.
+                    Err(e @ BackendError::PlaylistConflict { .. }) => {
+                        let alert = adw::AlertDialog::new(Some(&e.to_string()), None);
+                        alert.add_responses(&[("cancel", "Cancel"), ("reload", "Reload")]);
+                        alert.set_response_appearance("reload", adw::ResponseAppearance::Suggested);
+                        alert.set_close_response("cancel");
+                        let sender = sender.clone();
+                        alert.connect_response(Some("reload"), move |_, _| {
+                            sender.input(Msg::PlaylistsLagged)
+                        });
+                        alert.present(Some(root));
+                    }
+                    Err(e) => toast(widgets, &e),
+                    Ok(_) => {}
+                }
+                if self.shown_playlist_id(widgets).as_ref() == Some(&id) {
+                    self.reload_playlist(id, &sender);
+                }
+            }
+            Loaded::PlaylistUpdated(id, done) => {
+                if let Err(e) = done {
+                    toast(widgets, &e);
+                }
+                self.load_playlists(&sender);
+                if self.shown_playlist_id(widgets).as_ref() == Some(&id) {
+                    self.reload_playlist(id, &sender);
+                }
+            }
+            Loaded::PlaylistDeleted(name, done) => {
+                match done {
+                    Ok(()) if !name.is_empty() => toast_text(widgets, &format!("Deleted {name}")),
+                    Ok(()) => {}
+                    Err(e) => toast(widgets, &e),
+                }
+                self.load_playlists(&sender);
+            }
             Loaded::PinChanged(done) => {
                 if let Err(e) = done {
                     toast(widgets, &e);
@@ -2829,6 +3035,11 @@ impl App {
                 let sender = sender.clone();
                 Rc::new(move |person| sender.input(Msg::OpenPerson(Box::new(person))))
             }),
+            // Offered on items' menus only where the server has playlists.
+            add_to_playlist: session.has_playlists().then(|| -> views::AddToPlaylist {
+                let sender = sender.clone();
+                Rc::new(move |item| sender.input(Msg::AddToPlaylist(Box::new(item))))
+            }),
         });
         self.library_cache = Some(library::Cache::new(session.clone()));
         self.session = Some(session);
@@ -2941,6 +3152,26 @@ impl App {
             },
         });
         show(widgets, "Playlists", playlists::section(list, &actions));
+    }
+
+    /// "Add to playlist" for `item`, from the list known now.
+    fn add_dialog(
+        &self,
+        item: Item,
+        sender: &ComponentSender<Self>,
+        root: &adw::ApplicationWindow,
+    ) {
+        let Some(list) = &self.playlists else { return };
+        let rows = playlists::add_rows(list, item.id().kind());
+        let add: Rc<dyn Fn(String, String)> = {
+            let (sender, item) = (sender.clone(), item.clone());
+            Rc::new(move |id, name| sender.input(Msg::AddItemTo(id, name, Box::new(item.clone()))))
+        };
+        let new: Rc<dyn Fn()> = {
+            let (sender, item) = (sender.clone(), item.clone());
+            Rc::new(move || sender.input(Msg::NewPlaylist(Some(Box::new(item.clone())))))
+        };
+        playlists::add_dialog(root, &item, rows, add, new);
     }
 
     /// Loads a playlist's first page, then pushes its page.
@@ -3683,6 +3914,28 @@ fn playlist_actions(id: &str, sender: &ComponentSender<App>) -> playlists::PageA
         more: {
             let (sender, id) = (sender.clone(), id.to_owned());
             Rc::new(move |offset| sender.input(Msg::MorePlaylist(id.clone(), offset)))
+        },
+        edit: {
+            let sender = sender.clone();
+            Rc::new(move |on| sender.input(Msg::EditPlaylist(on)))
+        },
+        done: {
+            let sender = sender.clone();
+            Rc::new(move |name| sender.input(Msg::FinishEdit(name)))
+        },
+        edit_entries: {
+            let (sender, id) = (sender.clone(), id.to_owned());
+            Rc::new(move |revision, edits| {
+                sender.input(Msg::EditEntries(id.clone(), revision, edits))
+            })
+        },
+        update: {
+            let (sender, id) = (sender.clone(), id.to_owned());
+            Rc::new(move |update| sender.input(Msg::UpdatePlaylist(id.clone(), update)))
+        },
+        delete: {
+            let (sender, id) = (sender.clone(), id.to_owned());
+            Rc::new(move || sender.input(Msg::DeletePlaylist(id.clone())))
         },
     }
 }

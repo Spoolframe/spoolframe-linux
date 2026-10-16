@@ -4,17 +4,17 @@
 //! What they show is worked out in the core's `playlists`; this lays it
 //! out.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::rc::Rc;
 
 use adw::prelude::*;
 use spoolframe_linux_core::backend::{
-    ArtworkSize, EntryId, Kinds, PlaySettings, PlaylistEntry, PlaylistPage, PlaylistSummary,
-    Repeat, Visibility,
+    ArtworkSize, EntryId, Kinds, PlaySettings, PlaylistEdit, PlaylistEntry, PlaylistPage,
+    PlaylistSummary, PlaylistUpdate, Repeat, Visibility,
 };
-use spoolframe_linux_core::playlists;
-use spoolframe_types::ArtworkKind;
+use spoolframe_linux_core::playlists::{self, Offer};
+use spoolframe_types::{ArtworkKind, Item, MediaKind};
 
 use crate::views::{self, Cards, Facts};
 
@@ -217,6 +217,25 @@ pub struct PageActions {
     pub pin: Rc<dyn Fn(bool)>,
     /// Asks for the entries from this offset on: Show more.
     pub more: Rc<dyn Fn(u32)>,
+    /// Into the editor (`true`), or out of it as it is (Cancel).
+    pub edit: Rc<dyn Fn(bool)>,
+    /// Done: out of the editor, with the new name if one was typed.
+    pub done: Rc<dyn Fn(Option<String>)>,
+    /// Changes to the entries, as seen at a revision.
+    pub edit_entries: Rc<dyn Fn(u64, Vec<PlaylistEdit>)>,
+    /// Its kinds or who sees it.
+    pub update: Rc<dyn Fn(PlaylistUpdate)>,
+    pub delete: Rc<dyn Fn()>,
+}
+
+/// How a playlist's page shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    View,
+    /// The editor; `admin` offers Server-wide.
+    Edit {
+        admin: bool,
+    },
 }
 
 /// A playlist's page as shown: its header and the entries loaded so far.
@@ -233,10 +252,19 @@ pub struct PlaylistView {
     total: u32,
     up_next: Option<EntryId>,
     cards: Rc<Cards>,
+    /// In the editor: the revision shown, and the entries' ids in order.
+    editing: Option<(u64, Rc<RefCell<Vec<EntryId>>>)>,
+    actions: Rc<PageActions>,
 }
 
 impl PlaylistView {
-    pub fn new(page: &PlaylistPage, actions: PageActions, cards: Rc<Cards>) -> Rc<Self> {
+    pub fn new(
+        page: &PlaylistPage,
+        actions: PageActions,
+        cards: Rc<Cards>,
+        mode: Mode,
+    ) -> Rc<Self> {
+        let actions = Rc::new(actions);
         let widget = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(18)
@@ -245,9 +273,41 @@ impl PlaylistView {
             .margin_start(28)
             .margin_end(28)
             .build();
-        let settings = Rc::new(Cell::new(page.settings));
-        let (header, pin) = header(page, &actions, &settings);
-        widget.append(&header);
+        // The entries, and beside them in the editor the side panel.
+        let columns = gtk::Box::builder().spacing(28).build();
+        let entries = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(18)
+            .hexpand(true)
+            .build();
+        columns.append(&entries);
+        let (pin, editing) = match mode {
+            Mode::View => {
+                let settings = Rc::new(Cell::new(page.settings));
+                let (header, pin) = header(page, &actions, &settings);
+                widget.append(&header);
+                (pin, None)
+            }
+            Mode::Edit { admin } => {
+                let controls = playlists::editor_controls(&page.playlist, admin);
+                let side = controls
+                    .panel
+                    .then(|| crate::playlist_edit::panel(page, &actions, admin));
+                widget.append(&crate::playlist_edit::header(
+                    page,
+                    &actions,
+                    side.as_ref().map(|(_, name)| name),
+                ));
+                if let Some((side, _)) = side {
+                    columns.append(&side);
+                }
+                // Not shown: the pin is the page's, not the editor's.
+                let pin = gtk::ToggleButton::new();
+                (pin, Some((page.playlist.revision, Rc::default())))
+            }
+        };
+        widget.append(&columns);
+        let widget_for_entries = entries;
         let list = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::None)
             .valign(gtk::Align::Start)
@@ -260,7 +320,7 @@ impl PlaylistView {
             .visible(false)
             .build();
         if page.total == 0 {
-            widget.append(
+            widget_for_entries.append(
                 &adw::StatusPage::builder()
                     .icon_name(crate::icons::PLAYLISTS)
                     .title(format!("{} is empty", page.playlist.name))
@@ -268,8 +328,8 @@ impl PlaylistView {
                     .build(),
             );
         } else {
-            widget.append(&list);
-            widget.append(&more);
+            widget_for_entries.append(&list);
+            widget_for_entries.append(&more);
         }
         let view = Rc::new(PlaylistView {
             id: page.playlist.id.clone(),
@@ -283,6 +343,8 @@ impl PlaylistView {
             total: page.total,
             up_next: playlists::up_next(page),
             cards,
+            editing,
+            actions: actions.clone(),
         });
         {
             let (view_weak, more) = (Rc::downgrade(&view), actions.more.clone());
@@ -315,8 +377,21 @@ impl PlaylistView {
         }
         for (n, entry) in page.entries.iter().enumerate() {
             let number = page.offset as usize + n + 1;
-            self.list
-                .append(&entry_row(number, entry, self.up_next, &self.cards));
+            match &self.editing {
+                Some((revision, ids)) => {
+                    ids.borrow_mut().push(entry.entry);
+                    self.list.append(&crate::playlist_edit::entry_row(
+                        number,
+                        entry,
+                        *revision,
+                        ids,
+                        &self.actions,
+                    ));
+                }
+                None => self
+                    .list
+                    .append(&entry_row(number, entry, self.up_next, &self.cards)),
+            }
         }
         self.shown.set(page.offset + page.entries.len() as u32);
         self.more.set_sensitive(true);
@@ -470,6 +545,18 @@ fn header(
         .build();
     show_pin(&pin, pinned);
     controls.append(&pin);
+    // Edit for whoever may change it; a read-only playlist has none.
+    if playlists::editor_controls(&page.playlist, false).edit {
+        let edit = gtk::Button::builder()
+            .icon_name(crate::icons::EDIT)
+            .tooltip_text("Edit")
+            .valign(gtk::Align::Center)
+            .css_classes(["action", "compact", "outlined", "square-action"])
+            .build();
+        let open = actions.edit.clone();
+        edit.connect_clicked(move |_| open(true));
+        controls.append(&edit);
+    }
     let wrap = gtk::ScrolledWindow::builder()
         .vscrollbar_policy(gtk::PolicyType::Never)
         .hscrollbar_policy(gtk::PolicyType::Automatic)
@@ -542,11 +629,142 @@ fn label(text: &str, classes: &[&str]) -> gtk::Label {
         .build()
 }
 
-/// "New playlist": a name, the kinds it holds (at least one), and for an
-/// admin whether every user sees it. `create` gets what to send.
+/// One playlist "Add to playlist" lists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddRow {
+    pub id: String,
+    pub name: String,
+    /// What it holds and whose it is; for a greyed one, why it is.
+    pub line: String,
+    /// One click adds; otherwise greyed.
+    pub adds: bool,
+}
+
+/// The playlists "Add to playlist" lists for an item of `kind`: only those
+/// that take it, the ones it can go in first.
+pub fn add_rows(list: &[PlaylistSummary], kind: MediaKind) -> Vec<AddRow> {
+    playlists::add_targets(list, kind)
+        .into_iter()
+        .map(|(playlist, offer)| AddRow {
+            id: playlist.id.clone(),
+            name: playlist.name.clone(),
+            line: offer.reason().map(str::to_owned).unwrap_or_else(|| {
+                format!(
+                    "{} · {}",
+                    playlists::kinds_line(playlist.kinds),
+                    playlists::owner_line(playlist)
+                )
+            }),
+            adds: offer == Offer::Adds,
+        })
+        .collect()
+}
+
+/// The line under "Add … to a playlist": what the item is and, for one
+/// that stands for many, what goes in.
+pub fn add_context(item: &Item) -> String {
+    match item {
+        Item::Season(season) => format!(
+            "{} · {} · each of its episodes is added, in order",
+            season.show_title.clone().unwrap_or_default(),
+            season.title
+        ),
+        Item::Show(_) => "Every episode is added, in airing order".to_owned(),
+        Item::Album(album) => match &album.artist_name {
+            Some(artist) => format!("{artist} · each of its tracks is added, in order"),
+            None => "Each of its tracks is added, in order".to_owned(),
+        },
+        Item::Artist(_) => "Each album’s tracks are added, an album at a time".to_owned(),
+        other => playlists::entry_context(other),
+    }
+}
+
+/// "Add <item> to a playlist": the playlists that take it, one click
+/// adding to one (`add` gets its id and name); the others greyed with
+/// why; and New playlist… (`new`).
+pub fn add_dialog(
+    parent: &impl IsA<gtk::Widget>,
+    item: &Item,
+    rows: Vec<AddRow>,
+    add: Rc<dyn Fn(String, String)>,
+    new: Rc<dyn Fn()>,
+) {
+    let title = format!("Add {} to a playlist", playlists::title(item));
+    let dialog = adw::Dialog::builder()
+        .title(&title)
+        .content_width(440)
+        .build();
+    let column = crate::dialog::column();
+    column.append(&crate::dialog::dim(&add_context(item)));
+    if rows.is_empty() {
+        column.append(&crate::dialog::dim(
+            "No playlist takes this yet: make one that holds it.",
+        ));
+    } else {
+        let list = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .css_classes(["boxed-list"])
+            .build();
+        for row in rows {
+            let line = adw::ActionRow::builder()
+                .use_markup(false)
+                .activatable(row.adds)
+                .sensitive(row.adds)
+                .build();
+            line.set_title(&row.name);
+            line.set_subtitle(&row.line);
+            line.add_prefix(&mosaic(&row.id, 32));
+            let (add, closing) = (add.clone(), dialog.downgrade());
+            line.connect_activated(move |_| {
+                if let Some(dialog) = closing.upgrade() {
+                    dialog.close();
+                }
+                add(row.id.clone(), row.name.clone());
+            });
+            list.append(&line);
+        }
+        column.append(&list);
+    }
+    let buttons = gtk::Box::builder().spacing(8).build();
+    let make = gtk::Button::builder()
+        .child(
+            &adw::ButtonContent::builder()
+                .icon_name(crate::icons::ADD)
+                .label("New playlist…")
+                .build(),
+        )
+        .hexpand(true)
+        .halign(gtk::Align::Start)
+        .css_classes(["flat"])
+        .build();
+    {
+        let closing = dialog.downgrade();
+        make.connect_clicked(move |_| {
+            if let Some(dialog) = closing.upgrade() {
+                dialog.close();
+            }
+            new();
+        });
+    }
+    let cancel = gtk::Button::builder().label("Cancel").build();
+    crate::dialog::closes(&cancel, &dialog);
+    buttons.append(&make);
+    buttons.append(&cancel);
+    column.append(&buttons);
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&adw::HeaderBar::new());
+    toolbar.set_content(Some(&column));
+    dialog.set_child(Some(&toolbar));
+    dialog.present(Some(parent));
+}
+
+/// "New playlist": a name, the kinds it holds (at least one; `preset`
+/// ticked to begin with), and for an admin whether every user sees it.
+/// `create` gets what to send.
 pub fn new_playlist_dialog(
     parent: &impl IsA<gtk::Widget>,
     admin: bool,
+    preset: Kinds,
     create: Rc<dyn Fn(String, Kinds, Visibility)>,
 ) {
     let dialog = adw::Dialog::builder()
@@ -569,8 +787,8 @@ pub fn new_playlist_dialog(
         .selection_mode(gtk::SelectionMode::None)
         .css_classes(["boxed-list"])
         .build();
-    let check = |title: &str| {
-        let check = gtk::CheckButton::new();
+    let check = |title: &str, on: bool| {
+        let check = gtk::CheckButton::builder().active(on).build();
         let row = adw::ActionRow::builder()
             .use_markup(false)
             .activatable_widget(&check)
@@ -580,7 +798,11 @@ pub fn new_playlist_dialog(
         kinds.append(&row);
         check
     };
-    let (movies, episodes, tracks) = (check("Movies"), check("Episodes"), check("Music tracks"));
+    let (movies, episodes, tracks) = (
+        check("Movies", preset.movies),
+        check("Episodes", preset.episodes),
+        check("Music tracks", preset.tracks),
+    );
     column.append(&kinds);
     column.append(&crate::dialog::dim(
         "Kinds can be added later, never taken away.",
@@ -695,6 +917,56 @@ mod tests {
             (label.starts_with("Continue · S"), from_start(&page)),
             (true, Some(first))
         );
+    }
+
+    #[test]
+    fn a_season_is_offered_only_the_playlists_that_take_episodes() {
+        let client = FakeClient::new(None);
+        let list = ready(andrey(&client).playlists()).unwrap().playlists;
+        let names: Vec<_> = add_rows(&list, MediaKind::Season)
+            .into_iter()
+            .map(|row| (row.name, row.adds))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("Andor: the heists".to_owned(), true),
+                ("Movie night".to_owned(), true)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_greyed_playlist_says_why() {
+        let client = FakeClient::new(None);
+        let alice = client.session(&FakeClient::profile("alice")).unwrap();
+        ready(alice.unlock(spoolframe_linux_core::fake::FAKE_PIN)).unwrap();
+        let list = ready(alice.playlists()).unwrap().playlists;
+        assert_eq!(
+            add_rows(&list, MediaKind::Movie),
+            [AddRow {
+                id: list
+                    .iter()
+                    .find(|p| p.name == "New this month")
+                    .unwrap()
+                    .id
+                    .clone(),
+                name: "New this month".into(),
+                line: "Server-wide · admins edit".into(),
+                adds: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_playable_row_says_what_it_holds_and_whose_it_is() {
+        let client = FakeClient::new(None);
+        let list = ready(andrey(&client).playlists()).unwrap().playlists;
+        let lines: Vec<_> = add_rows(&list, MediaKind::Track)
+            .into_iter()
+            .map(|row| row.line)
+            .collect();
+        assert_eq!(lines, ["Music · Shared with you · you can edit"]);
     }
 
     #[test]

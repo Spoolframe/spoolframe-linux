@@ -25,6 +25,18 @@
   to unpin. A pin that left because the playlist was unshared or deleted
   says so once. Changes made elsewhere show as they happen. A server
   without playlists shows none of this.
+- Add to playlist… on the menus of films, shows, seasons (the season's
+  own More), episodes, albums, tracks and artists, and of the cards that
+  have menus: only playlists that take the item are listed, read-only and
+  others' server-wide ones greyed with why; New playlist… makes one with
+  the item's kind ticked and adds it. A toast says where it went, with
+  Undo, which takes out exactly what the add put in (a whole season too).
+- A playlist's Edit (for its owner, an editor, or an admin on a
+  server-wide one): drag entries to reorder, remove them; its owner also
+  renames it, adds kinds it holds, stops sharing it with someone or lets
+  them edit, makes it personal (or, for an admin, server-wide), and
+  deletes it. Each change is sent as it is made; the name goes with Done.
+  Someone's change to the same entries asks to reload.
 
 ## 0.6.1 — 2026-10-10
 
