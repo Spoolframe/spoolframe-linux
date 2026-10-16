@@ -722,8 +722,9 @@ pub fn version_line() -> String {
     )
 }
 
-/// About: the version, to copy into a bug report.
-pub(crate) fn about() -> adw::PreferencesPage {
+/// About: the version, to copy into a bug report, and Open source
+/// licenses, which `open_licenses` shows.
+pub(crate) fn about(open_licenses: impl Fn() + 'static) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::builder()
         .title("About")
         .icon_name(crate::icons::ABOUT)
@@ -738,8 +739,18 @@ pub(crate) fn about() -> adw::PreferencesPage {
         .build();
     copy.connect_clicked(|button| button.clipboard().set_text(&version_line()));
     row.add_suffix(&copy);
+    let licenses = adw::ActionRow::builder()
+        .use_markup(false)
+        .activatable(true)
+        .build();
+    licenses.set_title("Open source licenses");
+    licenses.set_subtitle("The components Spoolframe is built from, and their licenses.");
+    licenses.add_prefix(&gtk::Image::from_icon_name(crate::icons::LICENSES));
+    licenses.add_suffix(&gtk::Image::from_icon_name(crate::icons::RIGHT));
+    licenses.connect_activated(move |_| open_licenses());
     let group = adw::PreferencesGroup::new();
     group.add(&row);
+    group.add(&licenses);
     page.add(&group);
     page
 }

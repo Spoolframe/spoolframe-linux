@@ -51,6 +51,13 @@
   episodes. On a show's page choosing one plays it from your place;
   elsewhere it opens the playlist; right-click does the other. The rows
   are read with the page, so a change shows the next time it opens.
+- Settings › About › Open source licenses: the 471 components the client
+  is built from (the Spoolframe SDK and what it pulls in, this app's own
+  crates and the rest it links, the Catppuccin palette, the Lucide icons
+  and the four fonts, and the Flatpak's libfido2 and libcbor),
+  searched and filtered by license, each with its license text to read
+  and copy. The list is made from Cargo.lock and the Flatpak manifest by
+  `scripts/gen-licenses.py`; CI fails when it is out of date.
 
 ## 0.6.1 — 2026-10-10
 
