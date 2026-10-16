@@ -1222,6 +1222,20 @@ pub trait Session: Send + Sync {
     /// counts on item pages.
     fn has_play_history(&self) -> bool;
 
+    /// What the user played lately, from any device (PX-52): each item
+    /// once, by its latest counted play, newest first, a page of at most
+    /// `limit` (500), and how many in all. `kinds` keeps only films,
+    /// episodes or tracks; `None`, every kind. Each item's playback
+    /// state has its play count and when it was last played. Without
+    /// [`Session::has_play_history`], [`BackendError::Unsupported`],
+    /// unsent.
+    fn recently_played(
+        &self,
+        kinds: Option<Kinds>,
+        offset: u32,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<(Vec<Item>, u32), BackendError>>;
+
     /// Every playlist the user sees, with whether and where each is
     /// pinned, and the notes of pins that left their Pinned.
     fn playlists(&self) -> BoxFuture<'_, Result<PlaylistList, BackendError>>;

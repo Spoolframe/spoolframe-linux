@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use spoolframe_policy::{
+    plays::{self, PlayKind, PlayProgress},
     tracks::{self, TrackOverride},
     watch::{WatchRules, credits_to_end},
 };
@@ -444,11 +445,42 @@ struct WatchState {
     /// Movies and shows taken out of Continue watching and Next up (P1-22),
     /// until their progress next changes.
     hidden: std::collections::HashSet<MediaId>,
+    /// Each item's counted plays (PX-52): how many, and when the latest
+    /// was counted, Unix seconds.
+    plays: HashMap<MediaId, (u32, i64)>,
+    /// When each item was last viewed, Unix seconds: its last progress
+    /// report or mark as watched or unwatched.
+    viewed: HashMap<MediaId, i64>,
 }
 
 impl WatchState {
     fn get(&self, id: &MediaId) -> PlaybackState {
         self.states.get(id).cloned().unwrap_or_default()
+    }
+
+    /// `id`'s state as the session is shown it: with when it was last
+    /// viewed and its plays, for the features it has. The real server
+    /// sends them only on some replies (Home's rows, an item's details,
+    /// Recently played); the fake sends them wherever an item has a
+    /// state, which no screen relies on.
+    fn shown(&self, id: &MediaId, features: Features) -> PlaybackState {
+        let mut state = self.get(id);
+        if features.last_viewed {
+            state.last_viewed_at = self.viewed.get(id).copied();
+        }
+        if features.play_history
+            && let Some((count, at)) = self.plays.get(id)
+        {
+            state.play_count = *count;
+            state.last_played_at = Some(*at);
+        }
+        state
+    }
+
+    /// A counted play of `id`, at `at`.
+    fn played(&mut self, id: &MediaId, at: i64) {
+        let plays = self.plays.entry(id.clone()).or_insert((0, at));
+        *plays = (plays.0 + 1, at);
     }
 
     fn set(&mut self, id: &MediaId, state: PlaybackState) {
@@ -477,7 +509,17 @@ struct Playback {
     /// A converted playback's encode, and how much of it is written.
     epoch: u32,
     written: u64,
+    /// This play so far (PX-52): where it started, the last position
+    /// reported, how much has played, and whether it was counted.
+    from: Option<Duration>,
+    last: Option<Duration>,
+    played: Duration,
+    counted: bool,
 }
+
+/// The most one progress report credits as played (PX-52): a client
+/// reports every 10 s, and a gap longer than this was not all playing.
+const MOST_CREDITED: Duration = Duration::from_secs(30);
 
 /// One user's view of the fake server.
 pub struct FakeSession {
@@ -517,6 +559,9 @@ pub struct FakeSession {
     saved: Saved,
     /// Every user's playlists (PX-40), the client's.
     playlists: Arc<Mutex<playlists::Store>>,
+    /// The features this session has, as the store had them when it was
+    /// made: read without its lock, which item reads may hold.
+    features: Features,
 }
 
 /// What this device keeps saved, shared by the client and its sessions.
@@ -708,7 +753,12 @@ impl FakeSession {
             },
             _ => FakePin::default(),
         };
+        let features = playlists
+            .lock()
+            .expect("fake state is never poisoned")
+            .features;
         let session = FakeSession {
+            features,
             catalog,
             watch: Mutex::new(WatchState::default()),
             serving,
@@ -758,6 +808,23 @@ impl FakeSession {
                 watch.set(&media(MediaKind::Movie, "8"), at(114 * 60));
                 watch.set(&media(MediaKind::Movie, "1"), at(37 * 60 + 12));
             }
+            // Played and viewed, from other devices (PX-52): Severance's
+            // watched episodes once each, Low Tide's tracks a few times.
+            let days_ago = |days: i64| unix_now() - days * 86_400;
+            for (key, days) in [("22", 9), ("23", 8), ("24", 3)] {
+                let id = media(MediaKind::Episode, key);
+                watch.played(&id, days_ago(days));
+                watch.viewed.insert(id, days_ago(days));
+            }
+            watch
+                .viewed
+                .insert(media(MediaKind::Episode, "25"), days_ago(2));
+            for (key, plays, days) in [("42", 5, 1), ("40", 2, 3), ("46", 1, 6)] {
+                let id = media(MediaKind::Track, key);
+                for _ in 0..plays {
+                    watch.played(&id, days_ago(days));
+                }
+            }
         }
         session
     }
@@ -770,8 +837,10 @@ impl FakeSession {
     fn with_state(&self, item: &Item, watch: &WatchState) -> Item {
         let mut item = item.clone();
         match &mut item {
-            Item::Movie(m) => m.playback = watch.get(&m.id),
-            Item::Episode(e) => e.playback = watch.get(&e.id),
+            Item::Movie(m) => m.playback = watch.shown(&m.id, self.features),
+            Item::Episode(e) => e.playback = watch.shown(&e.id, self.features),
+            // A track has no resume point, but it has plays (PX-52).
+            Item::Track(t) => t.playback = watch.shown(&t.id, self.features),
             _ => {}
         }
         item
@@ -1077,6 +1146,42 @@ impl FakeSession {
         self.with_playback(handle, |p| (p.item.clone(), p.selection))
     }
 
+    /// Credits a report at `position` to its playback's play, as the
+    /// server does (PX-52): what the position moved by since the last
+    /// report, at most [`MOST_CREDITED`], a seek back nothing. Whether
+    /// the play counted just now, by the production rule; once a play.
+    fn count_play(&self, handle: &PlaybackHandle, item: &Item, position: Duration) -> bool {
+        let kind = match item {
+            Item::Track(_) => PlayKind::Track,
+            Item::Movie(_) | Item::Episode(_) => PlayKind::Video,
+            _ => return false,
+        };
+        let markers = &self.serving.markers;
+        self.with_playback(handle, |p| {
+            let moved = match p.last {
+                Some(last) => position.saturating_sub(last),
+                None => position,
+            }
+            .min(MOST_CREDITED);
+            let from = *p
+                .from
+                .get_or_insert_with(|| p.last.unwrap_or(position.saturating_sub(moved)));
+            p.last = Some(position);
+            p.played += moved;
+            let progress = PlayProgress {
+                played: p.played,
+                from,
+                position,
+                duration: length_of(item),
+                credits: credits_to_end(markers),
+            };
+            let counts = !p.counted && plays::counts(&WatchRules::default(), kind, &progress);
+            p.counted |= counts;
+            counts
+        })
+        .unwrap_or(false)
+    }
+
     fn with_playback<T>(
         &self,
         handle: &PlaybackHandle,
@@ -1320,6 +1425,10 @@ impl Session for FakeSession {
                         last_used: Instant::now(),
                         epoch: 0,
                         written: 0,
+                        from: None,
+                        last: options.start,
+                        played: Duration::ZERO,
+                        counted: false,
                     },
                 );
             // A chosen bitrate converts the fake's file, as one that
@@ -1579,7 +1688,14 @@ impl Session for FakeSession {
                 .lock()
                 .expect("fake state is never poisoned")
                 .push((id.clone(), position));
-            // Music has no watch state in Phase 1 (P1-14).
+            let counted = self.count_play(handle, item, position);
+            let mut watch = self.watch();
+            watch.viewed.insert(id.clone(), unix_now());
+            if counted {
+                watch.played(id, unix_now());
+            }
+            drop(watch);
+            // A track is recorded (PX-52), but has no resume point.
             if matches!(item, Item::Movie(_) | Item::Episode(_)) {
                 self.watch()
                     .progress(id, length_of(item), position, &self.serving.markers);
@@ -1600,6 +1716,7 @@ impl Session for FakeSession {
                     ..PlaybackState::default()
                 },
             );
+            self.watch().viewed.insert(id.clone(), unix_now());
             self.unhide(id);
             Ok(())
         })
@@ -1630,7 +1747,10 @@ impl Session for FakeSession {
     fn mark_unwatched<'a>(&'a self, id: &'a MediaId) -> BoxFuture<'a, Result<(), BackendError>> {
         Box::pin(async move {
             self.catalog.get(id)?;
-            self.watch().set(id, PlaybackState::default());
+            let mut watch = self.watch();
+            watch.set(id, PlaybackState::default());
+            watch.viewed.insert(id.clone(), unix_now());
+            drop(watch);
             self.unhide(id);
             Ok(())
         })
@@ -2161,23 +2281,61 @@ impl Session for FakeSession {
     }
 
     fn has_playlists(&self) -> bool {
-        self.lock_playlists().features.playlists
+        self.features.playlists
     }
 
     fn has_liked(&self) -> bool {
-        self.lock_playlists().features.liked
+        self.features.liked
     }
 
     fn has_last_viewed(&self) -> bool {
-        self.lock_playlists().features.last_viewed
+        self.features.last_viewed
     }
 
     fn has_playlist_sharing(&self) -> bool {
-        self.lock_playlists().features.playlist_sharing
+        self.features.playlist_sharing
     }
 
     fn has_play_history(&self) -> bool {
-        self.lock_playlists().features.play_history
+        self.features.play_history
+    }
+
+    fn recently_played(
+        &self,
+        kinds: Option<Kinds>,
+        offset: u32,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<(Vec<Item>, u32), BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            if !self.features.play_history {
+                return Err(BackendError::Unsupported(
+                    spoolframe_protocol::features::PLAY_HISTORY.into(),
+                ));
+            }
+            let watch = self.watch();
+            let mut played: Vec<(&MediaId, i64)> =
+                watch.plays.iter().map(|(id, (_, at))| (id, *at)).collect();
+            // Newest first; plays at the same second by id, so a test
+            // knows the order.
+            played.sort_by(|a, b| {
+                b.1.cmp(&a.1)
+                    .then_with(|| a.0.to_string().cmp(&b.0.to_string()))
+            });
+            let items: Vec<Item> = played
+                .into_iter()
+                .filter_map(|(id, _)| self.catalog.items.get(id))
+                .filter(|item| kinds.is_none_or(|k| k.allows(item.id().kind())))
+                .map(|item| self.with_state(item, &watch))
+                .collect();
+            let total = items.len() as u32;
+            let page = items
+                .into_iter()
+                .skip(offset as usize)
+                .take(limit.min(500) as usize)
+                .collect();
+            Ok((page, total))
+        })
     }
 
     fn playlists(&self) -> BoxFuture<'_, Result<PlaylistList, BackendError>> {
@@ -4670,7 +4828,14 @@ mod tests {
         ready(session.mark_unwatched(&alien)).unwrap();
         let (item, _) = ready(session.item(&alien)).unwrap();
         let Item::Movie(m) = item else { panic!() };
-        assert_eq!(m.playback, PlaybackState::default());
+        // Cleared, though the mark leaves it viewed just now.
+        assert_eq!(
+            PlaybackState {
+                last_viewed_at: None,
+                ..m.playback
+            },
+            PlaybackState::default()
+        );
     }
 
     #[test]
@@ -6587,5 +6752,105 @@ mod tests {
             ready(client.session(&again).unwrap().leave_server()).unwrap();
             assert!(!saved(&client));
         }
+    }
+
+    /// A track's playback state as the album's page has it.
+    fn track_state(session: &dyn Session, key: &str) -> PlaybackState {
+        let album = media(MediaKind::Album, "31");
+        let (_, tracks) = ready(session.item(&album)).unwrap();
+        tracks
+            .into_iter()
+            .find_map(|t| match t {
+                Item::Track(t) if t.id == media(MediaKind::Track, key) => Some(t.playback),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    /// Reports `positions` for one playback of `id`, as a player does
+    /// every 10 s.
+    fn play(session: &dyn Session, id: &MediaId, positions: impl IntoIterator<Item = u64>) {
+        let playback = ready(session.start_playback(id, None, Default::default())).unwrap();
+        for at in positions {
+            ready(session.update_progress(&playback.handle, Duration::from_secs(at))).unwrap();
+        }
+    }
+
+    #[test]
+    fn recently_played_is_the_counted_plays_newest_first() {
+        let tracks = Kinds {
+            tracks: true,
+            ..Kinds::default()
+        };
+        let (items, total) = ready(andrey().recently_played(Some(tracks), 0, 50)).unwrap();
+        assert_eq!(
+            (titles(&items), total),
+            (vec!["Harbour Lights", "Undertow", "Ebb"], 3)
+        );
+    }
+
+    #[test]
+    fn recently_played_items_carry_their_play_counts() {
+        let (items, _) = ready(andrey().recently_played(None, 0, 1)).unwrap();
+        let Item::Track(harbour) = &items[0] else {
+            panic!("{items:?}")
+        };
+        assert_eq!(harbour.playback.play_count, 5);
+    }
+
+    #[test]
+    fn a_track_played_past_half_its_length_counts_once() {
+        let (_dir, path) = file_with("progress", b"stand-in");
+        let client = FakeClient::new(Some(path));
+        let session = session_for(&client, "andrey");
+        // Salt Lines is 3:58: its bar is 1:59.
+        let salt_lines = media(MediaKind::Track, "41");
+        play(session.as_ref(), &salt_lines, (1..=11).map(|n| n * 10));
+        assert_eq!(track_state(session.as_ref(), "41").play_count, 0);
+        play(session.as_ref(), &salt_lines, (1..=20).map(|n| n * 10));
+        assert_eq!(track_state(session.as_ref(), "41").play_count, 1);
+    }
+
+    #[test]
+    fn a_seek_to_a_tracks_end_is_not_a_play() {
+        let (_dir, path) = file_with("progress", b"stand-in");
+        let client = FakeClient::new(Some(path));
+        let session = session_for(&client, "andrey");
+        play(
+            session.as_ref(),
+            &media(MediaKind::Track, "41"),
+            [10, 20, 200, 210, 220, 230],
+        );
+        assert_eq!(track_state(session.as_ref(), "41").play_count, 0);
+    }
+
+    #[test]
+    fn a_progress_report_marks_the_item_viewed_now() {
+        let (_dir, path) = file_with("progress", b"stand-in");
+        let client = FakeClient::new(Some(path));
+        let session = session_for(&client, "andrey");
+        let before = unix_now();
+        play(session.as_ref(), &media(MediaKind::Track, "41"), [10]);
+        let viewed = track_state(session.as_ref(), "41").last_viewed_at;
+        assert!(viewed.is_some_and(|at| at >= before), "{viewed:?}");
+    }
+
+    #[test]
+    fn without_play_history_nothing_is_listed_or_counted() {
+        let client = FakeClient::new(None).with_features(Features {
+            play_history: false,
+            ..Features::default()
+        });
+        let session = session_for(&client, "andrey");
+        assert_eq!(
+            (
+                ready(session.recently_played(None, 0, 50)),
+                track_state(session.as_ref(), "42").play_count
+            ),
+            (
+                Err(BackendError::Unsupported("spoolframe:play-history".into())),
+                0
+            )
+        );
     }
 }

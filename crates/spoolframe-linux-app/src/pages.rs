@@ -162,6 +162,13 @@ pub fn playable(
         }
         info.append(&row);
     }
+    // How often it was played, or when it was last viewed (PX-52).
+    if let Some(line) = facts
+        .playback
+        .and_then(|p| crate::history::played_line(p, crate::history::now()))
+    {
+        info.append(&label(&line, &["dim-label"]));
+    }
     if let Some(summary) = summary {
         let text = label(&summary, &["item-summary"]);
         text.set_wrap(true);
@@ -1376,6 +1383,7 @@ pub fn album(
         .build();
     // Each track's row and number, to mark the one playing.
     let mut marked: Vec<(MediaId, adw::ActionRow, gtk::Label, String)> = Vec::new();
+    let now = crate::history::now();
     for (index, track) in tracks.iter().enumerate() {
         let Item::Track(t) = track else { continue };
         let row = adw::ActionRow::builder()
@@ -1388,6 +1396,10 @@ pub fn album(
         number.set_width_chars(2);
         row.add_prefix(&number);
         marked.push((t.id.clone(), row.clone(), number, shown));
+        // Its plays (PX-52) where the row has no room to say them.
+        if let Some(line) = crate::history::played_line(&t.playback, now) {
+            row.set_tooltip_text(Some(&line));
+        }
         if let Some(length) = t.duration {
             row.add_suffix(&label(
                 &format::timestamp(length),

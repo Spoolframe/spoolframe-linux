@@ -56,6 +56,15 @@
   episodes. On a show's page choosing one plays it from your place;
   elsewhere it opens the playlist; right-click does the other. The rows
   are read with the page, so a change shows the next time it opens.
+- Play history (PX-52), on a server that keeps it: Home has a
+  "Recently played music" row, the albums of the tracks played lately on
+  any device, newest first. Movie and episode pages say how often they
+  were played and when last ("Played 3 times · last 2 days ago"), and an
+  album's track rows say it on hover. An item viewed but never played
+  through says when it was last viewed, on a server that says so.
+- Tracks now report where they are as they play, every 10 s as films
+  and episodes do, so their plays are counted; a track still has no
+  resume point and never shows in Continue watching.
 - Settings › About › Open source licenses: the 471 components the client
   is built from (the Spoolframe SDK and what it pulls in, this app's own
   crates and the rest it links, the Catppuccin palette, the Lucide icons

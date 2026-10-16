@@ -11,6 +11,7 @@ pub mod fake;
 pub mod fido2;
 pub mod format;
 pub mod helper;
+pub mod history;
 pub mod identity;
 pub mod markers;
 pub mod next_episode;

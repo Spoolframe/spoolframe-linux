@@ -9,6 +9,7 @@ mod denylist;
 mod dialog;
 mod file_helper;
 mod fonts;
+mod history;
 mod icons;
 mod identity_here;
 mod identity_page;

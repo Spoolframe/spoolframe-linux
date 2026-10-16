@@ -1400,6 +1400,18 @@ impl Session for SdkSession {
         self.session.features().play_history
     }
 
+    fn recently_played(
+        &self,
+        kinds: Option<Kinds>,
+        offset: u32,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<(Vec<Item>, u32), BackendError>> {
+        Box::pin(self.call(move |s| async move {
+            let page = s.recently_played(kinds, offset, limit).await?;
+            Ok((page.items, page.total))
+        }))
+    }
+
     fn playlists(&self) -> BoxFuture<'_, Result<PlaylistList, BackendError>> {
         Box::pin(self.call(|s| async move { s.playlists().await }))
     }

@@ -241,7 +241,8 @@ const KEEP_ALIVE: Duration = if cfg!(test) {
 };
 
 /// How often progress goes to the server while playing (P1-14 throttles
-/// on its side too).
+/// on its side too). Ten seconds is what play history asks for (PX-52):
+/// one report credits at most 30 s of play.
 const PROGRESS_EVERY: u32 = 10;
 
 /// How long an automatic intro skip can be undone.
@@ -1036,10 +1037,9 @@ impl Playback {
     }
 
     /// Uses the current playback, so the server does not end it as idle
-    /// (see [`KEEP_ALIVE`]). Paused, a film or episode reports where it is
-    /// paused. A paused song, which has no position to report (P1-14), and
-    /// a converted playback, which reads nothing while its buffer is full,
-    /// read a byte.
+    /// (see [`KEEP_ALIVE`]). Paused, the item reports where it is paused.
+    /// A converted playback, which reads nothing while its buffer is
+    /// full, reads a byte.
     fn keep_alive(&self) {
         let Some(current) = self.now() else { return };
         let paused = !self.playing.get() && !self.stopped.get();
@@ -1607,21 +1607,16 @@ impl Playback {
         }
     }
 
-    /// Where playback is, for movies and episodes; music has no watch
-    /// state (P1-14).
+    /// Where playback is. A track's report counts toward its plays
+    /// (PX-52), though a track has no resume point.
     fn report_progress(&self) -> Option<tokio::task::JoinHandle<()>> {
         self.send_progress(self.pipeline.position()?)
     }
 
-    /// Tells the server the current item is at `position`; nothing for
-    /// music.
+    /// Tells the server the current item is at `position`.
     fn send_progress(&self, position: Duration) -> Option<tokio::task::JoinHandle<()>> {
         let current = self.now()?;
-        let item = &current.item;
         let managed = current.managed.borrow().clone()?;
-        if !matches!(item, Item::Movie(_) | Item::Episode(_)) {
-            return None;
-        }
         Some(self.ordered_call(async move {
             if let Err(e) = managed.report_position(position) {
                 tracing::warn!(error = %e, "progress not queued");
@@ -2910,8 +2905,8 @@ mod tests {
         playback.stop();
     }
 
-    /// A paused song keeps its playback too, though music reports no
-    /// position (P1-14): a read of one byte is the use.
+    /// A paused song keeps its playback too, by reporting where it is
+    /// paused: tracks are recorded now (PX-52).
     fn a_paused_song_keeps_its_playback_alive() {
         let dir = TestDir::new_blocking("spoolframe-paused-song");
         let path = dir.join("clip.mkv");
@@ -2920,6 +2915,7 @@ mod tests {
         let profile = FakeClient::profile("andrey");
         let session = client.session(&profile).unwrap();
         let track = first_track(&session);
+        let track_id = &track.id().clone();
         let playback = Playback::start(Playlist {
             session,
             items: vec![track],
@@ -2944,7 +2940,11 @@ mod tests {
             1,
             "the paused playback idled out"
         );
-        assert!(client.progress_reports(&profile).is_empty());
+        let reports = client.progress_reports(&profile);
+        assert!(
+            reports.len() >= 2 && reports.iter().all(|(id, _)| id == track_id),
+            "paused, the song reported only {reports:?}"
+        );
         playback.stop();
     }
 

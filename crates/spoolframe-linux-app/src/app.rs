@@ -495,7 +495,9 @@ pub enum Loaded {
     /// to send as the current one.
     MustChangePassword(Box<Profile>, Option<Secret>),
     Libraries(Result<Vec<Library>, BackendError>),
-    Home(Result<HomeScreen, BackendError>),
+    /// Home, with the albums of what was played lately (PX-52): none
+    /// without play history, or when they could not be had.
+    Home(Result<(HomeScreen, Vec<Album>), BackendError>),
     Person(Box<Person>, Result<(Vec<Item>, u32), BackendError>),
     /// A movie or episode, what it belongs to (an episode's show), and its
     /// tracks for the pickers.
@@ -2471,7 +2473,7 @@ impl Component for App {
                 widgets.screens.set_visible_child_name("not-set-up");
             }
             Loaded::Libraries(Err(e)) => show_error(widgets, "Home", &e, home_again(&sender)),
-            Loaded::Home(Ok(home)) => {
+            Loaded::Home(Ok((home, recent))) => {
                 let mut rows = Vec::new();
                 // A row with nothing in it is left out, not shown empty.
                 if !home.continue_watching.is_empty() {
@@ -2488,6 +2490,16 @@ impl Component for App {
                         home.next_up
                             .iter()
                             .map(|i| views::continue_card(i, cards, views::Shelf::NextUp)),
+                    ));
+                }
+                // Albums, as the board has the row: a track card would
+                // only play that one track.
+                if !recent.is_empty() {
+                    rows.push(views::row(
+                        "Recently played music",
+                        recent
+                            .into_iter()
+                            .map(|a| views::poster_card(&Item::Album(a), cards)),
                     ));
                 }
                 if !home.recently_added.is_empty() {
@@ -3695,7 +3707,10 @@ impl App {
         let Some(session) = self.session.clone() else {
             return;
         };
-        self.load_root(sender, async move { Loaded::Home(session.home().await) });
+        self.load_root(sender, async move {
+            let (home, recent) = tokio::join!(session.home(), recent_albums(session.as_ref()));
+            Loaded::Home(home.map(|home| (home, recent)))
+        });
     }
 
     /// A new sidebar choice: the last one's load, if still going, is
@@ -4024,6 +4039,34 @@ fn update_text(name: &str, server_protocol: Option<u32>) -> String {
         _ => format!(
             "This app and {name} speak different versions. Update Spoolframe, or ask the server's admin to update it."
         ),
+    }
+}
+
+/// How many albums Home's "Recently played music" shows, and how many of
+/// the latest tracks they are found in.
+const RECENT_ALBUMS: usize = 12;
+const RECENT_TRACKS: u32 = 100;
+
+/// The albums of the tracks played lately, for Home (PX-52): none
+/// without play history, and none, said in the log, when the server
+/// could not say. The row is a convenience; Home opens without it.
+async fn recent_albums(session: &dyn Session) -> Vec<Album> {
+    if !session.has_play_history() {
+        return Vec::new();
+    }
+    let tracks = Kinds {
+        tracks: true,
+        ..Kinds::default()
+    };
+    match session
+        .recently_played(Some(tracks), 0, RECENT_TRACKS)
+        .await
+    {
+        Ok((played, _)) => spoolframe_linux_core::history::recent_albums(&played, RECENT_ALBUMS),
+        Err(e) => {
+            tracing::warn!(error = %e, "no recently played music");
+            Vec::new()
+        }
     }
 }
 
@@ -4614,6 +4657,43 @@ mod tests {
         let client = spoolframe_linux_core::fake::FakeClient::new(None).without_playlists();
         assert_eq!(andor_page_playlists(client), Vec::<String>::new());
     }
+
+    fn home_recent_albums(client: spoolframe_linux_core::fake::FakeClient) -> Vec<String> {
+        use spoolframe_linux_core::testing::ready;
+        let session = client
+            .session(&spoolframe_linux_core::fake::FakeClient::profile("andrey"))
+            .unwrap();
+        ready(recent_albums(session.as_ref()))
+            .into_iter()
+            .map(|a| a.title)
+            .collect()
+    }
+
+    #[test]
+    fn home_lists_the_albums_of_the_tracks_played_lately() {
+        let client = spoolframe_linux_core::fake::FakeClient::new(None);
+        assert_eq!(home_recent_albums(client), ["Low Tide"]);
+    }
+
+    #[test]
+    fn without_play_history_home_lists_no_recent_music() {
+        let client = spoolframe_linux_core::fake::FakeClient::new(None).with_features(
+            spoolframe_linux_core::backend::Features {
+                play_history: false,
+                ..FEATURES_ALL
+            },
+        );
+        assert_eq!(home_recent_albums(client), Vec::<String>::new());
+    }
+
+    const FEATURES_ALL: spoolframe_linux_core::backend::Features =
+        spoolframe_linux_core::backend::Features {
+            playlists: true,
+            liked: true,
+            last_viewed: true,
+            playlist_sharing: true,
+            play_history: true,
+        };
 
     #[test]
     fn a_secret_never_prints() {
