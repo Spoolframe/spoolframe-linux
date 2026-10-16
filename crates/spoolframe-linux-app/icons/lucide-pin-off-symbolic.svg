@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- @license lucide-static v1.50.0 - ISC -->
+
+<svg
+   class="lucide lucide-pin-off"
+   width="24"
+   height="24"
+   viewBox="0 0 24 24"
+   version="1.1"
+   id="svg4"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <defs
+     id="defs4" />
+  <path
+     style="baseline-shift:baseline;display:inline;overflow:visible;vector-effect:none;fill:#000000;stroke:none;stroke-linecap:butt;stroke-linejoin:miter;enable-background:accumulate;stop-color:#000000;stop-opacity:1;opacity:1"
+     d="m 12,16 a 1,1 0 0 0 -1,1 v 5 a 1,1 0 0 0 1,1 1,1 0 0 0 1,-1 v -5 a 1,1 0 0 0 -1,-1 z"
+     id="path1" />
+  <path
+     style="baseline-shift:baseline;display:inline;overflow:visible;vector-effect:none;fill:#000000;stroke:none;stroke-linecap:butt;stroke-linejoin:miter;enable-background:accumulate;stop-color:#000000;stop-opacity:1;opacity:1"
+     d="m 7.890625,1 a 1,1 0 0 0 -1,1 1,1 0 0 0 1,1 H 16 c 0.416666,0 0.601893,0.1202444 0.751953,0.2890625 C 16.902014,3.4578806 17,3.7222221 17,4 17,4.2777779 16.902014,4.5421194 16.751953,4.7109375 16.601893,4.8797556 16.416666,5 16,5 14.907275,5 14,5.9072751 14,7 v 2.3398438 a 1,1 0 0 0 1,1.0000002 1,1 0 0 0 1,-1.0000002 V 7 C 16.916666,7 17.731441,6.6202444 18.248047,6.0390625 18.764653,5.4578806 19,4.7222221 19,4 19,3.2777779 18.764653,2.5421194 18.248047,1.9609375 17.731441,1.3797556 16.916666,1 16,1 Z"
+     id="path2" />
+  <path
+     style="baseline-shift:baseline;display:inline;overflow:visible;vector-effect:none;fill:#000000;stroke:none;stroke-linecap:butt;stroke-linejoin:miter;enable-background:accumulate;stop-color:#000000;stop-opacity:1;opacity:1"
+     d="m 1.2929687,1.2929687 a 1,1 0 0 0 0,1.4140626 L 21.292969,22.707031 a 1,1 0 0 0 1.414062,0 1,1 0 0 0 0,-1.414062 L 2.7070313,1.2929687 a 1,1 0 0 0 -1.4140626,0 z"
+     id="path3" />
+  <path
+     style="baseline-shift:baseline;display:inline;overflow:visible;vector-effect:none;fill:#000000;stroke:none;stroke-linecap:butt;stroke-linejoin:miter;enable-background:accumulate;stop-color:#000000;stop-opacity:1;opacity:1"
+     d="M 9,8 A 1,1 0 0 0 8,9 v 1.759766 c -2.025e-4,0.381602 -0.2129507,0.724718 -0.5546875,0.894531 a 1.0001,1.0001 0 0 0 -0.00586,0.0039 L 5.6640625,12.554688 C 4.646484,13.060334 4.000603,14.103949 4,15.240234 V 16 c 0,1.092725 0.9072751,2 2,2 h 11 a 1,1 0 0 0 1,-1 1,1 0 0 0 -1,-1 H 6 v -0.759766 c 2.025e-4,-0.381602 0.2129507,-0.724718 0.5546875,-0.894531 a 1.0001,1.0001 0 0 0 0.00586,-0.0039 L 8.3359375,13.445313 C 9.353516,12.939666 9.999397,11.896051 10,10.759766 V 9 A 1,1 0 0 0 9,8 Z"
+     id="path4" />
+</svg>

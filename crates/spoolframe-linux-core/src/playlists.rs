@@ -354,6 +354,74 @@ pub fn pin_note_text(notes: &[crate::backend::PinNote]) -> Option<String> {
     (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
+/// The pin notes shown this session: the server keeps a note until some
+/// device dismisses it, so a list read again before the dismissal lands
+/// carries it once more, and it is not shown twice.
+#[derive(Debug, Default)]
+pub struct PinNotesShown(std::collections::HashSet<String>);
+
+impl PinNotesShown {
+    /// The text of the notes in `notes` not shown yet, now counted as
+    /// shown; `None` when there are none.
+    pub fn fresh(&mut self, notes: &[crate::backend::PinNote]) -> Option<String> {
+        let fresh: Vec<_> = notes
+            .iter()
+            .filter(|note| self.0.insert(note.playlist_id.clone()))
+            .cloned()
+            .collect();
+        pin_note_text(&fresh)
+    }
+}
+
+/// The pin a drag within Pinned makes: the playlist at `from` (in
+/// [`pinned`]'s order) dropped on the row at `to` takes that row's place.
+/// Its id and the position to pin it at; `None` when it stays.
+pub fn pin_drop(pinned: &[&PlaylistSummary], from: usize, to: usize) -> Option<(String, u32)> {
+    let playlist = pinned.get(from)?;
+    let to = to.min(pinned.len() - 1);
+    (to != from).then(|| (playlist.id.clone(), to as u32))
+}
+
+/// `list` with playlist `id` pinned at `position`, as the server will
+/// have it: shown at once, before its answer. Positions are made 0, 1, …
+/// in the new order.
+pub fn with_pin_at(list: &mut [PlaylistSummary], id: &str, position: u32) {
+    let mut order: Vec<String> = pinned(list)
+        .into_iter()
+        .filter(|p| p.id != id)
+        .map(|p| p.id.clone())
+        .collect();
+    let at = (position as usize).min(order.len());
+    order.insert(at, id.to_owned());
+    for playlist in list.iter_mut() {
+        playlist.pinned = order
+            .iter()
+            .position(|pinned| *pinned == playlist.id)
+            .map(|at| at as u32);
+    }
+}
+
+/// What "New playlist" sends, from what its dialog has: a trimmed name,
+/// at least one kind, and who sees it.
+pub fn new_playlist(
+    name: &str,
+    kinds: Kinds,
+    server_wide: bool,
+) -> Result<(String, Kinds, Visibility), &'static str> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Give the playlist a name.");
+    }
+    if !(kinds.movies || kinds.episodes || kinds.tracks) {
+        return Err("Tick at least one kind it holds.");
+    }
+    let visibility = match server_wide {
+        true => Visibility::ServerWide,
+        false => Visibility::Personal,
+    };
+    Ok((name.to_owned(), kinds, visibility))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -975,5 +1043,109 @@ mod tests {
         ready(andrey.delete_playlist(&night.id)).unwrap();
         let gone = events.try_recv().unwrap();
         assert!(refresh_for(&gone, &server, Some(&night.id)).page_gone);
+    }
+
+    /// Andrey with Movie night pinned after the heists, and the list.
+    fn two_pinned(client: &FakeClient) -> (Arc<dyn Session>, Vec<PlaylistSummary>) {
+        let andrey = session(client, "andrey");
+        let list = ready(andrey.playlists()).unwrap().playlists;
+        let night = named(&list, "Movie night").id.clone();
+        ready(andrey.pin_playlist(&night, new_pin_position(&list))).unwrap();
+        let list = ready(andrey.playlists()).unwrap().playlists;
+        (andrey, list)
+    }
+
+    #[test]
+    fn a_pin_dropped_on_the_first_row_goes_first_here_and_on_the_server() {
+        let client = FakeClient::new(None);
+        let (andrey, mut list) = two_pinned(&client);
+        let (id, position) = pin_drop(&pinned(&list), 1, 0).unwrap();
+        with_pin_at(&mut list, &id, position);
+        ready(andrey.pin_playlist(&id, position)).unwrap();
+        let server = ready(andrey.playlists()).unwrap().playlists;
+        assert_eq!(
+            (names(&pinned(&list)), names(&pinned(&server))),
+            (
+                vec!["Movie night".to_owned(), "Andor: the heists".to_owned()],
+                vec!["Movie night".to_owned(), "Andor: the heists".to_owned()],
+            )
+        );
+    }
+
+    #[test]
+    fn a_pin_dropped_on_itself_sends_nothing() {
+        let client = FakeClient::new(None);
+        let (_, list) = two_pinned(&client);
+        assert_eq!(pin_drop(&pinned(&list), 1, 1), None);
+    }
+
+    #[test]
+    fn a_pin_dropped_past_the_last_row_goes_last() {
+        let client = FakeClient::new(None);
+        let (_, list) = two_pinned(&client);
+        let heists = named(&list, "Andor: the heists").id.clone();
+        assert_eq!(pin_drop(&pinned(&list), 0, 7), Some((heists, 1)));
+    }
+
+    /// Alice pinned the heists, and Andrey stopped sharing it.
+    fn alice_lost_a_pin(client: &FakeClient) -> Arc<dyn Session> {
+        let (andrey, alice) = (session(client, "andrey"), session(client, "alice"));
+        let list = ready(alice.playlists()).unwrap().playlists;
+        let heists = named(&list, "Andor: the heists").id.clone();
+        ready(alice.pin_playlist(&heists, 0)).unwrap();
+        ready(andrey.update_playlist(
+            &heists,
+            PlaylistUpdate {
+                visibility: Some(Visibility::Personal),
+                ..PlaylistUpdate::default()
+            },
+        ))
+        .unwrap();
+        alice
+    }
+
+    #[test]
+    fn a_pin_note_is_shown_once_though_the_list_is_read_again() {
+        let client = FakeClient::new(None);
+        let alice = alice_lost_a_pin(&client);
+        let mut shown = PinNotesShown::default();
+        let first = ready(alice.playlists()).unwrap().pin_notes;
+        let again = ready(alice.playlists()).unwrap().pin_notes;
+        assert_eq!(
+            (shown.fresh(&first), shown.fresh(&again)),
+            (
+                Some("Andor: the heists is no longer shared with you, so it left Pinned.".into()),
+                None
+            )
+        );
+    }
+
+    #[test]
+    fn a_dismissed_pin_note_is_gone_from_the_next_list() {
+        let client = FakeClient::new(None);
+        let alice = alice_lost_a_pin(&client);
+        let mut shown = PinNotesShown::default();
+        let notes = ready(alice.playlists()).unwrap().pin_notes;
+        if shown.fresh(&notes).is_some() {
+            ready(alice.dismiss_pin_notes()).unwrap();
+        }
+        assert!(ready(alice.playlists()).unwrap().pin_notes.is_empty());
+    }
+
+    #[test]
+    fn a_new_playlist_needs_a_name_and_a_kind() {
+        let kinds = episodes();
+        assert_eq!(
+            (
+                new_playlist("  ", kinds, false),
+                new_playlist("Heists", Kinds::default(), false),
+                new_playlist(" Heists ", kinds, true),
+            ),
+            (
+                Err("Give the playlist a name."),
+                Err("Tick at least one kind it holds."),
+                Ok(("Heists".to_owned(), kinds, Visibility::ServerWide)),
+            )
+        );
     }
 }

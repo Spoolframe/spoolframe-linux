@@ -1,8 +1,9 @@
 //! The main window. It opens on "Choose a server" (or straight on "Who's
 //! watching" for the server used last), then shows the library: a sidebar
-//! of Home, Search and the libraries, and a navigation stack on the right.
-//! The stack's root is the page the sidebar picks; a card pushes its item's
-//! page on top, with a Back button and swipe-back.
+//! of Home, Search, the libraries and, where the server has them, playlists
+//! with the user's pinned ones, and a navigation stack on the right. The
+//! stack's root is the page the sidebar picks; a card pushes its item's page
+//! on top, with a Back button and swipe-back.
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -12,10 +13,13 @@ use adw::prelude::*;
 use gtk::glib;
 use relm4::{Component, ComponentParts, ComponentSender};
 use spoolframe_linux_core::backend::{
-    BackendError, ChosenTracks, Client, ConnectionState, HomeScreen, Invite, Person, Profile,
-    ProfileSignIn, SearchScope, Selection, Server, ServerKey, Session, TrackPreferencesInfo,
+    BackendError, ChosenTracks, Client, ConnectionState, EntryId, HomeScreen, Invite, Kinds,
+    Person, PlaySettings, PlaylistEvent, PlaylistList, PlaylistNext, PlaylistPage, PlaylistSummary,
+    Profile, ProfileSignIn, SearchScope, Selection, Server, ServerKey, Session,
+    TrackPreferencesInfo, Visibility,
 };
 use spoolframe_linux_core::next_episode::next_episode;
+use spoolframe_linux_core::playlists::{self as playlist_rules, PinNotesShown};
 use spoolframe_linux_core::theme::Theme;
 use spoolframe_types::{
     Album, Artist, Item, Library, LibraryKind, MediaId, MediaTracks, Season, Show, TrackPreferences,
@@ -26,14 +30,18 @@ use crate::minibar::MiniBar;
 use crate::mpris::Mpris;
 use crate::passkey_dialog::{self, PasskeySignIn};
 use crate::playback::{Change, Playback, Playlist};
+use crate::playlists::PlaylistView;
 use crate::queue::Queued;
 use crate::remote_sign_in::{self, RemoteSignIn, Via};
 use crate::saved_queue::SavedQueue;
 use crate::search::{self, SearchPage};
 use crate::settings::Settings;
+use crate::sidebar::{PinnedActions, Row, Sidebar};
 use crate::theme::ThemeApplier;
 use crate::views::{Cards, Enqueue};
-use crate::{library, nowplaying, pages, pin, player, preferences, start, views};
+use crate::{
+    library, nowplaying, pages, pin, player, playlists, preferences, sidebar, start, views,
+};
 use spoolframe_linux_core::artcache::ArtworkCache;
 
 /// A password or PIN in a message. Msg derives Debug, and Relm4 records
@@ -159,7 +167,48 @@ pub struct App {
     opening: Option<MediaId>,
     /// The item playing, for pages that mark it (an album's track list).
     now_playing: tokio::sync::watch::Sender<Option<MediaId>>,
+    /// The playlists the user sees (PX-40), once listed; never on a server
+    /// without them.
+    playlists: Option<Vec<PlaylistSummary>>,
+    /// Pin notes shown already, so a list read again shows none twice.
+    pin_notes: PinNotesShown,
+    /// Hears the server's playlist changes for the profile in use.
+    playlist_watch: Option<glib::JoinHandle<()>>,
+    /// The playlist whose page is loading: only the last asked for opens.
+    opening_playlist: Option<String>,
+    /// The playlist page pushed, if one is.
+    shown_playlist: Option<ShownPlaylist>,
+    /// What a pinned row's menu and a drag in Pinned do.
+    pinned_actions: Rc<PinnedActions>,
 }
+
+/// A playlist's page on the stack: its view, refilled in place when the
+/// playlist changes.
+struct ShownPlaylist {
+    view: Rc<PlaylistView>,
+    body: adw::Bin,
+    page: adw::NavigationPage,
+}
+
+/// How a playlist is asked to play.
+#[derive(Debug, Clone, Copy)]
+pub enum PlaylistPlay {
+    /// From its page: from an entry or the user's place, with the
+    /// settings the page shows.
+    Page {
+        from: Option<EntryId>,
+        settings: PlaySettings,
+    },
+    /// From a menu: at the user's place with their kept settings, shuffled
+    /// or not.
+    Menu { shuffle: bool },
+}
+
+/// The most entries the server sends at once.
+const PLAYLIST_PAGE: u32 = 200;
+
+/// The tag of a playlist's page on the stack.
+const PLAYLIST_TAG: &str = "playlist";
 
 /// The sidebar's choice.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -167,6 +216,7 @@ enum Root {
     Home,
     Search,
     Library,
+    Playlists,
 }
 
 pub struct AppWidgets {
@@ -196,7 +246,9 @@ pub struct AppWidgets {
     add_server: Option<start::AddServer>,
     /// "Add a server" from an invite (P6-01), while it is open.
     invite: Option<Rc<crate::invite::InviteDialog>>,
-    sidebar: gtk::ListBox,
+    sidebar: Sidebar,
+    /// "New playlist", in the root header while Playlists shows.
+    new_playlist: gtk::Button,
     stack: adw::NavigationView,
     /// Above the split view: the player is pushed here, over the whole
     /// window, so the sidebar is not beside the video.
@@ -278,8 +330,22 @@ pub enum Msg {
     SubmitSignIn(String, Secret, bool),
     /// Back to "Who's watching" from the library.
     SwitchProfile,
-    /// A sidebar row was activated: see the `ROW_*` constants.
-    Select(usize),
+    /// A sidebar row was picked.
+    Select(Row),
+    /// A playlist's page (PX-40).
+    OpenPlaylist(String),
+    /// Its entries from this offset on: Show more.
+    MorePlaylist(String, u32),
+    PlayPlaylist(String, PlaylistPlay),
+    /// Pin a playlist last (`true`), or unpin it.
+    PinPlaylist(String, bool),
+    /// The pinned one at the first index dropped on the second's row.
+    DropPin(usize, usize),
+    NewPlaylist,
+    CreatePlaylist(String, Kinds, Visibility),
+    PlaylistChanged(Box<PlaylistEvent>),
+    /// Playlist changes were missed: read everything shown again.
+    PlaylistsLagged,
     /// A person a search found: their items.
     OpenPerson(Box<Person>),
     Open(Box<Item>),
@@ -336,11 +402,6 @@ pub enum Msg {
     ExpandPlayer,
     StopPlayback,
 }
-
-/// Sidebar rows before the libraries.
-const ROW_HOME: usize = 0;
-const ROW_SEARCH: usize = 1;
-const FIRST_LIBRARY_ROW: usize = 2;
 
 /// How many search results to show.
 /// The most of a person's items listed.
@@ -443,6 +504,16 @@ pub enum Loaded {
     /// What the server said to the PIN typed for a locked profile.
     Unlocked(Box<Profile>, Result<(), BackendError>),
     Activated(u64, Box<Profile>, Result<(), BackendError>),
+    Playlists(Result<PlaylistList, BackendError>),
+    /// A playlist's first page: for its page to open, or (`true`) to
+    /// refill the one shown.
+    PlaylistPage(String, bool, Result<PlaylistPage, BackendError>),
+    /// A further page of its entries.
+    PlaylistMore(String, Result<PlaylistPage, BackendError>),
+    PlaylistCreated(Result<PlaylistSummary, BackendError>),
+    PinChanged(Result<(), BackendError>),
+    /// What the server picked to play from a playlist.
+    PlaylistStarted(Result<Option<PlaylistNext>, BackendError>),
 }
 
 impl Loaded {
@@ -493,7 +564,13 @@ impl Loaded {
             | Loaded::Enqueued(_, Err(e))
             | Loaded::Saved(Err(e))
             | Loaded::TracksForgotten(_, Err(e))
-            | Loaded::Preferences(_, Err(e)) => Some(e),
+            | Loaded::Preferences(_, Err(e))
+            | Loaded::Playlists(Err(e))
+            | Loaded::PlaylistPage(_, _, Err(e))
+            | Loaded::PlaylistMore(_, Err(e))
+            | Loaded::PlaylistCreated(Err(e))
+            | Loaded::PinChanged(Err(e))
+            | Loaded::PlaylistStarted(Err(e)) => Some(e),
             _ => None,
         }
     }
@@ -527,33 +604,32 @@ impl Component for App {
         let theme = ThemeApplier::new();
         theme.apply(settings.theme());
 
-        let sidebar = gtk::ListBox::builder()
-            .css_classes(["navigation-sidebar", "app-sidebar"])
-            .build();
-        sidebar.append(&sidebar_row("Home", crate::icons::HOME));
-        sidebar.append(&sidebar_row("Search", crate::icons::SEARCH));
-        // A rule between Home and Search and the libraries, as designed.
-        sidebar.set_header_func(|row, _| {
-            let first_library = row.index() == FIRST_LIBRARY_ROW as i32;
-            row.set_header(
-                first_library
-                    .then(|| {
-                        gtk::Separator::builder()
-                            .margin_top(8)
-                            .margin_bottom(8)
-                            .margin_start(4)
-                            .margin_end(4)
-                            .build()
-                    })
-                    .as_ref(),
-            );
-        });
-        {
+        let sidebar = Sidebar::new({
             let sender = sender.clone();
-            sidebar.connect_row_activated(move |_, row| {
-                sender.input(Msg::Select(row.index() as usize));
-            });
-        }
+            Rc::new(move |row| sender.input(Msg::Select(row)))
+        });
+        let pinned_actions = Rc::new(PinnedActions {
+            play: {
+                let sender = sender.clone();
+                Rc::new(move |id, shuffle| {
+                    sender.input(Msg::PlayPlaylist(id, PlaylistPlay::Menu { shuffle }))
+                })
+            },
+            unpin: {
+                let sender = sender.clone();
+                Rc::new(move |id| sender.input(Msg::PinPlaylist(id, false)))
+            },
+            dropped: {
+                let sender = sender.clone();
+                Rc::new(move |from, to| sender.input(Msg::DropPin(from, to)))
+            },
+        });
+        sidebar.fill(
+            sidebar::rows(0, sidebar::Playlists::Off),
+            &[],
+            &[],
+            &pinned_actions,
+        );
         // Who is watching, at the foot of the sidebar; it switches profile.
         let profile_avatar = adw::Avatar::new(34, None, true);
         profile_avatar.add_css_class("sidebar-avatar");
@@ -634,7 +710,7 @@ impl Component for App {
             &sidebar_header,
             &[],
             &gtk::ScrolledWindow::builder()
-                .child(&sidebar)
+                .child(&sidebar.list)
                 .vexpand(true)
                 .build(),
         );
@@ -666,6 +742,21 @@ impl Component for App {
             .css_classes(["title"])
             .build();
         let header = adw::HeaderBar::builder().title_widget(&root_title).build();
+        let new_playlist = gtk::Button::builder()
+            .child(
+                &adw::ButtonContent::builder()
+                    .icon_name(crate::icons::ADD)
+                    .label("New playlist")
+                    .build(),
+            )
+            .visible(false)
+            .css_classes(["suggested-action"])
+            .build();
+        {
+            let sender = sender.clone();
+            new_playlist.connect_clicked(move |_| sender.input(Msg::NewPlaylist));
+        }
+        header.pack_end(&new_playlist);
         let content = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             // 32 between rows, less the room each row keeps for a lifted
@@ -720,7 +811,7 @@ impl Component for App {
         narrow.add_setter(&split, "collapsed", Some(&true.to_value()));
         root.add_breakpoint(narrow);
         // Collapsed, picking a row goes on to its pane.
-        sidebar.connect_row_activated(glib::clone!(
+        sidebar.list.connect_row_activated(glib::clone!(
             #[weak]
             split,
             move |_, _| split.set_show_content(true)
@@ -872,6 +963,12 @@ impl Component for App {
             needs_sign_in: None,
             opening: None,
             now_playing: tokio::sync::watch::Sender::new(None),
+            playlists: None,
+            pin_notes: PinNotesShown::default(),
+            playlist_watch: None,
+            opening_playlist: None,
+            shown_playlist: None,
+            pinned_actions,
         };
         model.load_servers(&sender);
         // Invite links the desktop opened before the window was up.
@@ -909,6 +1006,7 @@ impl Component for App {
                 add_server: None,
                 invite: None,
                 sidebar,
+                new_playlist,
                 stack,
                 root_page,
                 window_stack,
@@ -1359,14 +1457,16 @@ impl Component for App {
                     self.load_profiles(server, &sender);
                 }
             }
-            Msg::Select(ROW_HOME) => {
+            Msg::Select(Row::Home) => {
+                widgets.new_playlist.set_visible(false);
                 self.select_root(Root::Home);
                 plain_header(widgets);
                 self.library = None;
                 widgets.stack.pop_to_page(&widgets.root_page);
                 self.load_home(&sender);
             }
-            Msg::Select(ROW_SEARCH) => {
+            Msg::Select(Row::Search) => {
+                widgets.new_playlist.set_visible(false);
                 self.select_root(Root::Search);
                 widgets.stack.pop_to_page(&widgets.root_page);
                 widgets.root_page.set_title("Search");
@@ -1387,13 +1487,29 @@ impl Component for App {
                     None => page.open(SearchScope::All, None),
                 }
             }
-            Msg::Select(row) => {
-                let Some(library) = self.libraries.get(row - FIRST_LIBRARY_ROW).cloned() else {
+            Msg::Select(Row::Playlists) => {
+                widgets.new_playlist.set_visible(true);
+                self.select_root(Root::Playlists);
+                plain_header(widgets);
+                self.library = None;
+                widgets.stack.pop_to_page(&widgets.root_page);
+                widgets.root_page.set_title("Playlists");
+                show_content(widgets);
+                clear(&widgets.content);
+                // What was listed last at once, then what the server has.
+                self.show_playlists(widgets, &sender);
+                self.load_playlists(&sender);
+            }
+            Msg::Select(Row::Pinned(id)) => self.open_playlist(id, &sender),
+            Msg::Select(Row::NothingPinned) => {}
+            Msg::Select(Row::Library(index)) => {
+                let Some(library) = self.libraries.get(index).cloned() else {
                     return;
                 };
                 let Some(cache) = self.library_cache.clone() else {
                     return;
                 };
+                widgets.new_playlist.set_visible(false);
                 self.select_root(Root::Library);
                 plain_header(widgets);
                 self.library = Some(library.clone());
@@ -1425,6 +1541,126 @@ impl Component for App {
                         }
                     }
                 }));
+            }
+            Msg::OpenPlaylist(id) => self.open_playlist(id, &sender),
+            Msg::MorePlaylist(id, offset) => {
+                let Some(session) = self.playlist_session() else {
+                    return;
+                };
+                self.command(&sender, async move {
+                    let page = session.playlist(&id, offset, PLAYLIST_PAGE).await;
+                    Loaded::PlaylistMore(id, page)
+                });
+            }
+            Msg::PlayPlaylist(id, how) => {
+                let Some(session) = self.playlist_session() else {
+                    return;
+                };
+                self.command(&sender, async move {
+                    let started = async {
+                        let (from, settings) = match how {
+                            PlaylistPlay::Page { from, settings } => (from, settings),
+                            // The user's own settings, kept by the server
+                            // with their place.
+                            PlaylistPlay::Menu { shuffle } => {
+                                let kept = session.playlist(&id, 0, 1).await?.settings;
+                                (None, PlaySettings { shuffle, ..kept })
+                            }
+                        };
+                        session.play_playlist(&id, from, settings).await
+                    }
+                    .await;
+                    Loaded::PlaylistStarted(started)
+                });
+            }
+            Msg::PinPlaylist(id, pin) => {
+                let (Some(session), Some(list)) = (self.playlist_session(), &mut self.playlists)
+                else {
+                    return;
+                };
+                // Shown at once; the server's list follows.
+                let position = playlist_rules::new_pin_position(list);
+                if pin {
+                    playlist_rules::with_pin_at(list, &id, position);
+                } else if let Some(playlist) = list.iter_mut().find(|p| p.id == id) {
+                    playlist.pinned = None;
+                }
+                self.fill_sidebar(widgets);
+                self.command(&sender, async move {
+                    let done = match pin {
+                        true => session.pin_playlist(&id, position).await,
+                        false => session.unpin_playlist(&id).await,
+                    };
+                    Loaded::PinChanged(done)
+                });
+            }
+            Msg::DropPin(from, to) => {
+                let (Some(session), Some(list)) = (self.playlist_session(), &mut self.playlists)
+                else {
+                    return;
+                };
+                let Some((id, position)) =
+                    playlist_rules::pin_drop(&playlist_rules::pinned(list), from, to)
+                else {
+                    return;
+                };
+                playlist_rules::with_pin_at(list, &id, position);
+                self.fill_sidebar(widgets);
+                self.command(&sender, async move {
+                    Loaded::PinChanged(session.pin_playlist(&id, position).await)
+                });
+            }
+            Msg::NewPlaylist => {
+                let Some(session) = self.playlist_session() else {
+                    return;
+                };
+                let create: Rc<dyn Fn(String, Kinds, Visibility)> = {
+                    let sender = sender.clone();
+                    Rc::new(move |name, kinds, visibility| {
+                        sender.input(Msg::CreatePlaylist(name, kinds, visibility))
+                    })
+                };
+                playlists::new_playlist_dialog(root, session.is_admin(), create);
+            }
+            Msg::CreatePlaylist(name, kinds, visibility) => {
+                let Some(session) = self.playlist_session() else {
+                    return;
+                };
+                self.command(&sender, async move {
+                    let made = session.create_playlist(&name, kinds, visibility).await;
+                    Loaded::PlaylistCreated(made)
+                });
+            }
+            Msg::PlaylistChanged(event) => {
+                let Some(server) = &self.server else { return };
+                let shown = self.shown_playlist_id(widgets);
+                let refresh = playlist_rules::refresh_for(&event, &server.key.0, shown.as_deref());
+                if refresh.list {
+                    self.load_playlists(&sender);
+                }
+                if refresh.page
+                    && let Some(id) = shown
+                {
+                    self.reload_playlist(id, &sender);
+                }
+                if refresh.page_gone
+                    && let Some(gone) = self.shown_playlist.take()
+                {
+                    widgets.stack.pop_to_page(&widgets.root_page);
+                    toast_text(
+                        widgets,
+                        &format!(
+                            "{} was deleted or is no longer shared with you.",
+                            gone.view.name
+                        ),
+                    );
+                }
+            }
+            Msg::PlaylistsLagged => {
+                self.load_playlists(&sender);
+                if let Some(id) = self.shown_playlist_id(widgets) {
+                    self.reload_playlist(id, &sender);
+                }
             }
             Msg::OpenPerson(person) => {
                 let Some(session) = self.session.clone() else {
@@ -2052,11 +2288,6 @@ impl Component for App {
                 None => toast(widgets, &e),
             },
             Loaded::Libraries(Ok(libraries)) => {
-                for library in &libraries {
-                    widgets
-                        .sidebar
-                        .append(&sidebar_row(&library.title, library_icon(library.kind)));
-                }
                 // Fetched ahead, so opening one rarely waits.
                 if let Some(cache) = &self.library_cache {
                     for library in &libraries {
@@ -2064,6 +2295,7 @@ impl Component for App {
                     }
                 }
                 self.libraries = libraries;
+                self.fill_sidebar(widgets);
             }
             // Signed in, but the admin has not finished setup: its own
             // page, where the library would be.
@@ -2273,6 +2505,109 @@ impl Component for App {
                 self.open_item(*item, &sender);
             }
             Loaded::TracksForgotten(_, Err(e)) => toast(widgets, &e),
+            Loaded::Playlists(Ok(list)) => {
+                // Once per note: the server keeps it until a device says
+                // it was shown.
+                if let Some(text) = self.pin_notes.fresh(&list.pin_notes)
+                    && let Some(session) = self.playlist_session()
+                {
+                    toast_text(widgets, &text);
+                    self.command(&sender, async move {
+                        Loaded::Saved(session.dismiss_pin_notes().await)
+                    });
+                }
+                if let Some(shown) = &self.shown_playlist
+                    && let Some(playlist) = list.playlists.iter().find(|p| p.id == shown.view.id)
+                {
+                    shown.view.set_pinned(playlist.pinned.is_some());
+                }
+                self.playlists = Some(list.playlists);
+                self.fill_sidebar(widgets);
+                if self.root == Root::Playlists {
+                    self.show_playlists(widgets, &sender);
+                }
+            }
+            Loaded::Playlists(Err(e)) => {
+                if self.root == Root::Playlists {
+                    let sender = sender.clone();
+                    let retry = Rc::new(move || sender.input(Msg::Select(Row::Playlists)));
+                    show_error(widgets, "Playlists", &e, retry);
+                } else {
+                    tracing::warn!(error = %e, "cannot list playlists");
+                }
+            }
+            Loaded::PlaylistPage(id, true, Ok(page)) => {
+                if let Some(shown) = &mut self.shown_playlist
+                    && shown.view.id == id
+                {
+                    let view = PlaylistView::new(
+                        &page,
+                        playlist_actions(&id, &sender),
+                        self.cards.clone(),
+                    );
+                    shown.body.set_child(Some(&view.widget));
+                    shown.page.set_title(&page.playlist.name);
+                    shown.view = view;
+                }
+            }
+            Loaded::PlaylistPage(id, false, Ok(page)) => {
+                if self.opening_playlist.as_ref() != Some(&id) {
+                    return;
+                }
+                self.opening_playlist = None;
+                let view =
+                    PlaylistView::new(&page, playlist_actions(&id, &sender), self.cards.clone());
+                let body = adw::Bin::builder().child(&view.widget).build();
+                let nav_page = pages::page(&page.playlist.name, &body);
+                nav_page.set_tag(Some(PLAYLIST_TAG));
+                // One playlist page at a time, over the sidebar's choice.
+                widgets.stack.pop_to_page(&widgets.root_page);
+                widgets.stack.push(&nav_page);
+                self.shown_playlist = Some(ShownPlaylist {
+                    view,
+                    body,
+                    page: nav_page,
+                });
+            }
+            Loaded::PlaylistPage(id, refresh, Err(e)) => {
+                if !refresh && self.opening_playlist.as_ref() == Some(&id) {
+                    self.opening_playlist = None;
+                }
+                toast(widgets, &e);
+            }
+            Loaded::PlaylistMore(id, Ok(page)) => {
+                if let Some(shown) = &self.shown_playlist
+                    && shown.view.id == id
+                {
+                    shown.view.append(&page);
+                }
+            }
+            Loaded::PlaylistMore(_, Err(e)) => toast(widgets, &e),
+            Loaded::PlaylistCreated(Ok(made)) => {
+                self.load_playlists(&sender);
+                self.open_playlist(made.id, &sender);
+            }
+            Loaded::PlaylistCreated(Err(e)) => toast(widgets, &e),
+            Loaded::PinChanged(done) => {
+                if let Err(e) = done {
+                    toast(widgets, &e);
+                }
+                // The server's order, over the one shown before it answered.
+                self.load_playlists(&sender);
+            }
+            // Only the entry the server picked plays; going on to the next
+            // as each ends, with the player's playlist controls, is the
+            // playlist player's.
+            Loaded::PlaylistStarted(Ok(Some(next))) => {
+                let from = views::Facts::of(&next.item).position();
+                sender.input(Msg::Play(Box::new(PlayRequest::one(
+                    next.item, from, None, None,
+                ))));
+            }
+            Loaded::PlaylistStarted(Ok(None)) => {
+                toast_text(widgets, "Nothing in this playlist can play now.")
+            }
+            Loaded::PlaylistStarted(Err(e)) => toast(widgets, &e),
             Loaded::Preferences(open, result) => {
                 // Without the server's preferences, Settings still opens.
                 let tracks = result
@@ -2502,10 +2837,16 @@ impl App {
         widgets.profile_avatar.set_text(Some(&profile.display_name));
         widgets.profile_name.set_label(&profile.display_name);
         self.watch_connection(&profile.server, sender);
-        while let Some(row) = widgets.sidebar.row_at_index(FIRST_LIBRARY_ROW as i32) {
-            widgets.sidebar.remove(&row);
-        }
+        self.watch_playlists(sender);
         self.libraries.clear();
+        self.playlists = None;
+        self.pin_notes = PinNotesShown::default();
+        self.shown_playlist = None;
+        self.opening_playlist = None;
+        widgets.new_playlist.set_visible(false);
+        self.fill_sidebar(widgets);
+        // Home is where the profile opens, whatever the last one picked.
+        widgets.sidebar.select(&Row::Home);
         self.select_root(Root::Home);
         plain_header(widgets);
         // The next profile has its own searches.
@@ -2521,7 +2862,116 @@ impl App {
         clear(&widgets.content);
         widgets.screens.set_visible_child_name("library");
         self.load_libraries(sender);
+        self.load_playlists(sender);
         self.load_home(sender);
+    }
+
+    /// Hears the server's playlist changes for the session in use,
+    /// replacing the watch on the last one. None on a server without
+    /// playlists.
+    fn watch_playlists(&mut self, sender: &ComponentSender<Self>) {
+        if let Some(watch) = self.playlist_watch.take() {
+            watch.abort();
+        }
+        if self.playlist_session().is_none() {
+            return;
+        }
+        let mut events = self.client.playlist_events();
+        let sender = sender.clone();
+        self.playlist_watch = Some(glib::spawn_future_local(async move {
+            use tokio::sync::broadcast::error::RecvError;
+            loop {
+                match events.recv().await {
+                    Ok(event) => sender.input(Msg::PlaylistChanged(Box::new(event))),
+                    Err(RecvError::Lagged(_)) => sender.input(Msg::PlaylistsLagged),
+                    Err(RecvError::Closed) => break,
+                }
+            }
+        }));
+    }
+
+    /// The session, if its server has playlists: nothing of them is sent
+    /// to one without.
+    fn playlist_session(&self) -> Option<Arc<dyn Session>> {
+        self.session.clone().filter(|s| s.has_playlists())
+    }
+
+    /// The sidebar for the libraries and playlists known now.
+    fn fill_sidebar(&self, widgets: &AppWidgets) {
+        let listed = self.playlists.as_deref();
+        let state = match (self.playlist_session(), listed) {
+            (None, _) => sidebar::Playlists::Off,
+            (Some(_), None) => sidebar::Playlists::Loading,
+            (Some(_), Some(list)) => sidebar::Playlists::Listed(list),
+        };
+        widgets.sidebar.fill(
+            sidebar::rows(self.libraries.len(), state),
+            &self.libraries,
+            listed.unwrap_or_default(),
+            &self.pinned_actions,
+        );
+    }
+
+    fn load_playlists(&self, sender: &ComponentSender<Self>) {
+        let Some(session) = self.playlist_session() else {
+            return;
+        };
+        self.command(sender, async move {
+            Loaded::Playlists(session.playlists().await)
+        });
+    }
+
+    /// The Playlists section from the list known now, if it is known.
+    fn show_playlists(&self, widgets: &AppWidgets, sender: &ComponentSender<Self>) {
+        let Some(list) = &self.playlists else { return };
+        let actions = Rc::new(playlists::ListActions {
+            open: {
+                let sender = sender.clone();
+                Rc::new(move |id| sender.input(Msg::OpenPlaylist(id)))
+            },
+            play: {
+                let sender = sender.clone();
+                Rc::new(move |id, shuffle| {
+                    sender.input(Msg::PlayPlaylist(id, PlaylistPlay::Menu { shuffle }))
+                })
+            },
+            pin: {
+                let sender = sender.clone();
+                Rc::new(move |id, pin| sender.input(Msg::PinPlaylist(id, pin)))
+            },
+        });
+        show(widgets, "Playlists", playlists::section(list, &actions));
+    }
+
+    /// Loads a playlist's first page, then pushes its page.
+    fn open_playlist(&mut self, id: String, sender: &ComponentSender<Self>) {
+        let Some(session) = self.playlist_session() else {
+            return;
+        };
+        self.opening_playlist = Some(id.clone());
+        self.command(sender, async move {
+            let page = session.playlist(&id, 0, PLAYLIST_PAGE).await;
+            Loaded::PlaylistPage(id, false, page)
+        });
+    }
+
+    /// The page shown for playlist `id`, read again in place.
+    fn reload_playlist(&self, id: String, sender: &ComponentSender<Self>) {
+        let Some(session) = self.playlist_session() else {
+            return;
+        };
+        self.command(sender, async move {
+            let page = session.playlist(&id, 0, PLAYLIST_PAGE).await;
+            Loaded::PlaylistPage(id, true, page)
+        });
+    }
+
+    /// The playlist whose page is on the stack, if one is: popped, it is
+    /// no longer there to find.
+    fn shown_playlist_id(&self, widgets: &AppWidgets) -> Option<String> {
+        let shown = self.shown_playlist.as_ref()?;
+        let on_stack = widgets.stack.find_page(PLAYLIST_TAG)?;
+        (on_stack == shown.page).then(|| shown.view.id.clone())
     }
 
     /// Follows the connection to `server` and shows its state, replacing
@@ -2879,6 +3329,9 @@ impl App {
         if let Some(load) = self.root_load.take() {
             load.abort();
         }
+        if let Some(watch) = self.playlist_watch.take() {
+            watch.abort();
+        }
     }
 
     fn command(
@@ -3211,18 +3664,26 @@ fn update_text(name: &str, server_protocol: Option<u32>) -> String {
     }
 }
 
-fn sidebar_row(title: &str, icon: &str) -> gtk::Box {
-    let row = gtk::Box::builder().spacing(12).build();
-    row.append(&gtk::Image::from_icon_name(icon));
-    row.append(&gtk::Label::builder().label(title).xalign(0.0).build());
-    row
-}
-
-fn library_icon(kind: LibraryKind) -> &'static str {
-    match kind {
-        LibraryKind::Movies => crate::icons::MOVIES,
-        LibraryKind::Shows => crate::icons::SHOWS,
-        LibraryKind::Music => crate::icons::MUSIC,
+/// What playlist `id`'s page does: its buttons, pin and Show more.
+fn playlist_actions(id: &str, sender: &ComponentSender<App>) -> playlists::PageActions {
+    playlists::PageActions {
+        play: {
+            let (sender, id) = (sender.clone(), id.to_owned());
+            Rc::new(move |from, settings| {
+                sender.input(Msg::PlayPlaylist(
+                    id.clone(),
+                    PlaylistPlay::Page { from, settings },
+                ))
+            })
+        },
+        pin: {
+            let (sender, id) = (sender.clone(), id.to_owned());
+            Rc::new(move |pin| sender.input(Msg::PinPlaylist(id.clone(), pin)))
+        },
+        more: {
+            let (sender, id) = (sender.clone(), id.to_owned());
+            Rc::new(move |offset| sender.input(Msg::MorePlaylist(id.clone(), offset)))
+        },
     }
 }
 
@@ -3322,7 +3783,7 @@ fn push_error(
 /// Home, loaded again.
 fn home_again(sender: &ComponentSender<App>) -> Rc<dyn Fn()> {
     let sender = sender.clone();
-    Rc::new(move || sender.input(Msg::Select(ROW_HOME)))
+    Rc::new(move || sender.input(Msg::Select(Row::Home)))
 }
 
 fn toast(widgets: &AppWidgets, error: &BackendError) {

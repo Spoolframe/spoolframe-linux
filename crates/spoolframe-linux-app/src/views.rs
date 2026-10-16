@@ -66,7 +66,7 @@ impl Cards {
 }
 
 /// The hues a placeholder tile can take; see `.tile-*` in style.css.
-const TILE_HUES: [&str; 8] = [
+pub(crate) const TILE_HUES: [&str; 8] = [
     "tile-teal",
     "tile-purple",
     "tile-yellow",

@@ -24,6 +24,7 @@ ICONS=(
   mic-vocal disc-3 key-round usb clipboard user-plus
   ticket fingerprint copy
   download users info
+  list-music pin pin-off
 )
 
 here="$(cd "$(dirname "$0")" && pwd)"

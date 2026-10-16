@@ -101,6 +101,10 @@ pub const CALENDAR: &str = "lucide-calendar-symbolic";
 // Going to a track's artist and album.
 pub const ARTIST: &str = "lucide-mic-vocal-symbolic";
 pub const ALBUM: &str = "lucide-disc-3-symbolic";
+// Playlists (PX-40) and their pins in the sidebar.
+pub const PLAYLISTS: &str = "lucide-list-music-symbolic";
+pub const PIN: &str = "lucide-pin-symbolic";
+pub const UNPIN: &str = "lucide-pin-off-symbolic";
 
 /// Every name above, for the tests.
 #[cfg(test)]
@@ -171,6 +175,9 @@ const ALL: &[&str] = &[
     CALENDAR,
     ARTIST,
     ALBUM,
+    PLAYLISTS,
+    PIN,
+    UNPIN,
 ];
 
 #[cfg(test)]

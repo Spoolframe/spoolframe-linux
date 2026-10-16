@@ -14,6 +14,17 @@
   text in Preferences › Invites, and the link that only finds the server,
   give `https://spoolframe.app/i#…`; the QR code keeps the spoolframe://
   one. "Add a server" says it takes either.
+- Playlists (PX-40), on a server that has them: a Playlists item in the
+  sidebar opens My playlists, Shared with me and Server-wide, with New
+  playlist (a name, the kinds it holds and, for an admin, Server-wide).
+  A playlist's page lists its entries with their notes (up next, watched,
+  unavailable) and has Continue, Play from start, Shuffle, Repeat and Skip
+  watched; for now it plays the entry the server picks, not the ones
+  after it. Pinned playlists show in the sidebar under Pinned, in your
+  order: pin one from its menu or its page, drag to reorder, right-click
+  to unpin. A pin that left because the playlist was unshared or deleted
+  says so once. Changes made elsewhere show as they happen. A server
+  without playlists shows none of this.
 
 ## 0.6.1 — 2026-10-10
 

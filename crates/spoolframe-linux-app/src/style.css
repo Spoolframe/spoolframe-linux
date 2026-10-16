@@ -1688,3 +1688,51 @@ popover.scrub-preview > contents {
   background-color: alpha(var(--error-color), 0.1);
   border: 1px solid alpha(var(--error-color), 0.4);
 }
+
+/* Playlists (PX-40). A playlist's mosaic, rounder on a card than in the
+   sidebar; Pinned's heading, its 34 px rows and the hint for an empty
+   group; a toggle that is on (Shuffle, Repeat, the pin) in the accent. */
+.mosaic {
+  border-radius: 10px;
+}
+
+.mosaic.small {
+  border-radius: 5px;
+}
+
+.app-sidebar .sidebar-group {
+  padding: 10px 12px 4px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  opacity: 0.55;
+}
+
+.app-sidebar > row.pinned-row {
+  min-height: 34px;
+  padding: 0 12px 0 10px;
+  font-size: 13px;
+}
+
+.app-sidebar > row.pinned-hint,
+.app-sidebar > row.pinned-hint:hover {
+  padding: 4px 12px 8px;
+  background: none;
+}
+
+button.action.outlined:checked,
+button.action.outlined.on {
+  background-color: alpha(var(--accent-color), 0.16);
+  color: var(--accent-color);
+  box-shadow: inset 0 0 0 1px alpha(var(--accent-color), 0.5);
+}
+
+/* A playlist's entries: the one Continue starts at on the surface, one
+   whose file cannot be read dimmed. */
+.playlist-entries > row.up-next {
+  background-color: alpha(currentColor, 0.06);
+}
+
+.playlist-entries > row.unavailable {
+  opacity: 0.5;
+}
