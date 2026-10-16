@@ -83,7 +83,8 @@ impl InviteDialog {
 
         // 1 · The link, and what it says.
         let lead = paragraph(
-            "Paste the spoolframe:// link from your invite. Opening the link does the same.",
+            "Paste the link from your invite: an https://spoolframe.app link or a \
+             spoolframe:// one. Opening the link does the same.",
         );
         let link = gtk::TextView::builder()
             .wrap_mode(gtk::WrapMode::Char)

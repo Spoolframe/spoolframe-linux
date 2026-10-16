@@ -1918,7 +1918,7 @@ impl Session for FakeSession {
                 .map(|i| char::from(alphabet[(n * 7 + i * 3) % alphabet.len()]))
                 .collect();
             let expires_at = spec.expires_in.map(|d| std::time::SystemTime::now() + d);
-            let link = spoolframe_protocol::invite::Invite {
+            let invite = spoolframe_protocol::invite::Invite {
                 server: home_media().0,
                 name: Some("Home Media".into()),
                 addrs: vec!["192.168.1.20:7430".parse().expect("an address")],
@@ -1937,8 +1937,8 @@ impl Session for FakeSession {
                     _ => spoolframe_protocol::invite::InviteLinkKind::CreateUser,
                 },
                 lookup: None,
-            }
-            .link();
+            };
+            let (link, share_link) = (invite.link(), invite.share_link());
             auth.invites.push(InviteSummary {
                 id: id.clone(),
                 kind: spec.kind,
@@ -1959,7 +1959,8 @@ impl Session for FakeSession {
                 id,
                 kind: spec.kind,
                 code: spoolframe_protocol::invite::display_code(&code),
-                copy_string: link.clone(),
+                copy_string: share_link.clone(),
+                share_link,
                 link,
                 expires_at,
                 uses: spec.uses,
@@ -5545,6 +5546,22 @@ mod tests {
                     },
                     revoked: false,
                 }]
+            );
+        }
+
+        #[test]
+        fn a_made_invite_is_copied_as_its_https_link() {
+            let made = ready(andrey().create_invite(create_user())).unwrap();
+            // The same parameters as the QR code's link, after the https
+            // prefix: the code with them.
+            let query = |link: &str| link.split_once(['?', '#']).map(|(_, q)| q.to_owned());
+            assert_eq!(
+                (
+                    made.share_link.starts_with("https://"),
+                    query(&made.share_link),
+                    made.copy_string.clone(),
+                ),
+                (true, query(&made.link), made.share_link.clone())
             );
         }
 

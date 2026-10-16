@@ -451,9 +451,14 @@ pub struct MintedInvite {
     pub kind: InviteKind,
     /// As people read and type it: `QW7K-2MFP-XR4T`.
     pub code: String,
-    /// `spoolframe://invite?…`, for the QR code and to send.
+    /// `spoolframe://invite?…`, for the QR code.
     pub link: String,
-    /// The text to paste into "Add a server".
+    /// The same invite as `https://spoolframe.app/i#…` (PX-45): what
+    /// Copy link copies. Every app's "Add a server" reads it, and a
+    /// browser that opens it sends none of the invite to the site.
+    pub share_link: String,
+    /// The text to paste into "Add a server": the https link, as the web
+    /// UI copies it.
     pub copy_string: String,
     pub expires_at: Option<std::time::SystemTime>,
     pub uses: Option<u32>,

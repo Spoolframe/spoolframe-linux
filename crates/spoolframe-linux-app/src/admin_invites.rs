@@ -205,7 +205,8 @@ pub fn guidance(kind: InviteKind) -> &'static str {
 }
 
 /// A link that only finds `server`, with no code: anyone with an account
-/// there signs in with it.
+/// there signs in with it. The https form (PX-45), which every app's "Add
+/// a server" reads and a browser opens without sending it to the site.
 pub fn share_link(server: &Server) -> String {
     spoolframe_protocol::invite::Invite {
         server: server.key.0.clone(),
@@ -218,7 +219,7 @@ pub fn share_link(server: &Server) -> String {
         relays: server.relays.clone(),
         ..Default::default()
     }
-    .link()
+    .share_link()
 }
 
 /// What the New invite form holds, by the pickers' positions.
@@ -918,7 +919,7 @@ impl Making {
             if let Some(making) = weak.upgrade()
                 && let Some(made) = making.made.borrow().as_ref()
             {
-                button.clipboard().set_text(&made.link);
+                button.clipboard().set_text(&made.share_link);
                 making.copied("Link copied");
             }
         });
@@ -999,7 +1000,7 @@ impl Making {
         self.made_chip.add_css_class(class);
         self.made_guidance.set_label(guidance(made.kind));
         self.code.set_label(&made.code);
-        self.link.set_label(&made.link);
+        self.link.set_label(&made.share_link);
         self.dialog.set_title(match made.kind {
             InviteKind::Federation => "Server invite made",
             _ => "Invite made",
@@ -1198,7 +1199,9 @@ mod tests {
             use_relays: None,
             relays_edited: false,
         };
-        let read = spoolframe_protocol::invite::parse_link(&share_link(&server)).unwrap();
+        let link = share_link(&server);
+        assert!(link.starts_with("https://"), "{link}");
+        let read = spoolframe_protocol::invite::parse_link(&link).unwrap();
         assert_eq!(
             (read.server, read.name, read.code),
             ("c4b1".repeat(16), Some("Home Media".into()), None)

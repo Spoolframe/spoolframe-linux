@@ -9,7 +9,11 @@
   airing (an episode in the last twelve months), or "2022–2025".
 - An episode's page says the day it aired, or its year where the server
   does not know the day.
-- The SDK crates are 0.9.0.
+- The SDK crates are 0.10.0.
+- Invites are copied as https links (PX-45): Copy link and Copy invite
+  text in Preferences › Invites, and the link that only finds the server,
+  give `https://spoolframe.app/i#…`; the QR code keeps the spoolframe://
+  one. "Add a server" says it takes either.
 
 ## 0.6.1 — 2026-10-10
 

@@ -67,6 +67,7 @@ fn minted_invite(made: sdk::MintedInvite) -> MintedInvite {
         kind: invite_kind(made.kind),
         code: made.code,
         link: made.link,
+        share_link: made.share_link,
         copy_string: made.copy_string,
         expires_at: Some(made.expires_at),
         uses: Some(made.uses),
