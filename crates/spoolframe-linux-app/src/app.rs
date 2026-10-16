@@ -2614,7 +2614,7 @@ impl Component for App {
                         actions,
                         pages::Under {
                             next: next.as_deref(),
-                            playlists: self.playlist_rows(&refs, false, &sender).as_ref(),
+                            playlists: self.playlist_rows(&refs, &sender).as_ref(),
                         },
                         cards,
                     ),
@@ -2643,7 +2643,7 @@ impl Component for App {
                         &seasons,
                         open.as_ref(),
                         actions,
-                        self.playlist_rows(&refs, true, &sender).as_ref(),
+                        self.playlist_tabs(&refs, &sender),
                         cards,
                     ),
                 );
@@ -2659,7 +2659,7 @@ impl Component for App {
                     &pages::artist(
                         &artist,
                         &albums,
-                        self.playlist_rows(&refs, false, &sender).as_ref(),
+                        self.playlist_rows(&refs, &sender).as_ref(),
                         cards,
                     ),
                 );
@@ -2708,7 +2708,7 @@ impl Component for App {
                         &tracks,
                         pages::AlbumActions { play, enqueue },
                         self.now_playing.subscribe(),
-                        self.playlist_rows(&refs, false, &sender).as_ref(),
+                        self.playlist_rows(&refs, &sender).as_ref(),
                         cards,
                     ),
                 );
@@ -3302,13 +3302,11 @@ impl App {
     }
 
     /// An item page's Playlists: those holding it, if any and the server
-    /// has playlists. On a show's page choosing one plays it from the
-    /// user's place (the ticket's); elsewhere it opens its page, as the
-    /// boards link it. The other is on the row's menu.
+    /// has playlists. Choosing one opens its page, as the boards link it;
+    /// its menu plays it from the user's place.
     fn playlist_rows(
         &self,
         refs: &[PlaylistRef],
-        show: bool,
         sender: &ComponentSender<Self>,
     ) -> Option<gtk::Widget> {
         let has = self.playlist_session().is_some();
@@ -3323,17 +3321,47 @@ impl App {
             let sender = sender.clone();
             Rc::new(move |id| sender.input(Msg::OpenPlaylist(id)))
         };
-        let actions = match show {
-            true => playlists::RefActions {
-                choose: play,
-                other: ("Open playlist", crate::icons::PLAYLISTS, open),
-            },
-            false => playlists::RefActions {
-                choose: open,
-                other: ("Play", crate::icons::PLAY, play),
-            },
+        Some(playlists::refs_section(
+            refs,
+            &playlists::RefActions { open, play },
+        ))
+    }
+
+    /// A show page's playlist tabs (PX-40): those holding any of its
+    /// episodes, if any and the server has playlists. A tab reads the
+    /// whole playlist as its page does, and plays it the same way.
+    fn playlist_tabs(
+        &self,
+        refs: &[PlaylistRef],
+        sender: &ComponentSender<Self>,
+    ) -> Option<pages::ShowPlaylists> {
+        let session = self.playlist_session()?;
+        let refs = playlists::shown_refs(true, refs)?.to_vec();
+        let load: pages::LoadPlaylist = {
+            let session = session.clone();
+            Rc::new(move |id, offset| {
+                let session = session.clone();
+                relm4::spawn(async move { session.playlist(&id, offset, PLAYLIST_PAGE).await })
+            })
         };
-        Some(playlists::refs_section(refs, show, &actions))
+        let actions: pages::TabActions = {
+            let sender = sender.clone();
+            Rc::new(move |id, more| playlists::PageActions {
+                more,
+                ..playlist_actions(id, &sender, Some(&session))
+            })
+        };
+        let open: Rc<dyn Fn(String)> = {
+            let sender = sender.clone();
+            Rc::new(move |id| sender.input(Msg::OpenPlaylist(id)))
+        };
+        Some(pages::ShowPlaylists {
+            refs,
+            load,
+            actions,
+            open,
+            cards: self.cards.clone(),
+        })
     }
 
     /// "Add to playlist" for `item`, from the list known now.

@@ -52,10 +52,13 @@
   credits says "Next in <playlist>". Music queued by hand plays first,
   then the playlist goes on.
 - Movie, episode, album and artist pages list the playlists that hold
-  them, and a show's page those holding any of its episodes, beside the
-  episodes. On a show's page choosing one plays it from your place;
-  elsewhere it opens the playlist; right-click does the other. The rows
-  are read with the page, so a change shows the next time it opens.
+  them: choosing one opens the playlist, and right-click plays it. On a
+  show's page each playlist holding any of its episodes is a tab after
+  the seasons, marked with a playlist icon; it shows the whole playlist
+  where a season's episodes go, with Continue (or Play), Play from
+  start, Shuffle and Open playlist, and an entry's menu plays from it.
+  Which playlists hold an item is read with the page, so a change shows
+  the next time it opens.
 - Sharing by name, on a server that has it: the editor's Add someone
   opens a picker of the people the playlist can go to, searched by name
   or username, a page at a time, each with their @username (or, for a
