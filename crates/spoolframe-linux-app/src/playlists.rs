@@ -10,8 +10,8 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use spoolframe_linux_core::backend::{
-    ArtworkSize, EntryId, Kinds, PlaySettings, PlaylistEdit, PlaylistEntry, PlaylistPage,
-    PlaylistSummary, PlaylistUpdate, Repeat, Visibility,
+    ArtworkSize, EntryId, Kinds, PlaySettings, PlaylistEdit, PlaylistEntry, PlaylistOwnerKind,
+    PlaylistPage, PlaylistRef, PlaylistSummary, PlaylistUpdate, Repeat, Visibility,
 };
 use spoolframe_linux_core::playlists::{self, Offer};
 use spoolframe_types::{ArtworkKind, Item, MediaKind};
@@ -59,6 +59,80 @@ pub fn mosaic(id: &str, size: i32) -> gtk::Widget {
         );
     }
     grid.upcast()
+}
+
+/// Whose a playlist an item's page lists is: all a reference says (it
+/// carries no counts).
+pub fn ref_line(kind: PlaylistOwnerKind) -> &'static str {
+    match kind {
+        PlaylistOwnerKind::Mine => "Yours",
+        PlaylistOwnerKind::ServerWide => "Server-wide",
+        PlaylistOwnerKind::SharedWithMe | PlaylistOwnerKind::Unknown => "Shared with you",
+    }
+}
+
+/// The playlists an item's page lists, if it lists any: none without the
+/// feature, and no section when none hold the item.
+pub fn shown_refs(has_playlists: bool, refs: &[PlaylistRef]) -> Option<&[PlaylistRef]> {
+    (has_playlists && !refs.is_empty()).then_some(refs)
+}
+
+/// What a row of an item page's Playlists does, by the playlist's id: a
+/// click, and the one other thing on its menu.
+pub struct RefActions {
+    pub choose: Rc<dyn Fn(String)>,
+    pub other: (&'static str, &'static str, Rc<dyn Fn(String)>),
+}
+
+/// An item page's Playlists (boards LinuxShowPlaylists and
+/// LinuxPlaylistRows): a row per playlist, its mosaic, name and whose it
+/// is. A show's says the rows hold its episodes and that choosing plays.
+pub fn refs_section(refs: &[PlaylistRef], show: bool, actions: &RefActions) -> gtk::Widget {
+    let section = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .valign(gtk::Align::Start)
+        .css_classes(["playlist-refs"])
+        .build();
+    section.append(&label("Playlists", &["title-3"]));
+    if show {
+        section.append(&label(
+            "with episodes of this show",
+            &["dim-label", "caption"],
+        ));
+    }
+    let list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .css_classes(["boxed-list"])
+        .build();
+    for playlist in refs {
+        let row = adw::ActionRow::builder()
+            .use_markup(false)
+            .activatable(true)
+            .build();
+        row.set_title(&playlist.name);
+        row.set_subtitle(ref_line(playlist.owner_kind));
+        row.add_prefix(&mosaic(&playlist.id, 36));
+        let (choose, id) = (actions.choose.clone(), playlist.id.clone());
+        row.connect_activated(move |_| choose(id.clone()));
+        let (text, icon, run) = &actions.other;
+        let (run, id) = (run.clone(), playlist.id.clone());
+        let menu = views::menu_popover(vec![vec![views::MenuEntry::new(*text, icon, move || {
+            run(id.clone())
+        })]]);
+        views::context_menu(row.upcast_ref(), &menu);
+        list.append(&row);
+    }
+    section.append(&list);
+    if show {
+        let note = crate::dialog::dim(
+            "Choosing one plays from the playlist at your place in it. Only playlists you can see \
+             are listed.",
+        );
+        note.add_css_class("caption");
+        section.append(&note);
+    }
+    section.upcast()
 }
 
 /// What a playlist's card, row and menu do, by its id.
@@ -991,6 +1065,56 @@ mod tests {
             .map(|row| row.line)
             .collect();
         assert_eq!(lines, ["Music · Shared with you · you can edit"]);
+    }
+
+    #[test]
+    fn an_items_playlists_say_only_whose_they_are() {
+        assert_eq!(
+            [
+                PlaylistOwnerKind::Mine,
+                PlaylistOwnerKind::SharedWithMe,
+                PlaylistOwnerKind::ServerWide,
+                PlaylistOwnerKind::Unknown,
+            ]
+            .map(ref_line),
+            ["Yours", "Shared with you", "Server-wide", "Shared with you"]
+        );
+    }
+
+    fn refs_of(session: &dyn Session, id: &spoolframe_types::MediaId) -> Vec<PlaylistRef> {
+        ready(session.item_detail(id)).unwrap().playlists
+    }
+
+    fn andor() -> spoolframe_types::MediaId {
+        spoolframe_types::MediaId::new(spoolframe_types::Namespace::Plex, MediaKind::Show, "60")
+            .unwrap()
+    }
+
+    #[test]
+    fn a_show_in_a_playlist_lists_it() {
+        let client = FakeClient::new(None);
+        let refs = refs_of(andrey(&client).as_ref(), &andor());
+        let shown: Vec<_> = shown_refs(true, &refs)
+            .unwrap()
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(shown, ["Andor: the heists"]);
+    }
+
+    #[test]
+    fn an_item_in_no_playlist_has_no_section() {
+        let client = FakeClient::new(None);
+        let mum = client.session(&FakeClient::profile("mum")).unwrap();
+        let refs = refs_of(mum.as_ref(), &andor());
+        assert_eq!(shown_refs(true, &refs), None);
+    }
+
+    #[test]
+    fn without_the_feature_there_is_no_section() {
+        let client = FakeClient::new(None);
+        let refs = refs_of(andrey(&client).as_ref(), &andor());
+        assert_eq!(shown_refs(false, &refs), None);
     }
 
     #[test]

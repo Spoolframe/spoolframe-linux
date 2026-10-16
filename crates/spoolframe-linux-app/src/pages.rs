@@ -50,6 +50,20 @@ pub struct PlayableActions {
     pub forget: Rc<dyn Fn()>,
 }
 
+/// What goes under a movie's or an episode's details.
+pub struct Under<'a> {
+    /// "Next episode".
+    pub next: Option<&'a Item>,
+    /// The playlists holding it (PX-40).
+    pub playlists: Option<&'a gtk::Widget>,
+}
+
+/// What an album's page does with its tracks.
+pub struct AlbumActions {
+    pub play: PlayTracks,
+    pub enqueue: EnqueueTracks,
+}
+
 /// A page with its own header bar, which shows the Back button.
 pub fn page(title: &str, body: &impl IsA<gtk::Widget>) -> adw::NavigationPage {
     let toolbar = adw::ToolbarView::new();
@@ -82,9 +96,10 @@ pub fn playable(
     tracks: Option<&MediaTracks>,
     chosen: Option<&ChosenTracks>,
     actions: PlayableActions,
-    next: Option<&Item>,
+    under: Under<'_>,
     cards: &Cards,
 ) -> gtk::Widget {
+    let Under { next, playlists } = under;
     let facts = Facts::of(item);
     let (title, summary, cast) = match item {
         Item::Movie(m) => (m.title.clone(), m.summary.clone(), m.cast.as_slice()),
@@ -173,6 +188,10 @@ pub fn playable(
     }
     if let Some(next) = next {
         info.append(&next_card(next, cards));
+    }
+    // The playlists holding it, under the details (PX-40).
+    if let Some(playlists) = playlists {
+        info.append(playlists);
     }
 
     let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -772,6 +791,7 @@ pub fn show(
     seasons: &[(Season, Vec<Item>)],
     open: Option<&MediaId>,
     actions: ShowActions,
+    playlists: Option<&gtk::Widget>,
     cards: &Cards,
 ) -> gtk::Widget {
     // The seasons as this page knows them. Marking something watched
@@ -940,8 +960,18 @@ pub fn show(
     bar.append(&tab_line);
     bar.append(&season_line);
     body.append(&bar);
-    let list_slot = adw::Bin::new();
-    body.append(&list_slot);
+    let list_slot = adw::Bin::builder().hexpand(true).build();
+    // The playlists holding its episodes beside them (PX-40).
+    match playlists {
+        Some(playlists) => {
+            let beside = gtk::Box::builder().spacing(28).build();
+            beside.append(&list_slot);
+            playlists.set_width_request(300);
+            beside.append(playlists);
+            body.append(&beside);
+        }
+        None => body.append(&list_slot),
+    }
 
     let open_season: Rc<dyn Fn(usize)> = {
         let (model, current, actions, cards_open, art, add) = (
@@ -1157,7 +1187,12 @@ fn episode_list(
 }
 
 /// An artist: their albums as a grid.
-pub fn artist(artist: &Artist, albums: &[Item], cards: &Cards) -> gtk::Widget {
+pub fn artist(
+    artist: &Artist,
+    albums: &[Item],
+    playlists: Option<&gtk::Widget>,
+    cards: &Cards,
+) -> gtk::Widget {
     let body = content();
     let heading = gtk::Box::builder().spacing(12).build();
     let name = label(&artist.name, &["title-1"]);
@@ -1171,6 +1206,11 @@ pub fn artist(artist: &Artist, albums: &[Item], cards: &Cards) -> gtk::Widget {
         ));
     }
     body.append(&heading);
+    if let Some(playlists) = playlists {
+        playlists.set_halign(gtk::Align::Start);
+        playlists.set_width_request(360);
+        body.append(playlists);
+    }
     body.append(&views::grid(
         "Albums",
         albums.iter().map(|a| views::poster_card(a, cards)),
@@ -1185,11 +1225,12 @@ pub fn album(
     album: &Album,
     artist: &str,
     tracks: &[Item],
-    play: PlayTracks,
-    enqueue: EnqueueTracks,
+    actions: AlbumActions,
     playing: tokio::sync::watch::Receiver<Option<MediaId>>,
+    playlists: Option<&gtk::Widget>,
     cards: &Cards,
 ) -> gtk::Widget {
+    let AlbumActions { play, enqueue } = actions;
     let body = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(40)
@@ -1322,6 +1363,9 @@ pub fn album(
     };
     let actions = buttons;
     side.append(&actions);
+    if let Some(playlists) = playlists {
+        side.append(playlists);
+    }
     body.append(&side);
 
     let list = gtk::ListBox::builder()

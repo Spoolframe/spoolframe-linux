@@ -14,35 +14,43 @@
   text in Preferences › Invites, and the link that only finds the server,
   give `https://spoolframe.app/i#…`; the QR code keeps the spoolframe://
   one. "Add a server" says it takes either.
-- Playlists (PX-40), on a server that has them: a Playlists item in the
-  sidebar opens My playlists, Shared with me and Server-wide, with New
-  playlist (a name, the kinds it holds and, for an admin, Server-wide).
-  A playlist's page lists its entries with their notes (up next, watched,
-  unavailable) and has Continue, Play from start, Shuffle, Repeat and Skip
-  watched. Pinned playlists show in the sidebar under Pinned, in your
-  order: pin one from its menu or its page, drag to reorder, right-click
-  to unpin. A pin that left because the playlist was unshared or deleted
-  says so once. Changes made elsewhere show as they happen. A server
-  without playlists shows none of this.
-- Add to playlist… on the menus of films, shows, seasons (the season's
-  own More), episodes, albums, tracks and artists, and of the cards that
-  have menus: only playlists that take the item are listed, read-only and
-  others' server-wide ones greyed with why; New playlist… makes one with
-  the item's kind ticked and adds it. A toast says where it went, with
-  Undo, which takes out exactly what the add put in (a whole season too).
-- A playlist's Edit (for its owner, an editor, or an admin on a
-  server-wide one): drag entries to reorder, remove them; its owner also
-  renames it, adds kinds it holds, stops sharing it with someone or lets
-  them edit, makes it personal (or, for an admin, server-wide), and
-  deletes it. Each change is sent as it is made; the name goes with Done.
-  Someone's change to the same entries asks to reload.
+- Playlists (PX-40), on a server that has them; a server without them
+  shows none of what follows. A Playlists item in the sidebar opens My
+  playlists, Shared with me and Server-wide, with New playlist (a name,
+  the kinds it holds and, for an admin, Server-wide). Changes made on
+  other devices show as they happen.
+- A playlist's page lists its entries with their notes (up next, watched,
+  unavailable), with Continue, Play from start, Shuffle, Repeat and Skip
+  watched; an entry's menu plays from it.
+- Pinned playlists show in the sidebar under Pinned, in your order: pin
+  one from its menu or its page, drag to reorder, right-click to unpin.
+  A pin that left because the playlist was unshared or deleted says so
+  once.
+- Add to playlist… is on the menus of films, shows, seasons (the
+  season's own More), episodes, albums, tracks and artists, and of the
+  cards that have menus. Only playlists that take the item are listed;
+  read-only ones and others' server-wide ones are greyed, saying why.
+  New playlist… makes one with the item's kind ticked and adds the item.
+  A toast says where it went, with Undo, which takes out exactly what the
+  add put in (a whole season too).
+- Edit, for a playlist's owner, an editor, or an admin on a server-wide
+  one: drag entries to reorder and remove them. The owner also renames
+  it, adds kinds it holds, lets someone it is shared with edit or stops
+  sharing with them, makes it personal (or, for an admin, server-wide),
+  and deletes it. Each change is sent as it is made; the name goes with
+  Done. When someone else changed the same entries, it asks to reload.
 - Playing a playlist goes on through it: as each entry ends, or on Next,
-  the server's next entry plays (its shuffle, repeat and skip watched),
-  from where you stopped in it; at the end, "End of <playlist>", and
-  Continue starts from the top. The player, the bar and Now Playing say
-  "Playing from <playlist>", and the button over the credits says "Next
-  in <playlist>". Music queued by hand plays first, then the playlist
-  goes on. An entry's menu on the playlist's page plays from it.
+  the server's next entry plays (with its shuffle, repeat and skip
+  watched), from where you stopped in it. At the end it says "End of
+  <playlist>", and Continue starts from the top. The player, the bar and
+  Now Playing say "Playing from <playlist>", and the button over the
+  credits says "Next in <playlist>". Music queued by hand plays first,
+  then the playlist goes on.
+- Movie, episode, album and artist pages list the playlists that hold
+  them, and a show's page those holding any of its episodes, beside the
+  episodes. On a show's page choosing one plays it from your place;
+  elsewhere it opens the playlist; right-click does the other. The rows
+  are read with the page, so a change shows the next time it opens.
 
 ## 0.6.1 — 2026-10-10
 

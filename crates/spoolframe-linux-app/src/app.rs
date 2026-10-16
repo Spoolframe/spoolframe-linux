@@ -13,10 +13,10 @@ use adw::prelude::*;
 use gtk::glib;
 use relm4::{Component, ComponentParts, ComponentSender};
 use spoolframe_linux_core::backend::{
-    BackendError, ChosenTracks, Client, ConnectionState, EntryId, HomeScreen, Invite, Kinds,
-    Person, PlaySettings, PlaylistEdit, PlaylistEvent, PlaylistList, PlaylistNext, PlaylistPage,
-    PlaylistSummary, PlaylistUpdate, Profile, ProfileSignIn, SearchScope, Selection, Server,
-    ServerKey, Session, TrackPreferencesInfo, Visibility,
+    BackendError, ChosenTracks, Client, ConnectionState, EntryId, HomeScreen, Invite, ItemDetail,
+    Kinds, Person, PlaySettings, PlaylistEdit, PlaylistEvent, PlaylistList, PlaylistNext,
+    PlaylistPage, PlaylistRef, PlaylistSummary, PlaylistUpdate, Profile, ProfileSignIn,
+    SearchScope, Selection, Server, ServerKey, Session, TrackPreferencesInfo, Visibility,
 };
 use spoolframe_linux_core::next_episode::next_episode;
 use spoolframe_linux_core::playlists::{self as playlist_rules, PinNotesShown};
@@ -505,6 +505,7 @@ pub enum Loaded {
         Result<MediaTracks, BackendError>,
         Option<ChosenTracks>,
         Option<Box<Item>>,
+        Vec<PlaylistRef>,
     ),
     /// A show, its seasons with their episodes, and the season to open on
     /// ("Go to season"), if one was asked for.
@@ -512,10 +513,15 @@ pub enum Loaded {
         Show,
         Result<Vec<SeasonEpisodes>, BackendError>,
         Option<MediaId>,
+        Vec<PlaylistRef>,
     ),
-    Artist(Artist, Result<Vec<Item>, BackendError>),
+    Artist(Artist, Result<Vec<Item>, BackendError>, Vec<PlaylistRef>),
     /// An album, its artist's name and its tracks.
-    Album(Album, Result<(String, Vec<Item>), BackendError>),
+    Album(
+        Album,
+        Result<(String, Vec<Item>), BackendError>,
+        Vec<PlaylistRef>,
+    ),
     WatchChanged(Result<(), BackendError>),
     /// A change the user does not need to hear about unless it failed.
     Saved(Result<(), BackendError>),
@@ -579,9 +585,9 @@ impl Loaded {
     fn opened(&self) -> Option<&MediaId> {
         match self {
             Loaded::Playable(item, ..) => Some(item.id()),
-            Loaded::Show(show, _, open) => Some(open.as_ref().unwrap_or(&show.id)),
-            Loaded::Artist(artist, _) => Some(&artist.id),
-            Loaded::Album(album, _) => Some(&album.id),
+            Loaded::Show(show, _, open, _) => Some(open.as_ref().unwrap_or(&show.id)),
+            Loaded::Artist(artist, ..) => Some(&artist.id),
+            Loaded::Album(album, ..) => Some(&album.id),
             _ => None,
         }
     }
@@ -590,13 +596,13 @@ impl Loaded {
     fn session_error(&self) -> Option<&BackendError> {
         match self {
             Loaded::Activated(_, _, Err(e))
-            | Loaded::Playable(_, _, Err(e), _, _)
+            | Loaded::Playable(_, _, Err(e), _, _, _)
             | Loaded::Libraries(Err(e))
             | Loaded::Home(Err(e))
             | Loaded::Person(_, Err(e))
-            | Loaded::Show(_, Err(e), _)
-            | Loaded::Artist(_, Err(e))
-            | Loaded::Album(_, Err(e))
+            | Loaded::Show(_, Err(e), _, _)
+            | Loaded::Artist(_, Err(e), _)
+            | Loaded::Album(_, Err(e), _)
             | Loaded::WatchChanged(Err(e))
             | Loaded::Hidden(_, _, _, Err(e))
             | Loaded::Enqueued(_, Err(e))
@@ -2507,7 +2513,7 @@ impl Component for App {
                 ),
             ),
             Loaded::Person(person, Err(e)) => push_error(widgets, &person.name, &e, None),
-            Loaded::Playable(item, context, tracks, chosen, next) => {
+            Loaded::Playable(item, context, tracks, chosen, next, refs) => {
                 // An episode's page is titled with its season, as designed.
                 let title = match &item {
                     Item::Episode(e) => views::season_name(e.season),
@@ -2554,12 +2560,15 @@ impl Component for App {
                         tracks.as_ref(),
                         chosen.as_ref(),
                         actions,
-                        next.as_deref(),
+                        pages::Under {
+                            next: next.as_deref(),
+                            playlists: self.playlist_rows(&refs, false, &sender).as_ref(),
+                        },
                         cards,
                     ),
                 );
             }
-            Loaded::Show(show, Ok(seasons), open) => {
+            Loaded::Show(show, Ok(seasons), open, refs) => {
                 let actions = pages::ShowActions {
                     play: {
                         let sender = sender.clone();
@@ -2577,25 +2586,37 @@ impl Component for App {
                 push(
                     widgets,
                     &show.title,
-                    &pages::show(&show, &seasons, open.as_ref(), actions, cards),
+                    &pages::show(
+                        &show,
+                        &seasons,
+                        open.as_ref(),
+                        actions,
+                        self.playlist_rows(&refs, true, &sender).as_ref(),
+                        cards,
+                    ),
                 );
             }
-            Loaded::Show(show, Err(e), _) => {
+            Loaded::Show(show, Err(e), ..) => {
                 let title = show.title.clone();
                 push_error(widgets, &title, &e, Some((Item::Show(show), &sender)))
             }
-            Loaded::Artist(artist, Ok(albums)) => {
+            Loaded::Artist(artist, Ok(albums), refs) => {
                 push(
                     widgets,
                     &artist.name,
-                    &pages::artist(&artist, &albums, cards),
+                    &pages::artist(
+                        &artist,
+                        &albums,
+                        self.playlist_rows(&refs, false, &sender).as_ref(),
+                        cards,
+                    ),
                 );
             }
-            Loaded::Artist(artist, Err(e)) => {
+            Loaded::Artist(artist, Err(e), _) => {
                 let title = artist.name.clone();
                 push_error(widgets, &title, &e, Some((Item::Artist(artist), &sender)))
             }
-            Loaded::Album(album, Ok((artist, tracks))) => {
+            Loaded::Album(album, Ok((artist, tracks)), refs) => {
                 let play: pages::PlayTracks = {
                     let (sender, album) = (sender.clone(), album.clone());
                     Rc::new(move |items, index, shuffle| {
@@ -2625,14 +2646,14 @@ impl Component for App {
                         &album,
                         &artist,
                         &tracks,
-                        play,
-                        enqueue,
+                        pages::AlbumActions { play, enqueue },
                         self.now_playing.subscribe(),
+                        self.playlist_rows(&refs, false, &sender).as_ref(),
                         cards,
                     ),
                 );
             }
-            Loaded::Album(album, Err(e)) => {
+            Loaded::Album(album, Err(e), _) => {
                 let title = album.title.clone();
                 push_error(widgets, &title, &e, Some((Item::Album(album), &sender)))
             }
@@ -2733,7 +2754,10 @@ impl Component for App {
                 let body = adw::Bin::builder().child(&view.widget).build();
                 let nav_page = pages::page(&page.playlist.name, &body);
                 nav_page.set_tag(Some(PLAYLIST_TAG));
-                // One playlist page at a time, over the sidebar's choice.
+                // One playlist page at a time, over the sidebar's choice;
+                // opened from an item's page, which covers the window, it
+                // is left for the library.
+                widgets.window_stack.pop_to_page(&widgets.library_page);
                 widgets.stack.pop_to_page(&widgets.root_page);
                 widgets.stack.push(&nav_page);
                 self.shown_playlist = Some(ShownPlaylist {
@@ -3183,6 +3207,41 @@ impl App {
             },
         });
         show(widgets, "Playlists", playlists::section(list, &actions));
+    }
+
+    /// An item page's Playlists: those holding it, if any and the server
+    /// has playlists. On a show's page choosing one plays it from the
+    /// user's place (the ticket's); elsewhere it opens its page, as the
+    /// boards link it. The other is on the row's menu.
+    fn playlist_rows(
+        &self,
+        refs: &[PlaylistRef],
+        show: bool,
+        sender: &ComponentSender<Self>,
+    ) -> Option<gtk::Widget> {
+        let has = self.playlist_session().is_some();
+        let refs = playlists::shown_refs(has, refs)?;
+        let play: Rc<dyn Fn(String)> = {
+            let sender = sender.clone();
+            Rc::new(move |id| {
+                sender.input(Msg::PlayPlaylist(id, PlaylistPlay::Menu { shuffle: false }))
+            })
+        };
+        let open: Rc<dyn Fn(String)> = {
+            let sender = sender.clone();
+            Rc::new(move |id| sender.input(Msg::OpenPlaylist(id)))
+        };
+        let actions = match show {
+            true => playlists::RefActions {
+                choose: play,
+                other: ("Open playlist", crate::icons::PLAYLISTS, open),
+            },
+            false => playlists::RefActions {
+                choose: open,
+                other: ("Play", crate::icons::PLAY, play),
+            },
+        };
+        Some(playlists::refs_section(refs, show, &actions))
     }
 
     /// "Add to playlist" for `item`, from the list known now.
@@ -3685,18 +3744,18 @@ impl App {
                 self.command(sender, async move {
                     // The card's copy may be from before the last
                     // playback: Resume would start from where it was then.
-                    let (item, tracks, chosen) = tokio::join!(
+                    let ((item, refs), tracks, chosen) = tokio::join!(
                         fresh(backend.as_ref(), item),
                         backend.tracks(&id),
                         server_choice(backend.as_ref(), &id),
                     );
-                    Loaded::Playable(item, None, tracks, chosen, None)
+                    Loaded::Playable(item, None, tracks, chosen, None, refs)
                 });
             }
             Item::Episode(ref e) => {
                 let (id, show, episode) = (e.id.clone(), e.show_id.clone(), e.clone());
                 self.command(sender, async move {
-                    let (item, show, tracks, chosen, next) = tokio::join!(
+                    let ((item, refs), show, tracks, chosen, next) = tokio::join!(
                         fresh(backend.as_ref(), item),
                         backend.item(&show),
                         backend.tracks(&id),
@@ -3711,12 +3770,12 @@ impl App {
                         Ok((Item::Show(s), _)) => Some(s.title),
                         _ => None,
                     };
-                    Loaded::Playable(item, context, tracks, chosen, next)
+                    Loaded::Playable(item, context, tracks, chosen, next, refs)
                 });
             }
             Item::Show(show) => self.command(sender, async move {
-                let (show, seasons) = show_with_seasons(backend.as_ref(), show).await;
-                Loaded::Show(show, seasons, None)
+                let (show, seasons, refs) = show_with_seasons(backend.as_ref(), show).await;
+                Loaded::Show(show, seasons, None, refs)
             }),
             // A season opens its show's page, on that season's tab.
             Item::Season(season) => self.command(sender, async move {
@@ -3732,23 +3791,31 @@ impl App {
                     cast: Vec::new(),
                     last_aired: None,
                 };
-                let (show, seasons) = show_with_seasons(backend.as_ref(), show).await;
-                Loaded::Show(show, seasons, Some(season.id))
+                let (show, seasons, refs) = show_with_seasons(backend.as_ref(), show).await;
+                Loaded::Show(show, seasons, Some(season.id), refs)
             }),
             // The artist and the album as the server has them: one opened
             // from a track's menu carries only its ID.
             Item::Artist(artist) => self.command(sender, async move {
-                match backend.item(&artist.id).await {
-                    Ok((Item::Artist(full), albums)) => Loaded::Artist(full, Ok(albums)),
-                    Ok((_, albums)) => Loaded::Artist(artist, Ok(albums)),
-                    Err(e) => Loaded::Artist(artist, Err(e)),
+                match read_item(backend.as_ref(), &artist.id).await {
+                    Ok(ItemDetail {
+                        item: Item::Artist(full),
+                        children,
+                        playlists,
+                    }) => Loaded::Artist(full, Ok(children), playlists),
+                    Ok(detail) => Loaded::Artist(artist, Ok(detail.children), detail.playlists),
+                    Err(e) => Loaded::Artist(artist, Err(e), Vec::new()),
                 }
             }),
             Item::Album(album) => self.command(sender, async move {
-                let (album, tracks) = match backend.item(&album.id).await {
-                    Ok((Item::Album(full), tracks)) => (full, Ok(tracks)),
-                    Ok((_, tracks)) => (album, Ok(tracks)),
-                    Err(e) => (album, Err(e)),
+                let (album, tracks, refs) = match read_item(backend.as_ref(), &album.id).await {
+                    Ok(ItemDetail {
+                        item: Item::Album(full),
+                        children,
+                        playlists,
+                    }) => (full, Ok(children), playlists),
+                    Ok(detail) => (album, Ok(detail.children), detail.playlists),
+                    Err(e) => (album, Err(e), Vec::new()),
                 };
                 let loaded = async {
                     let tracks = tracks?;
@@ -3762,7 +3829,7 @@ impl App {
                     Ok((artist, tracks))
                 }
                 .await;
-                Loaded::Album(album, loaded)
+                Loaded::Album(album, loaded, refs)
             }),
             // A track found by search plays on its own.
             Item::Track(_) => sender.input(Msg::Play(Box::new(PlayRequest::one(
@@ -3807,25 +3874,51 @@ type AlbumTracks = (Vec<Item>, Option<Album>);
 /// of an artist's albums.
 /// A show as the server has it (an item opened from an episode carries
 /// only its ID and title), and its seasons with their episodes.
+/// A show, its seasons with their episodes, and the playlists holding any
+/// of them.
 async fn show_with_seasons(
     backend: &dyn Session,
     show: Show,
-) -> (Show, Result<Vec<SeasonEpisodes>, BackendError>) {
-    let (full, children) = match backend.item(&show.id).await {
-        Ok((Item::Show(full), children)) => (full, children),
-        Ok((_, children)) => (show, children),
-        Err(e) => return (show, Err(e)),
+) -> (
+    Show,
+    Result<Vec<SeasonEpisodes>, BackendError>,
+    Vec<PlaylistRef>,
+) {
+    let (full, children, refs) = match read_item(backend, &show.id).await {
+        Ok(ItemDetail {
+            item: Item::Show(full),
+            children,
+            playlists,
+        }) => (full, children, playlists),
+        Ok(detail) => (show, detail.children, detail.playlists),
+        Err(e) => return (show, Err(e), Vec::new()),
     };
     let mut seasons = Vec::new();
     for child in children {
         if let Item::Season(season) = child {
+            // The seasons' own reads need only their episodes.
             match backend.item(&season.id).await {
                 Ok((_, episodes)) => seasons.push((season, episodes)),
-                Err(e) => return (full, Err(e)),
+                Err(e) => return (full, Err(e), refs),
             }
         }
     }
-    (full, Ok(seasons))
+    (full, Ok(seasons), refs)
+}
+
+/// An item's page's own read: the item, what is under it, and where the
+/// server has playlists (PX-40), those the user sees that hold it. An
+/// older server is asked as before and holds it in none.
+async fn read_item(session: &dyn Session, id: &MediaId) -> Result<ItemDetail, BackendError> {
+    if session.has_playlists() {
+        return session.item_detail(id).await;
+    }
+    let (item, children) = session.item(id).await?;
+    Ok(ItemDetail {
+        item,
+        children,
+        playlists: Vec::new(),
+    })
 }
 
 async fn tracks_of(session: &dyn Session, item: Item) -> Result<Vec<AlbumTracks>, BackendError> {
@@ -3858,10 +3951,10 @@ async fn tracks_of(session: &dyn Session, item: Item) -> Result<Vec<AlbumTracks>
 
 /// `item` as the server has it now, with its watch state; the copy given
 /// when the server cannot say.
-async fn fresh(session: &dyn Session, item: Item) -> Item {
-    match session.item(item.id()).await {
-        Ok((now, _)) => now,
-        Err(_) => item,
+async fn fresh(session: &dyn Session, item: Item) -> (Item, Vec<PlaylistRef>) {
+    match read_item(session, item.id()).await {
+        Ok(detail) => (detail.item, detail.playlists),
+        Err(_) => (item, Vec::new()),
     }
 }
 
@@ -4478,9 +4571,48 @@ mod tests {
             release_date: None,
         });
         for error in [BackendError::SignInRequired, BackendError::ProfileLocked] {
-            let loaded = Loaded::Playable(item.clone(), None, Err(error.clone()), None, None);
+            let loaded = Loaded::Playable(
+                item.clone(),
+                None,
+                Err(error.clone()),
+                None,
+                None,
+                Vec::new(),
+            );
             assert_eq!(loaded.session_error(), Some(&error));
         }
+    }
+
+    /// The playlists the show page of Andor lists, read as the page is.
+    fn andor_page_playlists(client: spoolframe_linux_core::fake::FakeClient) -> Vec<String> {
+        use spoolframe_linux_core::testing::ready;
+        let session = client
+            .session(&spoolframe_linux_core::fake::FakeClient::profile("andrey"))
+            .unwrap();
+        let id = MediaId::new(
+            spoolframe_types::Namespace::Plex,
+            spoolframe_types::MediaKind::Show,
+            "60",
+        )
+        .unwrap();
+        let Item::Show(show) = ready(session.item(&id)).unwrap().0 else {
+            panic!("60 is a show")
+        };
+        let (_, seasons, refs) = ready(show_with_seasons(session.as_ref(), show));
+        assert!(seasons.is_ok());
+        refs.into_iter().map(|p| p.name).collect()
+    }
+
+    #[test]
+    fn a_shows_page_reads_the_playlists_holding_its_episodes() {
+        let client = spoolframe_linux_core::fake::FakeClient::new(None);
+        assert_eq!(andor_page_playlists(client), ["Andor: the heists"]);
+    }
+
+    #[test]
+    fn a_server_without_playlists_gives_the_page_none() {
+        let client = spoolframe_linux_core::fake::FakeClient::new(None).without_playlists();
+        assert_eq!(andor_page_playlists(client), Vec::<String>::new());
     }
 
     #[test]
