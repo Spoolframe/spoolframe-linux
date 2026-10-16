@@ -256,7 +256,7 @@ impl View {
         match change {
             Change::Item(item) => {
                 self.undo.hide();
-                self.item(item);
+                self.item(playback, item);
             }
             Change::Starting => {
                 self.starting.set_visible(true);
@@ -285,7 +285,7 @@ impl View {
                 self.error.set_visible(true);
             }
             Change::Volume(_) | Change::Muted(_) => self.controls.volume.show(change),
-            Change::Offer(offer) => self.show_offer(*offer),
+            Change::Offer(offer) => self.show_offer(playback, *offer),
             Change::IntroSkipped => self.undo.show(),
             // The app closes the player on Stopped.
             Change::Modes { .. }
@@ -293,29 +293,31 @@ impl View {
             | Change::Skipped(_)
             | Change::TrackFailed(_)
             | Change::Stopped
-            | Change::SignedOut => {}
+            | Change::SignedOut
+            | Change::PlaylistFinished(_) => {}
         }
     }
 
-    fn show_offer(&self, offer: Option<Offer>) {
+    fn show_offer(&self, playback: &Playback, offer: Option<Offer>) {
         let label = match offer {
-            Some(Offer::SkipIntro { .. }) => "Skip Intro",
-            Some(Offer::SkipCredits { .. }) => "Skip Credits",
-            Some(Offer::NextItem) => "Next Episode",
+            Some(Offer::SkipIntro { .. }) => "Skip Intro".to_owned(),
+            Some(Offer::SkipCredits { .. }) => "Skip Credits".to_owned(),
+            Some(Offer::NextItem) => next_label(playback.playing_from().as_ref()),
             None => return self.offer.set_visible(false),
         };
-        self.offer.set_label(label);
+        self.offer.set_label(&label);
         self.offer.set_visible(true);
     }
 
-    fn item(&self, item: &Item) {
+    fn item(&self, playback: &Playback, item: &Item) {
         self.controls.preview.frames().for_item(item.id());
         let facts = crate::views::Facts::of(item);
         if let Some(page) = self.page.upgrade() {
             page.set_title(&facts.title);
         }
         self.top.title.set_label(&facts.title);
-        let detail = facts.detail.clone();
+        // "Playing from the Heists" after what the item is (PX-40).
+        let detail = with_playlist(facts.detail.clone(), playback.playing_from().as_ref());
         self.top
             .detail
             .set_label(detail.as_deref().unwrap_or_default());
@@ -1344,6 +1346,26 @@ pub fn mono(text: &str) -> gtk::Label {
         .build()
 }
 
+/// The credits' button: on into the playlist's next entry, or the show's.
+fn next_label(playing: Option<&spoolframe_linux_core::playlists::Playing>) -> String {
+    match playing {
+        Some(playing) => format!("Next in {}", playing.name),
+        None => "Next Episode".to_owned(),
+    }
+}
+
+/// `detail`, with the playlist it plays from after it.
+pub fn with_playlist(
+    detail: Option<String>,
+    playing: Option<&spoolframe_linux_core::playlists::Playing>,
+) -> Option<String> {
+    let line = playing.map(|p| p.line());
+    match (detail, line) {
+        (Some(detail), Some(line)) => Some(format!("{detail} · {line}")),
+        (detail, line) => detail.or(line),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1378,6 +1400,31 @@ mod tests {
     use spoolframe_types::{AudioCodec, Container, Delivery, SubtitleFormat, VideoCodec};
 
     use super::*;
+
+    #[test]
+    fn a_playlist_names_itself_under_what_plays_and_on_the_credits() {
+        let playing = spoolframe_linux_core::playlists::Playing {
+            id: "1".into(),
+            name: "the Heists".into(),
+            entry: 4,
+        };
+        assert_eq!(
+            (
+                with_playlist(Some("Andor · S1 · E3".into()), Some(&playing)),
+                with_playlist(None, Some(&playing)),
+                with_playlist(Some("1979".into()), None),
+                next_label(Some(&playing)),
+                next_label(None),
+            ),
+            (
+                Some("Andor · S1 · E3 · Playing from the Heists".into()),
+                Some("Playing from the Heists".into()),
+                Some("1979".into()),
+                "Next in the Heists".to_owned(),
+                "Next Episode".to_owned(),
+            )
+        );
+    }
 
     fn transcode() -> PlaybackPlan {
         PlaybackPlan::Converted {

@@ -14,7 +14,8 @@ use spoolframe_types::{Item, MediaId, MediaKind};
 
 use crate::backend::{
     BackendError, EntryId, Kinds, PlaylistChange, PlaylistEdit, PlaylistEntry, PlaylistEvent,
-    PlaylistOwnerKind, PlaylistPage, PlaylistShare, PlaylistSummary, Session, Visibility,
+    PlaylistNext, PlaylistOwnerKind, PlaylistPage, PlaylistShare, PlaylistSummary, Session,
+    Visibility,
 };
 
 /// The most entries a page of a playlist holds.
@@ -571,6 +572,65 @@ pub fn share_change(now: &Visibility, change: &ShareChange) -> Visibility {
     }
 }
 
+/// A playlist being played: which, and the entry playing. The server
+/// keeps the user's place and picks each next entry (shuffle, repeat and
+/// skip watched are its); this only follows its answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Playing {
+    pub id: String,
+    pub name: String,
+    pub entry: EntryId,
+}
+
+/// What follows when the entry playing ends, or Next is pressed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Advance {
+    /// The server's next entry: its item, from where the user stopped in
+    /// it.
+    Play {
+        item: Box<Item>,
+        from: Option<Duration>,
+    },
+    /// The end, with repeat off: the server has cleared the place, so the
+    /// next play starts at the top.
+    Finished,
+}
+
+impl Playing {
+    /// `next_in_playlist`'s answer, taken: the entry playing moves on.
+    pub fn advance(&mut self, next: Option<PlaylistNext>) -> Advance {
+        let Some(next) = next else {
+            return Advance::Finished;
+        };
+        self.entry = next.entry;
+        Advance::Play {
+            from: resume_from(&next.item),
+            item: Box::new(next.item),
+        }
+    }
+
+    /// Under what plays: "Playing from the Heists".
+    pub fn line(&self) -> String {
+        format!("Playing from {}", self.name)
+    }
+
+    /// When it has played to its end.
+    pub fn finished_text(&self) -> String {
+        format!("End of {}", self.name)
+    }
+}
+
+/// Where the user stopped in `item`, unless they watched it to the end.
+pub fn resume_from(item: &Item) -> Option<Duration> {
+    let state = match item {
+        Item::Movie(m) => &m.playback,
+        Item::Episode(e) => &e.playback,
+        Item::Track(t) => &t.playback,
+        _ => return None,
+    };
+    state.position.filter(|_| !state.watched)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -847,6 +907,118 @@ mod tests {
             ["64", "65", "72"].map(|k| media(MediaKind::Episode, k))
         );
         assert_eq!(page(andrey.as_ref(), &heists).place, None);
+    }
+
+    /// Andrey playing the heists from the top with `settings`.
+    fn playing_heists(andrey: &dyn Session, settings: PlaySettings) -> (Playing, Item) {
+        let list = ready(andrey.playlists()).unwrap().playlists;
+        let heists = named(&list, "Andor: the heists").clone();
+        let first = ready(andrey.play_playlist(&heists.id, None, settings))
+            .unwrap()
+            .unwrap();
+        let playing = Playing {
+            id: heists.id,
+            name: heists.name,
+            entry: first.entry,
+        };
+        (playing, first.item)
+    }
+
+    fn after(andrey: &dyn Session, playing: &mut Playing) -> Advance {
+        let next = ready(andrey.next_in_playlist(&playing.id, playing.entry)).unwrap();
+        playing.advance(next)
+    }
+
+    #[test]
+    fn an_entry_that_ends_plays_the_next_and_follows_it() {
+        let client = FakeClient::new(None);
+        let andrey = session(&client, "andrey");
+        let (mut playing, _) = playing_heists(andrey.as_ref(), PlaySettings::default());
+        let first = playing.entry;
+        let advance = after(andrey.as_ref(), &mut playing);
+        let Advance::Play { item, .. } = advance else {
+            panic!("the heists ended after one: {advance:?}")
+        };
+        assert_eq!(
+            (item.id().clone(), playing.entry != first),
+            (media(MediaKind::Episode, "65"), true)
+        );
+    }
+
+    #[test]
+    fn the_last_entry_ends_the_playlist_and_continue_starts_at_the_top() {
+        let client = FakeClient::new(None);
+        let andrey = session(&client, "andrey");
+        let (mut playing, _) = playing_heists(andrey.as_ref(), PlaySettings::default());
+        let mut advances = Vec::new();
+        for _ in 0..3 {
+            advances.push(matches!(
+                after(andrey.as_ref(), &mut playing),
+                Advance::Finished
+            ));
+        }
+        assert_eq!(
+            (advances, page(andrey.as_ref(), &playing.id).place),
+            (vec![false, false, true], None)
+        );
+    }
+
+    #[test]
+    fn repeat_one_plays_the_same_entry_again() {
+        let client = FakeClient::new(None);
+        let andrey = session(&client, "andrey");
+        let settings = PlaySettings {
+            repeat: Repeat::One,
+            ..PlaySettings::default()
+        };
+        let (mut playing, first) = playing_heists(andrey.as_ref(), settings);
+        let entry = playing.entry;
+        let advance = after(andrey.as_ref(), &mut playing);
+        assert_eq!(
+            (advance, playing.entry),
+            (
+                Advance::Play {
+                    from: resume_from(&first),
+                    item: Box::new(first)
+                },
+                entry
+            )
+        );
+    }
+
+    #[test]
+    fn an_item_part_watched_resumes_and_a_watched_one_starts_over() {
+        let client = FakeClient::new(None);
+        let andrey = session(&client, "andrey");
+        let (_, mut item) = playing_heists(andrey.as_ref(), PlaySettings::default());
+        let Item::Episode(e) = &mut item else {
+            panic!("the heists hold episodes")
+        };
+        e.playback.position = Some(Duration::from_secs(90));
+        let part = resume_from(&item);
+        if let Item::Episode(e) = &mut item {
+            e.playback.watched = true;
+        }
+        assert_eq!(
+            (part, resume_from(&item)),
+            (Some(Duration::from_secs(90)), None)
+        );
+    }
+
+    #[test]
+    fn the_lines_name_the_playlist() {
+        let playing = Playing {
+            id: "1".into(),
+            name: "the Heists".into(),
+            entry: 1,
+        };
+        assert_eq!(
+            (playing.line(), playing.finished_text()),
+            (
+                "Playing from the Heists".to_owned(),
+                "End of the Heists".to_owned()
+            )
+        );
     }
 
     #[test]

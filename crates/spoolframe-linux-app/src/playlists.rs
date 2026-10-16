@@ -255,6 +255,8 @@ pub struct PlaylistView {
     /// In the editor: the revision shown, and the entries' ids in order.
     editing: Option<(u64, Rc<RefCell<Vec<EntryId>>>)>,
     actions: Rc<PageActions>,
+    /// The play settings the header shows, for Play from here.
+    settings: Rc<Cell<PlaySettings>>,
 }
 
 impl PlaylistView {
@@ -281,9 +283,9 @@ impl PlaylistView {
             .hexpand(true)
             .build();
         columns.append(&entries);
+        let settings = Rc::new(Cell::new(page.settings));
         let (pin, editing) = match mode {
             Mode::View => {
-                let settings = Rc::new(Cell::new(page.settings));
                 let (header, pin) = header(page, &actions, &settings);
                 widget.append(&header);
                 (pin, None)
@@ -345,6 +347,7 @@ impl PlaylistView {
             cards,
             editing,
             actions: actions.clone(),
+            settings,
         });
         {
             let (view_weak, more) = (Rc::downgrade(&view), actions.more.clone());
@@ -388,15 +391,25 @@ impl PlaylistView {
                         &self.actions,
                     ));
                 }
-                None => self
-                    .list
-                    .append(&entry_row(number, entry, self.up_next, &self.cards)),
+                None => self.list.append(&entry_row(
+                    number,
+                    entry,
+                    self.up_next,
+                    &self.cards,
+                    self.play_from(entry.entry),
+                )),
             }
         }
         self.shown.set(page.offset + page.entries.len() as u32);
         self.more.set_sensitive(true);
         self.more
             .set_visible(self.shown.get() < self.total && !page.entries.is_empty());
+    }
+
+    /// Play from here: the playlist from `entry`, with the settings shown.
+    fn play_from(&self, entry: EntryId) -> Rc<dyn Fn()> {
+        let (play, settings) = (self.actions.play.clone(), self.settings.clone());
+        Rc::new(move || play(Some(entry), settings.get()))
     }
 
     /// The pin as the list now has it: unpinned from the sidebar, say.
@@ -575,6 +588,7 @@ fn entry_row(
     entry: &PlaylistEntry,
     up_next: Option<EntryId>,
     cards: &Rc<Cards>,
+    play_from: Rc<dyn Fn()>,
 ) -> adw::ActionRow {
     let row = adw::ActionRow::builder()
         .use_markup(false)
@@ -617,6 +631,16 @@ fn entry_row(
         row.add_css_class("unavailable");
     }
     let (open, item) = (cards.open.clone(), entry.item.clone());
+    // A click opens the item, as a card does; its menu plays the
+    // playlist from it.
+    {
+        let (open, item) = (open.clone(), item.clone());
+        let menu = views::menu_popover(vec![vec![
+            views::MenuEntry::new("Play from here", crate::icons::PLAY, move || play_from()),
+            views::MenuEntry::new("Open", crate::icons::RIGHT, move || open(item.clone())),
+        ]]);
+        views::context_menu(row.upcast_ref(), &menu);
+    }
     row.connect_activated(move |_| open(item.clone()));
     row
 }

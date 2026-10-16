@@ -26,6 +26,7 @@ use spoolframe_linux_core::markers;
 pub use spoolframe_linux_core::markers::Offer;
 use spoolframe_linux_core::next_episode::next_episode;
 use spoolframe_linux_core::playback::{self as managed, ManagedPlayback};
+use spoolframe_linux_core::playlists::{Advance, Playing};
 use spoolframe_linux_core::progressive::ProgressiveReader;
 use spoolframe_linux_core::reader::{self, ByteSource, MediaReader, Spawn};
 use spoolframe_linux_core::sdk::backend_error;
@@ -80,6 +81,9 @@ pub struct Playlist {
     pub quality: spoolframe_client_sdk::PlaybackQuality,
     /// What the screen shows (PGPU-06), told with every start.
     pub display: Option<spoolframe_types::DisplayCapabilities>,
+    /// The server's playlist (PX-40) the item is from: what follows it is
+    /// the server's next entry.
+    pub from_playlist: Option<Playing>,
 }
 
 /// How the first item starts: see [`Playlist`].
@@ -134,6 +138,29 @@ pub enum Change<'a> {
     /// The session ended under it (signed out elsewhere, or the password
     /// changed): back to "Who's watching".
     SignedOut,
+    /// The server's playlist played to its end (PX-40); it plays no more.
+    PlaylistFinished(&'a Playing),
+}
+
+/// Where what plays after the current item comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NextFrom {
+    /// The queue or the context has it.
+    Here,
+    /// The server's playlist: asked for when it is needed, since asking
+    /// moves the user's place there on.
+    Playlist,
+    Nothing,
+}
+
+/// Whatever is queued or ahead in the context plays first; then the
+/// playlist, if one is being played.
+fn next_from(here: bool, playlist: bool) -> NextFrom {
+    match (here, playlist) {
+        (true, _) => NextFrom::Here,
+        (false, true) => NextFrom::Playlist,
+        (false, false) => NextFrom::Nothing,
+    }
 }
 
 /// What plays after the current item, for "Up next".
@@ -259,6 +286,10 @@ pub struct Playback {
     length: Cell<Duration>,
     stopped: Cell<bool>,
     listeners: RefCell<Vec<Listener>>,
+    /// The server's playlist being played, and the entry playing.
+    from_playlist: RefCell<Option<Playing>>,
+    /// Its next entry is being asked for: once at a time.
+    asking_playlist: Cell<bool>,
     /// Itself, for callbacks that outlive a borrow (the track menu's).
     me: Weak<Self>,
     progress_tail: RefCell<Option<tokio::sync::oneshot::Receiver<()>>>,
@@ -412,7 +443,14 @@ impl Playback {
             quality: playlist.quality,
             display: playlist.display,
         };
-        Self::build(playlist.session, queue, start, true)
+        let playback = Self::build(playlist.session, queue, start, true)?;
+        playback.from_playlist.replace(playlist.from_playlist);
+        Ok(playback)
+    }
+
+    /// The server's playlist being played, if one is.
+    pub fn playing_from(&self) -> Option<Playing> {
+        self.from_playlist.borrow().clone()
     }
 
     /// Brings back a queue saved at the last run (P1-23): the current item
@@ -462,6 +500,8 @@ impl Playback {
             length: Cell::new(Duration::ZERO),
             stopped: Cell::new(false),
             listeners: RefCell::new(Vec::new()),
+            from_playlist: RefCell::new(None),
+            asking_playlist: Cell::new(false),
             progress_tail: RefCell::new(None),
         });
         connect(playback.pipeline.adapter(), &playback);
@@ -610,6 +650,8 @@ impl Playback {
     /// queue.
     pub fn play_context_at(self: &Rc<Self>, pos: usize) {
         self.report_progress();
+        // Picked by hand: the server's playlist no longer says what follows.
+        self.from_playlist.replace(None);
         self.step(|q| q.play_context_at(pos));
     }
 
@@ -1091,12 +1133,22 @@ impl Playback {
     /// Whether Next plays something. Video goes on through its context
     /// (a show's episodes) only; the queue is music's.
     pub fn has_next(&self) -> bool {
+        self.next_from() != NextFrom::Nothing
+    }
+
+    fn next_from(&self) -> NextFrom {
         let queue = self.queue.borrow();
-        if self.is_video() {
-            queue.context_has_next()
-        } else {
-            queue.has_next()
-        }
+        let playlist = self.from_playlist.borrow().is_some();
+        let here = match (playlist, self.is_video()) {
+            // The context is the entries played so far, which the server
+            // moves on from (its repeat, not the queue's wrap): only
+            // hand-queued music goes first.
+            (true, true) => false,
+            (true, false) => queue.queued().next().is_some(),
+            (false, true) => queue.context_has_next(),
+            (false, false) => queue.has_next(),
+        };
+        next_from(here, playlist)
     }
 
     pub fn has_previous(&self) -> bool {
@@ -1111,10 +1163,80 @@ impl Playback {
 
     /// Moves on from the current item; false at the end.
     fn advance(self: &Rc<Self>) -> bool {
-        if self.is_video() {
-            self.step(Queue::next_in_context)
-        } else {
-            self.step(Queue::next)
+        match self.next_from() {
+            NextFrom::Here if self.is_video() => self.step(Queue::next_in_context),
+            NextFrom::Here => self.step(Queue::next),
+            NextFrom::Playlist => {
+                self.ask_playlist();
+                true
+            }
+            NextFrom::Nothing => false,
+        }
+    }
+
+    /// Asks the server what follows the playlist's entry playing.
+    fn ask_playlist(self: &Rc<Self>) {
+        let Some(playing) = self.playing_from() else {
+            return;
+        };
+        if self.asking_playlist.replace(true) {
+            return;
+        }
+        let session = self.session.clone();
+        let asked =
+            relm4::spawn(async move { session.next_in_playlist(&playing.id, playing.entry).await });
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let Ok(answer) = asked.await else { return };
+            if let Some(playback) = weak.upgrade() {
+                playback.on(Event::PlaylistNext(answer));
+            }
+        });
+    }
+
+    /// The server's next entry: it plays, from where the user stopped in
+    /// it; or the playlist ended.
+    fn playlist_next(
+        self: &Rc<Self>,
+        answer: Result<Option<spoolframe_linux_core::backend::PlaylistNext>, BackendError>,
+    ) {
+        self.asking_playlist.set(false);
+        if self.stopped.get() {
+            return;
+        }
+        // Out of the borrow before anything is told: listeners read it.
+        let advance = {
+            let mut playing = self.from_playlist.borrow_mut();
+            let Some(playing) = playing.as_mut() else {
+                return;
+            };
+            match answer {
+                Ok(next) => Ok(playing.advance(next)),
+                Err(e) => Err(format!("Couldn’t go on with {}: {e}", playing.name)),
+            }
+        };
+        let advance = match advance {
+            Ok(advance) => advance,
+            // Next asks again.
+            Err(text) => return self.emit(&Change::Skipped(&text)),
+        };
+        match advance {
+            Advance::Play { item, from } => {
+                self.queue.borrow_mut().extend_context(vec![*item]);
+                let start = Start {
+                    from,
+                    selection: None,
+                    tracks: None,
+                    quality: self.quality.get(),
+                    display: self.display.borrow().clone(),
+                };
+                self.step_starting(Queue::next_in_context, Some(start));
+            }
+            Advance::Finished => {
+                if let Some(playing) = self.from_playlist.take() {
+                    self.emit(&Change::PlaylistFinished(&playing));
+                }
+            }
         }
     }
 
@@ -1170,6 +1292,15 @@ impl Playback {
     /// Moves the queue with `step` and starts what it then points at; false,
     /// with nothing changed, when `step` does not move.
     fn step(self: &Rc<Self>, step: impl FnOnce(&mut Queue) -> bool) -> bool {
+        self.step_starting(step, None)
+    }
+
+    /// [`Playback::step`], starting the item as `start` says.
+    fn step_starting(
+        self: &Rc<Self>,
+        step: impl FnOnce(&mut Queue) -> bool,
+        start: Option<Start>,
+    ) -> bool {
         if !step(&mut self.queue.borrow_mut()) {
             return false;
         }
@@ -1181,7 +1312,7 @@ impl Playback {
         // The next load takes the last item's subtitle away, while
         // stopped (see `Pipeline::load`).
         self.pipeline.stop();
-        self.begin(None);
+        self.begin(start);
         self.emit(&Change::Queue);
         true
     }
@@ -1338,6 +1469,10 @@ impl Playback {
         let Item::Episode(episode) = &current.item else {
             return;
         };
+        // The server's playlist says what follows, not the show.
+        if self.from_playlist.borrow().is_some() {
+            return;
+        }
         // What is ahead in the context, not counting Repeat All's wrap:
         // the show's next episode still follows a one-item context.
         if !self.queue.borrow().context_ahead().is_empty() {
@@ -1861,6 +1996,7 @@ enum Event {
         current: Weak<Current>,
         answer: Result<Option<Item>, BackendError>,
     },
+    PlaylistNext(Result<Option<spoolframe_linux_core::backend::PlaylistNext>, BackendError>),
 }
 
 impl Playback {
@@ -1928,6 +2064,7 @@ impl Playback {
                 answer,
             } => self.subtitle_arrived(current, handle, answer),
             Event::NextEpisode { current, answer } => self.next_episode_found(current, answer),
+            Event::PlaylistNext(answer) => self.playlist_next(answer),
         }
     }
 }
@@ -2140,6 +2277,24 @@ mod tests {
     /// Playback on the fake server, end to end. One test: GTK binds itself
     /// to the first thread that starts it, and each test has its own.
     #[test]
+    fn queued_music_plays_before_the_playlists_next_entry() {
+        assert_eq!(
+            [
+                next_from(true, true),
+                next_from(false, true),
+                next_from(false, false),
+                next_from(true, false),
+            ],
+            [
+                NextFrom::Here,
+                NextFrom::Playlist,
+                NextFrom::Nothing,
+                NextFrom::Here
+            ]
+        );
+    }
+
+    #[test]
     #[ignore = "needs a display for gtk4paintablesink"]
     fn playback_on_the_fake_server() {
         gtk::init().unwrap();
@@ -2163,6 +2318,67 @@ mod tests {
         the_intro_is_offered_and_skipped_on_asking();
         an_automatic_intro_skip_happens_once_and_undoes();
         quitting_waits_for_the_last_progress();
+        a_playlist_goes_on_to_the_servers_next_entry_then_ends();
+    }
+
+    /// Movie night (two films, then an episode) from the top: each entry
+    /// that ends plays the server's next, and the last one ends the
+    /// playlist, once.
+    fn a_playlist_goes_on_to_the_servers_next_entry_then_ends() {
+        use spoolframe_linux_core::backend::PlaySettings;
+        use spoolframe_linux_core::playlists::Playing;
+        let dir = TestDir::new_blocking("spoolframe-playlist");
+        let path = dir.join("clip.mkv");
+        clip(&path);
+        let client = FakeClient::new(Some(path));
+        let session = client.session(&FakeClient::profile("andrey")).unwrap();
+        let context = glib::MainContext::default();
+        let list = context.block_on(session.playlists()).unwrap().playlists;
+        let night = list.iter().find(|p| p.name == "Movie night").unwrap();
+        let first = context
+            .block_on(session.play_playlist(&night.id, None, PlaySettings::default()))
+            .unwrap()
+            .unwrap();
+        let playback = Playback::start(Playlist {
+            session,
+            items: vec![first.item.clone()],
+            index: 0,
+            queued: Vec::new(),
+            from: None,
+            selection: None,
+            tracks: None,
+            album: None,
+            quality: Default::default(),
+            display: None,
+            from_playlist: Some(Playing {
+                id: night.id.clone(),
+                name: night.name.clone(),
+                entry: first.entry,
+            }),
+        })
+        .unwrap();
+        let (played, finished) = (Rc::new(RefCell::new(Vec::new())), Rc::new(Cell::new(0)));
+        {
+            let (played, finished) = (played.clone(), finished.clone());
+            playback.subscribe(move |change| {
+                match change {
+                    Change::Item(item) => played.borrow_mut().push(item.id().clone()),
+                    Change::PlaylistFinished(_) => finished.set(finished.get() + 1),
+                    _ => {}
+                }
+                true
+            });
+        }
+        assert!(
+            run_until(Duration::from_secs(60), || finished.get() == 1),
+            "the playlist did not end (played {:?})",
+            played.borrow()
+        );
+        let mut seen = played.borrow().clone();
+        seen.dedup();
+        assert_eq!(seen.len(), 3, "played {seen:?}");
+        assert!(playback.playing_from().is_none());
+        playback.stop();
     }
 
     /// An intro from 1 s to 2.5 s of the four-second clip.
@@ -2571,6 +2787,7 @@ mod tests {
             album: None,
             quality: spoolframe_client_sdk::PlaybackQuality::Bitrate(2_000_000),
             display: None,
+            from_playlist: None,
         })
         .unwrap();
         assert!(
@@ -2714,6 +2931,7 @@ mod tests {
             album: None,
             quality: Default::default(),
             display: None,
+            from_playlist: None,
         })
         .unwrap();
         assert!(run_until(Duration::from_secs(20), || playback.position()
@@ -2804,6 +3022,7 @@ mod tests {
             album: None,
             quality: Default::default(),
             display: None,
+            from_playlist: None,
         })
         .unwrap();
         let (stopped, failed) = (Rc::new(Cell::new(false)), Rc::new(Cell::new(false)));
@@ -2845,6 +3064,7 @@ mod tests {
             album: None,
             quality: Default::default(),
             display: None,
+            from_playlist: None,
         })
         .unwrap();
         let (stopped, failed) = (Rc::new(Cell::new(false)), Rc::new(Cell::new(false)));
@@ -2887,6 +3107,7 @@ mod tests {
             album: None,
             quality: Default::default(),
             display: None,
+            from_playlist: None,
         })
         .unwrap();
         let failed = Rc::new(RefCell::new(None::<String>));
@@ -2926,6 +3147,7 @@ mod tests {
             album: None,
             quality: Default::default(),
             display: None,
+            from_playlist: None,
         })
         .unwrap()
     }

@@ -291,6 +291,7 @@ impl View {
             | Change::Failed(_)
             | Change::Stopped
             | Change::SignedOut
+            | Change::PlaylistFinished(_)
             | Change::Skipped(_)
             | Change::TrackFailed(_)
             | Change::Offer(_)
@@ -575,11 +576,15 @@ impl Queue {
         let mut rows = Vec::new();
         let up_next = playback.up_next();
         let album = playback.album();
-        if let Some(album) = &album {
-            self.from
-                .set_label(&format!("Playing from {}", album.title));
+        // The server's playlist (PX-40) over the album its track is from.
+        let from = playback
+            .playing_from()
+            .map(|playing| playing.line())
+            .or_else(|| album.as_ref().map(|a| format!("Playing from {}", a.title)));
+        if let Some(from) = &from {
+            self.from.set_label(from);
         }
-        self.from.set_visible(album.is_some());
+        self.from.set_visible(from.is_some());
 
         if let Some(item) = playback.current() {
             self.heading("Now playing", false, &mut rows);

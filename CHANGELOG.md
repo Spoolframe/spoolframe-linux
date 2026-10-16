@@ -19,8 +19,7 @@
   playlist (a name, the kinds it holds and, for an admin, Server-wide).
   A playlist's page lists its entries with their notes (up next, watched,
   unavailable) and has Continue, Play from start, Shuffle, Repeat and Skip
-  watched; for now it plays the entry the server picks, not the ones
-  after it. Pinned playlists show in the sidebar under Pinned, in your
+  watched. Pinned playlists show in the sidebar under Pinned, in your
   order: pin one from its menu or its page, drag to reorder, right-click
   to unpin. A pin that left because the playlist was unshared or deleted
   says so once. Changes made elsewhere show as they happen. A server
@@ -37,6 +36,13 @@
   them edit, makes it personal (or, for an admin, server-wide), and
   deletes it. Each change is sent as it is made; the name goes with Done.
   Someone's change to the same entries asks to reload.
+- Playing a playlist goes on through it: as each entry ends, or on Next,
+  the server's next entry plays (its shuffle, repeat and skip watched),
+  from where you stopped in it; at the end, "End of <playlist>", and
+  Continue starts from the top. The player, the bar and Now Playing say
+  "Playing from <playlist>", and the button over the credits says "Next
+  in <playlist>". Music queued by hand plays first, then the playlist
+  goes on. An entry's menu on the playlist's page plays from it.
 
 ## 0.6.1 — 2026-10-10
 

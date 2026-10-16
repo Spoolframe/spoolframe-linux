@@ -76,6 +76,9 @@ pub struct PlayRequest {
     pub shuffle: bool,
     /// The quality chosen on the item page (P6-06); Auto otherwise.
     pub quality: spoolframe_client_sdk::PlaybackQuality,
+    /// The server's playlist it plays from (PX-40); anything else played
+    /// leaves it.
+    pub playlist: Option<playlist_rules::Playing>,
 }
 
 impl PlayRequest {
@@ -94,6 +97,7 @@ impl PlayRequest {
             album: None,
             shuffle: false,
             quality: Default::default(),
+            playlist: None,
         }
     }
 
@@ -364,6 +368,8 @@ pub enum Msg {
     PlaylistChanged(Box<PlaylistEvent>),
     /// Playlist changes were missed: read everything shown again.
     PlaylistsLagged,
+    /// The playlist with this id played to its end.
+    PlaylistFinished(String),
     /// A person a search found: their items.
     OpenPerson(Box<Person>),
     Open(Box<Item>),
@@ -544,7 +550,8 @@ pub enum Loaded {
     PlaylistDeleted(String, Result<(), BackendError>),
     PinChanged(Result<(), BackendError>),
     /// What the server picked to play from a playlist.
-    PlaylistStarted(Result<Option<PlaylistNext>, BackendError>),
+    /// What the server picked to play first from playlist (id, name).
+    PlaylistStarted(String, String, Result<Option<PlaylistNext>, BackendError>),
 }
 
 impl Loaded {
@@ -605,7 +612,7 @@ impl Loaded {
             | Loaded::PlaylistUpdated(_, Err(e))
             | Loaded::PlaylistDeleted(_, Err(e))
             | Loaded::PinChanged(Err(e))
-            | Loaded::PlaylistStarted(Err(e)) => Some(e),
+            | Loaded::PlaylistStarted(_, _, Err(e)) => Some(e),
             _ => None,
         }
     }
@@ -1593,6 +1600,17 @@ impl Component for App {
                 let Some(session) = self.playlist_session() else {
                     return;
                 };
+                let name = self
+                    .playlists
+                    .iter()
+                    .flatten()
+                    .find(|p| p.id == id)
+                    .map(|p| p.name.clone())
+                    .or_else(|| {
+                        let shown = self.shown_playlist.as_ref()?;
+                        (shown.view.id == id).then(|| shown.view.name.clone())
+                    })
+                    .unwrap_or_else(|| "the playlist".to_owned());
                 self.command(&sender, async move {
                     let started = async {
                         let (from, settings) = match how {
@@ -1607,7 +1625,7 @@ impl Component for App {
                         session.play_playlist(&id, from, settings).await
                     }
                     .await;
-                    Loaded::PlaylistStarted(started)
+                    Loaded::PlaylistStarted(id, name, started)
                 });
             }
             Msg::PinPlaylist(id, pin) => {
@@ -1789,6 +1807,11 @@ impl Component for App {
                     );
                 }
             }
+            Msg::PlaylistFinished(id) => {
+                if self.shown_playlist_id(widgets).as_ref() == Some(&id) {
+                    self.reload_playlist(id, &sender);
+                }
+            }
             Msg::PlaylistsLagged => {
                 self.load_playlists(&sender);
                 if let Some(id) = self.shown_playlist_id(widgets) {
@@ -1818,6 +1841,7 @@ impl Component for App {
                     album,
                     shuffle,
                     quality,
+                    playlist,
                 } = *request;
                 // A new context keeps the queue, as Spotify does.
                 self.stop_playback(widgets);
@@ -1832,6 +1856,7 @@ impl Component for App {
                     album,
                     quality,
                     display: Some(crate::capabilities::display(self.settings.show_hdr())),
+                    from_playlist: playlist,
                 }) {
                     Ok(playback) => {
                         if shuffle {
@@ -2583,6 +2608,7 @@ impl Component for App {
                             album: Some(album.clone()),
                             shuffle,
                             quality: Default::default(),
+                            playlist: None,
                         })))
                     })
                 };
@@ -2801,19 +2827,24 @@ impl Component for App {
                 // The server's order, over the one shown before it answered.
                 self.load_playlists(&sender);
             }
-            // Only the entry the server picked plays; going on to the next
-            // as each ends, with the player's playlist controls, is the
-            // playlist player's.
-            Loaded::PlaylistStarted(Ok(Some(next))) => {
-                let from = views::Facts::of(&next.item).position();
-                sender.input(Msg::Play(Box::new(PlayRequest::one(
-                    next.item, from, None, None,
-                ))));
+            // The entry the server picked plays, from where the user
+            // stopped in it; the playback asks the server for each next.
+            Loaded::PlaylistStarted(id, name, Ok(Some(next))) => {
+                let from = playlist_rules::resume_from(&next.item);
+                let playing = playlist_rules::Playing {
+                    id,
+                    name,
+                    entry: next.entry,
+                };
+                sender.input(Msg::Play(Box::new(PlayRequest {
+                    playlist: Some(playing),
+                    ..PlayRequest::one(next.item, from, None, None)
+                })));
             }
-            Loaded::PlaylistStarted(Ok(None)) => {
-                toast_text(widgets, "Nothing in this playlist can play now.")
+            Loaded::PlaylistStarted(_, name, Ok(None)) => {
+                toast_text(widgets, &format!("Nothing in {name} can play now."))
             }
-            Loaded::PlaylistStarted(Err(e)) => toast(widgets, &e),
+            Loaded::PlaylistStarted(_, _, Err(e)) => toast(widgets, &e),
             Loaded::Preferences(open, result) => {
                 // Without the server's preferences, Settings still opens.
                 let tracks = result
@@ -3272,6 +3303,12 @@ impl App {
                 Change::Failed(error) if weak.upgrade().is_some_and(|p| !p.is_video()) => {
                     toasts.add_toast(crate::markup::toast(&format!("Cannot play: {error}")));
                 }
+                // The server cleared the place: its page, if shown, says
+                // Play again.
+                Change::PlaylistFinished(playing) => {
+                    toasts.add_toast(crate::markup::toast(&playing.finished_text()));
+                    stop.input(Msg::PlaylistFinished(playing.id.clone()));
+                }
                 _ => {}
             }
             true
@@ -3333,6 +3370,7 @@ impl App {
                 album,
                 shuffle: false,
                 quality: Default::default(),
+                playlist: None,
             })));
             return;
         };
@@ -3407,6 +3445,7 @@ impl App {
                     album: None,
                     shuffle: true,
                     quality: Default::default(),
+                    playlist: None,
                 })));
             })
         };
