@@ -156,6 +156,12 @@ impl Pipeline {
         self.subtitle.borrow().is_some() && self.external.show(self.play(), info)
     }
 
+    /// Whether GstPlay's error `message` is the external subtitle's, not
+    /// the media's.
+    pub fn subtitle_caused(&self, message: &str) -> bool {
+        self.subtitle.borrow().is_some() && self.external.caused(message)
+    }
+
     /// Stops, keeping the pipeline for the next item.
     pub fn stop(&self) {
         self.quiesce();
@@ -606,6 +612,8 @@ mod tests {
     /// How a playback given an external subtitle went.
     struct Played {
         failed: Option<String>,
+        /// Whether the failure was told to be the subtitle's.
+        subtitles_fault: bool,
         /// The external subtitle's cues that reached the overlay.
         cues: usize,
         /// Whether the overlay drawing them was silenced at the end.
@@ -707,6 +715,7 @@ mod tests {
         let _ = playbin.set_state(gst::State::Null);
         Played {
             silenced,
+            subtitles_fault: failed.as_deref().is_some_and(|e| external.caused(e)),
             failed,
             cues: cues.load(std::sync::atomic::Ordering::Relaxed),
         }
@@ -740,6 +749,21 @@ mod tests {
         let (_dir, file, srt) = file_and_srt("spoolframe-external-shown");
         let played = play_with_external_subtitle(&file_uri(&file), &srt, false);
         assert!(played.cues > 0, "no external cue reached the overlay");
+    }
+
+    #[test]
+    #[ignore = "needs GStreamer's base and good plugins; run on its own"]
+    fn a_broken_external_subtitle_is_told_from_the_media() {
+        let (_dir, file, srt) = file_and_srt("spoolframe-external-broken");
+        std::fs::write(
+            &srt,
+            (0..4096_u32)
+                .map(|n| (n * 7919 % 251) as u8)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let played = play_with_external_subtitle(&file_uri(&file), &srt, false);
+        assert!(played.subtitles_fault, "{:?}", played.failed);
     }
 
     #[test]

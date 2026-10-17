@@ -34,6 +34,7 @@ use spoolframe_protocol::{ConvertedVideo, PlannedSubtitle, SubtitleAction, Subti
 use spoolframe_types::Delivery;
 use spoolframe_types::{Album, Item, MediaTracks, SubtitleFormat};
 
+use crate::external_subtitle;
 use crate::pipeline::Pipeline;
 pub use crate::pipeline::VideoSink;
 pub use crate::queue::Repeat;
@@ -1579,6 +1580,11 @@ impl Playback {
             }
             Err(e) => return tracing::warn!(error = %e, "no external subtitle"),
         };
+        tracing::debug!(%format, bytes = bytes.len(), "the external subtitle arrived");
+        if let Err(why) = external_subtitle::check(&bytes) {
+            tracing::warn!(%format, bytes = bytes.len(), why, "not showing the external subtitle");
+            return self.emit(&Change::TrackFailed(external_subtitle::NOT_SHOWN));
+        }
         let Some(dir) = spoolframe_linux_core::paths::runtime_dir() else {
             return tracing::warn!("no private directory for the subtitle");
         };
@@ -1586,25 +1592,38 @@ impl Playback {
         if let Err(e) = std::fs::create_dir_all(&dir) {
             return tracing::warn!(error = %e, dir = %dir.display(), "cannot make the runtime directory");
         }
-        let path = dir.join(format!(
-            "spoolframe-subtitle-{}.{}",
-            std::process::id(),
-            match format {
-                SubtitleFormat::Ass => "ass",
-                SubtitleFormat::WebVtt => "vtt",
-                _ => "srt",
+        let path = match external_subtitle::write(&dir, format, &bytes) {
+            Ok(path) => path,
+            Err(e) => {
+                return tracing::warn!(error = %e, dir = %dir.display(), "cannot write the subtitle");
             }
-        ));
-        if let Err(e) = std::fs::write(&path, bytes) {
-            return tracing::warn!(error = %e, path = %path.display(), "cannot write the subtitle");
-        }
-        current.subtitle_file.replace(Some(path.clone()));
+        };
+        tracing::debug!(%format, bytes = bytes.len(), path = %path.display(), "the external subtitle is written");
+        // A file of its own each time: the one it replaces goes once
+        // GstPlay has the new one.
+        let replaced = current.subtitle_file.replace(Some(path.clone()));
         self.subtitles_on.set(true);
         if current.is_converted() {
             self.restart(&current, self.position.get());
         } else {
             self.pipeline.set_subtitle(Some(&path));
         }
+        if let Some(old) = replaced {
+            let _ = std::fs::remove_file(old);
+        }
+    }
+
+    /// The external subtitle failed in GstPlay, which stopped: the item
+    /// plays on from where it was, without it.
+    fn subtitle_failed(self: &Rc<Self>, error: &str) {
+        tracing::warn!(error, "the external subtitle failed; playing on without it");
+        let Some(current) = self.now() else { return };
+        if let Some(path) = current.subtitle_file.take() {
+            let _ = std::fs::remove_file(path);
+        }
+        self.subtitles_on.set(false);
+        self.emit(&Change::TrackFailed(external_subtitle::NOT_SHOWN));
+        self.read_anew(self.position.get());
     }
 
     /// Where playback is. A track's report counts toward its plays
@@ -2011,11 +2030,15 @@ impl Playback {
             Event::Ended => self.ended(),
             Event::Volume(volume) => self.emit(&Change::Volume(volume)),
             Event::Muted(muted) => self.emit(&Change::Muted(muted)),
-            Event::Error(uri, e) => {
-                if self.pipeline.accepts_error(&uri) {
+            Event::Error(uri, e) if self.pipeline.accepts_error(&uri) => {
+                // The subtitle's own source failing need not end the item.
+                if self.pipeline.subtitle_caused(&e) {
+                    self.subtitle_failed(&e);
+                } else {
                     self.failed(&e);
                 }
             }
+            Event::Error(..) => {}
             Event::Stopped(uri) => {
                 if self.pipeline.accepts_error(&uri) {
                     tracing::info!("the server's admin stopped the playback");
