@@ -2,10 +2,8 @@
 
 ## Unreleased
 
-- Artwork is kept on disk as one file an image (named as the Apple apps
-  name theirs), up to 400 MB: the least recently shown are deleted a
-  little after start when it is over. The earlier cache's files are
-  deleted with them.
+- Scrub-preview frames are kept in memory only, not in the artwork cache
+  on disk.
 - Home, the libraries, library pages, item pages and playlists show at
   once from what was read before, and are read again behind when old: a
   page changes in place when the server's answer differs. Marking

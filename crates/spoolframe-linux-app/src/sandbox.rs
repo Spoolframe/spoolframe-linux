@@ -608,7 +608,7 @@ fn refused_calls() -> Result<BTreeMap<i64, Vec<SeccompRule>>, seccompiler::Backe
         libc::SYS_perf_event_open,
         libc::SYS_bpf,
         libc::SYS_userfaultfd,
-        // Nothing here reads or writes files through io_uring.
+        // The artwork cache reads and writes with psync, not io_uring.
         libc::SYS_io_uring_setup,
         libc::SYS_io_uring_enter,
         libc::SYS_io_uring_register,

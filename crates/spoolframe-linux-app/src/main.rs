@@ -175,15 +175,15 @@ fn main() -> Result<()> {
     let runtime = tokio::runtime::Runtime::new().context("cannot start the async runtime")?;
     let client: Arc<dyn Client> = Arc::new(open_sdk(&runtime)?);
 
-    let artwork_cache = open_artwork_cache();
-    if let Some(cache) = &artwork_cache {
-        trim_later(cache.clone());
-    }
+    let artwork_cache = open_artwork_cache(&runtime);
     app.run::<app::App>(app::Init {
         client,
-        artwork_cache,
+        artwork_cache: artwork_cache.clone(),
     });
     playback::shutdown();
+    if let Some(cache) = artwork_cache {
+        runtime.block_on(cache.close());
+    }
     drop(runtime);
     Ok(())
 }
@@ -212,34 +212,17 @@ const FEATURES: sdk::Features = sdk::Features {
 
 /// The artwork cache, or none if it cannot be opened: images are then
 /// fetched each time, which is slower but works.
-fn open_artwork_cache() -> Option<Arc<ArtworkCache>> {
+fn open_artwork_cache(runtime: &tokio::runtime::Runtime) -> Option<Arc<ArtworkCache>> {
     let Some(dir) = ArtworkCache::default_dir() else {
         tracing::warn!("no cache directory (no home directory?); artwork is not cached");
         return None;
     };
-    match ArtworkCache::open(&dir, Limits::default()) {
+    match runtime.block_on(ArtworkCache::open(&dir, Limits::default())) {
         Ok(cache) => Some(Arc::new(cache)),
         Err(e) => {
             tracing::warn!(error = %e, "artwork is not cached");
             None
         }
-    }
-}
-
-/// Trims the artwork kept on disk to its cap once, a little after start
-/// and on a thread of its own, so the first pages are not slowed.
-fn trim_later(cache: Arc<ArtworkCache>) {
-    let spawned = std::thread::Builder::new()
-        .name("artwork-trim".into())
-        .spawn(move || {
-            std::thread::sleep(spoolframe_linux_core::artcache::TRIM_AFTER);
-            match cache.trim() {
-                Ok(trimmed) => tracing::debug!(?trimmed, "artwork cache trimmed"),
-                Err(e) => tracing::warn!(error = %e, "artwork cache not trimmed"),
-            }
-        });
-    if let Err(e) = spawned {
-        tracing::warn!(error = %e, "artwork cache not trimmed");
     }
 }
 
