@@ -20,7 +20,7 @@ use std::sync::Arc;
 use adw::prelude::*;
 use gtk::{gio, glib};
 use spoolframe_linux_core::backend::{BackendError, Session};
-use spoolframe_types::{Item, Library};
+use spoolframe_types::{Item, Library, LibraryId};
 
 use crate::views::{self, Cards};
 
@@ -167,6 +167,18 @@ impl Cache {
         pages.fill(0, items);
         self.libraries.borrow_mut().insert(key, pages.clone());
         Ok(pages)
+    }
+
+    /// The catalog's re-read of `library`'s page at `offset` came back
+    /// different: that page is fetched again, if it was fetched before,
+    /// and gets the new value the catalog keeps.
+    pub fn changed(&self, library: &LibraryId, offset: u32) {
+        let pages = self.libraries.borrow().get(&library.to_string()).cloned();
+        let Some(pages) = pages else { return };
+        let page = offset / PAGE;
+        if pages.asked.borrow().contains(&page) {
+            pages.fetch(page);
+        }
     }
 
     /// The grid for `library`, or what went wrong getting its first page.

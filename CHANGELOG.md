@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Artwork is kept on disk as one file an image (named as the Apple apps
+  name theirs), up to 400 MB: the least recently shown are deleted a
+  little after start when it is over. The earlier cache's files are
+  deleted with them.
+- Home, the libraries, library pages, item pages and playlists show at
+  once from what was read before, and are read again behind when old: a
+  page changes in place when the server's answer differs. Marking
+  watched, hiding, playing, liking or changing a playlist reads the
+  server again, so the change shows at once.
 - Movie, show and episode pages show the cast: the first six actors, each
   a round portrait (or their initials) with the part they play; a click
   opens their items. Cast comes with the server's 0.9.0.

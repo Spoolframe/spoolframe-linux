@@ -22,7 +22,8 @@ use spoolframe_linux_core::next_episode::next_episode;
 use spoolframe_linux_core::playlists::{self as playlist_rules, PinNotesShown};
 use spoolframe_linux_core::theme::Theme;
 use spoolframe_types::{
-    Album, Artist, Item, Library, LibraryKind, MediaId, MediaTracks, Season, Show, TrackPreferences,
+    Album, Artist, Item, Library, LibraryId, LibraryKind, MediaId, MediaTracks, Season, Show,
+    TrackPreferences,
 };
 
 use crate::artwork::Art;
@@ -43,6 +44,7 @@ use crate::{
     library, nowplaying, pages, pin, player, playlists, preferences, sidebar, start, views,
 };
 use spoolframe_linux_core::artcache::ArtworkCache;
+use spoolframe_linux_core::catalog::{self, CachedSession, Catalog, Scope};
 
 /// A password or PIN in a message. Msg derives Debug, and Relm4 records
 /// each message in a tracing span: this keeps them out of logs.
@@ -187,6 +189,26 @@ pub struct App {
     pinned_actions: Rc<PinnedActions>,
     /// The item "Add to playlist" was asked for while the list loads.
     pending_add: Option<Box<Item>>,
+    /// Catalog reads kept for every profile this run, shown at once and
+    /// re-read behind (stale-while-revalidate).
+    catalog: Arc<Catalog>,
+    /// The item whose page is loading, as it was opened: what a redraw of
+    /// the page opens again.
+    opening_item: Option<Item>,
+    /// The item page on top, and what it read: a change to one of those
+    /// reads draws it again.
+    shown_item: Option<ShownItem>,
+    /// The item page being drawn again: its new page replaces it.
+    redrawing: Option<(MediaId, glib::WeakRef<adw::NavigationPage>)>,
+}
+
+/// An item page on the stack.
+struct ShownItem {
+    /// What opened it.
+    item: Item,
+    /// The items whose reads it shows.
+    reads: Vec<MediaId>,
+    page: glib::WeakRef<adw::NavigationPage>,
 }
 
 /// Where a playlist's page goes.
@@ -382,6 +404,10 @@ pub enum Msg {
     UpdatePlaylist(String, PlaylistUpdate),
     DeletePlaylist(String),
     PlaylistChanged(Box<PlaylistEvent>),
+    /// A kept catalog read came back different from what was shown.
+    CatalogChanged(Box<catalog::Change>),
+    /// Catalog changes were missed: read again what is shown.
+    CatalogLagged,
     /// Playlist changes were missed: read everything shown again.
     PlaylistsLagged,
     /// The playlist with this id played to its end.
@@ -1056,7 +1082,17 @@ impl Component for App {
             shown_playlist: None,
             pinned_actions,
             pending_add: None,
+            catalog: Catalog::new(
+                Arc::new(catalog::SystemClock),
+                Arc::new(|reread| {
+                    relm4::spawn(reread);
+                }),
+            ),
+            opening_item: None,
+            shown_item: None,
+            redrawing: None,
         };
+        model.watch_catalog(&sender);
         model.load_servers(&sender);
         // Invite links the desktop opened before the window was up.
         for link in opened::listen(sender.clone()) {
@@ -1827,6 +1863,8 @@ impl Component for App {
                 });
             }
             Msg::PlaylistChanged(event) => {
+                // Changed elsewhere, or here: what is kept may be older.
+                self.clear_catalog();
                 let Some(server) = &self.server else { return };
                 let shown = self.shown_playlist_id(widgets);
                 let refresh = playlist_rules::refresh_for(&event, &server.key.0, shown.as_deref());
@@ -1852,11 +1890,23 @@ impl Component for App {
                 }
             }
             Msg::PlaylistFinished(id) => {
+                self.clear_catalog();
                 if self.shown_playlist_id(widgets).as_ref() == Some(&id) {
                     self.reload_playlist(id, &sender);
                 }
             }
             Msg::PlaylistsLagged => {
+                self.clear_catalog();
+                self.load_playlists(&sender);
+                if let Some(id) = self.shown_playlist_id(widgets) {
+                    self.reload_playlist(id, &sender);
+                }
+            }
+            Msg::CatalogChanged(change) => self.catalog_changed(*change, widgets, &sender),
+            Msg::CatalogLagged => {
+                if self.on_home(widgets) {
+                    self.load_home(&sender);
+                }
                 self.load_playlists(&sender);
                 if let Some(id) = self.shown_playlist_id(widgets) {
                     self.reload_playlist(id, &sender);
@@ -2620,22 +2670,19 @@ impl Component for App {
                         Rc::new(move || sender.input(Msg::ForgetTracks(Box::new(item.clone()))))
                     },
                 };
-                push(
-                    widgets,
-                    &title,
-                    &pages::playable(
-                        &item,
-                        context.as_deref(),
-                        tracks.as_ref(),
-                        chosen.as_ref(),
-                        actions,
-                        pages::Under {
-                            next: next.as_deref(),
-                            playlists: self.playlist_rows(&refs, &sender).as_ref(),
-                        },
-                        cards,
-                    ),
+                let body = pages::playable(
+                    &item,
+                    context.as_deref(),
+                    tracks.as_ref(),
+                    chosen.as_ref(),
+                    actions,
+                    pages::Under {
+                        next: next.as_deref(),
+                        playlists: self.playlist_rows(&refs, &sender).as_ref(),
+                    },
+                    cards,
                 );
+                self.push_item(widgets, &title, &body, reads_of_playable(&item));
             }
             Loaded::Show(show, Ok(seasons), open, refs) => {
                 let actions = pages::ShowActions {
@@ -2652,36 +2699,43 @@ impl Component for App {
                         Rc::new(move |id, watched| sender.input(Msg::SetWatched(id, watched)))
                     },
                 };
-                push(
+                let body = pages::show(
+                    &show,
+                    &seasons,
+                    open.as_ref(),
+                    actions,
+                    self.playlist_tabs(&refs, &sender),
+                    cards,
+                );
+                self.push_item(
                     widgets,
                     &show.title,
-                    &pages::show(
-                        &show,
-                        &seasons,
-                        open.as_ref(),
-                        actions,
-                        self.playlist_tabs(&refs, &sender),
-                        cards,
-                    ),
+                    &body,
+                    std::iter::once(show.id.clone())
+                        .chain(seasons.iter().map(|(season, _)| season.id.clone()))
+                        .collect(),
                 );
             }
             Loaded::Show(show, Err(e), ..) => {
+                if self.redraw_failed(&e) {
+                    return;
+                }
                 let title = show.title.clone();
                 push_error(widgets, &title, &e, Some((Item::Show(show), &sender)))
             }
             Loaded::Artist(artist, Ok(albums), refs) => {
-                push(
-                    widgets,
-                    &artist.name,
-                    &pages::artist(
-                        &artist,
-                        &albums,
-                        self.playlist_rows(&refs, &sender).as_ref(),
-                        cards,
-                    ),
+                let body = pages::artist(
+                    &artist,
+                    &albums,
+                    self.playlist_rows(&refs, &sender).as_ref(),
+                    cards,
                 );
+                self.push_item(widgets, &artist.name, &body, vec![artist.id.clone()]);
             }
             Loaded::Artist(artist, Err(e), _) => {
+                if self.redraw_failed(&e) {
+                    return;
+                }
                 let title = artist.name.clone();
                 push_error(widgets, &title, &e, Some((Item::Artist(artist), &sender)))
             }
@@ -2716,31 +2770,33 @@ impl Component for App {
                         sender.input(Msg::EnqueueTracks(items, Some(album.clone()), at))
                     })
                 };
-                push(
+                let body = pages::album(
+                    &album,
+                    &artist,
+                    &tracks,
+                    pages::AlbumActions { play, enqueue },
+                    self.now_playing.subscribe(),
+                    self.playlist_rows(&refs, &sender).as_ref(),
+                    cards,
+                );
+                self.push_item(
                     widgets,
                     &album.title,
-                    &pages::album(
-                        &album,
-                        &artist,
-                        &tracks,
-                        pages::AlbumActions { play, enqueue },
-                        self.now_playing.subscribe(),
-                        self.playlist_rows(&refs, &sender).as_ref(),
-                        cards,
-                    ),
+                    &body,
+                    vec![album.id.clone(), album.artist_id.clone()],
                 );
             }
             Loaded::Album(album, Err(e), _, _) => {
+                if self.redraw_failed(&e) {
+                    return;
+                }
                 let title = album.title.clone();
                 push_error(widgets, &title, &e, Some((Item::Album(album), &sender)))
             }
             // Home shows watch state (Continue watching, Next up): show it
             // again, if it is what is on screen.
             Loaded::WatchChanged(Ok(())) => {
-                let on_home = self.root == Root::Home
-                    && widgets.stack.visible_page().as_ref() == Some(&widgets.root_page)
-                    && widgets.window_stack.visible_page().as_ref() == Some(&widgets.library_page);
-                if on_home {
+                if self.on_home(widgets) {
                     self.load_home(&sender);
                 }
             }
@@ -3180,10 +3236,16 @@ impl App {
         widgets: &mut AppWidgets,
         sender: &ComponentSender<Self>,
     ) {
-        let session = match self.client.session(&profile) {
-            Ok(session) => session,
+        let session: Arc<dyn Session> = match self.client.session(&profile) {
+            Ok(session) => Arc::new(CachedSession::new(
+                session,
+                self.catalog.clone(),
+                Scope::of(&profile),
+            )),
             Err(e) => return toast(widgets, &e),
         };
+        self.shown_item = None;
+        self.redrawing = None;
         self.cards = Rc::new(Cards {
             open: open_with(sender),
             art: Some(Art::new(
@@ -3601,6 +3663,142 @@ impl App {
         close_player(widgets);
     }
 
+    /// Whether Home is what the window shows, nothing over it.
+    fn on_home(&self, widgets: &AppWidgets) -> bool {
+        self.root == Root::Home
+            && widgets.stack.visible_page().as_ref() == Some(&widgets.root_page)
+            && widgets.window_stack.visible_page().as_ref() == Some(&widgets.library_page)
+    }
+
+    /// Forgets the catalog reads kept for the profile in use, for changes
+    /// made elsewhere; changes made here clear it themselves (CachedSession).
+    fn clear_catalog(&self) {
+        if let Some(profile) = &self.profile {
+            self.catalog.clear(&Scope::of(profile));
+        }
+    }
+
+    /// Hears the catalog's changes for as long as the app runs.
+    fn watch_catalog(&self, sender: &ComponentSender<Self>) {
+        let mut changes = self.catalog.changes();
+        let sender = sender.clone();
+        glib::spawn_future_local(async move {
+            use tokio::sync::broadcast::error::RecvError;
+            loop {
+                match changes.recv().await {
+                    Ok(change) => sender.input(Msg::CatalogChanged(Box::new(change))),
+                    Err(RecvError::Lagged(_)) => sender.input(Msg::CatalogLagged),
+                    Err(RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+
+    /// A kept read came back different: the page showing it reads it
+    /// again ([`refresh_for`]), and gets the value just kept, so no other
+    /// re-read follows.
+    fn catalog_changed(
+        &mut self,
+        change: catalog::Change,
+        widgets: &AppWidgets,
+        sender: &ComponentSender<Self>,
+    ) {
+        if self.profile.as_ref().map(Scope::of) != Some(change.scope) {
+            return;
+        }
+        let item_on_top = self.shown_item.as_ref().filter(|shown| {
+            self.opening.is_none()
+                && shown
+                    .page
+                    .upgrade()
+                    .is_some_and(|page| widgets.window_stack.visible_page().as_ref() == Some(&page))
+        });
+        let playlist = self.shown_playlist_id(widgets);
+        let shown = Shown {
+            home: self.on_home(widgets),
+            playlist: playlist.as_deref(),
+            item: item_on_top.map(|shown| shown.reads.as_slice()),
+        };
+        match refresh_for(&change.read, &shown) {
+            None => {}
+            Some(Refresh::Home) => self.load_home(sender),
+            Some(Refresh::Libraries) => self.load_libraries(sender),
+            Some(Refresh::LibraryPage(library, offset)) => {
+                if let Some(cache) = &self.library_cache {
+                    cache.changed(&library, offset);
+                }
+            }
+            Some(Refresh::Item) => self.redraw_item(sender),
+            Some(Refresh::Playlists) => self.load_playlists(sender),
+            Some(Refresh::Playlist(id)) => self.reload_playlist(id, sender),
+        }
+    }
+
+    /// Opens the item page on top again; its new page replaces it.
+    fn redraw_item(&mut self, sender: &ComponentSender<Self>) {
+        let Some(shown) = &self.shown_item else {
+            return;
+        };
+        let Some(page) = shown.page.upgrade() else {
+            return;
+        };
+        let item = shown.item.clone();
+        let id = item.id().clone();
+        self.open_item(item, sender);
+        self.redrawing = Some((id, page.downgrade()));
+    }
+
+    /// An item page loaded: pushed, or in place of the page it draws
+    /// again (without the slide, so it reads as the same page changing).
+    /// A redraw of a page no longer on top is dropped.
+    fn push_item(
+        &mut self,
+        widgets: &AppWidgets,
+        title: &str,
+        body: &impl IsA<gtk::Widget>,
+        reads: Vec<MediaId>,
+    ) {
+        let Some(item) = self.opening_item.take() else {
+            return push(widgets, title, body);
+        };
+        let stack = &widgets.window_stack;
+        let redraw = self.redrawing.take().filter(|(id, _)| id == item.id());
+        if let Some((_, old)) = &redraw {
+            let Some(old) = old.upgrade() else { return };
+            if stack.visible_page().as_ref() != Some(&old) {
+                return;
+            }
+            stack.set_animate_transitions(false);
+            stack.pop();
+            push(widgets, title, body);
+            stack.set_animate_transitions(true);
+        } else {
+            push(widgets, title, body);
+        }
+        self.shown_item = stack.visible_page().map(|page| ShownItem {
+            item,
+            reads,
+            page: page.downgrade(),
+        });
+    }
+
+    /// A redraw that did not load leaves the page as it was; `true` when
+    /// `error` was one.
+    fn redraw_failed(&mut self, error: &BackendError) -> bool {
+        let Some((id, _)) = self.redrawing.take() else {
+            return false;
+        };
+        if self
+            .opening_item
+            .take()
+            .is_some_and(|item| item.id() == &id)
+        {
+            tracing::debug!(error = %error, "item page not drawn again");
+            return true;
+        }
+        false
+    }
+
     /// Home again, if it shows: Continue watching moved with what played.
     fn refresh_home(&mut self, sender: &ComponentSender<Self>) {
         self.load_home(sender);
@@ -3878,6 +4076,9 @@ impl App {
                 return;
             }
             self.opening = Some(item.id().clone());
+            self.opening_item = Some(item.clone());
+            // Opened anew: a redraw asked for before is dropped.
+            self.redrawing = None;
         }
         match item {
             Item::Movie(ref m) => {
@@ -4060,6 +4261,59 @@ async fn show_with_seasons(
 /// An item's page's own read: the item, what is under it, and where the
 /// server has playlists (PX-40), those the user sees that hold it. An
 /// older server is asked as before and holds it in none.
+/// What shows now, for [`refresh_for`].
+struct Shown<'a> {
+    /// Home, with nothing over it.
+    home: bool,
+    /// The playlist whose page is on its stack.
+    playlist: Option<&'a str>,
+    /// What the item page on top read, unless another page is loading.
+    item: Option<&'a [MediaId]>,
+}
+
+/// What reads again when a kept catalog read changes.
+#[derive(Debug, PartialEq, Eq)]
+enum Refresh {
+    Home,
+    Libraries,
+    LibraryPage(LibraryId, u32),
+    /// The item page on top, drawn again.
+    Item,
+    Playlists,
+    Playlist(String),
+}
+
+/// What reads again for a change to `read`, given what `shown`: only what
+/// shows it. The libraries and a library's fetched pages are kept by the
+/// sidebar and the grids, shown or not.
+fn refresh_for(read: &catalog::Read, shown: &Shown) -> Option<Refresh> {
+    use catalog::Read;
+    match read {
+        Read::Home => shown.home.then_some(Refresh::Home),
+        Read::Libraries => Some(Refresh::Libraries),
+        Read::Items {
+            library, offset, ..
+        } => Some(Refresh::LibraryPage(library.clone(), *offset)),
+        Read::Item(id) | Read::ItemDetail(id) => shown
+            .item
+            .is_some_and(|reads| reads.contains(id))
+            .then_some(Refresh::Item),
+        Read::Playlists => Some(Refresh::Playlists),
+        Read::Playlist { id, .. } => {
+            (shown.playlist == Some(id.as_str())).then(|| Refresh::Playlist(id.clone()))
+        }
+    }
+}
+
+/// What an episode's or movie's page reads: the item, and an episode's
+/// show for its title.
+fn reads_of_playable(item: &Item) -> Vec<MediaId> {
+    match item {
+        Item::Episode(episode) => vec![episode.id.clone(), episode.show_id.clone()],
+        other => vec![other.id().clone()],
+    }
+}
+
 async fn read_item(session: &dyn Session, id: &MediaId) -> Result<ItemDetail, BackendError> {
     if session.has_playlists() {
         return session.item_detail(id).await;
@@ -4881,6 +5135,93 @@ mod tests {
             playlist_sharing: true,
             play_history: true,
         };
+
+    fn nothing_shown() -> Shown<'static> {
+        Shown {
+            home: false,
+            playlist: None,
+            item: None,
+        }
+    }
+
+    fn movie(key: &str) -> MediaId {
+        MediaId::new(
+            spoolframe_types::Namespace::Plex,
+            spoolframe_types::MediaKind::Movie,
+            key,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_change_to_home_reloads_it_when_it_shows() {
+        let shown = Shown {
+            home: true,
+            ..nothing_shown()
+        };
+        assert_eq!(
+            refresh_for(&catalog::Read::Home, &shown),
+            Some(Refresh::Home)
+        );
+    }
+
+    #[test]
+    fn a_change_to_home_under_another_page_waits() {
+        assert_eq!(refresh_for(&catalog::Read::Home, &nothing_shown()), None);
+    }
+
+    #[test]
+    fn a_change_to_what_the_item_page_read_draws_it_again() {
+        let reads = [movie("1")];
+        let shown = Shown {
+            item: Some(&reads),
+            ..nothing_shown()
+        };
+        let read = catalog::Read::ItemDetail(movie("1"));
+        assert_eq!(refresh_for(&read, &shown), Some(Refresh::Item));
+    }
+
+    #[test]
+    fn a_change_to_another_item_leaves_the_page() {
+        let reads = [movie("1")];
+        let shown = Shown {
+            item: Some(&reads),
+            ..nothing_shown()
+        };
+        let read = catalog::Read::Item(movie("2"));
+        assert_eq!(refresh_for(&read, &shown), None);
+    }
+
+    #[test]
+    fn a_change_to_the_shown_playlist_reads_it_again() {
+        let shown = Shown {
+            playlist: Some("p1"),
+            ..nothing_shown()
+        };
+        let read = catalog::Read::Playlist {
+            id: "p1".into(),
+            offset: 0,
+            limit: 200,
+        };
+        assert_eq!(
+            refresh_for(&read, &shown),
+            Some(Refresh::Playlist("p1".into()))
+        );
+    }
+
+    #[test]
+    fn a_change_to_a_playlist_not_shown_reads_nothing() {
+        let shown = Shown {
+            playlist: Some("p1"),
+            ..nothing_shown()
+        };
+        let read = catalog::Read::Playlist {
+            id: "p2".into(),
+            offset: 0,
+            limit: 200,
+        };
+        assert_eq!(refresh_for(&read, &shown), None);
+    }
 
     #[test]
     fn a_secret_never_prints() {
