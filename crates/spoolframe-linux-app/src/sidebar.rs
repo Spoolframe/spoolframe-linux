@@ -137,6 +137,7 @@ impl Sidebar {
         libraries: &[Library],
         playlists: &[PlaylistSummary],
         actions: &Rc<PinnedActions>,
+        art: Option<&Rc<crate::artwork::Art>>,
     ) {
         let picked = self
             .list
@@ -156,8 +157,9 @@ impl Sidebar {
                     let playlist = playlists.iter().find(|p| p.id == *id);
                     let name = playlist.map_or("", |p| p.name.as_str());
                     let builtin = playlist.and_then(|p| p.builtin);
+                    let artwork = playlist.and_then(|p| p.artwork.as_ref());
                     let at = pinned_index(&rows, index).unwrap_or_default();
-                    pinned_row(id, name, builtin, at, actions)
+                    pinned_row(id, name, (builtin, artwork, art), at, actions)
                 }
                 Row::NothingPinned => hint_row(),
             };
@@ -243,12 +245,17 @@ fn hint_row() -> gtk::ListBoxRow {
 fn pinned_row(
     id: &str,
     name: &str,
-    builtin: Option<spoolframe_linux_core::backend::Builtin>,
+    // Its picture: built in or not, the server's, and where it loads from.
+    (builtin, artwork, art): (
+        Option<spoolframe_linux_core::backend::Builtin>,
+        Option<&spoolframe_types::ArtworkId>,
+        Option<&Rc<crate::artwork::Art>>,
+    ),
     at: usize,
     actions: &Rc<PinnedActions>,
 ) -> gtk::ListBoxRow {
     let body = gtk::Box::builder().spacing(12).build();
-    body.append(&crate::playlists::picture(id, builtin, 22));
+    body.append(&crate::playlists::picture(id, builtin, artwork, art, 22));
     body.append(
         &gtk::Label::builder()
             .label(name)

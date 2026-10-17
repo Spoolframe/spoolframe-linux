@@ -265,6 +265,29 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
+    /// A playlist's cover (PX-53) is named by its content, so it is kept
+    /// on disk like a poster, not in memory only like a preview frame.
+    #[tokio::test]
+    async fn a_playlist_cover_outlives_the_app() {
+        let (_tmp, dir) = temp_dir("cover-restart").await;
+        let cover: ArtworkId = "image:playlist/0f3a".parse().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        {
+            let cache = ArtworkCache::open(&dir, small()).await.unwrap();
+            cache
+                .get_or_fetch(&server(), &cover, ArtworkSize::Small, counted(&calls))
+                .await
+                .unwrap();
+            cache.close().await;
+        }
+        let cache = ArtworkCache::open(&dir, small()).await.unwrap();
+        cache
+            .get_or_fetch(&server(), &cover, ArtworkSize::Small, counted(&calls))
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn a_preview_frame_is_not_kept_past_the_app() {
         let (_tmp, dir) = temp_dir("frame-restart").await;

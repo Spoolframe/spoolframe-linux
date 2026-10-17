@@ -1605,7 +1605,8 @@ impl Session for FakeSession {
         // picture the fake has.
         Box::pin(async move {
             self.catalog()?;
-            if id.namespace() == Namespace::Preview {
+            // A playlist's picture (PX-53) is the one picture too.
+            if matches!(id.namespace(), Namespace::Preview | Namespace::Image) {
                 return Ok(FAKE_PREVIEW_SHEET.to_vec());
             }
             Err(BackendError::NotFound(id.to_string()))
@@ -2490,6 +2491,27 @@ impl Session for FakeSession {
         Box::pin(async move {
             self.guard()?;
             self.lock_playlists().update(id, update, self.viewer())
+        })
+    }
+
+    fn set_playlist_art<'a>(
+        &'a self,
+        id: &'a str,
+        bytes: Vec<u8>,
+    ) -> BoxFuture<'a, Result<ArtworkId, BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            self.lock_playlists().set_art(id, &bytes, self.viewer())
+        })
+    }
+
+    fn remove_playlist_art<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> BoxFuture<'a, Result<PlaylistSummary, BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            self.lock_playlists().remove_art(id, self.viewer())
         })
     }
 
@@ -6958,5 +6980,175 @@ mod tests {
                 0
             )
         );
+    }
+}
+
+/// Playlist covers (PX-53) on the fake server.
+#[cfg(test)]
+mod cover_tests {
+    use super::*;
+    use crate::backend::{MAX_ART_BYTES, PlaylistChange};
+    use crate::testing::ready;
+
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
+
+    /// `username`'s session, unlocked (Alice has a PIN).
+    fn session_for(client: &FakeClient, username: &str) -> Arc<dyn Session> {
+        let session = client.session(&FakeClient::profile(username)).unwrap();
+        if username == "alice" {
+            ready(session.unlock(FAKE_PIN)).unwrap();
+        }
+        session
+    }
+
+    fn named(session: &dyn Session, name: &str) -> PlaylistSummary {
+        ready(session.playlists())
+            .unwrap()
+            .playlists
+            .into_iter()
+            .find(|p| p.name == name)
+            .unwrap()
+    }
+
+    #[test]
+    fn a_playlist_shows_its_mosaic_until_a_cover_is_set() {
+        let client = FakeClient::new(None);
+        let andrey = session_for(&client, "andrey");
+        let before = named(andrey.as_ref(), "Movie night");
+        assert_eq!(
+            (
+                before.artwork.map(|a| a.key().starts_with("mosaic/")),
+                before.custom_art
+            ),
+            (Some(true), false)
+        );
+    }
+
+    #[test]
+    fn a_cover_set_is_the_playlists_artwork_for_everyone() {
+        let client = FakeClient::new(None);
+        let andrey = session_for(&client, "andrey");
+        let id = named(andrey.as_ref(), "Andor: the heists").id;
+        let cover = ready(andrey.set_playlist_art(&id, PNG.to_vec())).unwrap();
+        let alice = session_for(&client, "alice");
+        let seen = named(alice.as_ref(), "Andor: the heists");
+        assert_eq!((seen.artwork, seen.custom_art), (Some(cover), true));
+    }
+
+    #[test]
+    fn a_cover_changes_the_revision_and_is_told() {
+        let client = FakeClient::new(None);
+        let andrey = session_for(&client, "andrey");
+        let before = named(andrey.as_ref(), "Movie night");
+        let mut events = client.playlist_events();
+        ready(andrey.set_playlist_art(&before.id, PNG.to_vec())).unwrap();
+        let after = named(andrey.as_ref(), "Movie night").revision;
+        assert_eq!(
+            events.try_recv().unwrap().change,
+            PlaylistChange::Changed {
+                id: before.id,
+                revision: after
+            }
+        );
+    }
+
+    #[test]
+    fn a_removed_cover_gives_the_mosaic_back() {
+        let client = FakeClient::new(None);
+        let andrey = session_for(&client, "andrey");
+        let id = named(andrey.as_ref(), "Movie night").id;
+        ready(andrey.set_playlist_art(&id, PNG.to_vec())).unwrap();
+        let after = ready(andrey.remove_playlist_art(&id)).unwrap();
+        assert_eq!(
+            (
+                after.artwork.map(|a| a.key().starts_with("mosaic/")),
+                after.custom_art
+            ),
+            (Some(true), false)
+        );
+    }
+
+    #[test]
+    fn someone_who_only_reads_a_playlist_cannot_change_its_cover() {
+        let client = FakeClient::new(None);
+        let alice = session_for(&client, "alice");
+        let id = named(alice.as_ref(), "Andor: the heists").id;
+        assert_eq!(
+            ready(alice.set_playlist_art(&id, PNG.to_vec())),
+            Err(BackendError::NotAllowed)
+        );
+    }
+
+    #[test]
+    fn liked_keeps_its_own_tile() {
+        let client = FakeClient::new(None);
+        let andrey = session_for(&client, "andrey");
+        let liked = named(andrey.as_ref(), "Liked");
+        assert_eq!(
+            (
+                liked.artwork.as_ref().map(|a| a.key().to_owned()),
+                ready(andrey.set_playlist_art(&liked.id, PNG.to_vec()))
+            ),
+            (
+                Some("tile/liked/1".to_owned()),
+                Err(BackendError::NotAllowed)
+            )
+        );
+    }
+
+    #[test]
+    fn a_picture_past_the_limit_is_refused() {
+        let client = FakeClient::new(None);
+        let andrey = session_for(&client, "andrey");
+        let id = named(andrey.as_ref(), "Movie night").id;
+        let mut big = PNG.to_vec();
+        big.resize(MAX_ART_BYTES as usize + 1, 0);
+        assert!(matches!(
+            ready(andrey.set_playlist_art(&id, big)),
+            Err(BackendError::ImageTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn something_that_is_no_picture_is_refused() {
+        let client = FakeClient::new(None);
+        let andrey = session_for(&client, "andrey");
+        let id = named(andrey.as_ref(), "Movie night").id;
+        assert_eq!(
+            ready(andrey.set_playlist_art(&id, b"not a picture".to_vec())),
+            Err(BackendError::ImageUnreadable)
+        );
+    }
+
+    #[test]
+    fn without_the_feature_there_are_no_covers() {
+        let client = FakeClient::new(None).with_features(Features {
+            playlists: true,
+            ..Features::default()
+        });
+        let andrey = session_for(&client, "andrey");
+        let night = named(andrey.as_ref(), "Movie night");
+        assert_eq!(
+            (
+                night.artwork,
+                ready(andrey.set_playlist_art(&night.id, PNG.to_vec()))
+            ),
+            (
+                None,
+                Err(BackendError::Unsupported("spoolframe:playlist-art".into()))
+            )
+        );
+    }
+
+    #[test]
+    fn an_items_playlists_carry_their_covers() {
+        let client = FakeClient::new(None);
+        let andrey = session_for(&client, "andrey");
+        let id = named(andrey.as_ref(), "Movie night").id;
+        let cover = ready(andrey.set_playlist_art(&id, PNG.to_vec())).unwrap();
+        let alien = media(MediaKind::Movie, "1");
+        let refs = ready(andrey.item_detail(&alien)).unwrap().playlists;
+        let night = refs.into_iter().find(|r| r.id == id).unwrap();
+        assert_eq!(night.artwork, Some(cover));
     }
 }

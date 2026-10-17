@@ -1127,9 +1127,19 @@ pub fn show(
             }
             // A small teal list-music icon before the name tells a
             // playlist from a season.
+            // Its cover instead, where the server sends one (PX-53).
             ShowTab::Playlist(playlist) => {
                 let content = gtk::Box::builder().spacing(6).build();
-                content.append(&gtk::Image::from_icon_name(crate::icons::PLAYLISTS));
+                match (&playlist.artwork, &cards.art) {
+                    (Some(_), Some(art)) => content.append(&crate::playlists::picture(
+                        &playlist.id,
+                        playlist.builtin,
+                        playlist.artwork.as_ref(),
+                        Some(art),
+                        18,
+                    )),
+                    _ => content.append(&gtk::Image::from_icon_name(crate::icons::PLAYLISTS)),
+                }
                 content.append(&gtk::Label::new(Some(title)));
                 let tab = gtk::Button::builder()
                     .child(&content)

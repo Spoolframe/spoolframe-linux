@@ -207,6 +207,21 @@ pub enum BackendError {
     /// made on (PX-40); `revision` is the playlist's now. Nothing changed.
     #[error("Someone changed this playlist; reload.")]
     PlaylistConflict { revision: u64 },
+    /// Not the user's to do (PX-53): a playlist's cover changed by
+    /// someone who may not edit it, or on Liked or All. Nothing changed.
+    #[error("You can’t do that.")]
+    NotAllowed,
+    /// A picture past the server's limits (PX-53): over `max_bytes`, or
+    /// over `max_pixels` by its header. Nothing changed.
+    #[error(
+        "That picture is too large: at most {} MB and {} megapixels.",
+        .max_bytes / (1 << 20),
+        .max_pixels / 1_000_000
+    )]
+    ImageTooLarge { max_bytes: u64, max_pixels: u64 },
+    /// Not a JPEG, PNG, WebP or HEIC the server can read (PX-53).
+    #[error("That picture can’t be read. Choose a JPEG, PNG, WebP or HEIC.")]
+    ImageUnreadable,
     #[error("{0}")]
     Other(String),
 }
@@ -426,6 +441,9 @@ pub use spoolframe_protocol::playlists::{
     PlaylistEntry, PlaylistNext, PlaylistOwnerKind, PlaylistPage, PlaylistRef, PlaylistShare,
     PlaylistSummary, Repeat, ShareCandidate, ShareCandidatePage, UserKind, Visibility,
 };
+/// The most a playlist's cover may be (PX-53): bytes, and pixels by its
+/// header.
+pub use spoolframe_protocol::playlists::{MAX_ART_BYTES, MAX_ART_PIXELS};
 
 /// An item, what is under it, and the playlists the user sees that hold
 /// it (PX-40): all of one read.
@@ -1327,6 +1345,28 @@ pub trait Session: Send + Sync {
     ) -> BoxFuture<'a, Result<u64, BackendError>>;
 
     fn delete_playlist<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), BackendError>>;
+
+    /// Gives playlist `id` the picture in `bytes` as its cover (PX-53): a
+    /// JPEG, PNG, WebP or HEIC of at most [`MAX_ART_BYTES`] and
+    /// [`MAX_ART_PIXELS`]. Its new `artwork`. Whoever may edit its entries
+    /// may ([`BackendError::NotAllowed`] for anyone else, and on Liked and
+    /// All); past the limits [`BackendError::ImageTooLarge`], a picture
+    /// the server cannot read [`BackendError::ImageUnreadable`]. Without
+    /// [`Session::has_playlist_art`], [`BackendError::Unsupported`],
+    /// unsent.
+    fn set_playlist_art<'a>(
+        &'a self,
+        id: &'a str,
+        bytes: Vec<u8>,
+    ) -> BoxFuture<'a, Result<ArtworkId, BackendError>>;
+
+    /// Takes playlist `id`'s uploaded cover away (PX-53): the playlist
+    /// after, its `artwork` the mosaic again. Who may is as for
+    /// [`Session::set_playlist_art`].
+    fn remove_playlist_art<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> BoxFuture<'a, Result<PlaylistSummary, BackendError>>;
 
     /// Pins a playlist at `position` in the user's Pinned (0 first), or
     /// moves it there.

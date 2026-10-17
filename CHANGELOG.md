@@ -7,6 +7,14 @@
   them shows nothing new. On an item's page, a playlist shared with you
   says whose it is ("Alice’s"), as its card does, where the server names
   the owner.
+- Playlist covers, on a server that has them: the server's picture (a
+  cover someone chose, its mosaic, Liked's and All's tiles) shows on the
+  Playlists cards, Pinned in the sidebar, a playlist's page, the
+  playlist rows and tabs on item and show pages, and Add to playlist.
+  In the editor, whoever may edit a playlist chooses a picture (JPEG,
+  PNG, WebP or HEIC, up to 20 MB) through the desktop's file chooser, or
+  removes the one chosen; a picture past the limits is refused before it
+  is sent.
 - Scrub-preview frames are kept in memory only, not in the artwork cache
   on disk.
 - Home, the libraries, library pages, item pages and playlists show at

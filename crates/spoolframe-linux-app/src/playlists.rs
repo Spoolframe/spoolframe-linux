@@ -10,12 +10,12 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use spoolframe_linux_core::backend::{
-    ArtworkSize, Builtin, EntryId, Kinds, PlaySettings, PlaylistEdit, PlaylistEntry,
-    PlaylistOwnerKind, PlaylistPage, PlaylistRef, PlaylistSummary, PlaylistUpdate, Repeat,
-    Visibility,
+    ArtworkSize, BackendError, Builtin, EntryId, Kinds, MAX_ART_BYTES, MAX_ART_PIXELS,
+    PlaySettings, PlaylistEdit, PlaylistEntry, PlaylistOwnerKind, PlaylistPage, PlaylistRef,
+    PlaylistSummary, PlaylistUpdate, Repeat, Visibility,
 };
 use spoolframe_linux_core::playlists::{self, Offer};
-use spoolframe_types::{ArtworkKind, Item, MediaKind};
+use spoolframe_types::{ArtworkId, ArtworkKind, Item, MediaKind};
 
 use crate::views::{self, Cards, Facts};
 
@@ -62,9 +62,47 @@ pub fn mosaic(id: &str, size: i32) -> gtk::Widget {
     grid.upcast()
 }
 
-/// A playlist's picture: Liked's heart and All's tile (PX-43, board
+/// The size to ask the server for a playlist's picture `size` px wide:
+/// twice that, for a HiDPI screen.
+pub fn picture_size(size: i32) -> ArtworkSize {
+    match size {
+        ..=80 => ArtworkSize::Thumb,
+        81..=160 => ArtworkSize::Small,
+        _ => ArtworkSize::Medium,
+    }
+}
+
+/// A playlist's picture: the server's (PX-53: its cover, its mosaic, or
+/// Liked's and All's tiles) where it sends one, drawn over the app's own
+/// once it loads, so a picture that fails leaves the app's in place.
+/// The app's own is Liked's heart and All's tile (PX-43, board
 /// LinuxPlaylists), or for any other its [`mosaic`].
-pub fn picture(id: &str, builtin: Option<Builtin>, size: i32) -> gtk::Widget {
+pub fn picture(
+    id: &str,
+    builtin: Option<Builtin>,
+    artwork: Option<&ArtworkId>,
+    art: Option<&Rc<crate::artwork::Art>>,
+    size: i32,
+) -> gtk::Widget {
+    let own = own_picture(id, builtin, size);
+    let (Some(artwork), Some(art)) = (artwork, art) else {
+        return own;
+    };
+    let tile = gtk::Overlay::builder()
+        .child(&own)
+        .halign(gtk::Align::Start)
+        .valign(gtk::Align::Center)
+        .overflow(gtk::Overflow::Hidden)
+        .css_classes(["mosaic"])
+        .build();
+    if size < 40 {
+        tile.add_css_class("small");
+    }
+    art.show_id(&tile, artwork, picture_size(size));
+    tile.upcast()
+}
+
+fn own_picture(id: &str, builtin: Option<Builtin>, size: i32) -> gtk::Widget {
     let (icon, class) = match builtin {
         None => return mosaic(id, size),
         Some(Builtin::Liked) => (crate::icons::HEART_FULL, "builtin-liked"),
@@ -128,7 +166,11 @@ pub struct RefActions {
 /// An item page's Playlists (board LinuxPlaylistRows): a row per
 /// playlist, its mosaic, name and whose it is. A show's are tabs after its
 /// seasons instead (the pages' `show`).
-pub fn refs_section(refs: &[PlaylistRef], actions: &RefActions) -> gtk::Widget {
+pub fn refs_section(
+    refs: &[PlaylistRef],
+    actions: &RefActions,
+    art: Option<&Rc<crate::artwork::Art>>,
+) -> gtk::Widget {
     let section = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(8)
@@ -147,7 +189,13 @@ pub fn refs_section(refs: &[PlaylistRef], actions: &RefActions) -> gtk::Widget {
             .build();
         row.set_title(&playlist.name);
         row.set_subtitle(&ref_subtitle(playlist));
-        row.add_prefix(&picture(&playlist.id, playlist.builtin, 36));
+        row.add_prefix(&picture(
+            &playlist.id,
+            playlist.builtin,
+            playlist.artwork.as_ref(),
+            art,
+            36,
+        ));
         let (open, id) = (actions.open.clone(), playlist.id.clone());
         row.connect_activated(move |_| open(id.clone()));
         let (play, id) = (actions.play.clone(), playlist.id.clone());
@@ -175,7 +223,11 @@ pub struct ListActions {
 /// The Playlists section: Music (Liked and All, PX-43), My playlists,
 /// Shared with me and Server-wide, each a row of cards; a group with none
 /// is left out.
-pub fn section(list: &[PlaylistSummary], actions: &Rc<ListActions>) -> Vec<gtk::Box> {
+pub fn section(
+    list: &[PlaylistSummary],
+    actions: &Rc<ListActions>,
+    art: Option<&Rc<crate::artwork::Art>>,
+) -> Vec<gtk::Box> {
     let groups = playlists::sections(list);
     let rows: Vec<gtk::Box> = [
         ("Music", groups.builtin),
@@ -185,7 +237,7 @@ pub fn section(list: &[PlaylistSummary], actions: &Rc<ListActions>) -> Vec<gtk::
     ]
     .into_iter()
     .filter(|(_, group)| !group.is_empty())
-    .map(|(title, group)| views::row(title, group.into_iter().map(|p| card(p, actions))))
+    .map(|(title, group)| views::row(title, group.into_iter().map(|p| card(p, actions, art))))
     .collect();
     if !rows.is_empty() {
         return rows;
@@ -204,9 +256,19 @@ pub fn section(list: &[PlaylistSummary], actions: &Rc<ListActions>) -> Vec<gtk::
 
 /// A playlist's card: its mosaic, name, and whose it is; right-click for
 /// Play, Shuffle and its pin.
-fn card(playlist: &PlaylistSummary, actions: &Rc<ListActions>) -> gtk::Widget {
+fn card(
+    playlist: &PlaylistSummary,
+    actions: &Rc<ListActions>,
+    art: Option<&Rc<crate::artwork::Art>>,
+) -> gtk::Widget {
     let body = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    body.append(&picture(&playlist.id, playlist.builtin, CARD));
+    body.append(&picture(
+        &playlist.id,
+        playlist.builtin,
+        playlist.artwork.as_ref(),
+        art,
+        CARD,
+    ));
     let caption = gtk::Box::new(gtk::Orientation::Vertical, 2);
     caption.append(&views::caption_label(&playlist.name, &["heading"]));
     caption.append(&views::caption_label(
@@ -333,6 +395,50 @@ pub struct PageActions {
     /// Whom it can be shared with, for the editor's Add someone; none
     /// where the server does not share by name.
     pub people: Option<crate::share_picker::People>,
+    /// Its cover (PX-53); none where the server has no covers.
+    pub cover: Option<CoverActions>,
+}
+
+/// What the editor's Cover does.
+pub struct CoverActions {
+    /// Opens the file chooser for a picture, and uploads it.
+    pub choose: Rc<dyn Fn()>,
+    /// Takes the uploaded cover away.
+    pub remove: Rc<dyn Fn()>,
+}
+
+/// Whether the editor offers to change `playlist`'s cover: to whoever may
+/// edit its entries, as the server allows, and never on Liked or All.
+pub fn cover_editable(playlist: &PlaylistSummary) -> bool {
+    playlist.can_edit && playlist.builtin.is_none()
+}
+
+/// `bytes` refused before they are sent, where the app can tell they are
+/// past the server's limits (PX-53): too many bytes, or too many pixels
+/// by the header. A header the app cannot read (HEIC) is the server's to
+/// judge.
+pub fn cover_check(bytes: &[u8]) -> Result<(), BackendError> {
+    let too_large = BackendError::ImageTooLarge {
+        max_bytes: MAX_ART_BYTES,
+        max_pixels: MAX_ART_PIXELS,
+    };
+    if bytes.len() as u64 > MAX_ART_BYTES {
+        return Err(too_large);
+    }
+    match crate::artwork::image_size(bytes) {
+        Some((width, height)) if width.saturating_mul(height) > MAX_ART_PIXELS => Err(too_large),
+        _ => Ok(()),
+    }
+}
+
+/// What the app says when a cover change is refused.
+pub fn cover_refusal(error: &BackendError) -> String {
+    match error {
+        BackendError::NotAllowed => {
+            "Only someone who can edit this playlist can change its cover.".to_owned()
+        }
+        other => other.to_string(),
+    }
 }
 
 /// How a playlist's page shows.
@@ -393,7 +499,7 @@ impl PlaylistView {
         let settings = Rc::new(Cell::new(page.settings));
         let (pin, editing) = match mode {
             Mode::View => {
-                let (header, pin) = header(page, &actions, &settings);
+                let (header, pin) = header(page, &actions, &settings, cards.art.as_ref());
                 widget.append(&header);
                 (pin, None)
             }
@@ -407,8 +513,22 @@ impl PlaylistView {
                     &actions,
                     side.as_ref().map(|(_, name)| name),
                 ));
-                if let Some((side, _)) = side {
-                    columns.append(&side);
+                // The cover first, for whoever may edit the entries too.
+                let cover = actions
+                    .cover
+                    .as_ref()
+                    .filter(|_| cover_editable(&page.playlist))
+                    .map(|cover| {
+                        crate::playlist_edit::cover(&page.playlist, cover, cards.art.as_ref())
+                    });
+                match (cover, side) {
+                    (Some(cover), Some((side, _))) => {
+                        side.prepend(&cover);
+                        columns.append(&side);
+                    }
+                    (Some(cover), None) => columns.append(&cover),
+                    (None, Some((side, _))) => columns.append(&side),
+                    (None, None) => {}
                 }
                 // Not shown: the pin is the page's, not the editor's.
                 let pin = gtk::ToggleButton::new();
@@ -544,9 +664,16 @@ fn header(
     page: &PlaylistPage,
     actions: &PageActions,
     settings: &Rc<Cell<PlaySettings>>,
+    art: Option<&Rc<crate::artwork::Art>>,
 ) -> (gtk::Box, gtk::ToggleButton) {
     let header = gtk::Box::builder().spacing(28).build();
-    header.append(&picture(&page.playlist.id, page.playlist.builtin, HEADER));
+    header.append(&picture(
+        &page.playlist.id,
+        page.playlist.builtin,
+        page.playlist.artwork.as_ref(),
+        art,
+        HEADER,
+    ));
     let column = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(8)
@@ -774,6 +901,8 @@ pub struct AddRow {
     pub id: String,
     pub name: String,
     pub builtin: Option<Builtin>,
+    /// The server's picture of it (PX-53), if it sends one.
+    pub artwork: Option<ArtworkId>,
     /// What it holds and whose it is; for a greyed one, why it is.
     pub line: String,
     /// One click adds; otherwise greyed.
@@ -789,6 +918,7 @@ pub fn add_rows(list: &[PlaylistSummary], kind: MediaKind) -> Vec<AddRow> {
             id: playlist.id.clone(),
             name: playlist.name.clone(),
             builtin: playlist.builtin,
+            artwork: playlist.artwork.clone(),
             line: offer.reason().map(str::to_owned).unwrap_or_else(|| {
                 format!(
                     "{} · {}",
@@ -829,6 +959,7 @@ pub fn add_dialog(
     rows: Vec<AddRow>,
     add: Rc<dyn Fn(String, String)>,
     new: Rc<dyn Fn()>,
+    art: Option<&Rc<crate::artwork::Art>>,
 ) {
     let title = format!("Add {} to a playlist", playlists::title(item));
     let dialog = adw::Dialog::builder()
@@ -854,7 +985,13 @@ pub fn add_dialog(
                 .build();
             line.set_title(&row.name);
             line.set_subtitle(&row.line);
-            line.add_prefix(&picture(&row.id, row.builtin, 32));
+            line.add_prefix(&picture(
+                &row.id,
+                row.builtin,
+                row.artwork.as_ref(),
+                art,
+                32,
+            ));
             let (add, closing) = (add.clone(), dialog.downgrade());
             line.connect_activated(move |_| {
                 if let Some(dialog) = closing.upgrade() {
@@ -1077,23 +1214,102 @@ mod tests {
         );
     }
 
+    /// A PNG's signature and IHDR saying it is `width` × `height`.
+    fn png_header(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+        bytes.extend(width.to_be_bytes());
+        bytes.extend(height.to_be_bytes());
+        bytes.extend([8, 6, 0, 0, 0]);
+        bytes
+    }
+
+    #[test]
+    fn a_picture_within_the_limits_is_sent() {
+        assert_eq!(cover_check(&png_header(3000, 3000)), Ok(()));
+    }
+
+    #[test]
+    fn a_picture_with_too_many_pixels_is_refused_unsent() {
+        // 8000 × 6000 is 48 megapixels, past the server's 40.
+        assert!(matches!(
+            cover_check(&png_header(8000, 6000)),
+            Err(BackendError::ImageTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn a_picture_with_too_many_bytes_is_refused_unsent() {
+        let mut big = png_header(100, 100);
+        big.resize(MAX_ART_BYTES as usize + 1, 0);
+        assert!(matches!(
+            cover_check(&big),
+            Err(BackendError::ImageTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn a_header_the_app_cannot_read_is_left_to_the_server() {
+        assert_eq!(cover_check(b"\0\0\0\x18ftypheic"), Ok(()));
+    }
+
+    #[test]
+    fn a_cover_refused_to_a_reader_says_who_may() {
+        assert_eq!(
+            cover_refusal(&BackendError::NotAllowed),
+            "Only someone who can edit this playlist can change its cover."
+        );
+    }
+
+    #[test]
+    fn whoever_edits_the_entries_may_change_the_cover() {
+        let client = FakeClient::new(None);
+        let alice = client.session(&FakeClient::profile("alice")).unwrap();
+        ready(alice.unlock(spoolframe_linux_core::fake::FAKE_PIN)).unwrap();
+        let editable: Vec<(String, bool)> = ready(alice.playlists())
+            .unwrap()
+            .playlists
+            .iter()
+            .map(|p| (p.name.clone(), cover_editable(p)))
+            .collect();
+        assert_eq!(
+            editable,
+            [
+                ("Liked".to_owned(), false),
+                ("All".to_owned(), false),
+                ("Andor: the heists".to_owned(), false),
+                ("Road trip".to_owned(), true),
+                ("New this month".to_owned(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_small_picture_asks_for_a_small_size() {
+        assert_eq!(
+            [22, 72, 150, 196].map(picture_size),
+            [
+                ArtworkSize::Thumb,
+                ArtworkSize::Thumb,
+                ArtworkSize::Small,
+                ArtworkSize::Medium
+            ]
+        );
+    }
+
     #[test]
     fn a_greyed_playlist_says_why() {
         let client = FakeClient::new(None);
         let alice = client.session(&FakeClient::profile("alice")).unwrap();
         ready(alice.unlock(spoolframe_linux_core::fake::FAKE_PIN)).unwrap();
         let list = ready(alice.playlists()).unwrap().playlists;
+        let month = list.iter().find(|p| p.name == "New this month").unwrap();
         assert_eq!(
             add_rows(&list, MediaKind::Movie),
             [AddRow {
-                id: list
-                    .iter()
-                    .find(|p| p.name == "New this month")
-                    .unwrap()
-                    .id
-                    .clone(),
+                id: month.id.clone(),
                 name: "New this month".into(),
                 builtin: None,
+                artwork: month.artwork.clone(),
                 line: "Server-wide · admins edit".into(),
                 adds: false,
             }]

@@ -925,6 +925,21 @@ impl Session for CachedSession {
         self.changing(move || self.inner.delete_playlist(id))
     }
 
+    fn set_playlist_art<'a>(
+        &'a self,
+        id: &'a str,
+        bytes: Vec<u8>,
+    ) -> BoxFuture<'a, Result<ArtworkId, BackendError>> {
+        self.changing(move || self.inner.set_playlist_art(id, bytes))
+    }
+
+    fn remove_playlist_art<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> BoxFuture<'a, Result<PlaylistSummary, BackendError>> {
+        self.changing(move || self.inner.remove_playlist_art(id))
+    }
+
     fn pin_playlist<'a>(
         &'a self,
         id: &'a str,
@@ -1540,6 +1555,25 @@ mod tests {
             }),
             0
         );
+    }
+
+    /// A small PNG's first bytes: enough for the fake's check.
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
+
+    #[test]
+    fn setting_a_cover_clears_the_session() {
+        let kept = kept_after_playlist_change(|s, id| {
+            ready(s.set_playlist_art(id, PNG.to_vec())).unwrap();
+        });
+        assert_eq!(kept, 0);
+    }
+
+    #[test]
+    fn removing_a_cover_clears_the_session() {
+        let kept = kept_after_playlist_change(|s, id| {
+            ready(s.remove_playlist_art(id)).unwrap();
+        });
+        assert_eq!(kept, 0);
     }
 
     #[test]

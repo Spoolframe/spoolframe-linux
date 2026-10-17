@@ -78,6 +78,20 @@ impl Art {
         });
     }
 
+    /// Draws the artwork `id` names over `tile`, once it loads: a
+    /// playlist's cover (PX-53), which is not one of an item's kinds.
+    pub fn show_id(self: &Rc<Self>, tile: &gtk::Overlay, id: &ArtworkId, size: ArtworkSize) {
+        let (session, server, cache, id) = (
+            self.session.clone(),
+            self.server.clone(),
+            self.cache.clone(),
+            id.clone(),
+        );
+        load(tile, async move {
+            fetch(session, server, cache, id, size).await
+        });
+    }
+
     /// The first of `kinds` the item has, as image bytes with the
     /// artwork's id; `None` when it has none or the fetch fails. For uses
     /// other than a tile, such as the cover MPRIS points to.

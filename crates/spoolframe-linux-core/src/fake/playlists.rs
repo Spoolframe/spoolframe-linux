@@ -11,7 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use spoolframe_types::{Item, MediaId};
+use spoolframe_types::{ArtworkId, Item, MediaId};
 use tokio::sync::broadcast;
 
 use crate::backend::{
@@ -20,6 +20,38 @@ use crate::backend::{
     PlaylistRef, PlaylistShare, PlaylistSummary, PlaylistUpdate, Repeat, ShareCandidate,
     ShareCandidatePage, Visibility,
 };
+
+pub use spoolframe_protocol::playlists::{MAX_ART_BYTES, MAX_ART_PIXELS};
+
+/// A playlist's picture as the server names it (PX-53): its uploaded
+/// cover, Liked's and All's tiles, a placeholder while it holds nothing,
+/// and else a mosaic of its first covers, named by what it holds so it
+/// changes with them.
+fn art_of(stored: &Stored) -> ArtworkId {
+    let key = match (&stored.cover, stored.builtin) {
+        (Some(cover), _) => format!("playlist/{cover}"),
+        (None, Some(Builtin::Liked)) => "tile/liked/1".to_owned(),
+        (None, Some(_)) => "tile/all/1".to_owned(),
+        (None, None) if stored.entries.is_empty() => "tile/empty/1".to_owned(),
+        (None, None) => {
+            let mut hasher = std::hash::DefaultHasher::new();
+            for (_, item) in stored.entries.iter().take(4) {
+                std::hash::Hash::hash(&item.to_string(), &mut hasher);
+            }
+            format!("mosaic/{:016x}", std::hash::Hasher::finish(&hasher))
+        }
+    };
+    ArtworkId::new(spoolframe_types::Namespace::Image, &key).expect("a valid key")
+}
+
+/// Whether `bytes` start as a JPEG, PNG, WebP or HEIC does: the fake's
+/// stand-in for the server's decode.
+fn looks_like_an_image(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0xff, 0xd8, 0xff])
+        || bytes.starts_with(b"\x89PNG")
+        || (bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP")
+        || (bytes.len() >= 12 && &bytes[4..8] == b"ftyp")
+}
 
 /// The most share candidates one page gives, as on the server.
 pub const PEOPLE_LIMIT: u32 = 200;
@@ -45,6 +77,9 @@ pub(super) struct Stored {
     pub touched: Vec<(u64, Vec<EntryId>)>,
     /// Liked or All (PX-43), its owner's alone; `None` for one a user made.
     pub builtin: Option<Builtin>,
+    /// The cover an editor uploaded (PX-53), by its key: what its
+    /// `image:playlist/<key>` names.
+    pub cover: Option<String>,
 }
 
 /// Who a user is to the fake server.
@@ -295,6 +330,7 @@ impl Store {
             entries: Vec::new(),
             touched: Vec::new(),
             builtin: None,
+            cover: None,
         });
         id
     }
@@ -355,6 +391,10 @@ impl Store {
             .get(viewer.username)
             .and_then(|pins| pins.iter().position(|p| p == &stored.id))
             .map(|at| at as u32);
+        let (artwork, custom_art) = match self.features.playlist_art {
+            true => (Some(art_of(stored)), stored.cover.is_some()),
+            false => (None, false),
+        };
         Some(PlaylistSummary {
             id: stored.id.clone(),
             name: stored.name.clone(),
@@ -367,8 +407,8 @@ impl Store {
             pinned,
             builtin: stored.builtin,
             owner_name,
-            artwork: None,
-            custom_art: false,
+            artwork,
+            custom_art,
         })
     }
 
@@ -518,6 +558,75 @@ impl Store {
             revision: stored.revision,
         });
         Ok(summary)
+    }
+
+    /// Gives playlist `id` the picture `bytes` as its cover (PX-53), as
+    /// the server does: whoever may edit its entries may, never on Liked
+    /// or All; at most [`MAX_ART_BYTES`], and an image by its header.
+    /// Its revision goes up, and everyone who sees it is told.
+    pub fn set_art(
+        &mut self,
+        id: &str,
+        bytes: &[u8],
+        viewer: Viewer<'_>,
+    ) -> Result<ArtworkId, BackendError> {
+        self.editable_art(id, viewer)?;
+        if bytes.len() as u64 > MAX_ART_BYTES {
+            return Err(BackendError::ImageTooLarge {
+                max_bytes: MAX_ART_BYTES,
+                max_pixels: MAX_ART_PIXELS,
+            });
+        }
+        if !looks_like_an_image(bytes) {
+            return Err(BackendError::ImageUnreadable);
+        }
+        let mut hasher = std::hash::DefaultHasher::new();
+        std::hash::Hash::hash(bytes, &mut hasher);
+        let stored = self.stored_mut(id).expect("seen");
+        stored.cover = Some(format!("{:016x}", std::hash::Hasher::finish(&hasher)));
+        let artwork = art_of(stored);
+        self.changed(id);
+        Ok(artwork)
+    }
+
+    /// Takes playlist `id`'s uploaded cover away (PX-53): its mosaic
+    /// again. Who may is as for [`Store::set_art`].
+    pub fn remove_art(
+        &mut self,
+        id: &str,
+        viewer: Viewer<'_>,
+    ) -> Result<PlaylistSummary, BackendError> {
+        self.editable_art(id, viewer)?;
+        self.stored_mut(id).expect("seen").cover = None;
+        self.changed(id);
+        Ok(self.seen(id, viewer)?.0)
+    }
+
+    /// Refuses a cover change without the feature, unsent; on a playlist
+    /// `viewer` does not see; or from anyone who may not edit it, and on
+    /// Liked and All, `NotAllowed`.
+    fn editable_art(&self, id: &str, viewer: Viewer<'_>) -> Result<(), BackendError> {
+        if !self.features.playlist_art {
+            return Err(BackendError::Unsupported(
+                spoolframe_protocol::features::PLAYLIST_ART.into(),
+            ));
+        }
+        let (summary, stored) = self.seen(id, viewer)?;
+        if !summary.can_edit || stored.builtin.is_some() {
+            return Err(BackendError::NotAllowed);
+        }
+        Ok(())
+    }
+
+    /// Playlist `id` changed: a new revision, told to everyone.
+    fn changed(&mut self, id: &str) {
+        let stored = self.stored_mut(id).expect("seen");
+        stored.revision += 1;
+        let revision = stored.revision;
+        self.tell(PlaylistChange::Changed {
+            id: id.to_owned(),
+            revision,
+        });
     }
 
     pub fn update(

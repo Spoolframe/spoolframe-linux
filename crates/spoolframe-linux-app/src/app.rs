@@ -403,6 +403,14 @@ pub enum Msg {
     EditEntries(String, u64, Vec<PlaylistEdit>),
     UpdatePlaylist(String, PlaylistUpdate),
     DeletePlaylist(String),
+    /// The editor's Choose a picture… (PX-53): the file chooser for
+    /// playlist `id`'s cover.
+    ChooseCover(String),
+    /// A picture picked for playlist `id`'s cover, to upload.
+    SetCover(String, Vec<u8>),
+    RemoveCover(String),
+    /// A line to show in a toast, from work done off the update.
+    Toast(String),
     PlaylistChanged(Box<PlaylistEvent>),
     /// A kept catalog read came back different from what was shown.
     CatalogChanged(Box<catalog::Change>),
@@ -612,6 +620,8 @@ pub enum Loaded {
     /// A playlist's entries changed: its new revision.
     PlaylistEdited(String, Result<u64, BackendError>),
     PlaylistUpdated(String, Result<PlaylistSummary, BackendError>),
+    /// A playlist's cover set or taken away (PX-53).
+    CoverChanged(String, Result<(), BackendError>),
     /// A playlist deleted, by name.
     PlaylistDeleted(String, Result<(), BackendError>),
     PinChanged(Result<(), BackendError>),
@@ -678,6 +688,7 @@ impl Loaded {
             | Loaded::Added(_, _, _, Err(e))
             | Loaded::PlaylistEdited(_, Err(e))
             | Loaded::PlaylistUpdated(_, Err(e))
+            | Loaded::CoverChanged(_, Err(e))
             | Loaded::PlaylistDeleted(_, Err(e))
             | Loaded::PinChanged(Err(e))
             | Loaded::PlaylistStarted(_, _, Err(e)) => Some(e),
@@ -739,6 +750,7 @@ impl Component for App {
             &[],
             &[],
             &pinned_actions,
+            None,
         );
         // Who is watching, at the foot of the sidebar; it switches profile.
         let profile_avatar = adw::Avatar::new(34, None, true);
@@ -1841,6 +1853,43 @@ impl Component for App {
                 self.command(&sender, async move {
                     let done = session.update_playlist(&id, update).await;
                     Loaded::PlaylistUpdated(id, done)
+                });
+            }
+            Msg::ChooseCover(id) => {
+                let sender = sender.clone();
+                glib::spawn_future_local(async move {
+                    let opened = gtk::gio::spawn_blocking(|| {
+                        crate::file_helper::open_image("Choose a cover")
+                    })
+                    .await
+                    .unwrap_or_else(|_| Err("the open stopped".to_owned()));
+                    match opened {
+                        Ok(Some(file)) => sender.input(Msg::SetCover(id, file.bytes)),
+                        Ok(None) => {}
+                        Err(e) => sender.input(Msg::Toast(sentence(&e))),
+                    }
+                });
+            }
+            Msg::Toast(text) => toast_text(widgets, &text),
+            Msg::SetCover(id, bytes) => {
+                let Some(session) = self.playlist_session() else {
+                    return;
+                };
+                if let Err(e) = playlists::cover_check(&bytes) {
+                    return toast_text(widgets, &playlists::cover_refusal(&e));
+                }
+                self.command(&sender, async move {
+                    let done = session.set_playlist_art(&id, bytes).await.map(|_| ());
+                    Loaded::CoverChanged(id, done)
+                });
+            }
+            Msg::RemoveCover(id) => {
+                let Some(session) = self.playlist_session() else {
+                    return;
+                };
+                self.command(&sender, async move {
+                    let done = session.remove_playlist_art(&id).await.map(|_| ());
+                    Loaded::CoverChanged(id, done)
                 });
             }
             Msg::DeletePlaylist(id) => {
@@ -2989,6 +3038,15 @@ impl Component for App {
                     self.reload_playlist(id, &sender);
                 }
             }
+            Loaded::CoverChanged(id, done) => {
+                if let Err(e) = done {
+                    toast_text(widgets, &playlists::cover_refusal(&e));
+                }
+                self.load_playlists(&sender);
+                if self.shown_playlist_id(widgets).as_ref() == Some(&id) {
+                    self.reload_playlist(id, &sender);
+                }
+            }
             Loaded::PlaylistDeleted(name, done) => {
                 match done {
                     Ok(()) if !name.is_empty() => toast_text(widgets, &format!("Deleted {name}")),
@@ -3366,6 +3424,7 @@ impl App {
             &self.libraries,
             listed.unwrap_or_default(),
             &self.pinned_actions,
+            self.cards.art.as_ref(),
         );
     }
 
@@ -3397,7 +3456,11 @@ impl App {
                 Rc::new(move |id, pin| sender.input(Msg::PinPlaylist(id, pin)))
             },
         });
-        show(widgets, "Playlists", playlists::section(list, &actions));
+        show(
+            widgets,
+            "Playlists",
+            playlists::section(list, &actions, self.cards.art.as_ref()),
+        );
     }
 
     /// An item page's Playlists: those holding it, if any and the server
@@ -3423,6 +3486,7 @@ impl App {
         Some(playlists::refs_section(
             refs,
             &playlists::RefActions { open, play },
+            self.cards.art.as_ref(),
         ))
     }
 
@@ -3461,7 +3525,7 @@ impl App {
             let (sender, item) = (sender.clone(), item.clone());
             Rc::new(move || sender.input(Msg::NewPlaylist(Some(Box::new(item.clone())))))
         };
-        playlists::add_dialog(root, &item, rows, add, new);
+        playlists::add_dialog(root, &item, rows, add, new, self.cards.art.as_ref());
     }
 
     /// Loads a playlist's first page, then pushes its page in `place`.
@@ -4525,6 +4589,19 @@ fn playlist_actions(
             let (sender, id) = (sender.clone(), id.to_owned());
             Rc::new(move || sender.input(Msg::DeletePlaylist(id.clone())))
         },
+        // Only where the server has covers (PX-53).
+        cover: session
+            .filter(|s| s.has_playlist_art())
+            .map(|_| playlists::CoverActions {
+                choose: {
+                    let (sender, id) = (sender.clone(), id.to_owned());
+                    Rc::new(move || sender.input(Msg::ChooseCover(id.clone())))
+                },
+                remove: {
+                    let (sender, id) = (sender.clone(), id.to_owned());
+                    Rc::new(move || sender.input(Msg::RemoveCover(id.clone())))
+                },
+            }),
     }
 }
 

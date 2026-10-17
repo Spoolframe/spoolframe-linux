@@ -175,6 +175,15 @@ pub fn backend_error(error: sdk::SdkError) -> BackendError {
         E::PlaylistReadOnly => BackendError::PlaylistReadOnly,
         E::KindNotAllowed { kind } => BackendError::KindNotAllowed(kind),
         E::PlaylistConflict { revision } => BackendError::PlaylistConflict { revision },
+        E::NotAllowed => BackendError::NotAllowed,
+        E::ImageTooLarge {
+            max_bytes,
+            max_pixels,
+        } => BackendError::ImageTooLarge {
+            max_bytes,
+            max_pixels,
+        },
+        E::ImageUnreadable => BackendError::ImageUnreadable,
         E::UnknownServer(id) => BackendError::NotFound(id),
         E::UnknownIdentity(_) | E::Credential(_) | E::NotThisDevice | E::DeviceKeyRevoked => {
             BackendError::NotPaired
@@ -1505,6 +1514,23 @@ impl Session for SdkSession {
         Box::pin(self.call(move |s| async move { s.delete_playlist(&id).await }))
     }
 
+    fn set_playlist_art<'a>(
+        &'a self,
+        id: &'a str,
+        bytes: Vec<u8>,
+    ) -> BoxFuture<'a, Result<ArtworkId, BackendError>> {
+        let id = id.to_owned();
+        Box::pin(self.call(move |s| async move { s.set_playlist_art(&id, bytes).await }))
+    }
+
+    fn remove_playlist_art<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> BoxFuture<'a, Result<PlaylistSummary, BackendError>> {
+        let id = id.to_owned();
+        Box::pin(self.call(move |s| async move { s.remove_playlist_art(&id).await }))
+    }
+
     fn pin_playlist<'a>(
         &'a self,
         id: &'a str,
@@ -1854,6 +1880,41 @@ mod tests {
                 BackendError::KindNotAllowed(ItemKind::Movie),
                 BackendError::PlaylistConflict { revision: 9 },
             ]
+        );
+    }
+
+    #[test]
+    fn cover_refusals_keep_their_kind() {
+        assert_eq!(
+            [
+                sdk::SdkError::NotAllowed,
+                sdk::SdkError::ImageTooLarge {
+                    max_bytes: 20 << 20,
+                    max_pixels: 40_000_000,
+                },
+                sdk::SdkError::ImageUnreadable,
+            ]
+            .map(backend_error),
+            [
+                BackendError::NotAllowed,
+                BackendError::ImageTooLarge {
+                    max_bytes: 20 << 20,
+                    max_pixels: 40_000_000,
+                },
+                BackendError::ImageUnreadable,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_picture_too_large_says_the_limits_in_mb_and_megapixels() {
+        let refused = BackendError::ImageTooLarge {
+            max_bytes: 20 << 20,
+            max_pixels: 40_000_000,
+        };
+        assert_eq!(
+            refused.to_string(),
+            "That picture is too large: at most 20 MB and 40 megapixels."
         );
     }
 

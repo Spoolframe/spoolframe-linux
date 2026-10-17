@@ -1,4 +1,5 @@
-//! Saving and opening a file the person picks (P7-08's identity record),
+//! Saving and opening a file the person picks (P7-08's identity record,
+//! and PX-53's playlist cover, a picture opened only),
 //! through a helper the app forks before it confines itself. Landlock
 //! keeps the app out of the home directory, so a file chosen in GTK's
 //! own chooser could be neither written nor read. The helper is not
@@ -68,6 +69,45 @@ enum Request {
         title: String,
         filter: Filter,
     },
+    /// A picture for a playlist's cover (PX-53): the helper offers and
+    /// opens only JPEG, PNG, WebP and HEIC files, and reads at most
+    /// [`MAX_IMAGE`] of one.
+    OpenImage {
+        title: String,
+    },
+}
+
+/// The most a picture opened here may be: what the server takes for a
+/// cover.
+pub const MAX_IMAGE: u64 = spoolframe_linux_core::backend::MAX_ART_BYTES;
+
+/// The pictures the helper opens, by extension, lower case.
+const IMAGE_EXTENSIONS: [&str; 6] = ["jpg", "jpeg", "png", "webp", "heic", "heif"];
+
+/// Whether a file named `name` is a picture the helper opens, by its
+/// extension in any case.
+pub fn is_image(name: &str) -> bool {
+    std::path::Path::new(name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| IMAGE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+}
+
+/// Whether `bytes` start as a JPEG, PNG, WebP or HEIC/HEIF does, so the
+/// helper hands back nothing else, whatever the file is named.
+pub fn looks_like_image(bytes: &[u8]) -> bool {
+    let at = |range: std::ops::Range<usize>| bytes.get(range);
+    bytes.starts_with(&[0xff, 0xd8, 0xff])
+        || bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+        || (at(0..4) == Some(b"RIFF") && at(8..12) == Some(b"WEBP"))
+        || (at(4..8) == Some(b"ftyp")
+            && at(8..12).is_some_and(|brand| {
+                [
+                    b"heic", b"heix", b"hevc", b"heim", b"heis", b"mif1", b"msf1",
+                ]
+                .iter()
+                .any(|b| brand == *b)
+            }))
 }
 
 /// A file opened: its name, without the folder, and its bytes.
@@ -102,6 +142,7 @@ fn handle(request: &Request) -> Result<Reply, String> {
     match request {
         Request::Save { title, name, bytes } => save_here(title, name, bytes).map(Reply::Saved),
         Request::Open { title, filter } => open_here(title, filter).map(Reply::Opened),
+        Request::OpenImage { title } => open_image_here(title).map(Reply::Opened),
     }
 }
 
@@ -136,6 +177,17 @@ pub fn open(title: &str, filter: &Filter) -> Result<Option<Opened>, String> {
     match call(&Request::Open {
         title: title.to_owned(),
         filter: filter.clone(),
+    })? {
+        Reply::Opened(opened) => Ok(opened),
+        Reply::Saved(_) => Err("the file helper answered something else".into()),
+    }
+}
+
+/// Asks for a picture to open, and reads it. Blocks: call off the main
+/// loop. `None` if they cancelled.
+pub fn open_image(title: &str) -> Result<Option<Opened>, String> {
+    match call(&Request::OpenImage {
+        title: title.to_owned(),
     })? {
         Reply::Opened(opened) => Ok(opened),
         Reply::Saved(_) => Err("the file helper answered something else".into()),
@@ -188,6 +240,49 @@ fn open_here(title: &str, filter: &Filter) -> Result<Option<Opened>, String> {
         name: file_name(&path),
         bytes,
     }))
+}
+
+fn open_image_here(title: &str) -> Result<Option<Opened>, String> {
+    let options = glib::VariantDict::new(None);
+    let patterns: Vec<(u32, String)> = IMAGE_EXTENSIONS
+        .iter()
+        .flat_map(|ext| {
+            [
+                format!("*.{ext}"),
+                format!("*.{}", ext.to_ascii_uppercase()),
+            ]
+        })
+        .map(|pattern| (0u32, pattern))
+        .collect();
+    let filters = vec![("Pictures".to_owned(), patterns)];
+    options.insert_value("filters", &filters.to_variant());
+    let Some(path) = pick("OpenFile", title, options)? else {
+        return Ok(None);
+    };
+    let name = file_name(&path);
+    if !is_image(&name) {
+        return Err(format!(
+            "{name} isn’t a picture: choose a JPEG, PNG, WebP or HEIC"
+        ));
+    }
+    let file =
+        std::fs::File::open(&path).map_err(|e| format!("couldn’t open {}: {e}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_IMAGE + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("couldn’t read {}: {e}", path.display()))?;
+    if bytes.len() as u64 > MAX_IMAGE {
+        return Err(format!(
+            "{name} is larger than {} MB, the most a cover may be",
+            MAX_IMAGE >> 20
+        ));
+    }
+    if !looks_like_image(&bytes) {
+        return Err(format!(
+            "{name} isn’t a picture: choose a JPEG, PNG, WebP or HEIC"
+        ));
+    }
+    Ok(Some(Opened { name, bytes }))
 }
 
 fn file_name(path: &std::path::Path) -> String {
@@ -310,6 +405,44 @@ mod tests {
     #[test]
     fn a_file_that_is_not_a_record_is_not_opened() {
         assert!(!is_record("id_ed25519"));
+    }
+
+    #[test]
+    fn a_picture_is_opened_by_its_extension_in_any_case() {
+        assert!(
+            ["cover.jpg", "Cover.PNG", "a.webp", "IMG_1.HEIC"]
+                .into_iter()
+                .all(is_image)
+        );
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_picture_is_not_opened() {
+        assert!(
+            !["id_ed25519", "notes.txt", "cover.png.sh", "jpg"]
+                .into_iter()
+                .any(is_image)
+        );
+    }
+
+    #[test]
+    fn a_picture_is_known_by_its_first_bytes() {
+        let heic = b"\0\0\0\x18ftypheic\0\0\0\0";
+        let webp = b"RIFF\0\0\0\0WEBPVP8 ";
+        assert!(
+            [&b"\xff\xd8\xff\xe0"[..], b"\x89PNG\r\n\x1a\n\0", webp, heic]
+                .into_iter()
+                .all(looks_like_image)
+        );
+    }
+
+    #[test]
+    fn something_named_as_a_picture_but_not_one_is_refused() {
+        assert!(
+            ![&b"-----BEGIN OPENSSH"[..], b"", b"\0\0\0\x18ftypisom"]
+                .into_iter()
+                .any(looks_like_image)
+        );
     }
 
     #[test]

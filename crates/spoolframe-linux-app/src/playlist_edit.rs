@@ -17,7 +17,7 @@ use spoolframe_linux_core::backend::{
 };
 use spoolframe_linux_core::playlists::{self, ShareChange};
 
-use crate::playlists::PageActions;
+use crate::playlists::{CoverActions, PageActions};
 
 /// "7 items · Drag to reorder · an item may appear twice".
 pub fn hint(total: u32) -> String {
@@ -175,6 +175,75 @@ pub fn sharing(visibility: &Visibility, admin: bool) -> Sharing {
         on,
         shared: on == Who::Shared,
         server_wide: admin,
+    }
+}
+
+/// The editor's Cover (PX-53): the playlist's picture as everyone sees
+/// it, Choose a picture… and, for a cover someone uploaded, Remove
+/// cover. No board draws it; it follows the side panel's look.
+pub fn cover(
+    playlist: &spoolframe_linux_core::backend::PlaylistSummary,
+    actions: &CoverActions,
+    art: Option<&Rc<crate::artwork::Art>>,
+) -> gtk::Box {
+    let section = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .width_request(320)
+        .valign(gtk::Align::Start)
+        .build();
+    section.append(&label("COVER", &["picker-label"]));
+    let row = gtk::Box::builder().spacing(14).build();
+    row.append(&crate::playlists::picture(
+        &playlist.id,
+        playlist.builtin,
+        playlist.artwork.as_ref(),
+        art,
+        72,
+    ));
+    let buttons = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .valign(gtk::Align::Center)
+        .build();
+    let choose = gtk::Button::builder()
+        .label(match playlist.custom_art {
+            true => "Choose another picture…",
+            false => "Choose a picture…",
+        })
+        .halign(gtk::Align::Start)
+        .css_classes(["action", "compact", "outlined"])
+        .build();
+    {
+        let choose_it = actions.choose.clone();
+        choose.connect_clicked(move |_| choose_it());
+    }
+    buttons.append(&choose);
+    if playlist.custom_art {
+        let remove = gtk::Button::builder()
+            .label("Remove cover")
+            .halign(gtk::Align::Start)
+            .css_classes(["action", "compact", "flat"])
+            .build();
+        let remove_it = actions.remove.clone();
+        remove.connect_clicked(move |_| remove_it());
+        buttons.append(&remove);
+    }
+    row.append(&buttons);
+    section.append(&row);
+    section.append(&dim(&cover_hint(playlist.custom_art)));
+    section
+}
+
+/// The line under the editor's Cover.
+pub fn cover_hint(custom: bool) -> String {
+    let limit = format!(
+        "A JPEG, PNG, WebP or HEIC, up to {} MB.",
+        spoolframe_linux_core::backend::MAX_ART_BYTES >> 20
+    );
+    match custom {
+        true => format!("{limit} Everyone who sees the playlist sees this cover."),
+        false => format!("{limit} Until one is chosen, the first covers in it make one."),
     }
 }
 
@@ -466,6 +535,17 @@ mod tests {
                 shared: true,
                 server_wide: true
             }
+        );
+    }
+
+    #[test]
+    fn the_cover_hint_says_what_a_mosaic_is_until_one_is_chosen() {
+        assert_eq!(
+            [cover_hint(false), cover_hint(true)],
+            [
+                "A JPEG, PNG, WebP or HEIC, up to 20 MB. Until one is chosen, the first covers in it make one.",
+                "A JPEG, PNG, WebP or HEIC, up to 20 MB. Everyone who sees the playlist sees this cover.",
+            ]
         );
     }
 
