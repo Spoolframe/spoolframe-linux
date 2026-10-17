@@ -16,6 +16,8 @@ use gst_play::prelude::*;
 use gtk::prelude::*;
 use spoolframe_linux_core::format;
 
+use crate::external_subtitle::ExternalSubtitle;
+
 /// Plays the `position`th audio stream of `info`.
 pub fn select_audio(
     play: &gst_play::Play,
@@ -48,13 +50,18 @@ fn now(play: &gst_play::Play, info: &gst_play::PlayMediaInfo) -> gst_play::PlayM
 }
 
 /// Shows the `position`th subtitle stream of `info`, or none.
+/// `external` is told first, so an external subtitle picked away from is
+/// not failed by it (see [`crate::external_subtitle`]).
 pub fn select_subtitle(
     play: &gst_play::Play,
     info: &gst_play::PlayMediaInfo,
     position: Option<usize>,
+    external: &ExternalSubtitle,
 ) -> Result<(), glib::BoolError> {
     let Some(position) = position else {
-        play.set_subtitle_track_enabled(false);
+        if !external.picking(None) {
+            play.set_subtitle_track_enabled(false);
+        }
         return Ok(());
     };
     let stream = now(play, info)
@@ -63,6 +70,7 @@ pub fn select_subtitle(
         .cloned()
         .ok_or_else(|| glib::bool_error!("no subtitle stream {position}"))?;
     let id = PlayStreamInfoExt::stream_id(&stream);
+    external.picking(Some(&id));
     if play
         .current_subtitle_track()
         .map(|t| PlayStreamInfoExt::stream_id(&t))
@@ -71,6 +79,14 @@ pub fn select_subtitle(
         play.set_subtitle_track_id(Some(&id))?;
     }
     play.set_subtitle_track_enabled(true);
+    // Its cues were dropped while it was not shown: they are read again
+    // from where playback is.
+    if external.picked(Some(&id))
+        && now(play, info).is_seekable()
+        && let Some(at) = play.position()
+    {
+        play.seek(at);
+    }
     Ok(())
 }
 
@@ -96,6 +112,7 @@ pub fn menu(
     subtitles_on: &Rc<Cell<bool>>,
     failed: Rc<dyn Fn(&str)>,
     quality: Option<QualityMenu>,
+    external: ExternalSubtitle,
 ) -> gtk::Popover {
     let column = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -206,7 +223,7 @@ pub fn menu(
             let Some(play) = play.upgrade() else { return };
             // Row 0 is "Off"; the streams follow.
             let position = (row.index() as usize).checked_sub(1);
-            match select_subtitle(&play, &info, position) {
+            match select_subtitle(&play, &info, position, &external) {
                 Ok(()) => {
                     on.set(position.is_some());
                     marks.mark(Some(row.index() as usize));
@@ -511,7 +528,7 @@ mod tests {
         let (_dir, path) = clip_path("subtitle");
         clip(&path);
         let (play, info) = play(&path);
-        select_subtitle(&play, &info, Some(0)).unwrap();
+        select_subtitle(&play, &info, Some(0), &Default::default()).unwrap();
         let showing = play
             .current_subtitle_track()
             .map(|t| PlayStreamInfoExt::stream_id(&t));
@@ -537,7 +554,7 @@ mod tests {
         let (play, now) = play_on(play, &again);
         let picked = (
             select_audio(&play, &earlier, 1),
-            select_subtitle(&play, &earlier, Some(0)),
+            select_subtitle(&play, &earlier, Some(0), &Default::default()),
         );
         let playing = (
             play.current_audio_track()

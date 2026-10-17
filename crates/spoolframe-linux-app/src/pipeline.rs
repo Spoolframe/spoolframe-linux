@@ -20,6 +20,7 @@ use gst::prelude::*;
 use gtk::glib;
 use spoolframe_linux_core::reader::{self, ByteSource};
 
+use crate::external_subtitle::ExternalSubtitle;
 use crate::source::Published;
 use crate::tracks;
 
@@ -37,6 +38,9 @@ pub struct Pipeline {
     /// The external subtitle GstPlay was given last.
     subtitle: RefCell<Option<PathBuf>>,
     loading_subtitle: std::sync::Arc<std::sync::Mutex<Option<Option<String>>>>,
+    /// Holds the external subtitle's buffers until it is shown (see
+    /// [`crate::external_subtitle`]).
+    external: ExternalSubtitle,
 }
 
 impl Pipeline {
@@ -46,6 +50,8 @@ impl Pipeline {
         let renderer = gst_play::PlayVideoOverlayVideoRenderer::with_sink(&video.outer);
         let play = gst_play::Play::new(Some(renderer));
         style_subtitles(&play.pipeline());
+        let external = ExternalSubtitle::default();
+        external.watch(&play.pipeline());
         // GstPlay's subtitle setter restores the previous position, including
         // for a non-seekable replacement stream. Set playbin's startup subtitle
         // when its source is created, after GstPlay has reset the old URI.
@@ -76,6 +82,7 @@ impl Pipeline {
             published: RefCell::new(None),
             subtitle: RefCell::new(None),
             loading_subtitle,
+            external,
         })
     }
 
@@ -117,12 +124,13 @@ impl Pipeline {
         self.quiesce();
         let play = self.play();
         let published = Published::boxed(reader);
-        let uri = subtitle
-            .map(|path| gtk::prelude::FileExt::uri(&gtk::gio::File::for_path(path)).to_string());
+        let uri = subtitle.map(file_uri);
+        self.external.attach(uri.clone());
         *self.loading_subtitle.lock().unwrap() = Some(uri);
         self.subtitle.replace(subtitle.map(Path::to_path_buf));
+        // Shown once GstPlay lists it; see [`give_subtitle_uri`].
         if subtitle.is_some() {
-            play.set_subtitle_track_enabled(true);
+            play.set_subtitle_track_enabled(false);
         }
         play.set_uri(Some(&published.uri()));
         self.published.replace(Some(published));
@@ -137,13 +145,15 @@ impl Pipeline {
     }
 
     fn give_subtitle(&self, path: Option<&Path>) {
-        let play = self.play();
-        let uri = path.map(|p| gtk::prelude::FileExt::uri(&gtk::gio::File::for_path(p)));
-        play.set_subtitle_uri(uri.as_deref());
-        if path.is_some() {
-            play.set_subtitle_track_enabled(true);
-        }
+        give_subtitle_uri(self.play(), &self.external, path.map(file_uri).as_deref());
         self.subtitle.replace(path.map(Path::to_path_buf));
+    }
+
+    /// Shows the external subtitle once GstPlay lists it in `info`, as
+    /// it does not pick it itself (see [`crate::external_subtitle`]).
+    /// Whether it was shown now.
+    pub fn show_external_subtitle(&self, info: &gst_play::PlayMediaInfo) -> bool {
+        self.subtitle.borrow().is_some() && self.external.show(self.play(), info)
     }
 
     /// Stops, keeping the pipeline for the next item.
@@ -240,7 +250,7 @@ impl Pipeline {
         info: &gst_play::PlayMediaInfo,
         position: Option<usize>,
     ) -> Result<(), glib::BoolError> {
-        tracks::select_subtitle(self.play(), info, position)
+        tracks::select_subtitle(self.play(), info, position, &self.external)
     }
 
     /// The audio and subtitle menu for `info`; see [`tracks::menu`].
@@ -251,7 +261,14 @@ impl Pipeline {
         failed: std::rc::Rc<dyn Fn(&str)>,
         quality: Option<tracks::QualityMenu>,
     ) -> gtk::Popover {
-        tracks::menu(self.play(), info, subtitles_on, failed, quality)
+        tracks::menu(
+            self.play(),
+            info,
+            subtitles_on,
+            failed,
+            quality,
+            self.external.clone(),
+        )
     }
 
     pub fn reader_status(&self) -> Option<reader::Status> {
@@ -291,6 +308,23 @@ impl Drop for Pipeline {
             });
         }
     }
+}
+
+fn file_uri(path: &Path) -> String {
+    gtk::prelude::FileExt::uri(&gtk::gio::File::for_path(path)).to_string()
+}
+
+/// Hands GstPlay `uri` as its external subtitle mid-play, on, or takes it
+/// away. GstPlay restarts and seeks back.
+///
+/// Subtitles are off until [`ExternalSubtitle::show`] picks it: kept on,
+/// GstPlay's restart for it shows the file's own subtitle first, and
+/// decodebin3 moves its text output from a sparse stream to another only
+/// on that stream's next buffer, which may not come for minutes.
+fn give_subtitle_uri(play: &gst_play::Play, external: &ExternalSubtitle, uri: Option<&str>) {
+    external.attach(uri.map(str::to_owned));
+    play.set_subtitle_track_enabled(false);
+    play.set_subtitle_uri(uri);
 }
 
 /// The face text subtitles are drawn in: the app's own, not whatever
@@ -526,5 +560,201 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("spoolframe-srt-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Eight seconds of tiny raw video with a subtitle track of its own,
+    /// as the episode that failed had eleven.
+    fn file_with_its_own_subtitles(path: &Path) {
+        let mux = gst::parse::launch(&format!(
+            "videotestsrc num-buffers=80 ! video/x-raw,width=64,height=48,framerate=10/1 \
+             ! matroskamux name=mux ! filesink location={} \
+             appsrc name=text format=time caps=text/x-raw,format=utf8 ! mux.subtitle_%u",
+            path.display()
+        ))
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let text = mux.by_name("text").unwrap();
+        mux.set_state(gst::State::Playing).unwrap();
+        let mut cue = gst::Buffer::from_slice(b"the file's own cue".to_vec());
+        {
+            let cue = cue.get_mut().unwrap();
+            cue.set_pts(gst::ClockTime::ZERO);
+            cue.set_duration(gst::ClockTime::from_seconds(8));
+        }
+        let _ = text.emit_by_name::<gst::FlowReturn>("push-buffer", &[&cue]);
+        let _ = text.emit_by_name::<gst::FlowReturn>("end-of-stream", &[]);
+        wait_for_eos(&mux);
+    }
+
+    /// A downloaded SRT's shape: a cue a second for ten minutes, with the
+    /// ASS position tag the episode's had.
+    fn external_srt(path: &Path) {
+        let time = |s: u64| format!("{:02}:{:02}:{:02},417", s / 3600, s / 60 % 60, s % 60);
+        let cues: String = (1..600)
+            .map(|n| {
+                format!(
+                    "{n}\n{} --> {}\n{{\\an8}}[Vision] <i>external cue {n}</i>\n\n",
+                    time(n - 1),
+                    time(n)
+                )
+            })
+            .collect();
+        std::fs::write(path, cues).unwrap();
+    }
+
+    /// How a playback given an external subtitle went.
+    struct Played {
+        failed: Option<String>,
+        /// The external subtitle's cues that reached the overlay.
+        cues: usize,
+        /// Whether the overlay drawing them was silenced at the end.
+        silenced: bool,
+    }
+
+    /// Plays `uri` through GstPlay into fakesinks, and gives it `srt` as
+    /// the app does once the item plays: mid-play, then picked when
+    /// GstPlay lists it. With `off`, subtitles are then turned off from
+    /// the menu.
+    fn play_with_external_subtitle(uri: &str, srt: &Path, off: bool) -> Played {
+        let play = gst_play::Play::new(None::<gst_play::PlayVideoRenderer>);
+        let playbin = play.pipeline();
+        let sink = |name| {
+            gst::ElementFactory::make(name)
+                .property("sync", true)
+                .build()
+                .unwrap()
+        };
+        playbin.set_property("video-sink", sink("fakesink"));
+        playbin.set_property("audio-sink", sink("fakesink"));
+        style_subtitles(&playbin);
+        let external = ExternalSubtitle::default();
+        external.watch(&playbin);
+        let cues = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let overlays = Arc::new(Mutex::new(Vec::<gst::Element>::new()));
+        let (counted, seen) = (cues.clone(), overlays.clone());
+        playbin
+            .downcast_ref::<gst::Bin>()
+            .unwrap()
+            .connect_deep_element_added(move |_, _, element| {
+                let overlay = element
+                    .factory()
+                    .is_some_and(|f| f.name() == "subtitleoverlay");
+                if overlay {
+                    seen.lock().unwrap().push(element.clone());
+                }
+                if let (true, Some(pad)) = (overlay, element.static_pad("subtitle_sink")) {
+                    let counted = counted.clone();
+                    pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                        if let Some(gst::PadProbeData::Buffer(buffer)) = &info.data
+                            && let Ok(map) = buffer.map_readable()
+                            && String::from_utf8_lossy(&map).contains("external cue")
+                        {
+                            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        gst::PadProbeReturn::Ok
+                    });
+                }
+            });
+        let bus = play.message_bus();
+        play.set_uri(Some(uri));
+        play.play();
+        let srt = file_uri(srt);
+        let started = std::time::Instant::now();
+        let (mut given, mut shown, mut turned_off) = (None, None, false);
+        let mut failed = None;
+        while started.elapsed() < Duration::from_secs(20)
+            && given.is_none_or(|at: std::time::Instant| at.elapsed() < Duration::from_secs(4))
+        {
+            let Some(message) = bus.timed_pop(gst::ClockTime::from_mseconds(50)) else {
+                let one_second = gst::ClockTime::from_seconds(1);
+                if given.is_none() && play.position().is_some_and(|p| p >= one_second) {
+                    give_subtitle_uri(&play, &external, Some(&srt));
+                    given = Some(std::time::Instant::now());
+                }
+                let showing = shown.is_some_and(|at: std::time::Instant| {
+                    at.elapsed() > Duration::from_millis(1500)
+                });
+                if off && showing && !turned_off {
+                    let info = play.media_info().unwrap();
+                    crate::tracks::select_subtitle(&play, &info, None, &external).unwrap();
+                    turned_off = true;
+                }
+                continue;
+            };
+            match gst_play::PlayMessage::parse(&message) {
+                Ok(gst_play::PlayMessage::MediaInfoUpdated(info))
+                    if given.is_some() && !turned_off =>
+                {
+                    if external.show(&play, info.media_info()) {
+                        shown.get_or_insert_with(std::time::Instant::now);
+                    }
+                }
+                Ok(gst_play::PlayMessage::Error(e)) => {
+                    failed = Some(e.error().to_string());
+                    break;
+                }
+                Ok(gst_play::PlayMessage::EndOfStream(_)) => break,
+                _ => {}
+            }
+        }
+        let silenced = overlays
+            .lock()
+            .unwrap()
+            .last()
+            .is_some_and(|o| o.property::<bool>("silent"));
+        play.stop();
+        let _ = playbin.set_state(gst::State::Null);
+        Played {
+            silenced,
+            failed,
+            cues: cues.load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    fn file_and_srt(name: &str) -> (spoolframe_linux_core::testing::TestDir, PathBuf, PathBuf) {
+        gst::init().unwrap();
+        let dir = spoolframe_linux_core::testing::TestDir::new_blocking(name);
+        let (file, srt) = (dir.join("episode.mkv"), dir.join("external.srt"));
+        file_with_its_own_subtitles(&file);
+        external_srt(&srt);
+        (dir, file, srt)
+    }
+
+    /// VisionQuest S01E02: picking an external subtitle stopped playback
+    /// with "streaming stopped, reason not-linked" from the subtitle's
+    /// typefind.
+    #[test]
+    #[ignore = "needs GStreamer's base and good plugins; run on its own"]
+    fn an_external_subtitle_picked_mid_play_does_not_stop_playback() {
+        let (_dir, file, srt) = file_and_srt("spoolframe-external-subtitle");
+        crate::source::register().unwrap();
+        let published = crate::source::tests::published(file);
+        let played = play_with_external_subtitle(&published.uri(), &srt, false);
+        assert_eq!(played.failed, None);
+    }
+
+    #[test]
+    #[ignore = "needs GStreamer's base and good plugins; run on its own"]
+    fn an_external_subtitle_picked_mid_play_is_shown() {
+        let (_dir, file, srt) = file_and_srt("spoolframe-external-shown");
+        let played = play_with_external_subtitle(&file_uri(&file), &srt, false);
+        assert!(played.cues > 0, "no external cue reached the overlay");
+    }
+
+    #[test]
+    #[ignore = "needs GStreamer's base and good plugins; run on its own"]
+    fn turning_an_external_subtitle_off_silences_it() {
+        let (_dir, file, srt) = file_and_srt("spoolframe-external-silenced");
+        let played = play_with_external_subtitle(&file_uri(&file), &srt, true);
+        assert!(played.silenced);
+    }
+
+    #[test]
+    #[ignore = "needs GStreamer's base and good plugins; run on its own"]
+    fn turning_an_external_subtitle_off_does_not_stop_playback() {
+        let (_dir, file, srt) = file_and_srt("spoolframe-external-off");
+        let played = play_with_external_subtitle(&file_uri(&file), &srt, true);
+        assert_eq!(played.failed, None);
     }
 }

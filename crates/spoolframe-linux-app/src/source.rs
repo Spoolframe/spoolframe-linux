@@ -371,7 +371,7 @@ mod imp {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
@@ -413,7 +413,7 @@ mod tests {
         run_to_eos(&pipeline, Duration::from_secs(30));
     }
 
-    fn published(path: PathBuf) -> Published {
+    pub(crate) fn published(path: PathBuf) -> Published {
         let client = FakeClient::new(Some(path));
         let profile = FakeClient::profile("andrey");
         let session = client.session(&profile).unwrap();

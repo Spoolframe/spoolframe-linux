@@ -7,6 +7,7 @@ mod confirm;
 mod create_identity;
 mod denylist;
 mod dialog;
+mod external_subtitle;
 mod file_helper;
 mod fonts;
 mod hearts;

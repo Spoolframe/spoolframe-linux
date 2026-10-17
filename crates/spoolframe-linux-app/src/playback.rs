@@ -1788,6 +1788,11 @@ impl Playback {
                 self.apply(&current, selection, info);
             }
         }
+        // GstPlay does not pick an external subtitle by itself, and lists
+        // it only once its pipeline has it (on each restart for it).
+        if current.subtitle_file.borrow().is_some() && self.pipeline.show_external_subtitle(info) {
+            self.subtitles_on.set(true);
+        }
         self.emit(&Change::MediaInfo(info));
     }
 
