@@ -1418,6 +1418,18 @@ impl Session for SdkSession {
         self.session.features().play_history
     }
 
+    fn has_playlist_art(&self) -> bool {
+        self.session.features().playlist_art
+    }
+
+    fn has_subtitle_sync(&self) -> bool {
+        self.session.features().subtitle_sync
+    }
+
+    fn has_subtitle_search(&self) -> bool {
+        self.session.features().subtitle_search
+    }
+
     fn share_candidates<'a>(
         &'a self,
         id: &'a str,

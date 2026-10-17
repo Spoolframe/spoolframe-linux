@@ -1257,6 +1257,23 @@ pub trait Session: Send + Sync {
     /// counts on item pages.
     fn has_play_history(&self) -> bool;
 
+    /// Whether playlists have covers (PX-53, `spoolframe:playlist-art`):
+    /// each playlist's `artwork` (an uploaded cover, a mosaic, or Liked's
+    /// and All's tiles), fetched as any artwork is, and setting or taking
+    /// away a cover. Never without playlists. Without it no playlist has
+    /// `artwork`, and the app draws its own mosaic.
+    fn has_playlist_art(&self) -> bool;
+
+    /// Whether external text subtitles are synced and offset on the server
+    /// (PX-03, `spoolframe:subtitle-sync`): a track's `timing`, and Sync,
+    /// Use original timing and the offset control.
+    fn has_subtitle_sync(&self) -> bool;
+
+    /// Whether the server finds and downloads subtitles from subtitle
+    /// sites (PX-02, `spoolframe:subtitle-search`): "Find subtitles…", and
+    /// a downloaded track's `download`.
+    fn has_subtitle_search(&self) -> bool;
+
     /// What the user played lately, from any device (PX-52): each item
     /// once, by its latest counted play, newest first, a page of at most
     /// `limit` (500), and how many in all. `kinds` keeps only films,

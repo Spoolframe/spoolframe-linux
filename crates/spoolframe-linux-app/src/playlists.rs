@@ -92,11 +92,13 @@ pub fn picture(id: &str, builtin: Option<Builtin>, size: i32) -> gtk::Widget {
 }
 
 /// What an item page's row says of a playlist holding it: Liked is built
-/// in; any other, whose it is.
-pub fn ref_subtitle(playlist: &PlaylistRef) -> &'static str {
-    match playlist.builtin {
-        Some(_) => "Built in",
-        None => ref_line(playlist.owner_kind),
+/// in; one shared with the user, whose it is by name where the server
+/// says (sharing by name), as a card does; any other, whose it is.
+pub fn ref_subtitle(playlist: &PlaylistRef) -> String {
+    match (playlist.builtin, playlist.owner_kind, &playlist.owner_name) {
+        (Some(_), _, _) => "Built in".to_owned(),
+        (None, PlaylistOwnerKind::SharedWithMe, Some(owner)) => format!("{owner}’s"),
+        (None, kind, _) => ref_line(kind).to_owned(),
     }
 }
 
@@ -144,7 +146,7 @@ pub fn refs_section(refs: &[PlaylistRef], actions: &RefActions) -> gtk::Widget {
             .activatable(true)
             .build();
         row.set_title(&playlist.name);
-        row.set_subtitle(ref_subtitle(playlist));
+        row.set_subtitle(&ref_subtitle(playlist));
         row.add_prefix(&picture(&playlist.id, playlist.builtin, 36));
         let (open, id) = (actions.open.clone(), playlist.id.clone());
         row.connect_activated(move |_| open(id.clone()));
@@ -1145,10 +1147,33 @@ mod tests {
         assert_eq!(
             lines,
             [
-                ("Liked".to_owned(), "Built in"),
-                ("Road trip".to_owned(), "Shared with you")
+                ("Liked".to_owned(), "Built in".to_owned()),
+                ("Road trip".to_owned(), "Alice’s".to_owned())
             ]
         );
+    }
+
+    /// A server without sharing by name sends no owner's name: the row
+    /// says only that it is shared.
+    #[test]
+    fn without_names_a_shared_playlists_row_says_it_is_shared() {
+        let client =
+            FakeClient::new(None).with_features(spoolframe_linux_core::backend::Features {
+                playlists: true,
+                ..Default::default()
+            });
+        let session = andrey(&client);
+        let album = spoolframe_types::MediaId::new(
+            spoolframe_types::Namespace::Plex,
+            MediaKind::Album,
+            "31",
+        )
+        .unwrap();
+        let lines: Vec<_> = refs_of(session.as_ref(), &album)
+            .iter()
+            .map(ref_subtitle)
+            .collect();
+        assert_eq!(lines, ["Shared with you"]);
     }
 
     fn refs_of(session: &dyn Session, id: &spoolframe_types::MediaId) -> Vec<PlaylistRef> {

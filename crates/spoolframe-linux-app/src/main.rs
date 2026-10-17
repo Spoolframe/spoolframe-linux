@@ -200,7 +200,7 @@ fn client_options(settings: &settings::Settings) -> sdk::ClientOptions {
 }
 
 /// The regular features this app handles, listed to every server: the
-/// SDK turns on none by itself (0.11), and a session has those the
+/// SDK turns on none by itself (since 0.11), and a session has those the
 /// server lists too. Each is shown only where the session has it
 /// (`Session::has_*`).
 const FEATURES: sdk::Features = sdk::Features {
@@ -209,6 +209,9 @@ const FEATURES: sdk::Features = sdk::Features {
     last_viewed: true,
     playlist_sharing: true,
     play_history: true,
+    playlist_art: true,
+    subtitle_sync: true,
+    subtitle_search: true,
 };
 
 /// The artwork cache, or none if it cannot be opened: images are then
@@ -286,6 +289,9 @@ mod tests {
                 last_viewed: true,
                 playlist_sharing: true,
                 play_history: true,
+                playlist_art: true,
+                subtitle_sync: true,
+                subtitle_search: true,
             }
         );
     }

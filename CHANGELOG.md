@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- The SDK crates are 0.12.0. The app also lists playlist covers,
+  subtitle sync and subtitle search to each server; a server without
+  them shows nothing new. On an item's page, a playlist shared with you
+  says whose it is ("Alice’s"), as its card does, where the server names
+  the owner.
 - Scrub-preview frames are kept in memory only, not in the artwork cache
   on disk.
 - Home, the libraries, library pages, item pages and playlists show at

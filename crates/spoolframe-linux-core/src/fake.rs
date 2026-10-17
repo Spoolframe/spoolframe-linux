@@ -941,6 +941,8 @@ impl FakeSession {
             default: false,
             external,
             role,
+            timing: None,
+            download: None,
         };
         match item {
             Item::Track(_) => MediaTracks {
@@ -2347,6 +2349,18 @@ impl Session for FakeSession {
         self.features.play_history
     }
 
+    fn has_playlist_art(&self) -> bool {
+        self.features.playlist_art
+    }
+
+    fn has_subtitle_sync(&self) -> bool {
+        self.features.subtitle_sync
+    }
+
+    fn has_subtitle_search(&self) -> bool {
+        self.features.subtitle_search
+    }
+
     fn share_candidates<'a>(
         &'a self,
         id: &'a str,
@@ -3149,12 +3163,13 @@ impl FakeClient {
     }
 
     /// The session has only these features, as when the server or the
-    /// app lists fewer: Liked and sharing go with playlists, as the SDK
-    /// has it.
+    /// app lists fewer: Liked, sharing and covers go with playlists, as
+    /// the SDK has it.
     pub fn with_features(self, features: Features) -> Self {
         self.lock_playlists().features = Features {
             liked: features.liked && features.playlists,
             playlist_sharing: features.playlist_sharing && features.playlists,
+            playlist_art: features.playlist_art && features.playlists,
             ..features
         };
         self

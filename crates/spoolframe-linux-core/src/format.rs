@@ -518,6 +518,8 @@ mod tests {
             default: false,
             external: false,
             role: spoolframe_types::SubtitleRole::Forced,
+            timing: None,
+            download: None,
         };
         assert_eq!(subtitle_track(&track), "English · Forced");
     }
@@ -531,6 +533,8 @@ mod tests {
             default: false,
             external: true,
             role: spoolframe_types::SubtitleRole::Full,
+            timing: None,
+            download: None,
         };
         assert_eq!(subtitle_track(&track), "English · external file");
     }
@@ -544,6 +548,8 @@ mod tests {
             default: false,
             external: false,
             role: spoolframe_types::SubtitleRole::Sdh,
+            timing: None,
+            download: None,
         };
         assert_eq!(subtitle_track(&track), "English · SDH · English SDH");
     }

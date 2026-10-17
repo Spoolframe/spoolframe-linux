@@ -844,6 +844,18 @@ impl Session for CachedSession {
         self.inner.has_play_history()
     }
 
+    fn has_playlist_art(&self) -> bool {
+        self.inner.has_playlist_art()
+    }
+
+    fn has_subtitle_sync(&self) -> bool {
+        self.inner.has_subtitle_sync()
+    }
+
+    fn has_subtitle_search(&self) -> bool {
+        self.inner.has_subtitle_search()
+    }
+
     fn recently_played(
         &self,
         kinds: Option<Kinds>,

@@ -5134,6 +5134,9 @@ mod tests {
             last_viewed: true,
             playlist_sharing: true,
             play_history: true,
+            playlist_art: true,
+            subtitle_sync: true,
+            subtitle_search: true,
         };
 
     fn nothing_shown() -> Shown<'static> {

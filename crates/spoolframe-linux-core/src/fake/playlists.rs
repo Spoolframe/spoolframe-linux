@@ -94,6 +94,9 @@ impl Store {
                 last_viewed: true,
                 playlist_sharing: true,
                 play_history: true,
+                playlist_art: true,
+                subtitle_sync: true,
+                subtitle_search: true,
             },
             server: server.to_owned(),
             next_id: 1,
@@ -364,6 +367,8 @@ impl Store {
             pinned,
             builtin: stored.builtin,
             owner_name,
+            artwork: None,
+            custom_art: false,
         })
     }
 
@@ -471,6 +476,8 @@ impl Store {
                 name: s.name,
                 owner_kind: s.owner_kind,
                 builtin: s.builtin,
+                owner_name: s.owner_name,
+                artwork: s.artwork,
             })
             .collect();
         refs.sort_by_key(|r| r.builtin.is_none());

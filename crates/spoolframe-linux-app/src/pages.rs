@@ -1785,6 +1785,8 @@ mod tests {
             name: name.into(),
             owner_kind: spoolframe_linux_core::backend::PlaylistOwnerKind::Mine,
             builtin: None,
+            owner_name: None,
+            artwork: None,
         }
     }
 
