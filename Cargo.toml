@@ -113,9 +113,6 @@ rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", 
 # Service, never a plain file.
 oo7 = "0.6"
 
-# Artwork kept on this device, in memory and on disk.
-foyer = "0.22"
-
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
 

@@ -28,7 +28,7 @@ ignore = [
   # release exists.
   { id = "RUSTSEC-2023-0071", reason = "rsa comes in through webauthn-authenticator-rs; the client does no RSA private-key operation" },
   # paste: unmaintained, not vulnerable. A proc-macro run at build time
-  # (through foyer and iroh's netlink-packet-core); none of it is in the
+  # (through iroh's netlink-packet-core); none of it is in the
   # binary.
   { id = "RUSTSEC-2024-0436", reason = "paste is an unmaintained build-time proc-macro; no code of it runs in the client" },
 ]
