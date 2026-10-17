@@ -3328,40 +3328,20 @@ impl App {
     }
 
     /// A show page's playlist tabs (PX-40): those holding any of its
-    /// episodes, if any and the server has playlists. A tab reads the
-    /// whole playlist as its page does, and plays it the same way.
+    /// episodes, if any and the server has playlists. A tab opens the
+    /// playlist's page, as the boards link it.
     fn playlist_tabs(
         &self,
         refs: &[PlaylistRef],
         sender: &ComponentSender<Self>,
     ) -> Option<pages::ShowPlaylists> {
-        let session = self.playlist_session()?;
-        let refs = playlists::shown_refs(true, refs)?.to_vec();
-        let load: pages::LoadPlaylist = {
-            let session = session.clone();
-            Rc::new(move |id, offset| {
-                let session = session.clone();
-                relm4::spawn(async move { session.playlist(&id, offset, PLAYLIST_PAGE).await })
-            })
-        };
-        let actions: pages::TabActions = {
-            let sender = sender.clone();
-            Rc::new(move |id, more| playlists::PageActions {
-                more,
-                ..playlist_actions(id, &sender, Some(&session))
-            })
-        };
+        let has = self.playlist_session().is_some();
+        let refs = playlists::shown_refs(has, refs)?.to_vec();
         let open: Rc<dyn Fn(String)> = {
             let sender = sender.clone();
             Rc::new(move |id| sender.input(Msg::OpenPlaylist(id)))
         };
-        Some(pages::ShowPlaylists {
-            refs,
-            load,
-            actions,
-            open,
-            cards: self.cards.clone(),
-        })
+        Some(pages::ShowPlaylists { refs, open })
     }
 
     /// "Add to playlist" for `item`, from the list known now.

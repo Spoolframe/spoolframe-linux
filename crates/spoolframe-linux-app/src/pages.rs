@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use adw::prelude::*;
 use spoolframe_linux_core::backend::{
-    ArtworkSize, BackendError, ChosenTracks, PlaylistPage, PlaylistRef, Selection, TrackReason,
+    ArtworkSize, ChosenTracks, PlaylistRef, Selection, TrackReason,
 };
 use spoolframe_linux_core::format;
 use spoolframe_types::{
@@ -774,24 +774,13 @@ pub struct ShowActions {
     pub set_watched: Rc<dyn Fn(MediaId, bool)>,
 }
 
-/// A page of a playlist's entries from an offset, read off the main thread.
-pub type LoadPlaylist =
-    Rc<dyn Fn(String, u32) -> tokio::task::JoinHandle<Result<PlaylistPage, BackendError>>>;
-
-/// What a tab's playlist does, by its id, as its own page does; but Show
-/// more asks for the entries from an offset with the second.
-pub type TabActions = Rc<dyn Fn(&str, Rc<dyn Fn(u32)>) -> crate::playlists::PageActions>;
-
 /// The playlists holding a show's episodes (PX-40), each a tab after its
-/// seasons that shows the whole playlist.
+/// seasons that opens the playlist's own page.
 pub struct ShowPlaylists {
     /// In the server's order.
     pub refs: Vec<PlaylistRef>,
-    pub load: LoadPlaylist,
-    pub actions: TabActions,
     /// Opens its own page.
     pub open: Rc<dyn Fn(String)>,
-    pub cards: Rc<Cards>,
 }
 
 /// One of a show page's tabs.
@@ -818,9 +807,16 @@ pub(crate) fn show_tabs(
     seasons.chain(playlists).collect()
 }
 
+/// Where a show page's tabs take the thin divider: before the first
+/// playlist, when there is one.
+pub(crate) fn divider_before(tabs: &[(String, ShowTab)]) -> Option<usize> {
+    tabs.iter()
+        .position(|(_, t)| matches!(t, ShowTab::Playlist(_)))
+}
+
 /// The tab a show page opens on: the season `open` names, else the season
-/// of the episode up next, else the first. Never a playlist, which would
-/// be read for nothing; none when it has no seasons.
+/// of the episode up next, else the first. Never a playlist, whose tab
+/// opens its page; none when it has no seasons.
 pub(crate) fn first_tab(seasons: &[(Season, Vec<Item>)], open: Option<&MediaId>) -> Option<usize> {
     if seasons.is_empty() {
         return None;
@@ -857,7 +853,7 @@ pub(crate) fn episode_code(item: &Item) -> String {
 /// A show, as on the LinuxShow board: its facts and Resume, then one
 /// season at a time under tabs, opening on `open` or the season of the
 /// episode up next. The playlists holding its episodes are tabs after the
-/// seasons, each showing the whole playlist (PX-40).
+/// seasons, past a divider, each opening the playlist's own page (PX-40).
 pub fn show(
     show: &Show,
     seasons: &[(Season, Vec<Item>)],
@@ -977,14 +973,17 @@ pub fn show(
     }
 
     // The tabs, one per season and one per playlist, and the picked
-    // season under them.
+    // season under them. A playlist's tab is never picked: it opens the
+    // playlist's page and leaves the season tab as it was.
     let picked = first_tab(seasons, open);
     let tab_list = show_tabs(
         seasons,
         playlists.as_ref().map_or(&[][..], |p| p.refs.as_slice()),
     );
     let tabs = gtk::Box::builder()
-        .css_classes(["linked", "season-tabs"])
+        .spacing(2)
+        .halign(gtk::Align::Start)
+        .css_classes(["season-tabs"])
         .build();
     let tab_scroller = gtk::ScrolledWindow::builder()
         .child(&tabs)
@@ -1033,8 +1032,9 @@ pub fn show(
     body.append(&list_slot);
 
     let open_season: Rc<dyn Fn(usize)> = {
-        let (model, actions, cards_open, art, add) = (
+        let (model, current, actions, cards_open, art, add) = (
             model.clone(),
+            current.clone(),
             actions.clone(),
             cards.open.clone(),
             cards.art.clone(),
@@ -1048,6 +1048,7 @@ pub fn show(
         let mark_handler: Rc<std::cell::RefCell<Option<gtk::glib::SignalHandlerId>>> =
             Rc::default();
         Rc::new(move |index| {
+            current.set(index);
             let seasons = model.borrow();
             let Some((season, episodes)) = seasons.get(index) else {
                 return;
@@ -1091,151 +1092,62 @@ pub fn show(
             )));
         })
     };
-    // Only a season is drawn again: a playlist tab is read once opened.
     redraw.replace(Some(open_season.clone()));
-    // Which tab was opened last, so a playlist read for an earlier one is
-    // not shown over it.
-    let asked = Rc::new(Cell::new(0u64));
-    let open_playlist = playlists
-        .map(|playlists| playlist_tab(Rc::new(playlists), list_slot.clone(), asked.clone()));
-    let open_tab: Rc<dyn Fn(usize)> = {
-        let tab_list: Vec<ShowTab> = tab_list.iter().map(|(_, t)| t.clone()).collect();
-        Rc::new(move |index| {
-            current.set(index);
-            asked.set(asked.get() + 1);
-            match tab_list.get(index) {
-                Some(ShowTab::Season(n)) => {
-                    season_line.set_visible(true);
-                    open_season(*n);
-                }
-                // A playlist's own controls take the season's line.
-                Some(ShowTab::Playlist(playlist)) => {
-                    season_line.set_visible(false);
-                    if let Some(open) = &open_playlist {
-                        open(playlist);
-                    }
-                }
-                None => {}
-            }
-        })
-    };
+    let open_playlist = playlists.map(|p| p.open);
+    let divider = divider_before(&tab_list);
     let mut first: Option<gtk::ToggleButton> = None;
     for (index, (title, tab_of)) in tab_list.iter().enumerate() {
-        let tab = gtk::ToggleButton::builder()
-            .css_classes(["season-tab"])
-            .build();
+        if divider == Some(index) {
+            tabs.append(
+                &gtk::Separator::builder()
+                    .orientation(gtk::Orientation::Vertical)
+                    .valign(gtk::Align::Center)
+                    .css_classes(["tab-divider"])
+                    .build(),
+            );
+        }
         match tab_of {
-            ShowTab::Season(_) => tab.set_label(title),
-            // A small list-music icon before the name tells a playlist
-            // from a season.
-            ShowTab::Playlist(_) => {
-                let content = gtk::Box::builder().spacing(6).build();
-                content.append(
-                    &gtk::Image::builder()
-                        .icon_name(crate::icons::PLAYLISTS)
-                        .css_classes(["dim-label"])
-                        .build(),
-                );
-                content.append(&gtk::Label::new(Some(title)));
-                tab.set_child(Some(&content));
-                tab.set_tooltip_text(Some("Playlist"));
-            }
-        }
-        match &first {
-            Some(first) => tab.set_group(Some(first)),
-            None => first = Some(tab.clone()),
-        }
-        tab.set_active(Some(index) == picked);
-        let open_tab = open_tab.clone();
-        tab.connect_toggled(move |tab| {
-            if tab.is_active() {
-                open_tab(index);
-            }
-        });
-        tabs.append(&tab);
-    }
-    if let Some(picked) = picked {
-        open_tab(picked);
-    }
-    body.upcast()
-}
-
-/// Opens a playlist's tab on a show's page: reads its first entries and
-/// shows them, with its controls, in `slot`, where a season's episodes go.
-/// An answer comes to nothing once another tab was opened (`asked` moved
-/// on).
-fn playlist_tab(
-    playlists: Rc<ShowPlaylists>,
-    slot: adw::Bin,
-    asked: Rc<Cell<u64>>,
-) -> impl Fn(&PlaylistRef) {
-    // The playlist shown last, held here for Show more, which holds it
-    // only weakly: the view holds Show more.
-    let shown: Rc<std::cell::RefCell<Option<Rc<crate::playlists::PlaylistView>>>> = Rc::default();
-    move |playlist: &PlaylistRef| {
-        let now = asked.get();
-        slot.set_child(Some(
-            &gtk::Spinner::builder()
-                .spinning(true)
-                .halign(gtk::Align::Center)
-                .margin_top(24)
-                .build(),
-        ));
-        let more: Rc<dyn Fn(u32)> = {
-            let (load, id) = (playlists.load.clone(), playlist.id.clone());
-            let shown = Rc::downgrade(&shown);
-            Rc::new(move |offset| {
-                let answer = load(id.clone(), offset);
-                let (shown, id) = (shown.clone(), id.clone());
-                gtk::glib::spawn_future_local(async move {
-                    let Ok(answer) = answer.await else { return };
-                    let Some(shown) = shown.upgrade() else { return };
-                    let Some(view) = shown.borrow().clone().filter(|v| v.id == id) else {
-                        return;
-                    };
-                    match answer {
-                        Ok(page) => view.append(&page),
-                        Err(_) => view.more_failed(),
+            ShowTab::Season(n) => {
+                let tab = gtk::ToggleButton::builder()
+                    .label(title)
+                    .css_classes(["season-tab"])
+                    .build();
+                match &first {
+                    Some(first) => tab.set_group(Some(first)),
+                    None => first = Some(tab.clone()),
+                }
+                tab.set_active(Some(*n) == picked);
+                let (open_season, n) = (open_season.clone(), *n);
+                tab.connect_toggled(move |tab| {
+                    if tab.is_active() {
+                        open_season(n);
                     }
                 });
-            })
-        };
-        let answer = (playlists.load)(playlist.id.clone(), 0);
-        let (playlists, slot, asked, shown) = (
-            playlists.clone(),
-            slot.clone(),
-            asked.clone(),
-            shown.clone(),
-        );
-        let (id, name) = (playlist.id.clone(), playlist.name.clone());
-        gtk::glib::spawn_future_local(async move {
-            let Ok(answer) = answer.await else { return };
-            if asked.get() != now {
-                return;
+                tabs.append(&tab);
             }
-            match answer {
-                Ok(page) => {
-                    let open = {
-                        let (open, id) = (playlists.open.clone(), id.clone());
-                        Rc::new(move || open(id.clone()))
-                    };
-                    let view = crate::playlists::PlaylistView::tab(
-                        &page,
-                        (playlists.actions)(&id, more),
-                        playlists.cards.clone(),
-                        open,
-                    );
-                    slot.set_child(Some(&view.widget));
-                    shown.replace(Some(view));
+            // A small teal list-music icon before the name tells a
+            // playlist from a season.
+            ShowTab::Playlist(playlist) => {
+                let content = gtk::Box::builder().spacing(6).build();
+                content.append(&gtk::Image::from_icon_name(crate::icons::PLAYLISTS));
+                content.append(&gtk::Label::new(Some(title)));
+                let tab = gtk::Button::builder()
+                    .child(&content)
+                    .tooltip_text("Playlist · opens the whole playlist")
+                    .css_classes(["season-tab", "playlist-tab"])
+                    .build();
+                if let Some(open) = &open_playlist {
+                    let (open, id) = (open.clone(), playlist.id.clone());
+                    tab.connect_clicked(move |_| open(id.clone()));
                 }
-                Err(e) => {
-                    let why = crate::dialog::dim(&format!("Couldn’t read {name}: {e}"));
-                    why.set_margin_top(24);
-                    slot.set_child(Some(&why));
-                }
+                tabs.append(&tab);
             }
-        });
+        }
     }
+    if let Some(picked) = picked {
+        open_season(picked);
+    }
+    body.upcast()
 }
 
 /// Marks `id` watched or not in the page's copy: the whole show when it is
@@ -1903,6 +1815,25 @@ mod tests {
             show_tabs(&seasons, &[]),
             [("Season 1".to_owned(), ShowTab::Season(0))]
         );
+    }
+
+    #[test]
+    fn the_divider_goes_between_the_last_season_and_the_first_playlist() {
+        let seasons = vec![
+            (season(1), vec![episode(1, 1, None, false)]),
+            (season(2), vec![episode(2, 1, None, false)]),
+        ];
+        let tabs = show_tabs(
+            &seasons,
+            &[playlist("p1", "Movie night"), playlist("p2", "Road trip")],
+        );
+        assert_eq!(divider_before(&tabs), Some(2));
+    }
+
+    #[test]
+    fn a_show_in_no_playlist_has_no_divider() {
+        let seasons = vec![(season(1), vec![episode(1, 1, None, false)])];
+        assert_eq!(divider_before(&show_tabs(&seasons, &[])), None);
     }
 
     #[test]

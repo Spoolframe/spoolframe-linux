@@ -343,14 +343,6 @@ pub enum Mode {
     },
 }
 
-/// What tops a playlist's entries: the page's header, the editor's, or a
-/// show page's tab's line of controls.
-enum Head {
-    Page(Mode),
-    /// The tab's "Open playlist".
-    Tab(Rc<dyn Fn()>),
-}
-
 /// A playlist's page as shown: its header and the entries loaded so far.
 pub struct PlaylistView {
     pub id: String,
@@ -379,33 +371,15 @@ impl PlaylistView {
         cards: Rc<Cards>,
         mode: Mode,
     ) -> Rc<Self> {
-        Self::build(page, actions, cards, Head::Page(mode))
-    }
-
-    /// The whole playlist in a show page's tab (PX-40), under a line of
-    /// its controls: Play, Shuffle and `open` for its own page. The page
-    /// around it has the margins.
-    pub fn tab(
-        page: &PlaylistPage,
-        actions: PageActions,
-        cards: Rc<Cards>,
-        open: Rc<dyn Fn()>,
-    ) -> Rc<Self> {
-        Self::build(page, actions, cards, Head::Tab(open))
-    }
-
-    fn build(page: &PlaylistPage, actions: PageActions, cards: Rc<Cards>, head: Head) -> Rc<Self> {
         let actions = Rc::new(actions);
         let widget = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(18)
+            .margin_top(26)
+            .margin_bottom(28)
+            .margin_start(28)
+            .margin_end(28)
             .build();
-        if let Head::Page(_) = head {
-            widget.set_margin_top(26);
-            widget.set_margin_bottom(28);
-            widget.set_margin_start(28);
-            widget.set_margin_end(28);
-        }
         // The entries, and beside them in the editor the side panel.
         let columns = gtk::Box::builder().spacing(28).build();
         let entries = gtk::Box::builder()
@@ -415,18 +389,13 @@ impl PlaylistView {
             .build();
         columns.append(&entries);
         let settings = Rc::new(Cell::new(page.settings));
-        let (pin, editing) = match head {
-            // Not shown either: the pin is on the playlist's own page.
-            Head::Tab(open) => {
-                widget.append(&tab_line(page, &actions, &settings, open));
-                (gtk::ToggleButton::new(), None)
-            }
-            Head::Page(Mode::View) => {
+        let (pin, editing) = match mode {
+            Mode::View => {
                 let (header, pin) = header(page, &actions, &settings);
                 widget.append(&header);
                 (pin, None)
             }
-            Head::Page(Mode::Edit { admin }) => {
+            Mode::Edit { admin } => {
                 let controls = playlists::editor_controls(&page.playlist, admin);
                 let side = controls
                     .panel
@@ -545,11 +514,6 @@ impl PlaylistView {
             .set_visible(self.shown.get() < self.total && !page.entries.is_empty());
     }
 
-    /// Show more again, after its page could not be read.
-    pub fn more_failed(&self) {
-        self.more.set_sensitive(true);
-    }
-
     /// Play from here: the playlist from `entry`, with the settings shown.
     fn play_from(&self, entry: EntryId) -> Rc<dyn Fn()> {
         let (play, settings) = (self.actions.play.clone(), self.settings.clone());
@@ -600,7 +564,51 @@ fn header(
     ));
 
     let controls = gtk::Box::builder().spacing(10).margin_top(6).build();
-    play_buttons(page, actions, settings, &controls);
+    let playable = page.playable > 0;
+    let play = gtk::Button::builder()
+        .child(
+            &adw::ButtonContent::builder()
+                .icon_name(crate::icons::PLAY)
+                .label(play_label(page))
+                .build(),
+        )
+        .sensitive(playable)
+        .css_classes(["action", "compact", "suggested-action"])
+        .build();
+    {
+        let (run, settings) = (actions.play.clone(), settings.clone());
+        play.connect_clicked(move |_| run(None, settings.get()));
+    }
+    controls.append(&play);
+    if let Some(first) = from_start(page) {
+        let again = gtk::Button::builder()
+            .label("Play from start")
+            .css_classes(["action", "compact", "outlined"])
+            .build();
+        let (run, settings) = (actions.play.clone(), settings.clone());
+        again.connect_clicked(move |_| run(Some(first), settings.get()));
+        controls.append(&again);
+    }
+    let shuffle = gtk::ToggleButton::builder()
+        .child(
+            &adw::ButtonContent::builder()
+                .icon_name(crate::icons::SHUFFLE)
+                .label("Shuffle")
+                .build(),
+        )
+        .active(page.settings.shuffle)
+        .css_classes(["action", "compact", "outlined"])
+        .build();
+    {
+        let settings = settings.clone();
+        shuffle.connect_toggled(move |button| {
+            settings.set(PlaySettings {
+                shuffle: button.is_active(),
+                ..settings.get()
+            })
+        });
+    }
+    controls.append(&shuffle);
     let repeat_content = adw::ButtonContent::new();
     let repeat = gtk::Button::builder()
         .child(&repeat_content)
@@ -679,90 +687,6 @@ fn header(
     column.append(&wrap);
     header.append(&column);
     (header, pin)
-}
-
-/// Play (Continue at the user's place), Play from start where there is a
-/// place, and Shuffle, which the next play takes, as the header has them.
-fn play_buttons(
-    page: &PlaylistPage,
-    actions: &PageActions,
-    settings: &Rc<Cell<PlaySettings>>,
-    controls: &gtk::Box,
-) {
-    let playable = page.playable > 0;
-    let play = gtk::Button::builder()
-        .child(
-            &adw::ButtonContent::builder()
-                .icon_name(crate::icons::PLAY)
-                .label(play_label(page))
-                .build(),
-        )
-        .sensitive(playable)
-        .css_classes(["action", "compact", "suggested-action"])
-        .build();
-    {
-        let (run, settings) = (actions.play.clone(), settings.clone());
-        play.connect_clicked(move |_| run(None, settings.get()));
-    }
-    controls.append(&play);
-    if let Some(first) = from_start(page) {
-        let again = gtk::Button::builder()
-            .label("Play from start")
-            .css_classes(["action", "compact", "outlined"])
-            .build();
-        let (run, settings) = (actions.play.clone(), settings.clone());
-        again.connect_clicked(move |_| run(Some(first), settings.get()));
-        controls.append(&again);
-    }
-    let shuffle = gtk::ToggleButton::builder()
-        .child(
-            &adw::ButtonContent::builder()
-                .icon_name(crate::icons::SHUFFLE)
-                .label("Shuffle")
-                .build(),
-        )
-        .active(page.settings.shuffle)
-        .css_classes(["action", "compact", "outlined"])
-        .build();
-    {
-        let settings = settings.clone();
-        shuffle.connect_toggled(move |button| {
-            settings.set(PlaySettings {
-                shuffle: button.is_active(),
-                ..settings.get()
-            })
-        });
-    }
-    controls.append(&shuffle);
-}
-
-/// A show page's playlist tab's line: Play, Play from start and Shuffle;
-/// its counts and whose it is, dimmed; and Open playlist.
-fn tab_line(
-    page: &PlaylistPage,
-    actions: &PageActions,
-    settings: &Rc<Cell<PlaySettings>>,
-    open: Rc<dyn Fn()>,
-) -> gtk::ScrolledWindow {
-    let controls = gtk::Box::builder().spacing(10).build();
-    play_buttons(page, actions, settings, &controls);
-    let line = label(&header_line(page), &["dim-label", "small-text"]);
-    line.set_hexpand(true);
-    line.set_xalign(1.0);
-    line.set_margin_start(8);
-    controls.append(&line);
-    let go = gtk::Button::builder()
-        .label("Open playlist")
-        .css_classes(["action", "compact", "outlined"])
-        .build();
-    go.connect_clicked(move |_| open());
-    controls.append(&go);
-    gtk::ScrolledWindow::builder()
-        .vscrollbar_policy(gtk::PolicyType::Never)
-        .hscrollbar_policy(gtk::PolicyType::Automatic)
-        .propagate_natural_height(true)
-        .child(&controls)
-        .build()
 }
 
 /// An entry: its number, still, title, where it is from, and its note;

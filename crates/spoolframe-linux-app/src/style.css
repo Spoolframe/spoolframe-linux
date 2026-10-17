@@ -789,18 +789,53 @@ dropdown.picker > button {
   font-weight: 600;
 }
 
-/* The show page: season tabs in a linked group, the picked one on the
-   surface; episode rows with a still, part-watched ones in the accent. */
+/* The show page, as on the LinuxShow and LinuxShowPlaylists boards: the
+   season tabs in one sunken strip, dimmed until picked, the picked one
+   raised on the surface; past a thin divider the playlists, each with a
+   teal list-music icon and its name undimmed; episode rows with a still,
+   part-watched ones in the accent. */
+.season-tabs {
+  padding: 3px;
+  border-radius: 11px;
+  background-color: var(--card-bg-color);
+  border: 1px solid alpha(currentColor, 0.1);
+}
+
 button.season-tab {
-  min-height: 34px;
+  min-height: 32px;
   padding: 0 16px;
+  border-radius: 8px;
+  background: none;
+  box-shadow: none;
+  color: alpha(currentColor, 0.75);
   font-weight: 500;
 }
 
+button.season-tab:hover {
+  background-color: alpha(currentColor, 0.05);
+}
+
 button.season-tab:checked {
-  background-color: var(--accent-bg-color);
-  color: var(--accent-fg-color);
+  background-color: var(--thumbnail-bg-color);
+  box-shadow: 0 1px 2px var(--shade-color);
+  color: var(--window-fg-color);
   font-weight: 600;
+}
+
+button.playlist-tab {
+  padding: 0 14px 0 12px;
+  color: var(--window-fg-color);
+}
+
+button.playlist-tab image {
+  color: var(--accent-teal);
+}
+
+.season-tabs separator.tab-divider {
+  min-width: 1px;
+  min-height: 20px;
+  margin: 0 6px;
+  background-color: alpha(currentColor, 0.15);
 }
 
 .thumb,
