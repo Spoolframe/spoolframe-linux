@@ -178,8 +178,9 @@ pub struct App {
     pin_notes: PinNotesShown,
     /// Hears the server's playlist changes for the profile in use.
     playlist_watch: Option<glib::JoinHandle<()>>,
-    /// The playlist whose page is loading: only the last asked for opens.
-    opening_playlist: Option<String>,
+    /// The playlist whose page is loading, and where it goes: only the
+    /// last asked for opens.
+    opening_playlist: Option<(String, PlaylistPlace)>,
     /// The playlist page pushed, if one is.
     shown_playlist: Option<ShownPlaylist>,
     /// What a pinned row's menu and a drag in Pinned do.
@@ -188,12 +189,24 @@ pub struct App {
     pending_add: Option<Box<Item>>,
 }
 
+/// Where a playlist's page goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlaylistPlace {
+    /// In the library, over the sidebar's choice; an item page covering
+    /// the window is left for it.
+    Library,
+    /// Over the item page it was opened from (a show's playlist tab), so
+    /// Back returns there, on the season it was on.
+    OverItem,
+}
+
 /// A playlist's page on the stack: its view, refilled in place when the
 /// playlist changes.
 struct ShownPlaylist {
     view: Rc<PlaylistView>,
     body: adw::Bin,
     page: adw::NavigationPage,
+    place: PlaylistPlace,
     /// Shown in the editor.
     editing: bool,
 }
@@ -342,6 +355,9 @@ pub enum Msg {
     Select(Row),
     /// A playlist's page (PX-40).
     OpenPlaylist(String),
+    /// A playlist's page over the item page on top: a show's playlist
+    /// tab's, so Back returns to the show.
+    OpenPlaylistOver(String),
     /// Its entries from this offset on: Show more.
     MorePlaylist(String, u32),
     PlayPlaylist(String, PlaylistPlay),
@@ -1571,7 +1587,7 @@ impl Component for App {
                 self.show_playlists(widgets, &sender);
                 self.load_playlists(&sender);
             }
-            Msg::Select(Row::Pinned(id)) => self.open_playlist(id, &sender),
+            Msg::Select(Row::Pinned(id)) => self.open_playlist(id, PlaylistPlace::Library, &sender),
             Msg::Select(Row::NothingPinned) => {}
             Msg::Select(Row::Library(index)) => {
                 let Some(library) = self.libraries.get(index).cloned() else {
@@ -1613,7 +1629,8 @@ impl Component for App {
                     }
                 }));
             }
-            Msg::OpenPlaylist(id) => self.open_playlist(id, &sender),
+            Msg::OpenPlaylist(id) => self.open_playlist(id, PlaylistPlace::Library, &sender),
+            Msg::OpenPlaylistOver(id) => self.open_playlist(id, PlaylistPlace::OverItem, &sender),
             Msg::MorePlaylist(id, offset) => {
                 let Some(session) = self.playlist_session() else {
                     return;
@@ -1797,7 +1814,7 @@ impl Component for App {
                 // Left at once; its Gone event then finds no page to leave.
                 let name = match self.shown_playlist.take() {
                     Some(shown) if shown.view.id == id => {
-                        widgets.stack.pop_to_page(&widgets.root_page);
+                        leave_playlist(widgets, &shown);
                         shown.view.name.clone()
                     }
                     other => {
@@ -1824,7 +1841,7 @@ impl Component for App {
                 if refresh.page_gone
                     && let Some(gone) = self.shown_playlist.take()
                 {
-                    widgets.stack.pop_to_page(&widgets.root_page);
+                    leave_playlist(widgets, &gone);
                     toast_text(
                         widgets,
                         &format!(
@@ -2801,10 +2818,13 @@ impl Component for App {
                 }
             }
             Loaded::PlaylistPage(id, false, Ok(page)) => {
-                if self.opening_playlist.as_ref() != Some(&id) {
-                    return;
-                }
-                self.opening_playlist = None;
+                let place = match self.opening_playlist.take() {
+                    Some((opening, place)) if opening == id => place,
+                    other => {
+                        self.opening_playlist = other;
+                        return;
+                    }
+                };
                 let view = PlaylistView::new(
                     &page,
                     playlist_actions(&id, &sender, self.session.as_ref()),
@@ -2814,21 +2834,38 @@ impl Component for App {
                 let body = adw::Bin::builder().child(&view.widget).build();
                 let nav_page = pages::page(&page.playlist.name, &body);
                 nav_page.set_tag(Some(PLAYLIST_TAG));
-                // One playlist page at a time, over the sidebar's choice;
-                // opened from an item's page, which covers the window, it
-                // is left for the library.
-                widgets.window_stack.pop_to_page(&widgets.library_page);
+                // One playlist page at a time. The one shown before keeps
+                // no tag, which is one per stack; under item pages it is
+                // left as it was.
+                if let Some(old) = self.shown_playlist.take() {
+                    old.page.set_tag(None);
+                }
                 widgets.stack.pop_to_page(&widgets.root_page);
-                widgets.stack.push(&nav_page);
+                match place {
+                    // Over the sidebar's choice; opened from an item's
+                    // page, which covers the window, it is left for the
+                    // library.
+                    PlaylistPlace::Library => {
+                        widgets.window_stack.pop_to_page(&widgets.library_page);
+                        widgets.stack.push(&nav_page);
+                    }
+                    PlaylistPlace::OverItem => widgets.window_stack.push(&nav_page),
+                }
                 self.shown_playlist = Some(ShownPlaylist {
                     view,
                     body,
                     page: nav_page,
+                    place,
                     editing: false,
                 });
             }
             Loaded::PlaylistPage(id, refresh, Err(e)) => {
-                if !refresh && self.opening_playlist.as_ref() == Some(&id) {
+                if !refresh
+                    && self
+                        .opening_playlist
+                        .as_ref()
+                        .is_some_and(|(o, _)| o == &id)
+                {
                     self.opening_playlist = None;
                 }
                 toast(widgets, &e);
@@ -2846,7 +2883,7 @@ impl Component for App {
                 match item {
                     // Made from an item's "Add to playlist": it goes in.
                     Some(item) => sender.input(Msg::AddItemTo(made.id, made.name, item)),
-                    None => self.open_playlist(made.id, &sender),
+                    None => self.open_playlist(made.id, PlaylistPlace::Library, &sender),
                 }
             }
             Loaded::PlaylistCreated(Err(e), _) => toast(widgets, &e),
@@ -3329,7 +3366,8 @@ impl App {
 
     /// A show page's playlist tabs (PX-40): those holding any of its
     /// episodes, if any and the server has playlists. A tab opens the
-    /// playlist's page, as the boards link it.
+    /// playlist's page over the show's, as the boards link it, so Back
+    /// returns to the show.
     fn playlist_tabs(
         &self,
         refs: &[PlaylistRef],
@@ -3339,7 +3377,7 @@ impl App {
         let refs = playlists::shown_refs(has, refs)?.to_vec();
         let open: Rc<dyn Fn(String)> = {
             let sender = sender.clone();
-            Rc::new(move |id| sender.input(Msg::OpenPlaylist(id)))
+            Rc::new(move |id| sender.input(Msg::OpenPlaylistOver(id)))
         };
         Some(pages::ShowPlaylists { refs, open })
     }
@@ -3364,12 +3402,12 @@ impl App {
         playlists::add_dialog(root, &item, rows, add, new);
     }
 
-    /// Loads a playlist's first page, then pushes its page.
-    fn open_playlist(&mut self, id: String, sender: &ComponentSender<Self>) {
+    /// Loads a playlist's first page, then pushes its page in `place`.
+    fn open_playlist(&mut self, id: String, place: PlaylistPlace, sender: &ComponentSender<Self>) {
         let Some(session) = self.playlist_session() else {
             return;
         };
-        self.opening_playlist = Some(id.clone());
+        self.opening_playlist = Some((id.clone(), place));
         self.command(sender, async move {
             let page = session.playlist(&id, 0, PLAYLIST_PAGE).await;
             Loaded::PlaylistPage(id, false, page)
@@ -3391,7 +3429,7 @@ impl App {
     /// no longer there to find.
     fn shown_playlist_id(&self, widgets: &AppWidgets) -> Option<String> {
         let shown = self.shown_playlist.as_ref()?;
-        let on_stack = widgets.stack.find_page(PLAYLIST_TAG)?;
+        let on_stack = playlist_stack(widgets, shown.place).find_page(PLAYLIST_TAG)?;
         (on_stack == shown.page).then(|| shown.view.id.clone())
     }
 
@@ -4283,6 +4321,34 @@ fn plain_header(widgets: &AppWidgets) {
     widgets
         .root_header
         .set_title_widget(Some(&widgets.root_title));
+}
+
+/// The stack a playlist's page in `place` is on.
+fn playlist_stack(widgets: &AppWidgets, place: PlaylistPlace) -> &adw::NavigationView {
+    match place {
+        PlaylistPlace::Library => &widgets.stack,
+        PlaylistPlace::OverItem => &widgets.window_stack,
+    }
+}
+
+/// Leaves a playlist's page that is deleted or gone. In the library the
+/// sidebar's choice shows again, under any item page covering the window;
+/// over an item page, that page shows again, and what was opened from the
+/// playlist goes with it.
+fn leave_playlist(widgets: &AppWidgets, shown: &ShownPlaylist) {
+    match shown.place {
+        PlaylistPlace::Library => {
+            widgets.stack.pop_to_page(&widgets.root_page);
+        }
+        PlaylistPlace::OverItem => {
+            let stack = &widgets.window_stack;
+            if stack.find_page(PLAYLIST_TAG).as_ref() == Some(&shown.page)
+                && let Some(under) = stack.previous_page(&shown.page)
+            {
+                stack.pop_to_page(&under);
+            }
+        }
+    }
 }
 
 /// An item page, over the whole window as designed: the sidebar is the

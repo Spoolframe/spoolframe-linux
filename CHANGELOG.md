@@ -55,10 +55,10 @@
   them: choosing one opens the playlist, and right-click plays it. On a
   show's page each playlist holding any of its episodes is a tab after
   the seasons, past a thin divider, marked with a teal playlist icon;
-  choosing it opens the playlist's page, as a playlist row does
-  elsewhere. The tabs scroll sideways when they do not fit. Which
-  playlists hold an item is read with the page, so a change shows the
-  next time it opens.
+  choosing it opens the playlist's page over the show's, and Back
+  returns to the show on the season you were on. The tabs scroll
+  sideways when they do not fit. Which playlists hold an item is read
+  with the page, so a change shows the next time it opens.
 - Sharing by name, on a server that has it: the editor's Add someone
   opens a picker of the people the playlist can go to, searched by name
   or username, a page at a time, each with their @username (or, for a
