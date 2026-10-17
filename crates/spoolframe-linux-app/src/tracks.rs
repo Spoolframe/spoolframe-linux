@@ -104,6 +104,17 @@ pub const SEARCH_FROM: usize = 3;
 /// Opens Search for subtitles over the widget the menu hangs from.
 pub type FindSubtitles = Rc<dyn Fn(&gtk::Widget)>;
 
+/// What the subtitle section offers past the file's own streams, where
+/// the server has it.
+#[derive(Default)]
+pub struct SubtitleExtras {
+    /// Search for subtitles… (PX-02), under the subtitles, as the board
+    /// LinuxPlayer has it; it opens over what the menu hangs from.
+    pub find: Option<FindSubtitles>,
+    /// The chosen external text subtitle's timing (PX-03), under it.
+    pub timing: Option<crate::subtitle_timing::TimingMenu>,
+}
+
 pub struct QualityMenu {
     pub current: Rc<dyn Fn() -> (spoolframe_client_sdk::PlaybackQuality, Option<u32>)>,
     pub choose: Rc<dyn Fn(spoolframe_client_sdk::PlaybackQuality)>,
@@ -116,9 +127,7 @@ pub fn menu(
     failed: Rc<dyn Fn(&str)>,
     quality: Option<QualityMenu>,
     external: ExternalSubtitle,
-    // Search for subtitles… (PX-02), under the subtitles, as the board
-    // LinuxPlayer has it; it opens over what the menu hangs from.
-    find: Option<FindSubtitles>,
+    SubtitleExtras { find, timing }: SubtitleExtras,
 ) -> gtk::Popover {
     let column = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -214,6 +223,11 @@ pub fn menu(
         column.append(&button);
         (button, find)
     });
+    let timing = timing.map(|menu| {
+        let (section, draw) = crate::subtitle_timing::section(menu);
+        column.append(&section);
+        draw
+    });
 
     let weak = play.downgrade();
     {
@@ -302,6 +316,9 @@ pub fn menu(
             true => current_subtitle(&play, &info).map(|p| p + 1),
         };
         subtitles.mark(subtitle);
+        if let Some(draw) = &timing {
+            draw();
+        }
         if let Some((picks, current)) = &quality {
             let (chosen, height) = current();
             picks.rename(

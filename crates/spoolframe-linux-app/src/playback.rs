@@ -20,7 +20,7 @@ use gtk::glib;
 use gtk::glib::thread_guard::ThreadGuard;
 use spoolframe_client_sdk::PlaybackOptions;
 use spoolframe_linux_core::backend::{
-    BackendError, Marker, PlaybackHandle, PlaybackPlan, Selection, Session,
+    BackendError, Marker, PlaybackHandle, PlaybackPlan, Selection, Session, SubtitleTiming,
 };
 use spoolframe_linux_core::markers;
 pub use spoolframe_linux_core::markers::Offer;
@@ -32,7 +32,7 @@ use spoolframe_linux_core::reader::{self, ByteSource, MediaReader, Spawn};
 use spoolframe_linux_core::sdk::backend_error;
 use spoolframe_protocol::{ConvertedVideo, PlannedSubtitle, SubtitleAction, SubtitleDelivery};
 use spoolframe_types::Delivery;
-use spoolframe_types::{Album, Item, MediaTracks, SubtitleFormat};
+use spoolframe_types::{Album, Item, MediaId, MediaTracks, SubtitleFormat};
 
 use crate::external_subtitle;
 use crate::pipeline::Pipeline;
@@ -776,7 +776,10 @@ impl Playback {
             &self.subtitles_on,
             failed,
             quality,
-            self.subtitle_search(),
+            crate::tracks::SubtitleExtras {
+                find: self.subtitle_search(),
+                timing: self.timing_menu(),
+            },
         )
     }
 
@@ -815,6 +818,115 @@ impl Playback {
                 },
             );
         }))
+    }
+
+    /// The subtitle menu's Timing (PX-03), where the server syncs
+    /// subtitles: for the chosen track while it is an external text one.
+    fn timing_menu(&self) -> Option<crate::subtitle_timing::TimingMenu> {
+        if !self.session.has_subtitle_sync() {
+            return None;
+        }
+        let me = self.me.clone();
+        let current: Rc<dyn Fn() -> Option<(u32, SubtitleTiming)>> = {
+            let me = me.clone();
+            Rc::new(move || {
+                let this = me.upgrade()?;
+                let current = this.now()?;
+                if !this.subtitles_on.get() {
+                    return None;
+                }
+                let track = current.selected.get()?.subtitle?;
+                let tracks = current.track_list.borrow();
+                let timing = tracks
+                    .as_ref()?
+                    .subtitles
+                    .get(track as usize)?
+                    .timing
+                    .clone()?;
+                Some((track, timing))
+            })
+        };
+        let call = |me: Weak<Self>, ask: TimingCall| -> Rc<dyn Fn(u32, i64)> {
+            Rc::new(move |track, ms| {
+                if let Some(this) = me.upgrade() {
+                    this.retime(track, ask, ms);
+                }
+            })
+        };
+        let (sync, original, offset) = (
+            call(me.clone(), TimingCall::Sync),
+            call(me.clone(), TimingCall::Original),
+            call(me, TimingCall::Offset),
+        );
+        Some(crate::subtitle_timing::TimingMenu {
+            current,
+            sync: Rc::new(move |track| sync(track, 0)),
+            original: Rc::new(move |track| original(track, 0)),
+            offset,
+        })
+    }
+
+    /// Asks the server to sync, set back or offset the playing item's
+    /// subtitle `track`; its answer is the track's timing now, as an
+    /// event would tell it.
+    fn retime(self: &Rc<Self>, track: u32, ask: TimingCall, offset_ms: i64) {
+        let Some(item) = self.current() else { return };
+        let (session, id) = (self.session.clone(), item.id().clone());
+        let answer = relm4::spawn(async move {
+            match ask {
+                TimingCall::Sync => session.sync_subtitle(&id, track).await,
+                TimingCall::Original => session.use_original_subtitle_timing(&id, track).await,
+                TimingCall::Offset => session.set_subtitle_offset(&id, track, offset_ms).await,
+            }
+        });
+        let (weak, id) = (Rc::downgrade(self), item.id().clone());
+        glib::spawn_future_local(async move {
+            let answer = answer.await;
+            let Some(playback) = weak.upgrade() else {
+                return;
+            };
+            match answer {
+                Ok(Ok(timing)) => playback.timing_changed(&id, track, timing),
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "the subtitle's timing did not change");
+                    playback.emit(&Change::TrackFailed(TIMING_FAILED));
+                }
+                Err(e) => tracing::warn!(error = %e, "the timing change stopped"),
+            }
+        });
+    }
+
+    /// Item `id`'s subtitle `track` is timed as `timing` now (PX-03): an
+    /// event from the server, or the answer to a change made here. When
+    /// it is the track showing and what the server serves changed, the
+    /// subtitle is read again from its start and swapped in, as one
+    /// arriving is (PR #6's path: a fresh file, held until shown).
+    pub fn timing_changed(self: &Rc<Self>, id: &MediaId, track: u32, timing: SubtitleTiming) {
+        let Some(current) = self.now().filter(|c| c.item.id() == id) else {
+            return;
+        };
+        let reread = {
+            let mut tracks = current.track_list.borrow_mut();
+            let Some(kept) = tracks
+                .as_mut()
+                .and_then(|t| t.subtitles.get_mut(track as usize))
+            else {
+                return;
+            };
+            let reread = crate::subtitle_timing::rereads(kept.timing.as_ref(), &timing);
+            kept.timing = Some(timing);
+            reread
+        };
+        let showing = current.selected.get().and_then(|s| s.subtitle) == Some(track)
+            && current.subtitle_file.borrow().is_some();
+        if !(reread && showing) {
+            return;
+        }
+        let Some(managed) = current.managed.borrow().clone() else {
+            return;
+        };
+        tracing::debug!(track, "the subtitle's timing changed; reading it again");
+        self.load_external_subtitle(&current, managed.snapshot().handle);
     }
 
     /// Plays the item's subtitle track `track` (a server track, by its
@@ -1999,6 +2111,17 @@ impl Drop for Playback {
         self.stop();
     }
 }
+
+/// Which timing change the subtitle menu asked for (PX-03).
+#[derive(Debug, Clone, Copy)]
+enum TimingCall {
+    Sync,
+    Original,
+    Offset,
+}
+
+/// What the player says when a timing change is refused.
+pub const TIMING_FAILED: &str = "Couldn't change the subtitle's timing";
 
 /// The tracks to ask for to show subtitle `track`: the audio that plays
 /// now, or the server's choice where none was known.

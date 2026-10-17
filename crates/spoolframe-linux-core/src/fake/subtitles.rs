@@ -14,7 +14,13 @@ use spoolframe_types::{
     SubtitleTrack,
 };
 
-use crate::backend::BackendError;
+use spoolframe_types::{SubtitleSync, SubtitleTiming};
+use tokio::sync::broadcast;
+
+use crate::backend::{BackendError, SubtitleTimingEvent};
+
+/// When the fake says an offset was set, Unix seconds.
+pub const OFFSET_SET_AT: i64 = 1_760_000_100;
 
 /// When the fake's OpenSubtitles quota comes back, Unix seconds.
 pub const QUOTA_RESETS_AT: i64 = 1_760_054_400;
@@ -60,14 +66,145 @@ pub(in crate::fake) struct Asker<'a> {
     pub admin: bool,
 }
 
-#[derive(Default)]
 pub(in crate::fake) struct Store {
     pub sites: Sites,
     downloads: HashMap<MediaId, Vec<Downloaded>>,
     next: u64,
+    /// The server's key, as its events name it.
+    server: String,
+    /// Each external text track's timing (PX-03), once changed.
+    timings: HashMap<(MediaId, u32), SubtitleTiming>,
+    events: broadcast::Sender<SubtitleTimingEvent>,
 }
 
 impl Store {
+    pub fn new(server: &str) -> Self {
+        Store {
+            sites: Sites::default(),
+            downloads: HashMap::new(),
+            next: 0,
+            server: server.to_owned(),
+            timings: HashMap::new(),
+            events: broadcast::channel(64).0,
+        }
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<SubtitleTimingEvent> {
+        self.events.subscribe()
+    }
+
+    /// Whether item `id`'s subtitle `track` is an external text one, the
+    /// only kind that is synced: the item's own first track (an SRT beside
+    /// the file, in the fake), or one downloaded, after its `before` own.
+    fn external_text(&self, id: &MediaId, track: u32, before: usize) -> bool {
+        let track = track as usize;
+        track == 0 || self.download_at(id, track, before).is_some()
+    }
+
+    fn download_at(&self, id: &MediaId, track: usize, before: usize) -> Option<&Downloaded> {
+        self.downloads.get(id)?.get(track.checked_sub(before)?)
+    }
+
+    /// Item `id`'s external text track `track`'s timing: as changed, or
+    /// as it came: a download not made for this file is being synced, as
+    /// the server starts at once; any other has its own timing.
+    pub fn timing_of(&self, id: &MediaId, track: u32, before: usize) -> SubtitleTiming {
+        if let Some(timing) = self.timings.get(&(id.clone(), track)) {
+            return timing.clone();
+        }
+        let syncing = self
+            .download_at(id, track as usize, before)
+            .is_some_and(|d| !d.hash_match);
+        SubtitleTiming {
+            sync: match syncing {
+                true => SubtitleSync::Syncing,
+                false => SubtitleSync::Original,
+            },
+            offset_ms: 0,
+            offset_by: None,
+            offset_at: None,
+        }
+    }
+
+    /// Changes track `track`'s timing with `change` and tells everyone.
+    fn retime(
+        &mut self,
+        id: &MediaId,
+        track: u32,
+        before: usize,
+        change: impl FnOnce(&mut SubtitleTiming),
+    ) -> Result<SubtitleTiming, BackendError> {
+        if !self.external_text(id, track, before) {
+            return Err(BackendError::InvalidInput(
+                "only an external text subtitle is synced".into(),
+            ));
+        }
+        let mut timing = self.timing_of(id, track, before);
+        change(&mut timing);
+        self.timings.insert((id.clone(), track), timing.clone());
+        // Nobody listening is fine.
+        let _ = self.events.send(SubtitleTimingEvent {
+            server: self.server.clone(),
+            id: id.clone(),
+            track,
+            timing: timing.clone(),
+        });
+        Ok(timing)
+    }
+
+    /// Starts a sync: `Syncing` until [`Store::finish_sync`].
+    pub fn sync(
+        &mut self,
+        id: &MediaId,
+        track: u32,
+        before: usize,
+    ) -> Result<SubtitleTiming, BackendError> {
+        self.retime(id, track, before, |t| t.sync = SubtitleSync::Syncing)
+    }
+
+    /// Its original timing again; the offset stays.
+    pub fn original(
+        &mut self,
+        id: &MediaId,
+        track: u32,
+        before: usize,
+    ) -> Result<SubtitleTiming, BackendError> {
+        self.retime(id, track, before, |t| t.sync = SubtitleSync::Original)
+    }
+
+    /// Moves it by `offset_ms`, as `asker` set it now.
+    pub fn offset(
+        &mut self,
+        id: &MediaId,
+        track: u32,
+        before: usize,
+        offset_ms: i64,
+        asker: Asker<'_>,
+    ) -> Result<SubtitleTiming, BackendError> {
+        if offset_ms.abs() > crate::backend::MAX_SUBTITLE_OFFSET_MS {
+            return Err(BackendError::InvalidInput(
+                "an offset is at most ten minutes either way".into(),
+            ));
+        }
+        let by = asker.display_name.to_owned();
+        self.retime(id, track, before, |t| {
+            t.offset_ms = offset_ms;
+            t.offset_by = Some(by);
+            t.offset_at = Some(OFFSET_SET_AT);
+        })
+    }
+
+    /// The server's sync of track `track` ended as `sync`.
+    pub fn finish_sync(
+        &mut self,
+        id: &MediaId,
+        track: u32,
+        before: usize,
+        sync: SubtitleSync,
+    ) -> Result<SubtitleTiming, BackendError> {
+        self.retime(id, track, before, |t| t.sync = sync)
+    }
+
     fn check(&self) -> Result<(), BackendError> {
         match self.sites {
             Sites::NoSource => Err(BackendError::NoSubtitleSource),

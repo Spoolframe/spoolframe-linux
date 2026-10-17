@@ -266,7 +266,7 @@ impl Pipeline {
         subtitles_on: &std::rc::Rc<std::cell::Cell<bool>>,
         failed: std::rc::Rc<dyn Fn(&str)>,
         quality: Option<tracks::QualityMenu>,
-        find: Option<tracks::FindSubtitles>,
+        extras: tracks::SubtitleExtras,
     ) -> gtk::Popover {
         tracks::menu(
             self.play(),
@@ -275,7 +275,7 @@ impl Pipeline {
             failed,
             quality,
             self.external.clone(),
-            find,
+            extras,
         )
     }
 

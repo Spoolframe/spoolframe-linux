@@ -26,6 +26,14 @@
   page it is then picked, and in the player it plays from where you
   are. A downloaded track says where it came from, who downloaded it
   and when, with Remove for whoever may.
+- Subtitle timing, on a server that syncs subtitles: for an external
+  text subtitle that plays, the player's subtitle menu shows how it is
+  timed (original, syncing, synced and by how much, uncertain, or why a
+  sync failed), an offset with − and + in 0.1 s steps and Reset, who set
+  it and when, and Sync to this file or Sync again and Use original
+  timing. The timing is the server's, for everyone: when anyone changes
+  it, the subtitle is read again and shows the new timing at once,
+  without restarting the film.
 - Scrub-preview frames are kept in memory only, not in the artwork cache
   on disk.
 - Home, the libraries, library pages, item pages and playlists show at

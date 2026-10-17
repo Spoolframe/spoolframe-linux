@@ -64,6 +64,7 @@ mod start;
 #[cfg(test)]
 mod stylesheet;
 mod subtitle_search;
+mod subtitle_timing;
 mod theme;
 mod tracks;
 mod transport;

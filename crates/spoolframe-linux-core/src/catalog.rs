@@ -873,6 +873,31 @@ impl Session for CachedSession {
         self.changing(move || self.inner.download_subtitle(id, result))
     }
 
+    fn sync_subtitle<'a>(
+        &'a self,
+        id: &'a MediaId,
+        track: u32,
+    ) -> BoxFuture<'a, Result<SubtitleTiming, BackendError>> {
+        self.changing(move || self.inner.sync_subtitle(id, track))
+    }
+
+    fn use_original_subtitle_timing<'a>(
+        &'a self,
+        id: &'a MediaId,
+        track: u32,
+    ) -> BoxFuture<'a, Result<SubtitleTiming, BackendError>> {
+        self.changing(move || self.inner.use_original_subtitle_timing(id, track))
+    }
+
+    fn set_subtitle_offset<'a>(
+        &'a self,
+        id: &'a MediaId,
+        track: u32,
+        offset_ms: i64,
+    ) -> BoxFuture<'a, Result<SubtitleTiming, BackendError>> {
+        self.changing(move || self.inner.set_subtitle_offset(id, track, offset_ms))
+    }
+
     fn remove_subtitle_download<'a>(
         &'a self,
         id: &'a MediaId,
@@ -1638,6 +1663,36 @@ mod tests {
             ready(s.remove_subtitle_download(&alien(), &download)).unwrap();
         });
         assert_eq!(kept, 0);
+    }
+
+    #[test]
+    fn offsetting_a_subtitle_clears_the_session() {
+        assert_eq!(
+            kept_after(|s| {
+                ready(s.set_subtitle_offset(&alien(), 0, 1500)).unwrap();
+            }),
+            0
+        );
+    }
+
+    #[test]
+    fn syncing_a_subtitle_clears_the_session() {
+        assert_eq!(
+            kept_after(|s| {
+                ready(s.sync_subtitle(&alien(), 0)).unwrap();
+            }),
+            0
+        );
+    }
+
+    #[test]
+    fn its_original_timing_clears_the_session() {
+        assert_eq!(
+            kept_after(|s| {
+                ready(s.use_original_subtitle_timing(&alien(), 0)).unwrap();
+            }),
+            0
+        );
     }
 
     #[test]

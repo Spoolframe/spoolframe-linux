@@ -38,7 +38,7 @@ use crate::backend::{
     TrackPreferencesInfo, Trust, TrustedProfile,
 };
 use crate::backend::{InviteKind, InviteOrigin, InviteSpec, InviteSummary, MintedInvite};
-use crate::backend::{SubtitleDownloaded, SubtitleSearch};
+use crate::backend::{SubtitleDownloaded, SubtitleSearch, SubtitleTiming};
 use crate::storage::Storage;
 
 fn invite_kind(kind: sdk::InviteKind) -> InviteKind {
@@ -995,6 +995,12 @@ impl Client for SdkClient {
     fn playlist_events(&self) -> tokio::sync::broadcast::Receiver<crate::backend::PlaylistEvent> {
         self.client.playlist_events()
     }
+
+    fn subtitle_timing_events(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::backend::SubtitleTimingEvent> {
+        self.client.subtitle_timing_events()
+    }
 }
 
 pub struct SdkSession {
@@ -1487,6 +1493,38 @@ impl Session for SdkSession {
     ) -> BoxFuture<'a, Result<SubtitleDownloaded, BackendError>> {
         let (id, result) = (id.clone(), result.to_owned());
         Box::pin(self.call(move |s| async move { s.download_subtitle(&id, &result).await }))
+    }
+
+    fn sync_subtitle<'a>(
+        &'a self,
+        id: &'a MediaId,
+        track: u32,
+    ) -> BoxFuture<'a, Result<SubtitleTiming, BackendError>> {
+        let id = id.clone();
+        Box::pin(self.call(move |s| async move { s.sync_subtitle(&id, track).await }))
+    }
+
+    fn use_original_subtitle_timing<'a>(
+        &'a self,
+        id: &'a MediaId,
+        track: u32,
+    ) -> BoxFuture<'a, Result<SubtitleTiming, BackendError>> {
+        let id = id.clone();
+        Box::pin(
+            self.call(move |s| async move { s.use_original_subtitle_timing(&id, track).await }),
+        )
+    }
+
+    fn set_subtitle_offset<'a>(
+        &'a self,
+        id: &'a MediaId,
+        track: u32,
+        offset_ms: i64,
+    ) -> BoxFuture<'a, Result<SubtitleTiming, BackendError>> {
+        let id = id.clone();
+        Box::pin(
+            self.call(move |s| async move { s.set_subtitle_offset(&id, track, offset_ms).await }),
+        )
     }
 
     fn remove_subtitle_download<'a>(

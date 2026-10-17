@@ -443,6 +443,8 @@ pub enum ConnectionPath {
     Unknown,
 }
 
+/// A subtitle track's timing changed (PX-03), as a server told.
+pub use spoolframe_client_sdk::SubtitleTimingEvent;
 pub use spoolframe_client_sdk::{
     Chunk, Playback as PlaybackStart, PlaybackChange, PlaybackOptions, PlaybackQuality,
 };
@@ -452,6 +454,10 @@ pub use spoolframe_client_sdk::{
     DialReport, DialStage, KnownPath, LivePath, LookupOutcome, LookupResult, PathKind,
     Reachability, SavedAddr,
 };
+
+/// The most a subtitle may be moved either way (PX-03): ten minutes, ms.
+pub const MAX_SUBTITLE_OFFSET_MS: i64 = 10 * 60 * 1000;
+
 /// Playlists (PX-40), in the protocol's and the SDK's own types.
 pub use spoolframe_client_sdk::{
     Features, PlaylistChange, PlaylistEvent, PlaylistList, PlaylistUpdate,
@@ -823,6 +829,11 @@ pub trait Client: Send + Sync {
     /// user signed in on them: read again what is shown. Changes made
     /// before subscribing, or while not connected, are not seen.
     fn playlist_events(&self) -> tokio::sync::broadcast::Receiver<PlaylistEvent>;
+
+    /// Every subtitle timing change a server this device is connected to
+    /// tells of (PX-03): a track synced, set back to its original timing,
+    /// or offset, by anyone. A player showing the track reads it again.
+    fn subtitle_timing_events(&self) -> tokio::sync::broadcast::Receiver<SubtitleTimingEvent>;
 }
 
 /// One signed-in user's view of a server: the catalog, their watch state
@@ -1336,6 +1347,36 @@ pub trait Session: Send + Sync {
         id: &'a MediaId,
         result: &'a str,
     ) -> BoxFuture<'a, Result<SubtitleDownloaded, BackendError>>;
+
+    /// Syncs item `id`'s external text subtitle `track` to the file, in
+    /// the background (PX-03): its timing now, `Syncing`; the outcome
+    /// comes as a [`SubtitleTimingEvent`]. Without
+    /// [`Session::has_subtitle_sync`], [`BackendError::Unsupported`],
+    /// unsent.
+    fn sync_subtitle<'a>(
+        &'a self,
+        id: &'a MediaId,
+        track: u32,
+    ) -> BoxFuture<'a, Result<SubtitleTiming, BackendError>>;
+
+    /// Serves item `id`'s subtitle `track` with its original timing
+    /// again, for everyone; its offset stays.
+    fn use_original_subtitle_timing<'a>(
+        &'a self,
+        id: &'a MediaId,
+        track: u32,
+    ) -> BoxFuture<'a, Result<SubtitleTiming, BackendError>>;
+
+    /// Moves item `id`'s subtitle `track` by `offset_ms` (positive:
+    /// later), for everyone; 0 resets it. At most
+    /// [`MAX_SUBTITLE_OFFSET_MS`] either way. What the server serves has
+    /// it already: a player never adds it itself.
+    fn set_subtitle_offset<'a>(
+        &'a self,
+        id: &'a MediaId,
+        track: u32,
+        offset_ms: i64,
+    ) -> BoxFuture<'a, Result<SubtitleTiming, BackendError>>;
 
     /// Removes item `id`'s downloaded track `download`
     /// (`SubtitleDownload::id`), for everyone: its downloader or an admin

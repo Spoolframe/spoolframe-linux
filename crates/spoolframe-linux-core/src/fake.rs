@@ -50,7 +50,7 @@ use crate::backend::{InviteKind, InviteOrigin, InviteSpec, InviteSummary, Minted
 mod playlists;
 mod subtitles;
 
-use crate::backend::{SubtitleDownloaded, SubtitleSearch};
+use crate::backend::{SubtitleDownloaded, SubtitleSearch, SubtitleSync, SubtitleTiming};
 
 pub use playlists::PAGE_LIMIT as PLAYLIST_PAGE_LIMIT;
 pub use subtitles::{QUOTA_RESETS_AT, Sites};
@@ -944,7 +944,22 @@ impl FakeSession {
         }
     }
 
+    /// An item's tracks, each external text subtitle with its timing
+    /// where the session has subtitle sync (PX-03).
     fn tracks_of(&self, item: &Item) -> MediaTracks {
+        let mut tracks = self.untimed_tracks(item);
+        if self.features.subtitle_sync {
+            let store = self.lock_subtitles();
+            for (n, track) in tracks.subtitles.iter_mut().enumerate() {
+                if track.external {
+                    track.timing = Some(store.timing_of(item.id(), n as u32, OWN_SUBTITLES));
+                }
+            }
+        }
+        tracks
+    }
+
+    fn untimed_tracks(&self, item: &Item) -> MediaTracks {
         let audio = |title: Option<&str>, channels, default, role| AudioTrack {
             language: Some("eng".into()),
             title: title.map(str::to_owned),
@@ -2430,6 +2445,49 @@ impl Session for FakeSession {
         })
     }
 
+    fn sync_subtitle<'a>(
+        &'a self,
+        id: &'a MediaId,
+        track: u32,
+    ) -> BoxFuture<'a, Result<SubtitleTiming, BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            self.subtitle_sync_listed()?;
+            self.catalog.get(id)?;
+            self.lock_subtitles().sync(id, track, OWN_SUBTITLES)
+        })
+    }
+
+    fn use_original_subtitle_timing<'a>(
+        &'a self,
+        id: &'a MediaId,
+        track: u32,
+    ) -> BoxFuture<'a, Result<SubtitleTiming, BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            self.subtitle_sync_listed()?;
+            self.catalog.get(id)?;
+            self.lock_subtitles().original(id, track, OWN_SUBTITLES)
+        })
+    }
+
+    fn set_subtitle_offset<'a>(
+        &'a self,
+        id: &'a MediaId,
+        track: u32,
+        offset_ms: i64,
+    ) -> BoxFuture<'a, Result<SubtitleTiming, BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            self.subtitle_sync_listed()?;
+            self.catalog.get(id)?;
+            let name = display_name(&self.username);
+            let asker = self.asker(&name);
+            self.lock_subtitles()
+                .offset(id, track, OWN_SUBTITLES, offset_ms, asker)
+        })
+    }
+
     fn remove_subtitle_download<'a>(
         &'a self,
         id: &'a MediaId,
@@ -2992,6 +3050,16 @@ impl FakeSession {
         }
     }
 
+    /// Refuses a subtitle sync call without the feature, unsent.
+    fn subtitle_sync_listed(&self) -> Result<(), BackendError> {
+        match self.features.subtitle_sync {
+            true => Ok(()),
+            false => Err(BackendError::Unsupported(
+                spoolframe_protocol::features::SUBTITLE_SYNC.into(),
+            )),
+        }
+    }
+
     /// Refuses a subtitle search call without the feature, unsent.
     fn subtitle_search_listed(&self) -> Result<(), BackendError> {
         match self.features.subtitle_search {
@@ -3278,7 +3346,7 @@ impl FakeClient {
             servers_changed: Arc::new(watch::Sender::new(())),
             joined: Mutex::default(),
             playlists: Arc::new(Mutex::new(seeded_playlists())),
-            subtitles: Arc::default(),
+            subtitles: Arc::new(Mutex::new(subtitles::Store::new(&home_media().0))),
         }
     }
 
@@ -3303,6 +3371,16 @@ impl FakeClient {
             ..features
         };
         self
+    }
+
+    /// The server's sync of `item`'s subtitle `track` (PX-03) ended as
+    /// `sync`: everyone is told.
+    pub fn finish_sync(&self, item: &MediaId, track: u32, sync: SubtitleSync) {
+        self.subtitles
+            .lock()
+            .expect("fake state is never poisoned")
+            .finish_sync(item, track, OWN_SUBTITLES, sync)
+            .expect("an external text subtitle");
     }
 
     /// The server's subtitle sites (PX-02) answer as `sites` says.
@@ -4452,6 +4530,15 @@ impl Client for FakeClient {
 
     fn playlist_events(&self) -> tokio::sync::broadcast::Receiver<PlaylistEvent> {
         self.lock_playlists().subscribe()
+    }
+
+    fn subtitle_timing_events(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::backend::SubtitleTimingEvent> {
+        self.subtitles
+            .lock()
+            .expect("fake state is never poisoned")
+            .subscribe()
     }
 }
 
@@ -7470,6 +7557,162 @@ mod subtitle_search_tests {
             String::from_utf8(bytes)
                 .unwrap()
                 .contains("downloaded from SubDL")
+        );
+    }
+}
+
+/// Subtitle sync and offset (PX-03) on the fake server.
+#[cfg(test)]
+mod subtitle_sync_tests {
+    use super::*;
+    use crate::backend::SubtitleSync;
+    use crate::testing::ready;
+
+    fn andrey(client: &FakeClient) -> Arc<dyn Session> {
+        client.session(&FakeClient::profile("andrey")).unwrap()
+    }
+
+    fn alien() -> MediaId {
+        media(MediaKind::Movie, "1")
+    }
+
+    fn timings(session: &dyn Session) -> Vec<Option<SubtitleTiming>> {
+        ready(session.tracks(&alien()))
+            .unwrap()
+            .subtitles
+            .into_iter()
+            .map(|t| t.timing)
+            .collect()
+    }
+
+    fn original() -> SubtitleTiming {
+        SubtitleTiming {
+            sync: SubtitleSync::Original,
+            offset_ms: 0,
+            offset_by: None,
+            offset_at: None,
+        }
+    }
+
+    #[test]
+    fn only_the_external_text_track_has_a_timing() {
+        let client = FakeClient::new(None);
+        assert_eq!(
+            timings(andrey(&client).as_ref()),
+            [Some(original()), None, None]
+        );
+    }
+
+    #[test]
+    fn a_download_not_made_for_this_file_is_being_synced() {
+        let client = FakeClient::new(None);
+        let session = andrey(&client);
+        let results = ready(session.search_subtitles(&alien(), None))
+            .unwrap()
+            .results;
+        let other = results.iter().find(|r| !r.hash_match).unwrap();
+        let got = ready(session.download_subtitle(&alien(), &other.id)).unwrap();
+        let track = &timings(session.as_ref())[got.track as usize];
+        assert_eq!(
+            track.as_ref().map(|t| &t.sync),
+            Some(&SubtitleSync::Syncing)
+        );
+    }
+
+    #[test]
+    fn an_offset_is_kept_with_who_set_it_and_told() {
+        let client = FakeClient::new(None);
+        let session = andrey(&client);
+        let mut events = client.subtitle_timing_events();
+        let timing = ready(session.set_subtitle_offset(&alien(), 0, -1500)).unwrap();
+        assert_eq!(
+            (
+                timing.clone(),
+                events.try_recv().map(|e| (e.track, e.timing)).ok()
+            ),
+            (
+                SubtitleTiming {
+                    offset_ms: -1500,
+                    offset_by: Some("Andrey".into()),
+                    offset_at: Some(subtitles::OFFSET_SET_AT),
+                    ..original()
+                },
+                Some((0, timing))
+            )
+        );
+    }
+
+    #[test]
+    fn an_offset_past_ten_minutes_is_refused() {
+        let client = FakeClient::new(None);
+        assert!(matches!(
+            ready(andrey(&client).set_subtitle_offset(&alien(), 0, 600_001)),
+            Err(BackendError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn an_embedded_subtitle_is_not_synced() {
+        let client = FakeClient::new(None);
+        assert!(matches!(
+            ready(andrey(&client).sync_subtitle(&alien(), 1)),
+            Err(BackendError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn the_original_timing_keeps_the_offset() {
+        let client = FakeClient::new(None);
+        let session = andrey(&client);
+        ready(session.set_subtitle_offset(&alien(), 0, 700)).unwrap();
+        ready(session.sync_subtitle(&alien(), 0)).unwrap();
+        let timing = ready(session.use_original_subtitle_timing(&alien(), 0)).unwrap();
+        assert_eq!(
+            (timing.sync, timing.offset_ms),
+            (SubtitleSync::Original, 700)
+        );
+    }
+
+    #[test]
+    fn a_finished_sync_is_told_and_listed() {
+        let client = FakeClient::new(None);
+        let session = andrey(&client);
+        ready(session.sync_subtitle(&alien(), 0)).unwrap();
+        let mut events = client.subtitle_timing_events();
+        let synced = SubtitleSync::Synced {
+            offset_ms: -3200,
+            factor_ppm: 1_000_000,
+            splits: 0,
+            score: 87,
+        };
+        client.finish_sync(&alien(), 0, synced.clone());
+        assert_eq!(
+            (
+                events.try_recv().map(|e| e.timing.sync).ok(),
+                timings(session.as_ref())[0]
+                    .as_ref()
+                    .map(|t| t.sync.clone())
+            ),
+            (Some(synced.clone()), Some(synced))
+        );
+    }
+
+    #[test]
+    fn without_the_feature_there_is_no_timing_and_nothing_is_sent() {
+        let client = FakeClient::new(None).with_features(Features {
+            playlists: true,
+            ..Features::default()
+        });
+        let session = andrey(&client);
+        assert_eq!(
+            (
+                timings(session.as_ref()),
+                ready(session.sync_subtitle(&alien(), 0)).err()
+            ),
+            (
+                vec![None, None, None],
+                Some(BackendError::Unsupported("spoolframe:subtitle-sync".into()))
+            )
         );
     }
 }

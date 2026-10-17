@@ -180,6 +180,8 @@ pub struct App {
     pin_notes: PinNotesShown,
     /// Hears the server's playlist changes for the profile in use.
     playlist_watch: Option<glib::JoinHandle<()>>,
+    /// Hears the server's subtitle timing changes (PX-03).
+    timing_watch: Option<glib::JoinHandle<()>>,
     /// The playlist whose page is loading, and where it goes: only the
     /// last asked for opens.
     opening_playlist: Option<(String, PlaylistPlace)>,
@@ -414,6 +416,8 @@ pub enum Msg {
     RemoveCover(String),
     /// A line to show in a toast, from work done off the update.
     Toast(String),
+    /// A subtitle track's timing changed on a server (PX-03).
+    SubtitleTiming(Box<spoolframe_linux_core::backend::SubtitleTimingEvent>),
     /// Search for subtitles (PX-02) for an item page's item, by its id and
     /// name.
     FindSubtitles(MediaId, String),
@@ -1103,6 +1107,7 @@ impl Component for App {
             playlists: None,
             pin_notes: PinNotesShown::default(),
             playlist_watch: None,
+            timing_watch: None,
             opening_playlist: None,
             shown_playlist: None,
             pinned_actions,
@@ -1885,6 +1890,15 @@ impl Component for App {
                 });
             }
             Msg::Toast(text) => toast_text(widgets, &text),
+            Msg::SubtitleTiming(event) => {
+                let ours = self
+                    .server
+                    .as_ref()
+                    .is_some_and(|s| s.key.0 == event.server);
+                if let (true, Some(playback)) = (ours, &self.playback) {
+                    playback.timing_changed(&event.id, event.track, event.timing);
+                }
+            }
             Msg::FindSubtitles(id, title) => {
                 let Some(session) = self.session.clone() else {
                     return;
@@ -3405,6 +3419,7 @@ impl App {
         widgets.profile_name.set_label(&profile.display_name);
         self.watch_connection(&profile.server, sender);
         self.watch_playlists(sender);
+        self.watch_subtitle_timing(sender);
         self.libraries.clear();
         self.playlists = None;
         self.pin_notes = PinNotesShown::default();
@@ -3451,6 +3466,32 @@ impl App {
                 match events.recv().await {
                     Ok(event) => sender.input(Msg::PlaylistChanged(Box::new(event))),
                     Err(RecvError::Lagged(_)) => sender.input(Msg::PlaylistsLagged),
+                    Err(RecvError::Closed) => break,
+                }
+            }
+        }));
+    }
+
+    /// Hears subtitle timing changes (PX-03), where the session has
+    /// subtitle sync: the playing item's subtitle is read again when its
+    /// timing changes. A missed one is only a subtitle shown as before.
+    fn watch_subtitle_timing(&mut self, sender: &ComponentSender<Self>) {
+        if let Some(watch) = self.timing_watch.take() {
+            watch.abort();
+        }
+        if !self.session.as_ref().is_some_and(|s| s.has_subtitle_sync()) {
+            return;
+        }
+        let mut events = self.client.subtitle_timing_events();
+        let sender = sender.clone();
+        self.timing_watch = Some(glib::spawn_future_local(async move {
+            use tokio::sync::broadcast::error::RecvError;
+            loop {
+                match events.recv().await {
+                    Ok(event) => sender.input(Msg::SubtitleTiming(Box::new(event))),
+                    Err(RecvError::Lagged(missed)) => {
+                        tracing::debug!(missed, "subtitle timing changes missed");
+                    }
                     Err(RecvError::Closed) => break,
                 }
             }
@@ -4154,6 +4195,9 @@ impl App {
             load.abort();
         }
         if let Some(watch) = self.playlist_watch.take() {
+            watch.abort();
+        }
+        if let Some(watch) = self.timing_watch.take() {
             watch.abort();
         }
     }
