@@ -295,6 +295,8 @@ pub struct Playback {
     /// Itself, for callbacks that outlive a borrow (the track menu's).
     me: Weak<Self>,
     progress_tail: RefCell<Option<tokio::sync::oneshot::Receiver<()>>>,
+    /// The server's name, as Search for subtitles says it (PX-02).
+    server_name: RefCell<String>,
 }
 
 /// What belongs to the item playing now, and lives exactly as long as it
@@ -323,6 +325,9 @@ struct Current {
     track_list: RefCell<Option<MediaTracks>>,
     /// The tracks that play, to pick once the file's streams are known.
     pending: Cell<Option<Selection>>,
+    /// The tracks that play, as asked or as the server chose: what a
+    /// change of subtitle track keeps the audio of.
+    selected: Cell<Option<Selection>>,
     media_info: RefCell<Option<gst_play::PlayMediaInfo>>,
     /// The item's intro and credits (P2-10), in its own time.
     markers: RefCell<Vec<Marker>>,
@@ -385,6 +390,7 @@ impl Current {
             plan: RefCell::new(None),
             track_list: RefCell::new(tracks),
             pending: Cell::new(None),
+            selected: Cell::new(None),
             media_info: RefCell::new(None),
             markers: RefCell::new(Vec::new()),
             offered: Cell::new(None),
@@ -505,6 +511,7 @@ impl Playback {
             from_playlist: RefCell::new(None),
             asking_playlist: Cell::new(false),
             progress_tail: RefCell::new(None),
+            server_name: RefCell::new("the server".to_owned()),
         });
         connect(playback.pipeline.adapter(), &playback);
         {
@@ -764,8 +771,74 @@ impl Playback {
                 }),
             }
         });
-        self.pipeline
-            .track_menu(info, &self.subtitles_on, failed, quality)
+        self.pipeline.track_menu(
+            info,
+            &self.subtitles_on,
+            failed,
+            quality,
+            self.subtitle_search(),
+        )
+    }
+
+    /// The server's name, for what the player says of it.
+    pub fn set_server_name(&self, name: &str) {
+        self.server_name.replace(name.to_owned());
+    }
+
+    /// The subtitle menu's Search for subtitles… (PX-02), where the
+    /// server has it and a film or an episode plays: the panel over
+    /// `anchor`, and a track it downloads plays from here.
+    fn subtitle_search(&self) -> Option<crate::tracks::FindSubtitles> {
+        if !self.is_video() || !self.session.has_subtitle_search() {
+            return None;
+        }
+        let me = self.me.clone();
+        Some(Rc::new(move |anchor: &gtk::Widget| {
+            let Some(this) = me.upgrade() else { return };
+            let Some(item) = this.current() else { return };
+            let picked: Rc<dyn Fn(u32)> = {
+                let me = me.clone();
+                Rc::new(move |track| {
+                    if let Some(this) = me.upgrade() {
+                        this.use_subtitle(track);
+                    }
+                })
+            };
+            crate::subtitle_search::present(
+                anchor,
+                crate::subtitle_search::Search {
+                    session: this.session.clone(),
+                    item: item.id().clone(),
+                    title: crate::views::Facts::of(&item).title,
+                    server: this.server_name.borrow().clone(),
+                    picked,
+                },
+            );
+        }))
+    }
+
+    /// Plays the item's subtitle track `track` (a server track, by its
+    /// place in the item's subtitles), keeping the audio, from where it
+    /// is: the server serves a track only with a playback that asked for
+    /// it, so the item starts again there, paused if it was, and the
+    /// external subtitle comes as at any start (PR #6's path).
+    pub fn use_subtitle(self: &Rc<Self>, track: u32) {
+        let Some(current) = self.now() else { return };
+        let selection = subtitle_change(current.selected.get(), track);
+        let (at, playing) = (self.position.get(), self.playing.get());
+        let start = Start {
+            from: Some(at),
+            selection: Some(selection),
+            // Asked again: the new track is not in the list read before.
+            tracks: None,
+            quality: self.quality.get(),
+            display: self.display.borrow().clone(),
+        };
+        // The queue stays where it is.
+        self.step_starting(|_| true, Some(start));
+        if !playing {
+            self.autoplay.set(false);
+        }
     }
 
     /// What the screen shows, for the items started from now on: the user
@@ -1426,6 +1499,7 @@ impl Playback {
             .or(start.chosen.map(|c| c.selection))
             .unwrap_or_default();
         current.pending.set(Some(selection));
+        current.selected.set(Some(selection));
         current.plan.replace(Some(start.plan.clone()));
         current.markers.replace(std::mem::take(&mut start.markers));
         // After the answer, not alongside the start: it is needed only at
@@ -1926,6 +2000,15 @@ impl Drop for Playback {
     }
 }
 
+/// The tracks to ask for to show subtitle `track`: the audio that plays
+/// now, or the server's choice where none was known.
+fn subtitle_change(playing: Option<Selection>, track: u32) -> Selection {
+    Selection {
+        audio: playing.and_then(|s| s.audio),
+        subtitle: Some(track),
+    }
+}
+
 /// Whether the plan's subtitle comes as a file to fetch: a direct play's
 /// external one, or one the server reads as text for a converted
 /// playback (P2-07).
@@ -2204,6 +2287,37 @@ fn spawn() -> Spawn {
     Arc::new(|future| {
         relm4::spawn(future);
     })
+}
+
+#[cfg(test)]
+mod subtitle_change_tests {
+    use super::*;
+
+    #[test]
+    fn a_new_subtitle_keeps_the_audio_that_plays() {
+        let playing = Selection {
+            audio: Some(1),
+            subtitle: Some(0),
+        };
+        assert_eq!(
+            subtitle_change(Some(playing), 4),
+            Selection {
+                audio: Some(1),
+                subtitle: Some(4)
+            }
+        );
+    }
+
+    #[test]
+    fn with_no_audio_known_the_server_chooses_it() {
+        assert_eq!(
+            subtitle_change(None, 4),
+            Selection {
+                audio: None,
+                subtitle: Some(4)
+            }
+        );
+    }
 }
 
 #[cfg(test)]

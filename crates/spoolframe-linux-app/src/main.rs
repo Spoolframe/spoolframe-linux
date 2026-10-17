@@ -63,6 +63,7 @@ mod srt_markup;
 mod start;
 #[cfg(test)]
 mod stylesheet;
+mod subtitle_search;
 mod theme;
 mod tracks;
 mod transport;

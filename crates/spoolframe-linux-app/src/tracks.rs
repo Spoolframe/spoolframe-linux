@@ -101,6 +101,9 @@ pub const SEARCH_FROM: usize = 3;
 /// the last reference (see [`crate::pipeline`]).
 /// The quality section (P6-06): what is chosen now, with the height the
 /// server encodes to, and how to choose.
+/// Opens Search for subtitles over the widget the menu hangs from.
+pub type FindSubtitles = Rc<dyn Fn(&gtk::Widget)>;
+
 pub struct QualityMenu {
     pub current: Rc<dyn Fn() -> (spoolframe_client_sdk::PlaybackQuality, Option<u32>)>,
     pub choose: Rc<dyn Fn(spoolframe_client_sdk::PlaybackQuality)>,
@@ -113,6 +116,9 @@ pub fn menu(
     failed: Rc<dyn Fn(&str)>,
     quality: Option<QualityMenu>,
     external: ExternalSubtitle,
+    // Search for subtitles… (PX-02), under the subtitles, as the board
+    // LinuxPlayer has it; it opens over what the menu hangs from.
+    find: Option<FindSubtitles>,
 ) -> gtk::Popover {
     let column = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -194,6 +200,20 @@ pub fn menu(
         .propagate_natural_height(true)
         .build();
     column.append(&scroller);
+    let find_button = find.map(|find| {
+        let button = gtk::Button::builder()
+            .child(
+                &adw::ButtonContent::builder()
+                    .icon_name(crate::icons::SEARCH)
+                    .label("Search for subtitles…")
+                    .halign(gtk::Align::Start)
+                    .build(),
+            )
+            .css_classes(["flat", "subtitle-find"])
+            .build();
+        column.append(&button);
+        (button, find)
+    });
 
     let weak = play.downgrade();
     {
@@ -259,6 +279,18 @@ pub fn menu(
     });
 
     let popover = gtk::Popover::builder().child(&column).build();
+    if let Some((button, find)) = find_button {
+        let popover = popover.downgrade();
+        button.connect_clicked(move |_| {
+            let Some(popover) = popover.upgrade() else {
+                return;
+            };
+            popover.popdown();
+            if let Some(anchor) = popover.parent() {
+                find(&anchor);
+            }
+        });
+    }
     // What plays can change without the menu (the item page's choice, an
     // external subtitle arriving), so the marks are read on each opening.
     let (play, info, on) = (weak, info.clone(), subtitles_on.clone());

@@ -856,6 +856,31 @@ impl Session for CachedSession {
         self.inner.has_subtitle_search()
     }
 
+    /// Not kept: the server keeps each search a day itself.
+    fn search_subtitles<'a>(
+        &'a self,
+        id: &'a MediaId,
+        language: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<SubtitleSearch, BackendError>> {
+        self.inner.search_subtitles(id, language)
+    }
+
+    fn download_subtitle<'a>(
+        &'a self,
+        id: &'a MediaId,
+        result: &'a str,
+    ) -> BoxFuture<'a, Result<SubtitleDownloaded, BackendError>> {
+        self.changing(move || self.inner.download_subtitle(id, result))
+    }
+
+    fn remove_subtitle_download<'a>(
+        &'a self,
+        id: &'a MediaId,
+        download: &'a str,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        self.changing(move || self.inner.remove_subtitle_download(id, download))
+    }
+
     fn recently_played(
         &self,
         kinds: Option<Kinds>,
@@ -1572,6 +1597,45 @@ mod tests {
     fn removing_a_cover_clears_the_session() {
         let kept = kept_after_playlist_change(|s, id| {
             ready(s.remove_playlist_art(id)).unwrap();
+        });
+        assert_eq!(kept, 0);
+    }
+
+    fn alien_subtitle_result(s: &CachedSession) -> String {
+        ready(s.search_subtitles(&alien(), None)).unwrap().results[0]
+            .id
+            .clone()
+    }
+
+    #[test]
+    fn a_subtitle_search_is_not_kept() {
+        assert_eq!(
+            kept_after(|s| {
+                ready(s.search_subtitles(&alien(), None)).unwrap();
+            }),
+            2
+        );
+    }
+
+    #[test]
+    fn downloading_a_subtitle_clears_the_session() {
+        assert_eq!(
+            kept_after(|s| {
+                let result = alien_subtitle_result(s);
+                ready(s.download_subtitle(&alien(), &result)).unwrap();
+            }),
+            0
+        );
+    }
+
+    #[test]
+    fn removing_a_downloaded_subtitle_clears_the_session() {
+        let kept = kept_after(|s| {
+            let result = alien_subtitle_result(s);
+            let got = ready(s.download_subtitle(&alien(), &result)).unwrap();
+            ready(s.home()).unwrap();
+            let download = got.subtitle.download.unwrap().id;
+            ready(s.remove_subtitle_download(&alien(), &download)).unwrap();
         });
         assert_eq!(kept, 0);
     }

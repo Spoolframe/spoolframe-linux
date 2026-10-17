@@ -15,6 +15,17 @@
   PNG, WebP or HEIC, up to 20 MB) through the desktop's file chooser, or
   removes the one chosen; a picture past the limits is refused before it
   is sent.
+- Search for subtitles, on a server that has subtitle search: the last
+  row of a film's or an episode's subtitle picker, and the player's
+  subtitle menu, open a panel of what OpenSubtitles and SubDL have, in
+  a language you pick: files made for this one first, each with its
+  site, HI, machine-translated or AI-made, rating and downloads; ones
+  removed before as bad last. It says when a site can't be reached,
+  when today's downloads are used up, and when search is off. A result
+  chosen downloads as a track for everyone on the server: on the item's
+  page it is then picked, and in the player it plays from where you
+  are. A downloaded track says where it came from, who downloaded it
+  and when, with Remove for whoever may.
 - Scrub-preview frames are kept in memory only, not in the artwork cache
   on disk.
 - Home, the libraries, library pages, item pages and playlists show at

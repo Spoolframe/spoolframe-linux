@@ -200,6 +200,9 @@ pub struct App {
     shown_item: Option<ShownItem>,
     /// The item page being drawn again: its new page replaces it.
     redrawing: Option<(MediaId, glib::WeakRef<adw::NavigationPage>)>,
+    /// A subtitle track just downloaded from the item's page (PX-02):
+    /// its next drawing shows it picked.
+    picked_subtitle: Option<(MediaId, u32)>,
 }
 
 /// An item page on the stack.
@@ -411,6 +414,13 @@ pub enum Msg {
     RemoveCover(String),
     /// A line to show in a toast, from work done off the update.
     Toast(String),
+    /// Search for subtitles (PX-02) for an item page's item, by its id and
+    /// name.
+    FindSubtitles(MediaId, String),
+    /// A subtitle downloaded from an item page: its track, to show picked.
+    SubtitleDownloaded(MediaId, u32),
+    /// Removes item `id`'s downloaded track `download`.
+    RemoveDownload(MediaId, String),
     PlaylistChanged(Box<PlaylistEvent>),
     /// A kept catalog read came back different from what was shown.
     CatalogChanged(Box<catalog::Change>),
@@ -622,6 +632,8 @@ pub enum Loaded {
     PlaylistUpdated(String, Result<PlaylistSummary, BackendError>),
     /// A playlist's cover set or taken away (PX-53).
     CoverChanged(String, Result<(), BackendError>),
+    /// A downloaded subtitle removed (PX-02).
+    DownloadRemoved(Result<(), BackendError>),
     /// A playlist deleted, by name.
     PlaylistDeleted(String, Result<(), BackendError>),
     PinChanged(Result<(), BackendError>),
@@ -689,6 +701,7 @@ impl Loaded {
             | Loaded::PlaylistEdited(_, Err(e))
             | Loaded::PlaylistUpdated(_, Err(e))
             | Loaded::CoverChanged(_, Err(e))
+            | Loaded::DownloadRemoved(Err(e))
             | Loaded::PlaylistDeleted(_, Err(e))
             | Loaded::PinChanged(Err(e))
             | Loaded::PlaylistStarted(_, _, Err(e)) => Some(e),
@@ -1103,6 +1116,7 @@ impl Component for App {
             opening_item: None,
             shown_item: None,
             redrawing: None,
+            picked_subtitle: None,
         };
         model.watch_catalog(&sender);
         model.load_servers(&sender);
@@ -1871,6 +1885,37 @@ impl Component for App {
                 });
             }
             Msg::Toast(text) => toast_text(widgets, &text),
+            Msg::FindSubtitles(id, title) => {
+                let Some(session) = self.session.clone() else {
+                    return;
+                };
+                let picked: Rc<dyn Fn(u32)> = {
+                    let (sender, id) = (sender.clone(), id.clone());
+                    Rc::new(move |track| sender.input(Msg::SubtitleDownloaded(id.clone(), track)))
+                };
+                crate::subtitle_search::present(
+                    root,
+                    crate::subtitle_search::Search {
+                        session,
+                        item: id,
+                        title,
+                        server: self.server_name(),
+                        picked,
+                    },
+                );
+            }
+            Msg::SubtitleDownloaded(id, track) => {
+                self.picked_subtitle = Some((id, track));
+                self.redraw_item(&sender);
+            }
+            Msg::RemoveDownload(id, download) => {
+                let Some(session) = self.session.clone() else {
+                    return;
+                };
+                self.command(&sender, async move {
+                    Loaded::DownloadRemoved(session.remove_subtitle_download(&id, &download).await)
+                });
+            }
             Msg::SetCover(id, bytes) => {
                 let Some(session) = self.playlist_session() else {
                     return;
@@ -2718,6 +2763,7 @@ impl Component for App {
                         let (sender, item) = (sender.clone(), item.clone());
                         Rc::new(move || sender.input(Msg::ForgetTracks(Box::new(item.clone()))))
                     },
+                    subtitles: self.subtitle_actions(&item, &sender),
                 };
                 let body = pages::playable(
                     &item,
@@ -3037,6 +3083,12 @@ impl Component for App {
                 if self.shown_playlist_id(widgets).as_ref() == Some(&id) {
                     self.reload_playlist(id, &sender);
                 }
+            }
+            Loaded::DownloadRemoved(done) => {
+                if let Err(e) = done {
+                    toast(widgets, &e);
+                }
+                self.redraw_item(&sender);
             }
             Loaded::CoverChanged(id, done) => {
                 if let Err(e) = done {
@@ -3508,6 +3560,48 @@ impl App {
         Some(pages::ShowPlaylists { refs, open })
     }
 
+    /// What the item page's subtitle picker does with subtitle sites
+    /// (PX-02), where the server searches them: a film's or an episode's.
+    /// A track just downloaded for this item is shown picked, once.
+    fn subtitle_actions(
+        &mut self,
+        item: &Item,
+        sender: &ComponentSender<Self>,
+    ) -> Option<pages::SubtitleActions> {
+        let picked = self
+            .picked_subtitle
+            .take()
+            .filter(|(id, _)| id == item.id())
+            .map(|(_, track)| track);
+        if !self
+            .session
+            .as_ref()
+            .is_some_and(|s| s.has_subtitle_search())
+        {
+            return None;
+        }
+        let id = item.id().clone();
+        Some(pages::SubtitleActions {
+            find: {
+                let (sender, id) = (sender.clone(), id.clone());
+                let title = views::Facts::of(item).title;
+                Rc::new(move || sender.input(Msg::FindSubtitles(id.clone(), title.clone())))
+            },
+            remove: {
+                let sender = sender.clone();
+                Rc::new(move |download| sender.input(Msg::RemoveDownload(id.clone(), download)))
+            },
+            picked,
+        })
+    }
+
+    /// The server's name, as the app shows it.
+    fn server_name(&self) -> String {
+        self.server
+            .as_ref()
+            .map_or_else(|| "the server".to_owned(), |s| s.name.clone())
+    }
+
     /// "Add to playlist" for `item`, from the list known now.
     fn add_dialog(
         &self,
@@ -3597,6 +3691,7 @@ impl App {
         widgets: &AppWidgets,
         sender: &ComponentSender<Self>,
     ) {
+        playback.set_server_name(&self.server_name());
         playback.set_skip_intros(self.settings.skip_intros());
         // A queued item that cannot play is passed over with a word, not
         // a stop (P1-23).

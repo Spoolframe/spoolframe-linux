@@ -1839,3 +1839,38 @@ textview.license-text text {
   background-color: var(--sidebar-bg-color);
   font-size: 12.5px;
 }
+
+/* Search for subtitles (PX-02), as boards LinuxSubtitleSearch and
+   LinuxSubtitleSearchStates draw it: "Matches this file" on green in the
+   tiles' dark ink, releases in the mono face, and the notes for a
+   search that is off (blue) or in trouble (yellow). */
+.subtitle-match {
+  padding: 1px 8px;
+  border-radius: 6px;
+  background-color: var(--accent-green);
+  color: var(--accent-fg-color);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.subtitle-release {
+  font-size: 13px;
+}
+
+.subtitle-note.note {
+  border: 1px solid alpha(var(--accent-blue), 0.45);
+}
+
+.subtitle-note.warning,
+label.warning {
+  color: var(--warning-color);
+}
+
+.subtitle-note.warning {
+  background-color: alpha(var(--warning-color), 0.10);
+  border: 1px solid alpha(var(--warning-color), 0.45);
+}
+
+label.accent {
+  color: var(--accent-color);
+}

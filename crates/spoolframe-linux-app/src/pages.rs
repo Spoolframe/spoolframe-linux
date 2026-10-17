@@ -1,6 +1,6 @@
 //! The pages a card opens, laid out as in the UI mockups.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -50,6 +50,28 @@ pub struct PlayableActions {
     pub remember: Rc<dyn Fn(Selection)>,
     /// Forgets them: back to the user's preferences.
     pub forget: Rc<dyn Fn()>,
+    /// Subtitles from subtitle sites (PX-02); none where the server has
+    /// no subtitle search.
+    pub subtitles: Option<SubtitleActions>,
+}
+
+/// What the subtitle picker does with subtitle sites (PX-02).
+pub struct SubtitleActions {
+    /// Opens Search for subtitles, the picker's last row.
+    pub find: Rc<dyn Fn()>,
+    /// Removes a downloaded track, by its download's id.
+    pub remove: Rc<dyn Fn(String)>,
+    /// A track just downloaded, shown picked.
+    pub picked: Option<u32>,
+}
+
+/// The subtitle picker's rows: Off, the tracks, and with subtitle search
+/// its last row (board LinuxSubtitleSearch).
+pub fn subtitle_names(tracks: &MediaTracks, search: bool) -> Vec<String> {
+    std::iter::once("Off".to_owned())
+        .chain(tracks.subtitles.iter().map(format::subtitle_track))
+        .chain(search.then(|| "Search for subtitles…".to_owned()))
+        .collect()
 }
 
 /// What goes under a movie's or an episode's details.
@@ -178,7 +200,15 @@ pub fn playable(
         info.append(&text);
     }
     let series = matches!(item, Item::Episode(_));
-    let pickers = tracks.map(|t| TrackPickers::new(t, chosen, series, &actions.forget));
+    let pickers = tracks.map(|t| {
+        TrackPickers::new(
+            t,
+            chosen,
+            series,
+            &actions.forget,
+            actions.subtitles.as_ref(),
+        )
+    });
     let buttons = playback_buttons(&facts, &actions, pickers.clone());
     let mut more = Vec::new();
     if let Item::Episode(e) = item {
@@ -488,6 +518,7 @@ impl TrackPickers {
         chosen: Option<&ChosenTracks>,
         series: bool,
         forget: &Rc<dyn Fn()>,
+        search: Option<&SubtitleActions>,
     ) -> Self {
         let start = chosen.map(|c| c.selection);
         let row = gtk::Box::builder().spacing(14).homogeneous(true).build();
@@ -503,19 +534,21 @@ impl TrackPickers {
             dropdown.set_sensitive(names.len() > 1);
             dropdown
         });
-        let subtitles = (!tracks.subtitles.is_empty()).then(|| {
-            let names: Vec<String> = std::iter::once("Off".to_owned())
-                .chain(tracks.subtitles.iter().map(format::subtitle_track))
-                .collect();
-            let selected = match start {
-                Some(s) => s.subtitle.map_or(0, |i| i as usize + 1),
-                None => tracks
+        // With subtitle search, shown with no tracks too: its last row
+        // finds one.
+        let subtitles = (!tracks.subtitles.is_empty() || search.is_some()).then(|| {
+            let names = subtitle_names(tracks, search.is_some());
+            let picked = search.and_then(|s| s.picked);
+            let selected = match (picked, start) {
+                (Some(track), _) => track as usize + 1,
+                (None, Some(s)) => s.subtitle.map_or(0, |i| i as usize + 1),
+                (None, None) => tracks
                     .subtitles
                     .iter()
                     .position(|t| t.default)
                     .map_or(0, |i| i + 1),
             };
-            picker(&row, "Subtitles", &names, selected)
+            picker(&row, "Subtitles", &names, selected.min(names.len() - 1))
         });
         let qualities: Vec<String> = crate::quality::choices()
             .into_iter()
@@ -536,6 +569,9 @@ impl TrackPickers {
         }
         let column = gtk::Box::new(gtk::Orientation::Vertical, 8);
         column.append(&row);
+        if let (Some(dropdown), Some(search)) = (&subtitles, search) {
+            column.append(&search_row(dropdown, tracks, search));
+        }
         if let Some(chosen) = chosen {
             let why: Vec<String> = [
                 format::track_reason(chosen.audio).map(|r| format!("audio from {r}")),
@@ -613,6 +649,82 @@ impl TrackPickers {
         });
         (!unchanged).then_some(picked)
     }
+}
+
+/// The subtitle picker's last row opens Search for subtitles, and the
+/// picker goes back to what it showed; a downloaded track picked says
+/// where it came from, with Remove for whoever may (PX-02). The line it
+/// returns sits under the pickers.
+fn search_row(
+    dropdown: &gtk::DropDown,
+    tracks: &MediaTracks,
+    search: &SubtitleActions,
+) -> gtk::Box {
+    let line = gtk::Box::builder().spacing(10).build();
+    let note = label("", &["dim-label", "caption"]);
+    note.set_wrap(true);
+    let remove = gtk::Button::builder()
+        .label("Remove")
+        .css_classes(["flat", "compact"])
+        .build();
+    line.append(&note);
+    line.append(&remove);
+    let downloads: Vec<Option<spoolframe_linux_core::backend::SubtitleDownload>> = tracks
+        .subtitles
+        .iter()
+        .map(|t| t.download.clone())
+        .collect();
+    let picked: Rc<RefCell<Option<String>>> = Rc::default();
+    let show = {
+        let (line, note, remove, picked) = (
+            line.downgrade(),
+            note.downgrade(),
+            remove.downgrade(),
+            picked.clone(),
+        );
+        move |selected: u32| {
+            let (Some(line), Some(note), Some(remove)) =
+                (line.upgrade(), note.upgrade(), remove.upgrade())
+            else {
+                return;
+            };
+            let download = (selected as usize)
+                .checked_sub(1)
+                .and_then(|i| downloads.get(i).cloned().flatten());
+            line.set_visible(download.is_some());
+            if let Some(download) = &download {
+                note.set_label(&crate::subtitle_search::download_note(
+                    download,
+                    crate::subtitle_search::now(),
+                ));
+                remove.set_visible(download.can_remove);
+            }
+            picked.replace(download.map(|d| d.id));
+        }
+    };
+    show(dropdown.selected());
+    {
+        let remove_it = search.remove.clone();
+        remove.connect_clicked(move |_| {
+            if let Some(id) = picked.borrow().clone() {
+                remove_it(id);
+            }
+        });
+    }
+    let last = tracks.subtitles.len() as u32 + 1;
+    let shown = Rc::new(Cell::new(dropdown.selected()));
+    let find = search.find.clone();
+    dropdown.connect_selected_notify(move |dropdown| {
+        let selected = dropdown.selected();
+        if selected == last {
+            dropdown.set_selected(shown.get());
+            find();
+            return;
+        }
+        shown.set(selected);
+        show(selected);
+    });
+    line
 }
 
 fn picker(row: &gtk::Box, title: &str, names: &[String], selected: usize) -> gtk::DropDown {
@@ -1603,6 +1715,36 @@ mod tests {
 
     fn id(kind: MediaKind, key: &str) -> MediaId {
         MediaId::new(Namespace::Plex, kind, key).unwrap()
+    }
+
+    fn alien_tracks() -> MediaTracks {
+        use spoolframe_linux_core::backend::Client;
+        let client = spoolframe_linux_core::fake::FakeClient::new(None);
+        let session = client
+            .session(&spoolframe_linux_core::fake::FakeClient::profile("andrey"))
+            .unwrap();
+        spoolframe_linux_core::testing::ready(session.tracks(&id(MediaKind::Movie, "1"))).unwrap()
+    }
+
+    #[test]
+    fn with_subtitle_search_the_pickers_last_row_searches() {
+        let names = subtitle_names(&alien_tracks(), true);
+        assert_eq!(
+            (
+                names.first().map(String::as_str),
+                names.last().map(String::as_str)
+            ),
+            (Some("Off"), Some("Search for subtitles…"))
+        );
+    }
+
+    #[test]
+    fn without_subtitle_search_the_picker_lists_only_tracks() {
+        let tracks = alien_tracks();
+        assert_eq!(
+            subtitle_names(&tracks, false).len(),
+            tracks.subtitles.len() + 1
+        );
     }
 
     fn season(n: u32) -> Season {

@@ -36,9 +36,41 @@ pub fn timestamp(position: Duration) -> String {
     }
 }
 
-/// The name of an ISO 639-2 language code, for the common ones; the code
-/// itself, upper-cased, for the rest.
+/// The name of an ISO 639-2 language code, or of a two-letter one with
+/// or without its region as subtitle sites name them (`en`, `pt-BR`,
+/// PX-02), for the common ones; the code itself, upper-cased, for the
+/// rest.
 pub fn language(code: &str) -> String {
+    match code.to_ascii_lowercase().as_str() {
+        "pt-br" => return "Portuguese (Brazil)".to_owned(),
+        "zh-tw" => return "Chinese (Taiwan)".to_owned(),
+        _ => {}
+    }
+    let primary = code.split(['-', '_']).next().unwrap_or(code);
+    let name = match primary.to_ascii_lowercase().as_str() {
+        "en" => "English",
+        "fr" => "French",
+        "de" => "German",
+        "es" => "Spanish",
+        "it" => "Italian",
+        "pt" => "Portuguese",
+        "ru" => "Russian",
+        "uk" => "Ukrainian",
+        "pl" => "Polish",
+        "nl" => "Dutch",
+        "sv" => "Swedish",
+        "no" | "nb" => "Norwegian",
+        "da" => "Danish",
+        "fi" => "Finnish",
+        "ja" => "Japanese",
+        "ko" => "Korean",
+        "zh" => "Chinese",
+        _ => return language_639_2(code),
+    };
+    name.to_owned()
+}
+
+fn language_639_2(code: &str) -> String {
     let name = match code {
         "eng" => "English",
         "fre" | "fra" => "French",
@@ -125,8 +157,17 @@ pub fn subtitle_track(track: &spoolframe_types::SubtitleTrack) -> String {
         track
             .title
             .clone()
+            // A downloaded one's title is its site's name, said below.
+            .filter(|_| track.download.is_none())
             .filter(|t| role.is_none_or(|r| !t.eq_ignore_ascii_case(r))),
-        track.external.then(|| "external file".to_owned()),
+        // A downloaded one (PX-02) is titled by its site.
+        track.download.as_ref().map(|d| {
+            format!(
+                "Searched ({})",
+                spoolframe_types::SubtitleSource::name_of(&d.source)
+            )
+        }),
+        (track.external && track.download.is_none()).then(|| "external file".to_owned()),
     ]
     .into_iter()
     .flatten()
@@ -498,6 +539,20 @@ mod tests {
     }
 
     #[test]
+    fn a_subtitle_sites_language_codes_are_named() {
+        assert_eq!(
+            ["en", "pt-BR", "pt-br", "sv", "xx"].map(language),
+            [
+                "English",
+                "Portuguese (Brazil)",
+                "Portuguese (Brazil)",
+                "Swedish",
+                "XX"
+            ]
+        );
+    }
+
+    #[test]
     fn an_audio_track_names_language_title_and_channels() {
         let track = spoolframe_types::AudioTrack {
             language: Some("eng".into()),
@@ -537,6 +592,30 @@ mod tests {
             download: None,
         };
         assert_eq!(subtitle_track(&track), "English · external file");
+    }
+
+    #[test]
+    fn a_downloaded_subtitle_says_which_site_it_was_searched_on() {
+        let track = spoolframe_types::SubtitleTrack {
+            language: Some("en".into()),
+            title: Some("SubDL".into()),
+            forced: false,
+            default: false,
+            external: true,
+            role: spoolframe_types::SubtitleRole::Full,
+            timing: None,
+            download: Some(spoolframe_types::SubtitleDownload {
+                id: "d1".into(),
+                source: "subdl".into(),
+                release: "Alien.1979.1080p".into(),
+                by: "Alice".into(),
+                at: 0,
+                hash_match: false,
+                origin: Default::default(),
+                can_remove: true,
+            }),
+        };
+        assert_eq!(subtitle_track(&track), "English · Searched (SubDL)");
     }
 
     #[test]

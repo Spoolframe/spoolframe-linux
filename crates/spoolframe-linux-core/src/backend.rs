@@ -35,6 +35,12 @@ use spoolframe_types::{
 pub use spoolframe_types::{
     Marker, MarkerKind, Person, PersonId, PersonRole, SearchKind, SearchScope,
 };
+/// Subtitles from subtitle sites (PX-02) and their timing (PX-03), in the
+/// types' own shapes.
+pub use spoolframe_types::{
+    QuotaOf, SubtitleDownload, SubtitleDownloaded, SubtitleOrigin, SubtitleResult, SubtitleSearch,
+    SubtitleSource, SubtitleSourceState, SubtitleSourceStatus, SubtitleSync, SubtitleTiming,
+};
 use tokio::sync::watch;
 
 /// A boxed future, so that the UI can hold a backend as `dyn Client` or
@@ -222,6 +228,21 @@ pub enum BackendError {
     /// Not a JPEG, PNG, WebP or HEIC the server can read (PX-53).
     #[error("That picture can’t be read. Choose a JPEG, PNG, WebP or HEIC.")]
     ImageUnreadable,
+    /// The server has no subtitle site set up (PX-02): "Search for
+    /// subtitles" says it is off. Nothing was asked of any site.
+    #[error("Subtitle search is off on this server.")]
+    NoSubtitleSource,
+    /// The downloads of `whose` are used up for today (PX-02): the
+    /// server's account at subtitle site `site`, or the user's own daily
+    /// limit. Searching still works. The SDK (0.12.0) passes this on as
+    /// a server message only, so `site` and `resets_at` are `None` from
+    /// it: see `sdk::backend_error`.
+    #[error("No subtitle downloads are left today.")]
+    QuotaExhausted {
+        whose: QuotaOf,
+        site: Option<String>,
+        resets_at: Option<i64>,
+    },
     #[error("{0}")]
     Other(String),
 }
@@ -1291,6 +1312,39 @@ pub trait Session: Send + Sync {
     /// sites (PX-02, `spoolframe:subtitle-search`): "Find subtitles…", and
     /// a downloaded track's `download`.
     fn has_subtitle_search(&self) -> bool;
+
+    /// What the server's subtitle sites have for item `id` (PX-02), in
+    /// `language` (`en`, `pt-BR`) or, with `None`, the languages the
+    /// server offers first: one list, best first, and how each site's
+    /// part went. Never kept by the catalog: the server keeps it a day.
+    /// [`BackendError::NoSubtitleSource`] when the server has no site set
+    /// up. Without [`Session::has_subtitle_search`],
+    /// [`BackendError::Unsupported`], unsent.
+    fn search_subtitles<'a>(
+        &'a self,
+        id: &'a MediaId,
+        language: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<SubtitleSearch, BackendError>>;
+
+    /// Downloads search result `result` (its `SubtitleResult::id`) as a
+    /// track of item `id`, for everyone: its place in the item's
+    /// subtitles, the track, and the downloads left today. Ask for the
+    /// item's tracks again after it: no event says so.
+    /// [`BackendError::QuotaExhausted`] when the downloads are used up.
+    fn download_subtitle<'a>(
+        &'a self,
+        id: &'a MediaId,
+        result: &'a str,
+    ) -> BoxFuture<'a, Result<SubtitleDownloaded, BackendError>>;
+
+    /// Removes item `id`'s downloaded track `download`
+    /// (`SubtitleDownload::id`), for everyone: its downloader or an admin
+    /// may.
+    fn remove_subtitle_download<'a>(
+        &'a self,
+        id: &'a MediaId,
+        download: &'a str,
+    ) -> BoxFuture<'a, Result<(), BackendError>>;
 
     /// What the user played lately, from any device (PX-52): each item
     /// once, by its latest counted play, newest first, a page of at most

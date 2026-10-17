@@ -48,7 +48,12 @@ use crate::backend::{
 use crate::backend::{InviteKind, InviteOrigin, InviteSpec, InviteSummary, MintedInvite};
 
 mod playlists;
+mod subtitles;
+
+use crate::backend::{SubtitleDownloaded, SubtitleSearch};
+
 pub use playlists::PAGE_LIMIT as PLAYLIST_PAGE_LIMIT;
+pub use subtitles::{QUOTA_RESETS_AT, Sites};
 
 /// Every fake account's password.
 pub const FAKE_PASSWORD: &str = "spoolframe";
@@ -562,6 +567,9 @@ pub struct FakeSession {
     /// The features this session has, as the store had them when it was
     /// made: read without its lock, which item reads may hold.
     features: Features,
+    /// The server's subtitle sites and what was downloaded (PX-02), for
+    /// everyone.
+    subtitles: Arc<Mutex<subtitles::Store>>,
 }
 
 /// What this device keeps saved, shared by the client and its sessions.
@@ -727,6 +735,10 @@ pub enum PreviewsAnswer {
     Ready,
 }
 
+/// The subtitle tracks every film and episode of the fake has of its own;
+/// downloaded ones follow them (PX-02).
+const OWN_SUBTITLES: usize = 3;
+
 /// The fake's preview sheet: two by two tiles of 64 × 36 px, red, green,
 /// blue and yellow, a second apart.
 pub const FAKE_PREVIEW_SHEET: &[u8] = include_bytes!("fake-preview-sheet.png");
@@ -740,8 +752,13 @@ impl FakeSession {
         active: Arc<Mutex<std::collections::HashSet<String>>>,
         passkeys: Arc<Mutex<FakeAuth>>,
         // Its server and the device's saved list, together: leaving needs
-        // both; and the server's playlists.
-        (server, saved, playlists): (ServerKey, Saved, Arc<Mutex<playlists::Store>>),
+        // both; and the server's playlists and subtitles.
+        (server, saved, playlists, subtitles): (
+            ServerKey,
+            Saved,
+            Arc<Mutex<playlists::Store>>,
+            Arc<Mutex<subtitles::Store>>,
+        ),
     ) -> Self {
         // Alice has a PIN, asked for here, so the fake opens her locked.
         let pin = match username {
@@ -780,6 +797,7 @@ impl FakeSession {
             server,
             saved,
             playlists,
+            subtitles,
         };
         {
             let mut watch = session.watch();
@@ -975,11 +993,19 @@ impl FakeSession {
                         AudioRole::AudioDescription,
                     ),
                 ],
-                subtitles: vec![
+                subtitles: [
                     subtitle(None, SubtitleRole::Full, true),
                     subtitle(Some("Forced"), SubtitleRole::Forced, false),
                     subtitle(Some("SDH"), SubtitleRole::Sdh, false),
-                ],
+                ]
+                .into_iter()
+                // Those downloaded from a subtitle site (PX-02), after.
+                .chain(self.lock_subtitles().tracks(
+                    item.id(),
+                    self.asker(&display_name(&self.username)),
+                    self.features.subtitle_search,
+                ))
+                .collect(),
             },
         }
     }
@@ -1580,15 +1606,28 @@ impl Session for FakeSession {
         handle: &'a PlaybackHandle,
     ) -> BoxFuture<'a, Result<(SubtitleFormat, Vec<u8>), BackendError>> {
         Box::pin(async move {
-            let (_, selection) = self.playback(handle)?;
+            let (id, selection) = self.playback(handle)?;
             if let Some(waits) = self.serving.reading_subtitle {
                 if self.subtitle_asks.fetch_add(1, Ordering::SeqCst) < waits {
                     return Err(BackendError::SubtitleNotReady(50));
                 }
             } else if selection.subtitle != Some(0) {
-                return Err(BackendError::NotFound(
-                    "an external subtitle in this playback".into(),
-                ));
+                // A track downloaded from a subtitle site (PX-02), after
+                // the item's three own.
+                let site = selection.subtitle.and_then(|n| {
+                    self.lock_subtitles()
+                        .site_of(&id, n as usize, OWN_SUBTITLES)
+                        .map(str::to_owned)
+                });
+                let Some(site) = site else {
+                    return Err(BackendError::NotFound(
+                        "an external subtitle in this playback".into(),
+                    ));
+                };
+                let srt = format!(
+                    "1\n00:00:01,000 --> 00:00:05,000\nA subtitle downloaded from {site}.\n"
+                );
+                return Ok((SubtitleFormat::Srt, srt.into_bytes()));
             }
             let srt = "1\n00:00:01,000 --> 00:00:05,000\nA subtitle from the fake server.\n\n\
                        2\n00:00:06,000 --> 00:00:10,000\nIt came over read_subtitle.\n";
@@ -2362,6 +2401,49 @@ impl Session for FakeSession {
         self.features.subtitle_search
     }
 
+    fn search_subtitles<'a>(
+        &'a self,
+        id: &'a MediaId,
+        language: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<SubtitleSearch, BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            self.subtitle_search_listed()?;
+            let title = crate::playlists::title(self.catalog.get(id)?);
+            self.lock_subtitles().search(id, &title, language)
+        })
+    }
+
+    fn download_subtitle<'a>(
+        &'a self,
+        id: &'a MediaId,
+        result: &'a str,
+    ) -> BoxFuture<'a, Result<SubtitleDownloaded, BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            self.subtitle_search_listed()?;
+            let title = crate::playlists::title(self.catalog.get(id)?);
+            let name = display_name(&self.username);
+            let asker = self.asker(&name);
+            self.lock_subtitles()
+                .download(id, &title, result, OWN_SUBTITLES, asker)
+        })
+    }
+
+    fn remove_subtitle_download<'a>(
+        &'a self,
+        id: &'a MediaId,
+        download: &'a str,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            self.subtitle_search_listed()?;
+            let name = display_name(&self.username);
+            let asker = self.asker(&name);
+            self.lock_subtitles().remove(id, download, asker)
+        })
+    }
+
     fn share_candidates<'a>(
         &'a self,
         id: &'a str,
@@ -2897,6 +2979,29 @@ impl FakeSession {
         store
     }
 
+    fn lock_subtitles(&self) -> std::sync::MutexGuard<'_, subtitles::Store> {
+        self.subtitles.lock().expect("fake state is never poisoned")
+    }
+
+    /// Who asks, by the display name `name` (see [`display_name`]).
+    fn asker<'a>(&'a self, name: &'a str) -> subtitles::Asker<'a> {
+        subtitles::Asker {
+            username: &self.username,
+            display_name: name,
+            admin: self.is_admin(),
+        }
+    }
+
+    /// Refuses a subtitle search call without the feature, unsent.
+    fn subtitle_search_listed(&self) -> Result<(), BackendError> {
+        match self.features.subtitle_search {
+            true => Ok(()),
+            false => Err(BackendError::Unsupported(
+                spoolframe_protocol::features::SUBTITLE_SEARCH.into(),
+            )),
+        }
+    }
+
     /// An item's tracks, for an edit's add or a like: a track itself, an
     /// album or artist its tracks, in order.
     fn tracks_for(&self, item: &MediaId) -> Result<Vec<Item>, BackendError> {
@@ -2979,6 +3084,8 @@ pub struct FakeClient {
     passkeys: Arc<Mutex<FakeAuth>>,
     /// Every user's playlists (PX-40), as the server keeps them.
     playlists: Arc<Mutex<playlists::Store>>,
+    /// The server's subtitle sites and downloads (PX-02).
+    subtitles: Arc<Mutex<subtitles::Store>>,
 }
 
 /// How the fake answers a sign-in a phone approves.
@@ -3171,6 +3278,7 @@ impl FakeClient {
             servers_changed: Arc::new(watch::Sender::new(())),
             joined: Mutex::default(),
             playlists: Arc::new(Mutex::new(seeded_playlists())),
+            subtitles: Arc::default(),
         }
     }
 
@@ -3194,6 +3302,15 @@ impl FakeClient {
             playlist_art: features.playlist_art && features.playlists,
             ..features
         };
+        self
+    }
+
+    /// The server's subtitle sites (PX-02) answer as `sites` says.
+    pub fn with_subtitle_sites(self, sites: Sites) -> Self {
+        self.subtitles
+            .lock()
+            .expect("fake state is never poisoned")
+            .sites = sites;
         self
     }
 
@@ -3399,7 +3516,12 @@ impl FakeClient {
                     self.gone.clone(),
                     self.active.clone(),
                     self.passkeys.clone(),
-                    (profile.server.clone(), self.saved(), self.playlists.clone()),
+                    (
+                        profile.server.clone(),
+                        self.saved(),
+                        self.playlists.clone(),
+                        self.subtitles.clone(),
+                    ),
                 ))
             })
             .clone()
@@ -7150,5 +7272,204 @@ mod cover_tests {
         let refs = ready(andrey.item_detail(&alien)).unwrap().playlists;
         let night = refs.into_iter().find(|r| r.id == id).unwrap();
         assert_eq!(night.artwork, Some(cover));
+    }
+}
+
+/// Subtitle search and download (PX-02) on the fake server.
+#[cfg(test)]
+mod subtitle_search_tests {
+    use super::*;
+    use crate::backend::{QuotaOf, SubtitleSourceState, SubtitleSourceStatus};
+    use crate::testing::{file_with, ready};
+
+    fn session_for(client: &FakeClient, username: &str) -> Arc<dyn Session> {
+        let session = client.session(&FakeClient::profile(username)).unwrap();
+        if username == "alice" {
+            ready(session.unlock(FAKE_PIN)).unwrap();
+        }
+        session
+    }
+
+    fn alien() -> MediaId {
+        media(MediaKind::Movie, "1")
+    }
+
+    fn found(session: &dyn Session) -> SubtitleSearch {
+        ready(session.search_subtitles(&alien(), None)).unwrap()
+    }
+
+    #[test]
+    fn a_search_lists_a_match_for_this_file_first_and_a_rejected_one_last() {
+        let andrey = session_for(&FakeClient::new(None), "andrey");
+        let results = found(andrey.as_ref()).results;
+        assert_eq!(
+            (
+                results.first().map(|r| r.hash_match),
+                results.last().map(|r| r.rejected)
+            ),
+            (Some(true), Some(true))
+        );
+    }
+
+    #[test]
+    fn a_search_says_how_each_site_went() {
+        let andrey = session_for(&FakeClient::new(None), "andrey");
+        assert_eq!(
+            found(andrey.as_ref()).sources,
+            [
+                SubtitleSourceStatus {
+                    source: "opensubtitles".into(),
+                    state: SubtitleSourceState::Found { found: 3 }
+                },
+                SubtitleSourceStatus {
+                    source: "subdl".into(),
+                    state: SubtitleSourceState::Found { found: 1 }
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn one_site_down_leaves_the_others_results() {
+        let client = FakeClient::new(None).with_subtitle_sites(Sites::SubDlDown);
+        let search = found(session_for(&client, "andrey").as_ref());
+        assert_eq!(
+            (
+                search.results.iter().all(|r| r.source == "opensubtitles"),
+                matches!(search.sources[1].state, SubtitleSourceState::Failed { .. })
+            ),
+            (true, true)
+        );
+    }
+
+    #[test]
+    fn a_language_nobody_made_subtitles_in_finds_none() {
+        let andrey = session_for(&FakeClient::new(None), "andrey");
+        let search = ready(andrey.search_subtitles(&alien(), Some("sv"))).unwrap();
+        assert_eq!(
+            (search.languages, search.results.len()),
+            (vec!["sv".to_owned()], 0)
+        );
+    }
+
+    #[test]
+    fn a_server_without_a_site_says_so() {
+        let client = FakeClient::new(None).with_subtitle_sites(Sites::NoSource);
+        let andrey = session_for(&client, "andrey");
+        assert_eq!(
+            ready(andrey.search_subtitles(&alien(), None)),
+            Err(BackendError::NoSubtitleSource)
+        );
+    }
+
+    #[test]
+    fn a_download_is_a_track_of_the_item_for_everyone() {
+        let client = FakeClient::new(None);
+        let andrey = session_for(&client, "andrey");
+        let result = found(andrey.as_ref()).results[0].id.clone();
+        let got = ready(andrey.download_subtitle(&alien(), &result)).unwrap();
+        let alice = session_for(&client, "alice");
+        let tracks = ready(alice.tracks(&alien())).unwrap().subtitles;
+        let track = &tracks[got.track as usize];
+        assert_eq!(
+            (
+                track.title.as_deref(),
+                track
+                    .download
+                    .as_ref()
+                    .map(|d| (d.by.as_str(), d.can_remove))
+            ),
+            (Some("OpenSubtitles"), Some(("Andrey", false)))
+        );
+    }
+
+    #[test]
+    fn the_same_result_downloaded_again_is_the_same_track() {
+        let andrey = session_for(&FakeClient::new(None), "andrey");
+        let result = found(andrey.as_ref()).results[0].id.clone();
+        let first = ready(andrey.download_subtitle(&alien(), &result)).unwrap();
+        let again = ready(andrey.download_subtitle(&alien(), &result)).unwrap();
+        assert_eq!(first.track, again.track);
+    }
+
+    #[test]
+    fn a_downloaded_result_says_so_in_the_next_search() {
+        let andrey = session_for(&FakeClient::new(None), "andrey");
+        let result = found(andrey.as_ref()).results[1].id.clone();
+        ready(andrey.download_subtitle(&alien(), &result)).unwrap();
+        assert!(found(andrey.as_ref()).results[1].downloaded);
+    }
+
+    #[test]
+    fn only_its_downloader_removes_a_download() {
+        let client = FakeClient::new(None);
+        let andrey = session_for(&client, "andrey");
+        let result = found(andrey.as_ref()).results[0].id.clone();
+        let got = ready(andrey.download_subtitle(&alien(), &result)).unwrap();
+        let download = got.subtitle.download.unwrap().id;
+        let alice = session_for(&client, "alice");
+        assert_eq!(
+            ready(alice.remove_subtitle_download(&alien(), &download)),
+            Err(BackendError::NotAllowed)
+        );
+        ready(andrey.remove_subtitle_download(&alien(), &download)).unwrap();
+        let tracks = ready(andrey.tracks(&alien())).unwrap().subtitles;
+        assert_eq!(tracks.len(), OWN_SUBTITLES);
+    }
+
+    #[test]
+    fn a_used_up_quota_refuses_the_download_but_still_searches() {
+        let client = FakeClient::new(None).with_subtitle_sites(Sites::QuotaSpent);
+        let andrey = session_for(&client, "andrey");
+        let search = found(andrey.as_ref());
+        assert_eq!(
+            ready(andrey.download_subtitle(&alien(), &search.results[0].id)),
+            Err(BackendError::QuotaExhausted {
+                whose: QuotaOf::Account,
+                site: Some("opensubtitles".into()),
+                resets_at: Some(QUOTA_RESETS_AT),
+            })
+        );
+    }
+
+    #[test]
+    fn without_the_feature_nothing_is_searched_and_no_track_says_where_it_came_from() {
+        let full = FakeClient::new(None);
+        let andrey = session_for(&full, "andrey");
+        let result = found(andrey.as_ref()).results[0].id.clone();
+        ready(andrey.download_subtitle(&alien(), &result)).unwrap();
+        // The same server, seen by an app that did not list the feature.
+        let client = FakeClient::new(None).with_features(Features {
+            playlists: true,
+            ..Features::default()
+        });
+        let off = session_for(&client, "andrey");
+        assert_eq!(
+            ready(off.search_subtitles(&alien(), None)),
+            Err(BackendError::Unsupported(
+                "spoolframe:subtitle-search".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_downloaded_track_plays_as_an_external_subtitle() {
+        let (_dir, path) = file_with("subtitle-download", &[0; 4096]);
+        let client = FakeClient::new(Some(path));
+        let andrey = session_for(&client, "andrey");
+        let result = found(andrey.as_ref()).results[1].id.clone();
+        let got = ready(andrey.download_subtitle(&alien(), &result)).unwrap();
+        let selection = Selection {
+            audio: None,
+            subtitle: Some(got.track),
+        };
+        let started =
+            ready(andrey.start_playback(&alien(), Some(selection), Default::default())).unwrap();
+        let (_, bytes) = ready(andrey.read_subtitle(&started.handle)).unwrap();
+        assert!(
+            String::from_utf8(bytes)
+                .unwrap()
+                .contains("downloaded from SubDL")
+        );
     }
 }
