@@ -113,22 +113,59 @@ pub fn sources_line(sources: &[SubtitleSourceStatus]) -> Option<String> {
     }
 }
 
-/// "14:00 UTC", from Unix seconds.
-pub fn utc_time(at: i64) -> String {
-    let day = at.rem_euclid(86_400);
-    format!("{:02}:{:02} UTC", day / 3600, day / 60 % 60)
+/// When a time is, in words, for a reader whose clock says `now_local`:
+/// "at 17:00" today, "tomorrow at 03:00", else "on 2026-10-19 at 03:00".
+/// Both arguments are Unix seconds moved by the reader's UTC offset, so
+/// this is pure; [`local_when`] supplies the offsets.
+pub fn when_phrase(at_local: i64, now_local: i64) -> String {
+    let day = |t: i64| t.div_euclid(86_400);
+    let clock = at_local.rem_euclid(86_400);
+    let clock = format!("{:02}:{:02}", clock / 3600, clock / 60 % 60);
+    match day(at_local) - day(now_local) {
+        0 => format!("at {clock}"),
+        1 => format!("tomorrow at {clock}"),
+        _ => {
+            let (y, m, d) = civil_date(day(at_local));
+            format!("on {y:04}-{m:02}-{d:02} at {clock}")
+        }
+    }
+}
+
+/// The year, month and day of day number `days` since 1970-01-01.
+fn civil_date(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + i64::from(m <= 2), m, d)
+}
+
+/// [`when_phrase`] on this machine's clock and time zone.
+pub fn local_when(at: i64) -> String {
+    let local = |t: i64| {
+        glib::DateTime::from_unix_utc(t)
+            .ok()
+            .and_then(|utc| utc.to_local().ok())
+            .map_or(t, |l| t + l.utc_offset().as_seconds())
+    };
+    let now = glib::DateTime::now_utc().map_or(0, |n| n.to_unix());
+    when_phrase(local(at), local(now))
 }
 
 /// What a site's part of a search says, where it did not just answer.
-pub fn source_problem(status: &SubtitleSourceStatus) -> Option<String> {
+pub fn source_problem(
+    status: &SubtitleSourceStatus,
+    when: &dyn Fn(i64) -> String,
+) -> Option<String> {
     let name = SubtitleSource::name_of(&status.source);
     match &status.state {
         SubtitleSourceState::Found { .. } | SubtitleSourceState::Unknown => None,
         SubtitleSourceState::QuotaExhausted { resets_at } => Some(match resets_at {
-            Some(at) => format!(
-                "{name} has no downloads left today; more after {}.",
-                utc_time(*at)
-            ),
+            Some(at) => format!("{name} has no downloads left today; more {}.", when(*at)),
             None => format!("{name} has no downloads left today."),
         }),
         SubtitleSourceState::RateLimited { retry_after_ms } => Some(format!(
@@ -151,7 +188,7 @@ pub struct Problem {
 }
 
 /// A search refused, as the states board words it, for server `server`.
-pub fn search_problem(error: &BackendError, server: &str) -> Problem {
+pub fn search_problem(error: &BackendError, server: &str, when: &dyn Fn(i64) -> String) -> Problem {
     let problem = |title: String, detail: &str, retry| Problem {
         title,
         detail: detail.to_owned(),
@@ -179,7 +216,7 @@ pub fn search_problem(error: &BackendError, server: &str) -> Problem {
             whose,
             site,
             resets_at,
-        } => quota_problem(*whose, site.as_deref(), *resets_at, server),
+        } => quota_problem(*whose, site.as_deref(), *resets_at, server, when),
         other => problem(
             "Couldn’t search for subtitles".to_owned(),
             &crate::app::sentence(&other.to_string()),
@@ -195,20 +232,22 @@ pub fn quota_problem(
     site: Option<&str>,
     resets_at: Option<i64>,
     server: &str,
+    when: &dyn Fn(i64) -> String,
 ) -> Problem {
     let after = match (site, resets_at) {
         (Some(site), Some(at)) => format!(
-            "{} allows more after {}.",
+            "{} allows more downloads {}.",
             SubtitleSource::name_of(site),
-            utc_time(at)
+            when(at)
         ),
+        (None, Some(at)) => format!("More downloads {}.", when(at)),
         (Some(site), None) => format!("{} allows more tomorrow.", SubtitleSource::name_of(site)),
-        (None, _) => "More are allowed tomorrow.".to_owned(),
+        (None, None) => "More are allowed tomorrow.".to_owned(),
     };
     let (title, detail) = match whose {
         QuotaOf::User => (
-            "You’ve used your subtitle downloads for today".to_owned(),
-            format!("{server}’s admin set a daily limit. Results still show; downloading waits."),
+            format!("You’ve used today’s downloads on {server}"),
+            format!("{after} Results still show; downloading waits."),
         ),
         QuotaOf::Account | QuotaOf::Unknown => (
             format!("{server} has used today’s downloads"),
@@ -449,7 +488,7 @@ impl View {
         let search = match answer {
             Ok(search) => search,
             Err(e) => {
-                let problem = search_problem(&e, &self.search.server);
+                let problem = search_problem(&e, &self.search.server, &local_when);
                 let retry = problem.retry.then(|| {
                     let (weak, asked) = (Rc::downgrade(self), asked.clone());
                     let again: Rc<dyn Fn()> = Rc::new(move || {
@@ -472,7 +511,7 @@ impl View {
         let mut notes: Vec<gtk::Widget> = search
             .sources
             .iter()
-            .filter_map(source_problem)
+            .filter_map(|s| source_problem(s, &local_when))
             .map(|text| label(&text, &["warning", "caption"]).upcast())
             .collect();
         if search.results.is_empty() {
@@ -584,8 +623,13 @@ impl View {
                         resets_at,
                     } = &e
                     {
-                        let problem =
-                            quota_problem(*whose, site.as_deref(), *resets_at, &view.search.server);
+                        let problem = quota_problem(
+                            *whose,
+                            site.as_deref(),
+                            *resets_at,
+                            &view.search.server,
+                            &local_when,
+                        );
                         view.show_status(&[problem_note(&problem, "warning", None)]);
                     }
                 }
@@ -822,6 +866,33 @@ mod tests {
         );
     }
 
+    /// A reader whose clock is UTC and whose day is 1970-01-01.
+    fn at_utc(at: i64) -> String {
+        when_phrase(at, 0)
+    }
+
+    #[test]
+    fn a_time_today_is_a_clock_time() {
+        assert_eq!(when_phrase(17 * 3600, 3600), "at 17:00");
+    }
+
+    #[test]
+    fn a_time_on_the_next_day_says_tomorrow() {
+        assert_eq!(
+            when_phrase(86_400 + 3 * 3600, 23 * 3600),
+            "tomorrow at 03:00"
+        );
+    }
+
+    #[test]
+    fn a_time_further_off_names_its_date() {
+        // 2025-10-10 00:00:00 UTC is 1_760_054_400; a week earlier is "now".
+        assert_eq!(
+            when_phrase(1_760_054_400 + 90 * 60, 1_760_054_400 - 7 * 86_400),
+            "on 2025-10-10 at 01:30"
+        );
+    }
+
     #[test]
     fn a_site_that_failed_says_so_and_one_that_answered_says_nothing() {
         let status = |state| SubtitleSourceStatus {
@@ -830,21 +901,30 @@ mod tests {
         };
         assert_eq!(
             [
-                source_problem(&status(SubtitleSourceState::Found { found: 3 })),
-                source_problem(&status(SubtitleSourceState::Failed {
-                    message: "no answer".into()
-                })),
-                source_problem(&status(SubtitleSourceState::QuotaExhausted {
-                    resets_at: Some(14 * 3600)
-                })),
-                source_problem(&status(SubtitleSourceState::RateLimited {
-                    retry_after_ms: 1500
-                })),
+                source_problem(&status(SubtitleSourceState::Found { found: 3 }), &at_utc),
+                source_problem(
+                    &status(SubtitleSourceState::Failed {
+                        message: "no answer".into()
+                    }),
+                    &at_utc
+                ),
+                source_problem(
+                    &status(SubtitleSourceState::QuotaExhausted {
+                        resets_at: Some(14 * 3600)
+                    }),
+                    &at_utc
+                ),
+                source_problem(
+                    &status(SubtitleSourceState::RateLimited {
+                        retry_after_ms: 1500
+                    }),
+                    &at_utc
+                ),
             ],
             [
                 None,
                 Some("SubDL can’t be reached: no answer".to_owned()),
-                Some("SubDL has no downloads left today; more after 14:00 UTC.".to_owned()),
+                Some("SubDL has no downloads left today; more at 14:00.".to_owned()),
                 Some("SubDL asked to wait 2 s; its results may be missing.".to_owned()),
             ]
         );
@@ -853,7 +933,7 @@ mod tests {
     #[test]
     fn a_server_without_a_site_says_search_is_off_with_no_retry() {
         assert_eq!(
-            search_problem(&BackendError::NoSubtitleSource, "Home Media"),
+            search_problem(&BackendError::NoSubtitleSource, "Home Media", &at_utc),
             Problem {
                 title: "Subtitle search is off on Home Media".into(),
                 detail: "Ask the server’s owner to turn on subtitle search.".into(),
@@ -864,7 +944,11 @@ mod tests {
 
     #[test]
     fn sites_out_of_reach_offer_try_again() {
-        let problem = search_problem(&BackendError::Unavailable("down".into()), "Home Media");
+        let problem = search_problem(
+            &BackendError::Unavailable("down".into()),
+            "Home Media",
+            &at_utc,
+        );
         assert_eq!(
             (problem.title.as_str(), problem.retry),
             ("Home Media can’t reach the subtitle sites", true)
@@ -872,28 +956,53 @@ mod tests {
     }
 
     #[test]
-    fn the_servers_used_up_downloads_say_when_more_come() {
+    fn the_servers_used_up_downloads_name_the_site_and_say_when_more_come() {
         let problem = quota_problem(
             QuotaOf::Account,
             Some("opensubtitles"),
-            Some(0),
+            Some(17 * 3600),
             "Home Media",
+            &at_utc,
         );
         assert_eq!(
             (problem.title, problem.detail),
             (
                 "Home Media has used today’s downloads".to_owned(),
-                "OpenSubtitles allows more after 00:00 UTC. Results still show; downloading waits."
+                "OpenSubtitles allows more downloads at 17:00. Results still show; downloading waits."
                     .to_owned()
             )
         );
     }
 
     #[test]
-    fn the_users_own_used_up_downloads_say_whose_limit_it_is() {
+    fn a_quota_with_no_reset_time_says_tomorrow() {
+        let detail =
+            |site| quota_problem(QuotaOf::Account, site, None, "Home Media", &at_utc).detail;
         assert_eq!(
-            quota_problem(QuotaOf::User, None, None, "Home Media").title,
-            "You’ve used your subtitle downloads for today"
+            [detail(Some("subdl")), detail(None)],
+            [
+                "SubDL allows more tomorrow. Results still show; downloading waits.",
+                "More are allowed tomorrow. Results still show; downloading waits."
+            ]
+        );
+    }
+
+    #[test]
+    fn the_users_own_used_up_downloads_say_whose_limit_it_is_and_when_more_come() {
+        let problem = quota_problem(
+            QuotaOf::User,
+            None,
+            Some(86_400 + 3 * 3600),
+            "Home Media",
+            &at_utc,
+        );
+        assert_eq!(
+            (problem.title, problem.detail),
+            (
+                "You’ve used today’s downloads on Home Media".to_owned(),
+                "More downloads tomorrow at 03:00. Results still show; downloading waits."
+                    .to_owned()
+            )
         );
     }
 

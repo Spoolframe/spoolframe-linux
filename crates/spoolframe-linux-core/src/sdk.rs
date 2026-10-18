@@ -185,41 +185,22 @@ pub fn backend_error(error: sdk::SdkError) -> BackendError {
             max_pixels,
         },
         E::ImageUnreadable => BackendError::ImageUnreadable,
-        E::Server(message) => server_error(message),
+        E::QuotaExhausted {
+            whose,
+            site,
+            resets_at,
+        } => BackendError::QuotaExhausted {
+            whose,
+            site,
+            resets_at,
+        },
+        E::NoSubtitleSource => BackendError::NoSubtitleSource,
         E::UnknownServer(id) => BackendError::NotFound(id),
         E::UnknownIdentity(_) | E::Credential(_) | E::NotThisDevice | E::DeviceKeyRevoked => {
             BackendError::NotPaired
         }
         other => BackendError::Other(other.to_string()),
     }
-}
-
-/// The SDK's 0.12.0 has no variants of its own for PX-02's two subtitle
-/// refusals and passes them on as `SdkError::Server` with the protocol
-/// error's message, so they are told apart by it here. A quota's site and
-/// reset time are lost on the way: the message has only whose it is.
-fn server_error(message: String) -> BackendError {
-    const NO_SOURCE: &str = "this server has no subtitle source set up";
-    const QUOTA: &str = "no subtitle downloads left today (";
-    if message == NO_SOURCE {
-        return BackendError::NoSubtitleSource;
-    }
-    if let Some(whose) = message
-        .strip_prefix(QUOTA)
-        .and_then(|rest| rest.strip_suffix(')'))
-    {
-        let whose = match whose {
-            "Account" => spoolframe_types::QuotaOf::Account,
-            "User" => spoolframe_types::QuotaOf::User,
-            _ => spoolframe_types::QuotaOf::Unknown,
-        };
-        return BackendError::QuotaExhausted {
-            whose,
-            site: None,
-            resets_at: None,
-        };
-    }
-    BackendError::Other(sdk::SdkError::Server(message).to_string())
 }
 
 /// The SDK's connection states, in the UI's words.
@@ -2017,40 +1998,43 @@ mod tests {
         );
     }
 
-    /// The protocol's messages for PX-02's refusals, as the SDK passes
-    /// them on (`ServerError`'s Display in spoolframe-protocol 0.12.0).
     #[test]
-    fn a_server_without_a_subtitle_site_is_told_apart() {
-        let message = spoolframe_protocol::Error::NoSubtitleSource.to_string();
+    fn a_used_up_quota_keeps_whose_where_and_when() {
         assert_eq!(
-            backend_error(sdk::SdkError::Server(message)),
-            BackendError::NoSubtitleSource
+            backend_error(sdk::SdkError::QuotaExhausted {
+                whose: spoolframe_types::QuotaOf::Account,
+                site: Some("subdl".into()),
+                resets_at: Some(1_760_054_400),
+            }),
+            BackendError::QuotaExhausted {
+                whose: spoolframe_types::QuotaOf::Account,
+                site: Some("subdl".into()),
+                resets_at: Some(1_760_054_400),
+            }
         );
     }
 
     #[test]
-    fn used_up_downloads_say_whose() {
-        let quota = |whose| {
-            spoolframe_protocol::Error::QuotaExhausted {
-                whose,
-                resets_at: Some(1),
-                site: Some("subdl".into()),
-            }
-            .to_string()
-        };
-        let whose = |message| match backend_error(sdk::SdkError::Server(message)) {
-            BackendError::QuotaExhausted { whose, .. } => Some(whose),
-            _ => None,
-        };
+    fn a_users_own_quota_has_no_site() {
         assert_eq!(
-            [
-                whose(quota(spoolframe_types::QuotaOf::Account)),
-                whose(quota(spoolframe_types::QuotaOf::User))
-            ],
-            [
-                Some(spoolframe_types::QuotaOf::Account),
-                Some(spoolframe_types::QuotaOf::User)
-            ]
+            backend_error(sdk::SdkError::QuotaExhausted {
+                whose: spoolframe_types::QuotaOf::User,
+                site: None,
+                resets_at: None,
+            }),
+            BackendError::QuotaExhausted {
+                whose: spoolframe_types::QuotaOf::User,
+                site: None,
+                resets_at: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_server_without_a_subtitle_site_is_its_own_error() {
+        assert_eq!(
+            backend_error(sdk::SdkError::NoSubtitleSource),
+            BackendError::NoSubtitleSource
         );
     }
 

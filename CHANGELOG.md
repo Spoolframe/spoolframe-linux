@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- The SDK crates are 0.12.0. The app also lists playlist covers,
+- The SDK crates are 0.12.1. The app also lists playlist covers,
   subtitle sync and subtitle search to each server; a server without
   them shows nothing new. On an item's page, a playlist shared with you
   says whose it is ("Alice’s"), as its card does, where the server names
@@ -21,7 +21,9 @@
   a language you pick: files made for this one first, each with its
   site, HI, machine-translated or AI-made, rating and downloads; ones
   removed before as bad last. It says when a site can't be reached,
-  when today's downloads are used up, and when search is off. A result
+  when today's downloads are used up (naming the site, and the
+  time in your local clock when they come back, as the server tells it),
+  and when search is off. A result
   chosen downloads as a track for everyone on the server: on the item's
   page it is then picked, and in the player it plays from where you
   are. A downloaded track says where it came from, who downloaded it
