@@ -24,6 +24,8 @@ use crate::volume::Volume;
 const THUMB: (i32, i32) = (128, 72);
 /// A cover's size in the bar.
 const COVER: i32 = 52;
+/// Stable space for artwork, track details and the heart.
+const NOW_PLAYING_WIDTH: i32 = 340;
 
 type Current = Rc<RefCell<Option<Rc<Playback>>>>;
 
@@ -85,25 +87,27 @@ impl MiniBar {
             .build();
         let title = gtk::Label::builder()
             .xalign(0.0)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .single_line_mode(true)
             .css_classes(["heading"])
             .build();
         let detail = gtk::Label::builder()
             .xalign(0.0)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .single_line_mode(true)
             .css_classes(["dim-label", "caption"])
             .build();
         let titles = gtk::Box::builder()
+            .hexpand(true)
             .orientation(gtk::Orientation::Vertical)
             .valign(gtk::Align::Center)
             .build();
-        titles.append(&title);
-        titles.append(&detail);
+        titles.append(&scrolling_label(&title));
+        titles.append(&scrolling_label(&detail));
         let what = gtk::Box::builder().spacing(12).build();
         what.append(&thumb);
         what.append(&titles);
         // The picture and the titles open the full player.
         let open = gtk::Button::builder()
+            .hexpand(true)
             .child(&what)
             .tooltip_text("Back to the full player")
             // Never focused, so Space (play/pause) cannot press it.
@@ -149,11 +153,11 @@ impl MiniBar {
             label.add_css_class("dim-label");
             label.add_css_class("mini-time");
         }
-        // The seek takes what the window leaves, at least 200 px: fixed
-        // widths here (340 + 520 + 300) kept the window from going below
-        // 1192 px while anything played.
+        // Let the seek shrink in narrow windows. The fixed track slot,
+        // timestamps and volume controls already consume most of the
+        // width; a 200 px seek forced the whole window above 849 px.
         scale.set_hexpand(true);
-        scale.set_width_request(200);
+        scale.set_width_request(120);
         let seek_row = gtk::Box::builder().spacing(10).hexpand(true).build();
         seek_row.append(&position);
         seek_row.append(&scale);
@@ -221,7 +225,14 @@ impl MiniBar {
         // The heart is beside the titles, not in their button: a button
         // in a button takes no clicks of its own.
         let heart = adw::Bin::builder().valign(gtk::Align::Center).build();
-        let start = gtk::Box::builder().spacing(4).build();
+        // The scrolling labels do not request their full text width;
+        // this slot stays the same size as the current text changes.
+        let start = gtk::Box::builder()
+            .spacing(4)
+            .width_request(NOW_PLAYING_WIDTH)
+            .hexpand(false)
+            .halign(gtk::Align::Start)
+            .build();
         start.append(&open);
         start.append(&heart);
         let bar = gtk::CenterBox::builder()
@@ -400,6 +411,7 @@ impl MiniBar {
                 }
                 let facts = crate::views::Facts::of(item);
                 self.title.set_label(&facts.title);
+                self.title.set_tooltip_text(Some(&facts.title));
                 let detail = match (item, playback.album()) {
                     (Item::Track(_), album) => Some(
                         [
@@ -431,6 +443,7 @@ impl MiniBar {
                 };
                 let detail = crate::player::with_playlist(detail, playback.playing_from().as_ref());
                 self.detail.set_label(detail.as_deref().unwrap_or_default());
+                self.detail.set_tooltip_text(detail.as_deref());
                 if let Some(music) = self.music.borrow().as_ref() {
                     music.show_item(playback);
                 }
@@ -478,5 +491,96 @@ impl MiniBar {
             | Change::Offer(_)
             | Change::IntroSkipped => {}
         }
+    }
+}
+
+/// Clip long text to its slot and gently pan back and forth, pausing at
+/// either end. The viewport never contributes the text's natural width.
+fn scrolling_label(label: &gtk::Label) -> gtk::ScrolledWindow {
+    let viewport = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::External)
+        .vscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_width(false)
+        .min_content_width(1)
+        .hexpand(true)
+        .can_focus(false)
+        .child(label)
+        .build();
+    let start = Rc::new(Cell::new(None::<i64>));
+    {
+        let start = start.clone();
+        let adjustment = viewport.hadjustment();
+        label.connect_label_notify(move |_| {
+            start.set(None);
+            adjustment.set_value(0.0);
+        });
+    }
+    let previous_range = Cell::new(-1.0_f64);
+    viewport.add_tick_callback(move |viewport, clock| {
+        let adjustment = viewport.hadjustment();
+        let range = (adjustment.upper() - adjustment.page_size()).max(0.0);
+        let animations = viewport.settings().is_gtk_enable_animations();
+        if !animations || range <= 0.5 {
+            start.set(None);
+            adjustment.set_value(0.0);
+            return gtk::glib::ControlFlow::Continue;
+        }
+        if (previous_range.replace(range) - range).abs() > 0.5 {
+            start.set(None);
+        }
+        let now = clock.frame_time();
+        let began = start.get().unwrap_or_else(|| {
+            start.set(Some(now));
+            now
+        });
+        let elapsed = (now - began) as f64 / 1_000_000.0;
+        let pause = 1.8;
+        let travel = range / 28.0;
+        let phase = elapsed % (2.0 * (pause + travel));
+        let offset = if phase < pause {
+            0.0
+        } else if phase < pause + travel {
+            (phase - pause) * 28.0
+        } else if phase < 2.0 * pause + travel {
+            range
+        } else {
+            range - (phase - 2.0 * pause - travel) * 28.0
+        };
+        adjustment.set_value(offset.clamp(0.0, range));
+        gtk::glib::ControlFlow::Continue
+    });
+    viewport
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "needs a GTK display"]
+    fn player_bar_fits_an_849_pixel_window() {
+        adw::init().unwrap();
+        let provider = gtk::CssProvider::new();
+        provider.load_from_string(include_str!("style.css"));
+        gtk::style_context_add_provider_for_display(
+            &gtk::gdk::Display::default().unwrap(),
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+        let bar = MiniBar::new(Rc::new(|| {}), Rc::new(|| {}));
+        bar.title
+            .set_label("A very long title that must never resize the player controls");
+        bar.detail
+            .set_label("Artist · Album · Playing from a very long playlist name");
+        bar.thumb.set_child(Some(
+            &gtk::Box::builder()
+                .width_request(128)
+                .height_request(72)
+                .build(),
+        ));
+        bar.position.set_label("1:23:45");
+        bar.length.set_label("2:34:56");
+        let minimum = bar.bar.measure(gtk::Orientation::Horizontal, -1).0;
+        assert!(minimum <= 849, "player bar requests {minimum}px");
     }
 }

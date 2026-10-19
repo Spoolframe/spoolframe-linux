@@ -38,6 +38,7 @@ landlock = { workspace = true }
 seccompiler = { workspace = true }
 libc = { workspace = true }
 rustls = { workspace = true }
+stratum-dsp = { version = "1", default-features = false }
 
 [dev-dependencies]
 tempfile = { workspace = true }

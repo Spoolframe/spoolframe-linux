@@ -71,6 +71,7 @@ mod transport;
 #[cfg(test)]
 mod ui_test;
 mod views;
+mod visualizer;
 mod volume;
 mod wake;
 

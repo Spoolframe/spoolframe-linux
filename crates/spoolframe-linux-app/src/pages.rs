@@ -1630,14 +1630,14 @@ pub fn album(
         // Right-click (or a long press) for the track's menu, as designed:
         // no button on every row.
         let menu = {
-            let added = views::add_entry(track, cards.add_to_playlist.as_ref());
             let (enqueue, track) = (enqueue.clone(), track.clone());
-            let mut groups = vec![
-                views::enqueue_entries(move |at| enqueue(vec![track.clone()], at)),
-                views::track_go_to_entries(t, &cards.open, false),
-            ];
-            groups.extend(added.map(|e| vec![e]));
-            views::menu_popover(groups)
+            views::menu_popover(views::track_menu_entries(
+                t,
+                &cards.open,
+                false,
+                Some(Rc::new(move |at| enqueue(vec![track.clone()], at))),
+                cards.add_to_playlist.as_ref(),
+            ))
         };
         views::context_menu(row.upcast_ref(), &menu);
         let (play, tracks) = (play.clone(), tracks.to_vec());

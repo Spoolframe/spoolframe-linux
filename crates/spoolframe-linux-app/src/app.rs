@@ -176,6 +176,7 @@ pub struct App {
     /// The playlists the user sees (PX-40), once listed; never on a server
     /// without them.
     playlists: Option<Vec<PlaylistSummary>>,
+    playlist_browser: std::cell::RefCell<Option<playlists::PlaylistBrowser>>,
     /// Pin notes shown already, so a list read again shows none twice.
     pin_notes: PinNotesShown,
     /// Hears the server's playlist changes for the profile in use.
@@ -241,6 +242,13 @@ struct ShownPlaylist {
 /// How a playlist is asked to play.
 #[derive(Debug, Clone, Copy)]
 pub enum PlaylistPlay {
+    Music {
+        from: Option<EntryId>,
+        settings: PlaySettings,
+    },
+    Random {
+        settings: PlaySettings,
+    },
     /// From its page: from an entry or the user's place, with the
     /// settings the page shows.
     Page {
@@ -249,7 +257,9 @@ pub enum PlaylistPlay {
     },
     /// From a menu: at the user's place with their kept settings, shuffled
     /// or not.
-    Menu { shuffle: bool },
+    Menu {
+        shuffle: bool,
+    },
 }
 
 /// The most entries the server sends at once.
@@ -382,12 +392,15 @@ pub enum Msg {
     Select(Row),
     /// A playlist's page (PX-40).
     OpenPlaylist(String),
+    BrowsePlaylists,
     /// A playlist's page over the item page on top: a show's playlist
     /// tab's, so Back returns to the show.
     OpenPlaylistOver(String),
     /// Its entries from this offset on: Show more.
     MorePlaylist(String, u32),
     PlayPlaylist(String, PlaylistPlay),
+    PlaylistSettings(String, PlaySettings),
+    SyncPlaylistSettings(String, PlaySettings),
     /// Pin a playlist last (`true`), or unpin it.
     PinPlaylist(String, bool),
     /// The pinned one at the first index dropped on the second's row.
@@ -1105,6 +1118,7 @@ impl Component for App {
             opening: None,
             now_playing: tokio::sync::watch::Sender::new(None),
             playlists: None,
+            playlist_browser: Default::default(),
             pin_notes: PinNotesShown::default(),
             playlist_watch: None,
             timing_watch: None,
@@ -1697,6 +1711,7 @@ impl Component for App {
                 }));
             }
             Msg::OpenPlaylist(id) => self.open_playlist(id, PlaylistPlace::Library, &sender),
+            Msg::BrowsePlaylists => self.show_playlist_list(widgets, &sender, true),
             Msg::OpenPlaylistOver(id) => self.open_playlist(id, PlaylistPlace::OverItem, &sender),
             Msg::MorePlaylist(id, offset) => {
                 let Some(session) = self.playlist_session() else {
@@ -1707,7 +1722,22 @@ impl Component for App {
                     Loaded::PlaylistMore(id, page)
                 });
             }
+            Msg::PlaylistSettings(id, settings) => {
+                if let Some(playback) = &self.playback
+                    && playback.playing_from().is_some_and(|p| p.id == id)
+                {
+                    playback.set_playlist_settings(settings);
+                }
+            }
+            Msg::SyncPlaylistSettings(id, settings) => {
+                if let Some(shown) = &self.shown_playlist
+                    && shown.view.id == id
+                {
+                    shown.view.set_play_settings(settings);
+                }
+            }
             Msg::PlayPlaylist(id, how) => {
+                let current_shuffle = self.playback.as_ref().map(|p| p.is_shuffled());
                 let Some(session) = self.playlist_session() else {
                     return;
                 };
@@ -1726,10 +1756,51 @@ impl Component for App {
                     let started = async {
                         let (from, settings) = match how {
                             PlaylistPlay::Page { from, settings } => (from, settings),
+                            PlaylistPlay::Music { from, settings } => (
+                                from,
+                                PlaySettings {
+                                    shuffle: current_shuffle.unwrap_or(settings.shuffle),
+                                    ..settings
+                                },
+                            ),
+                            PlaylistPlay::Random { settings } => {
+                                let mut offset = 0;
+                                let mut choices = Vec::new();
+                                loop {
+                                    let page = session.playlist(&id, offset, PLAYLIST_PAGE).await?;
+                                    offset += page.entries.len() as u32;
+                                    let done = page.entries.is_empty() || offset >= page.total;
+                                    choices.extend(
+                                        page.entries
+                                            .into_iter()
+                                            .filter(|e| !e.unavailable)
+                                            .map(|e| e.entry),
+                                    );
+                                    if done {
+                                        break;
+                                    }
+                                }
+                                if choices.is_empty() {
+                                    return Ok(None);
+                                }
+                                let index =
+                                    gtk::glib::random_int_range(0, choices.len() as i32) as usize;
+                                (
+                                    Some(choices[index]),
+                                    PlaySettings {
+                                        shuffle: true,
+                                        ..settings
+                                    },
+                                )
+                            }
                             // The user's own settings, kept by the server
                             // with their place.
                             PlaylistPlay::Menu { shuffle } => {
-                                let kept = session.playlist(&id, 0, 1).await?.settings;
+                                let page = session.playlist(&id, 0, 1).await?;
+                                let kept = playlist_rules::play_settings(
+                                    page.playlist.kinds,
+                                    page.settings,
+                                );
                                 (None, PlaySettings { shuffle, ..kept })
                             }
                         };
@@ -2943,6 +3014,11 @@ impl Component for App {
                 {
                     shown.view.set_pinned(playlist.pinned.is_some());
                 }
+                if widgets.stack.find_page("playlist-browser").is_some()
+                    && let Some(browser) = self.playlist_browser.borrow().as_ref()
+                {
+                    browser.update(&list.playlists);
+                }
                 self.playlists = Some(list.playlists);
                 self.fill_sidebar(widgets);
                 if self.root == Root::Playlists {
@@ -2996,6 +3072,12 @@ impl Component for App {
                     self.cards.clone(),
                     Mode::View,
                 );
+                if let Some(playback) = &self.playback
+                    && playback.playing_from().is_some_and(|p| p.id == id)
+                    && let Some(settings) = playback.playlist_settings()
+                {
+                    view.set_play_settings(settings);
+                }
                 let body = adw::Bin::builder().child(&view.widget).build();
                 let nav_page = pages::page(&page.playlist.name, &body);
                 nav_page.set_tag(Some(PLAYLIST_TAG));
@@ -3005,7 +3087,20 @@ impl Component for App {
                 if let Some(old) = self.shown_playlist.take() {
                     old.page.set_tag(None);
                 }
-                widgets.stack.pop_to_page(&widgets.root_page);
+                let browser = widgets
+                    .stack
+                    .find_page("playlist-browser")
+                    .filter(|browser| {
+                        widgets.stack.visible_page().is_some_and(|visible| {
+                            &visible == browser
+                                || widgets.stack.previous_page(&visible).as_ref() == Some(browser)
+                        })
+                    });
+                if let Some(browser) = browser {
+                    widgets.stack.pop_to_page(&browser);
+                } else {
+                    widgets.stack.pop_to_page(&widgets.root_page);
+                }
                 match place {
                     // Over the sidebar's choice; opened from an item's
                     // page, which covers the window, it is left for the
@@ -3422,6 +3517,7 @@ impl App {
         self.watch_subtitle_timing(sender);
         self.libraries.clear();
         self.playlists = None;
+        self.playlist_browser.borrow_mut().take();
         self.pin_notes = PinNotesShown::default();
         self.shown_playlist = None;
         self.opening_playlist = None;
@@ -3532,6 +3628,15 @@ impl App {
 
     /// The Playlists section from the list known now, if it is known.
     fn show_playlists(&self, widgets: &AppWidgets, sender: &ComponentSender<Self>) {
+        self.show_playlist_list(widgets, sender, false);
+    }
+
+    fn show_playlist_list(
+        &self,
+        widgets: &AppWidgets,
+        sender: &ComponentSender<Self>,
+        browse: bool,
+    ) {
         let Some(list) = &self.playlists else { return };
         let actions = Rc::new(playlists::ListActions {
             open: {
@@ -3549,10 +3654,27 @@ impl App {
                 Rc::new(move |id, pin| sender.input(Msg::PinPlaylist(id, pin)))
             },
         });
+        if browse {
+            let browser = playlists::browse(list, &actions, self.cards.art.as_ref());
+            let body = &browser.widget;
+            body.set_margin_start(28);
+            body.set_margin_end(28);
+            body.set_margin_top(24);
+            body.set_margin_bottom(28);
+            let page = pages::page("All playlists", body);
+            page.set_tag(Some("playlist-browser"));
+            widgets.stack.push(&page);
+            self.playlist_browser.replace(Some(browser));
+            return;
+        }
+        let browse = {
+            let sender = sender.clone();
+            Rc::new(move || sender.input(Msg::BrowsePlaylists))
+        };
         show(
             widgets,
             "Playlists",
-            playlists::section(list, &actions, self.cards.art.as_ref()),
+            playlists::section(list, &actions, self.cards.art.as_ref(), browse),
         );
     }
 
@@ -3745,6 +3867,14 @@ impl App {
         now_playing.send_replace(playback.current().map(|i| i.id().clone()));
         playback.subscribe(move |change| {
             match change {
+                Change::Modes { .. } => {
+                    if let Some(playback) = weak.upgrade()
+                        && let Some(playing) = playback.playing_from()
+                        && let Some(settings) = playback.playlist_settings()
+                    {
+                        stop.input(Msg::SyncPlaylistSettings(playing.id, settings));
+                    }
+                }
                 Change::Item(item) => {
                     now_playing.send_replace(Some(item.id().clone()));
                 }
@@ -3785,14 +3915,14 @@ impl App {
         let (Some(session), Some(saved)) = (self.session.clone(), self.saved_queue.clone()) else {
             return;
         };
-        let Some((queue, at)) = saved.load() else {
+        let Some((queue, at, playlist)) = saved.load() else {
             return;
         };
         if queue.current().is_none() {
             return;
         }
         let display = Some(crate::capabilities::display(self.settings.show_hdr()));
-        match Playback::restore(session, queue, at, display) {
+        match Playback::restore(session, queue, at, playlist, display) {
             Ok(playback) => {
                 self.attach_playback(&playback, widgets, sender);
                 self.playback = Some(playback);
@@ -4413,7 +4543,11 @@ fn save_queue_on_changes(playback: &Rc<Playback>, saved: Rc<SavedQueue>) {
             _ => false,
         };
         if due && !playback.is_video() {
-            saved.save(&playback.snapshot(), playback.position());
+            saved.save(
+                &playback.snapshot(),
+                playback.position(),
+                playback.playlist_resume(),
+            );
             last.set(std::time::Instant::now());
         }
         true
@@ -4675,6 +4809,28 @@ fn playlist_actions(
     session: Option<&Arc<dyn Session>>,
 ) -> playlists::PageActions {
     playlists::PageActions {
+        start_music: {
+            let (sender, id) = (sender.clone(), id.to_owned());
+            Rc::new(move |from, settings| {
+                sender.input(Msg::PlayPlaylist(
+                    id.clone(),
+                    PlaylistPlay::Music { from, settings },
+                ))
+            })
+        },
+        random: {
+            let (sender, id) = (sender.clone(), id.to_owned());
+            Rc::new(move |settings| {
+                sender.input(Msg::PlayPlaylist(
+                    id.clone(),
+                    PlaylistPlay::Random { settings },
+                ))
+            })
+        },
+        settings_changed: {
+            let (sender, id) = (sender.clone(), id.to_owned());
+            Rc::new(move |settings| sender.input(Msg::PlaylistSettings(id.clone(), settings)))
+        },
         // Only where the server shares by name.
         people: session.filter(|s| s.has_playlist_sharing()).map(
             |session| -> crate::share_picker::People {

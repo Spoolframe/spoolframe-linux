@@ -21,6 +21,18 @@ use crate::backend::{
 /// The most entries a page of a playlist holds.
 pub const PAGE: u32 = 200;
 
+/// Watch-state skipping is a video option. Clear a previously saved value
+/// for music-only playlists as well as hiding its control in the UI.
+pub fn play_settings(
+    kinds: Kinds,
+    mut settings: crate::backend::PlaySettings,
+) -> crate::backend::PlaySettings {
+    if kinds.tracks && !kinds.movies && !kinds.episodes {
+        settings.skip_watched = false;
+    }
+    settings
+}
+
 /// The Playlists section's groups, each in the server's order.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Sections<'a> {
@@ -654,7 +666,7 @@ pub fn candidate_line(candidate: &ShareCandidate) -> String {
 /// A playlist being played: which, and the entry playing. The server
 /// keeps the user's place and picks each next entry (shuffle, repeat and
 /// skip watched are its); this only follows its answers.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Playing {
     pub id: String,
     pub name: String,
@@ -1023,6 +1035,37 @@ mod tests {
             (item.id().clone(), playing.entry != first),
             (media(MediaKind::Episode, "65"), true)
         );
+    }
+
+    #[test]
+    fn music_does_not_skip_previously_played_tracks_with_saved_video_settings() {
+        let client = FakeClient::new(None);
+        let andrey = session(&client, "andrey");
+        let list = ready(andrey.playlists()).unwrap().playlists;
+        let all = list
+            .iter()
+            .find(|p| p.builtin == Some(Builtin::All))
+            .unwrap();
+        let page = page(andrey.as_ref(), &all.id);
+        for entry in &page.entries {
+            ready(andrey.mark_watched(entry.item.id())).unwrap();
+        }
+        let settings = play_settings(
+            all.kinds,
+            PlaySettings {
+                skip_watched: true,
+                ..Default::default()
+            },
+        );
+        let mut next =
+            ready(andrey.play_playlist(&all.id, Some(page.entries[0].entry), settings)).unwrap();
+        let mut played = 0;
+        while let Some(entry) = next {
+            played += 1;
+            assert!(played <= page.entries.len());
+            next = ready(andrey.next_in_playlist(&all.id, entry.entry)).unwrap();
+        }
+        assert_eq!(played, page.entries.len());
     }
 
     #[test]

@@ -9,6 +9,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::rc::Rc;
 
 use adw::prelude::*;
+use gtk::glib;
 use spoolframe_linux_core::backend::{
     ArtworkSize, BackendError, Builtin, EntryId, Kinds, MAX_ART_BYTES, MAX_ART_PIXELS,
     PlaySettings, PlaylistEdit, PlaylistEntry, PlaylistOwnerKind, PlaylistPage, PlaylistRef,
@@ -227,6 +228,7 @@ pub fn section(
     list: &[PlaylistSummary],
     actions: &Rc<ListActions>,
     art: Option<&Rc<crate::artwork::Art>>,
+    browse: Rc<dyn Fn()>,
 ) -> Vec<gtk::Box> {
     let groups = playlists::sections(list);
     let rows: Vec<gtk::Box> = [
@@ -237,7 +239,22 @@ pub fn section(
     ]
     .into_iter()
     .filter(|(_, group)| !group.is_empty())
-    .map(|(title, group)| views::row(title, group.into_iter().map(|p| card(p, actions, art))))
+    .map(|(title, group)| {
+        let button = (title == "My playlists").then(|| {
+            let button = gtk::Button::builder()
+                .label("Browse all")
+                .css_classes(["flat"])
+                .build();
+            let browse = browse.clone();
+            button.connect_clicked(move |_| browse());
+            button
+        });
+        views::row_with_action(
+            title,
+            group.into_iter().map(|p| card(p, actions, art)),
+            button.as_ref(),
+        )
+    })
     .collect();
     if !rows.is_empty() {
         return rows;
@@ -261,13 +278,168 @@ fn card(
     actions: &Rc<ListActions>,
     art: Option<&Rc<crate::artwork::Art>>,
 ) -> gtk::Widget {
+    sized_card(playlist, actions, art, CARD)
+}
+
+pub struct PlaylistBrowser {
+    pub widget: gtk::Box,
+    list: Rc<RefCell<Vec<PlaylistSummary>>>,
+    populate: Rc<dyn Fn()>,
+}
+
+impl PlaylistBrowser {
+    /// Refresh the cards without replacing the page or its filter state.
+    pub fn update(&self, list: &[PlaylistSummary]) {
+        *self.list.borrow_mut() = list.to_vec();
+        (self.populate)();
+    }
+}
+
+pub fn browse(
+    list: &[PlaylistSummary],
+    actions: &Rc<ListActions>,
+    art: Option<&Rc<crate::artwork::Art>>,
+) -> PlaylistBrowser {
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 20);
+    let search = gtk::SearchEntry::builder()
+        .placeholder_text("Search playlists by name")
+        .hexpand(true)
+        .build();
+    body.append(&search);
+    let query = Rc::new(RefCell::new(String::new()));
+    let filters = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    let buttons =
+        [("Movies", false), ("Episodes", false), ("Music", true)].map(|(name, active)| {
+            let button = gtk::ToggleButton::builder()
+                .label(name)
+                .active(active)
+                .build();
+            filters.append(&button);
+            button
+        });
+    body.append(&filters);
+    let flow = gtk::FlowBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .column_spacing(16)
+        .row_spacing(24)
+        .homogeneous(true)
+        .css_classes(["playlist-browser-grid"])
+        .hexpand(true)
+        .build();
+    body.append(&flow);
+    let empty = label("No playlists match your search and filters", &["dim-label"]);
+    body.append(&empty);
+    let width = Rc::new(Cell::new(0));
+    let selected = Rc::new(Cell::new(
+        buttons.each_ref().map(|button| button.is_active()),
+    ));
+    let list = Rc::new(RefCell::new(list.to_vec()));
+    let rebuild: Rc<dyn Fn()> = {
+        let (list, actions, art) = (list.clone(), actions.clone(), art.cloned());
+        let (flow, empty, width, selected) =
+            (flow.clone(), empty.clone(), width.clone(), selected.clone());
+        let query = query.clone();
+        Rc::new(move || {
+            if width.get() <= 0 {
+                return;
+            }
+            while let Some(child) = flow.first_child() {
+                flow.remove(&child);
+            }
+            let (columns, size) = browse_dimensions(width.get());
+            flow.set_min_children_per_line(1);
+            flow.set_max_children_per_line(columns);
+            let mut count = 0;
+            let selected = selected.get();
+            let query = query.borrow();
+            for playlist in list.borrow().iter() {
+                if !playlist.name.to_lowercase().contains(query.as_str()) {
+                    continue;
+                }
+                let kinds = playlist.kinds;
+                if (selected[0] && kinds.movies)
+                    || (selected[1] && kinds.episodes)
+                    || (selected[2] && kinds.tracks)
+                {
+                    flow.append(&sized_card(playlist, &actions, art.as_ref(), size));
+                    count += 1;
+                }
+            }
+            empty.set_visible(count == 0);
+        })
+    };
+    // A resize is emitted during GTK allocation. Replacing the flow's
+    // children there leaves GTK allocating new cards using the old layout
+    // (including zero-width slots). Rebuild once allocation has finished.
+    let pending = Rc::new(Cell::new(false));
+    let populate: Rc<dyn Fn()> = Rc::new(move || {
+        if pending.replace(true) {
+            return;
+        }
+        let (pending, rebuild) = (pending.clone(), rebuild.clone());
+        glib::idle_add_local_once(move || {
+            pending.set(false);
+            rebuild();
+        });
+    });
+    {
+        let populate = populate.clone();
+        search.connect_changed(move |entry| {
+            *query.borrow_mut() = entry.text().trim().to_lowercase();
+            populate();
+        });
+    }
+    for (index, button) in buttons.iter().enumerate() {
+        let populate = populate.clone();
+        let selected = selected.clone();
+        button.connect_toggled(move |button| {
+            let mut kinds = selected.get();
+            kinds[index] = button.is_active();
+            selected.set(kinds);
+            populate();
+        });
+    }
+    // Watch the available width rather than the cards' natural widths,
+    // so a resize can both add and remove columns.
+    let measure = gtk::DrawingArea::builder()
+        .height_request(1)
+        .hexpand(true)
+        .build();
+    let resized = populate.clone();
+    measure.connect_resize(move |_, available, _| {
+        if available > 0 && width.replace(available) != available {
+            resized();
+        }
+    });
+    body.prepend(&measure);
+    PlaylistBrowser {
+        widget: body,
+        list,
+        populate,
+    }
+}
+
+fn browse_dimensions(width: i32) -> (u32, i32) {
+    let columns = ((width + 16) / 256).clamp(1, 12);
+    (
+        columns as u32,
+        ((width - (columns - 1) * 16) / columns - 4).max(1),
+    )
+}
+
+fn sized_card(
+    playlist: &PlaylistSummary,
+    actions: &Rc<ListActions>,
+    art: Option<&Rc<crate::artwork::Art>>,
+    size: i32,
+) -> gtk::Widget {
     let body = gtk::Box::new(gtk::Orientation::Vertical, 8);
     body.append(&picture(
         &playlist.id,
         playlist.builtin,
         playlist.artwork.as_ref(),
         art,
-        CARD,
+        size,
     ));
     let caption = gtk::Box::new(gtk::Orientation::Vertical, 2);
     caption.append(&views::caption_label(&playlist.name, &["heading"]));
@@ -278,7 +450,7 @@ fn card(
     body.append(&caption);
     let button = gtk::Button::builder()
         .child(&body)
-        .width_request(CARD)
+        .width_request(size)
         .halign(gtk::Align::Start)
         .valign(gtk::Align::Start)
         .css_classes(["card-button", "flat", "lift"])
@@ -377,6 +549,9 @@ pub fn holds_line(kinds: Kinds) -> String {
 
 /// What a playlist's page does.
 pub struct PageActions {
+    pub start_music: Rc<dyn Fn(Option<EntryId>, PlaySettings)>,
+    pub random: Rc<dyn Fn(PlaySettings)>,
+    pub settings_changed: Rc<dyn Fn(PlaySettings)>,
     /// Plays from an entry, or the user's place, with the settings shown.
     pub play: Rc<dyn Fn(Option<EntryId>, PlaySettings)>,
     /// Pins it, last (`true`), or unpins it.
@@ -470,9 +645,16 @@ pub struct PlaylistView {
     actions: Rc<PageActions>,
     /// The play settings the header shows, for Play from here.
     settings: Rc<Cell<PlaySettings>>,
+    sync_settings: Option<Rc<dyn Fn(PlaySettings)>>,
 }
 
 impl PlaylistView {
+    pub fn set_play_settings(&self, settings: PlaySettings) {
+        if let Some(sync) = &self.sync_settings {
+            sync(settings);
+        }
+    }
+
     pub fn new(
         page: &PlaylistPage,
         actions: PageActions,
@@ -496,12 +678,15 @@ impl PlaylistView {
             .hexpand(true)
             .build();
         columns.append(&entries);
-        let settings = Rc::new(Cell::new(page.settings));
-        let (pin, editing) = match mode {
+        let settings = Rc::new(Cell::new(playlists::play_settings(
+            page.playlist.kinds,
+            page.settings,
+        )));
+        let (pin, editing, sync_settings) = match mode {
             Mode::View => {
-                let (header, pin) = header(page, &actions, &settings, cards.art.as_ref());
+                let (header, pin, sync) = header(page, &actions, &settings, cards.art.as_ref());
                 widget.append(&header);
-                (pin, None)
+                (pin, None, Some(sync))
             }
             Mode::Edit { admin } => {
                 let controls = playlists::editor_controls(&page.playlist, admin);
@@ -532,7 +717,7 @@ impl PlaylistView {
                 }
                 // Not shown: the pin is the page's, not the editor's.
                 let pin = gtk::ToggleButton::new();
-                (pin, Some((page.playlist.revision, Rc::default())))
+                (pin, Some((page.playlist.revision, Rc::default())), None)
             }
         };
         widget.append(&columns);
@@ -573,11 +758,19 @@ impl PlaylistView {
             syncing: Cell::new(false),
             shown: Cell::new(0),
             total: page.total,
-            up_next: playlists::up_next(page),
+            up_next: if page.playlist.kinds.tracks
+                && !page.playlist.kinds.movies
+                && !page.playlist.kinds.episodes
+            {
+                None
+            } else {
+                playlists::up_next(page)
+            },
             cards,
             editing,
             actions: actions.clone(),
             settings,
+            sync_settings,
         });
         {
             let (view_weak, more) = (Rc::downgrade(&view), actions.more.clone());
@@ -627,6 +820,17 @@ impl PlaylistView {
                     self.up_next,
                     &self.cards,
                     self.play_from(entry.entry),
+                    (page.playlist.builtin.is_none()
+                        && playlists::editor_controls(&page.playlist, false).edit)
+                        .then(|| {
+                            let (edit, revision, entry) = (
+                                self.actions.edit_entries.clone(),
+                                page.playlist.revision,
+                                entry.entry,
+                            );
+                            Rc::new(move || edit(revision, vec![PlaylistEdit::Remove { entry }]))
+                                as Rc<dyn Fn()>
+                        }),
                 )),
             }
         }
@@ -665,7 +869,7 @@ fn header(
     actions: &PageActions,
     settings: &Rc<Cell<PlaySettings>>,
     art: Option<&Rc<crate::artwork::Art>>,
-) -> (gtk::Box, gtk::ToggleButton) {
+) -> (gtk::Box, gtk::ToggleButton, Rc<dyn Fn(PlaySettings)>) {
     let header = gtk::Box::builder().spacing(28).build();
     header.append(&picture(
         &page.playlist.id,
@@ -692,24 +896,63 @@ fn header(
         &["dim-label", "caption"],
     ));
 
-    let controls = gtk::Box::builder().spacing(10).margin_top(6).build();
+    let controls = gtk::FlowBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .column_spacing(10)
+        .row_spacing(10)
+        .min_children_per_line(1)
+        .max_children_per_line(8)
+        .margin_top(6)
+        .build();
     let playable = page.playable > 0;
+    let music_only =
+        page.playlist.kinds.tracks && !page.playlist.kinds.movies && !page.playlist.kinds.episodes;
     let play = gtk::Button::builder()
         .child(
             &adw::ButtonContent::builder()
                 .icon_name(crate::icons::PLAY)
-                .label(play_label(page))
+                .label(if !music_only && page.place.is_some() {
+                    "Continue"
+                } else {
+                    "Play"
+                })
                 .build(),
         )
         .sensitive(playable)
+        .tooltip_text(if music_only {
+            "Play from the first song".to_owned()
+        } else {
+            play_label(page)
+        })
         .css_classes(["action", "compact", "suggested-action"])
         .build();
     {
-        let (run, settings) = (actions.play.clone(), settings.clone());
-        play.connect_clicked(move |_| run(None, settings.get()));
+        let run = if music_only {
+            actions.start_music.clone()
+        } else {
+            actions.play.clone()
+        };
+        let settings = settings.clone();
+        let from = music_only.then(|| from_start(page)).flatten();
+        play.connect_clicked(move |_| run(from, settings.get()));
     }
     controls.append(&play);
-    if let Some(first) = from_start(page) {
+    if music_only {
+        let random = gtk::Button::builder()
+            .label("Play random")
+            .tooltip_text("Play a random song and turn shuffle on")
+            .sensitive(playable)
+            .css_classes(["action", "compact", "outlined"])
+            .build();
+        let (run, settings) = (actions.random.clone(), settings.clone());
+        random.connect_clicked(move |_| {
+            run(PlaySettings {
+                shuffle: true,
+                ..settings.get()
+            })
+        });
+        controls.append(&random);
+    } else if let Some(first) = from_start(page) {
         let again = gtk::Button::builder()
             .label("Play from start")
             .css_classes(["action", "compact", "outlined"])
@@ -730,14 +973,20 @@ fn header(
         .build();
     {
         let settings = settings.clone();
+        let changed = actions.settings_changed.clone();
         shuffle.connect_toggled(move |button| {
-            settings.set(PlaySettings {
+            let now = PlaySettings {
                 shuffle: button.is_active(),
                 ..settings.get()
-            })
+            };
+            if settings.replace(now) != now {
+                changed(now);
+            }
         });
     }
-    controls.append(&shuffle);
+    if !music_only {
+        controls.append(&shuffle);
+    }
     let repeat_content = adw::ButtonContent::new();
     let repeat = gtk::Button::builder()
         .child(&repeat_content)
@@ -745,7 +994,7 @@ fn header(
         .build();
     let show_repeat = {
         let (button, content) = (repeat.clone(), repeat_content.clone());
-        move |repeat: Repeat| {
+        Rc::new(move |repeat: Repeat| {
             let (text, icon) = repeat_label(repeat);
             content.set_label(text);
             content.set_icon_name(icon);
@@ -754,11 +1003,13 @@ fn header(
             } else {
                 button.add_css_class("on");
             }
-        }
+        })
     };
     show_repeat(page.settings.repeat);
     {
         let settings = settings.clone();
+        let changed = actions.settings_changed.clone();
+        let show_repeat = show_repeat.clone();
         repeat.connect_clicked(move |_| {
             let now = PlaySettings {
                 repeat: next_repeat(settings.get().repeat),
@@ -766,9 +1017,12 @@ fn header(
             };
             settings.set(now);
             show_repeat(now.repeat);
+            changed(now);
         });
     }
-    controls.append(&repeat);
+    if !music_only {
+        controls.append(&repeat);
+    }
     let skip = gtk::Switch::builder()
         .active(page.settings.skip_watched)
         .valign(gtk::Align::Center)
@@ -785,8 +1039,9 @@ fn header(
     let skip_box = gtk::Box::builder().spacing(10).margin_start(8).build();
     skip_box.append(&skip);
     skip_box.append(&gtk::Label::new(Some("Skip watched")));
-    controls.append(&skip_box);
-    controls.append(&gtk::Box::builder().hexpand(true).build());
+    if page.playlist.kinds.movies || page.playlist.kinds.episodes {
+        controls.append(&skip_box);
+    }
     let pinned = page.playlist.pinned.is_some();
     let pin = gtk::ToggleButton::builder()
         .active(pinned)
@@ -807,25 +1062,27 @@ fn header(
         edit.connect_clicked(move |_| open(true));
         controls.append(&edit);
     }
-    let wrap = gtk::ScrolledWindow::builder()
-        .vscrollbar_policy(gtk::PolicyType::Never)
-        .hscrollbar_policy(gtk::PolicyType::Automatic)
-        .propagate_natural_height(true)
-        .child(&controls)
-        .build();
-    column.append(&wrap);
+    column.append(&controls);
     header.append(&column);
-    (header, pin)
+    let settings = settings.clone();
+    let sync = Rc::new(move |now: PlaySettings| {
+        settings.set(now);
+        shuffle.set_active(now.shuffle);
+        show_repeat(now.repeat);
+        skip.set_active(now.skip_watched);
+    });
+    (header, pin, sync)
 }
 
 /// An entry: its number, still, title, where it is from, and its note;
-/// dimmed when its file cannot be read. A click opens its item.
+/// dimmed when its file cannot be read. A click plays the playlist from it.
 fn entry_row(
     number: usize,
     entry: &PlaylistEntry,
     up_next: Option<EntryId>,
     cards: &Rc<Cards>,
     play_from: Rc<dyn Fn()>,
+    remove: Option<Rc<dyn Fn()>>,
 ) -> adw::ActionRow {
     let row = adw::ActionRow::builder()
         .use_markup(false)
@@ -837,15 +1094,25 @@ fn entry_row(
     count.set_width_chars(3);
     count.set_xalign(1.0);
     row.add_prefix(&count);
-    let thumb = views::tile(entry.item.id(), "", "thumb", THUMB);
+    let music = matches!(entry.item, Item::Track(_));
+    let thumb = views::tile(
+        entry.item.id(),
+        "",
+        "thumb",
+        if music { (THUMB.1, THUMB.1) } else { THUMB },
+    );
     cards.art(
         &thumb,
         Facts::of(&entry.item).artwork,
-        &[
-            ArtworkKind::Thumb,
-            ArtworkKind::Background,
-            ArtworkKind::Poster,
-        ],
+        if music {
+            &[ArtworkKind::Poster, ArtworkKind::Thumb]
+        } else {
+            &[
+                ArtworkKind::Thumb,
+                ArtworkKind::Background,
+                ArtworkKind::Poster,
+            ]
+        },
         ArtworkSize::Small,
     );
     thumb.set_valign(gtk::Align::Center);
@@ -872,18 +1139,37 @@ fn entry_row(
     if entry.unavailable {
         row.add_css_class("unavailable");
     }
-    let (open, item) = (cards.open.clone(), entry.item.clone());
-    // A click opens the item, as a card does; its menu plays the
-    // playlist from it.
-    {
-        let (open, item) = (open.clone(), item.clone());
-        let menu = views::menu_popover(vec![vec![
+    let mut groups = if let Item::Track(track) = &entry.item {
+        let enqueue = cards.enqueue.as_ref().map(|enqueue| {
+            let (enqueue, item) = (enqueue.clone(), entry.item.clone());
+            Rc::new(move |at| enqueue(item.clone(), at)) as Rc<dyn Fn(views::Enqueue)>
+        });
+        views::track_menu_entries(
+            track,
+            &cards.open,
+            true,
+            enqueue,
+            cards.add_to_playlist.as_ref(),
+        )
+    } else {
+        let (open, item) = (cards.open.clone(), entry.item.clone());
+        let play_from = play_from.clone();
+        vec![vec![
             views::MenuEntry::new("Play from here", crate::icons::PLAY, move || play_from()),
             views::MenuEntry::new("Open", crate::icons::RIGHT, move || open(item.clone())),
-        ]]);
-        views::context_menu(row.upcast_ref(), &menu);
+        ]]
+    };
+    if let Some(remove) = remove {
+        groups.push(vec![views::MenuEntry {
+            destructive: true,
+            ..views::MenuEntry::new("Remove from playlist", crate::icons::REMOVE, move || {
+                remove()
+            })
+        }]);
     }
-    row.connect_activated(move |_| open(item.clone()));
+    let menu = views::menu_popover(groups);
+    views::context_menu(row.upcast_ref(), &menu);
+    row.connect_activated(move |_| play_from());
     row
 }
 
@@ -965,9 +1251,15 @@ pub fn add_dialog(
     let dialog = adw::Dialog::builder()
         .title(&title)
         .content_width(440)
+        .content_height(560)
         .build();
     let column = crate::dialog::column();
     column.append(&crate::dialog::dim(&add_context(item)));
+    let search = gtk::SearchEntry::builder()
+        .placeholder_text("Search playlists by name")
+        .hexpand(true)
+        .build();
+    column.append(&search);
     if rows.is_empty() {
         column.append(&crate::dialog::dim(
             "No playlist takes this yet: make one that holds it.",
@@ -977,6 +1269,7 @@ pub fn add_dialog(
             .selection_mode(gtk::SelectionMode::None)
             .css_classes(["boxed-list"])
             .build();
+        let mut searchable = Vec::new();
         for row in rows {
             let line = adw::ActionRow::builder()
                 .use_markup(false)
@@ -992,6 +1285,7 @@ pub fn add_dialog(
                 art,
                 32,
             ));
+            searchable.push((row.name.to_lowercase(), line.clone()));
             let (add, closing) = (add.clone(), dialog.downgrade());
             line.connect_activated(move |_| {
                 if let Some(dialog) = closing.upgrade() {
@@ -1001,7 +1295,32 @@ pub fn add_dialog(
             });
             list.append(&line);
         }
-        column.append(&list);
+        let empty = crate::dialog::dim("No playlists match your search.");
+        empty.set_visible(false);
+        let results = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        results.append(&list);
+        results.append(&empty);
+        let scroller = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vscrollbar_policy(gtk::PolicyType::Automatic)
+            .propagate_natural_height(false)
+            .vexpand(true)
+            .child(&results)
+            .build();
+        let adjustment = scroller.vadjustment();
+        search.connect_changed(move |search| {
+            let query = search.text().trim().to_lowercase();
+            let mut any = false;
+            for (name, row) in &searchable {
+                let matches = name.contains(&query);
+                row.set_visible(matches);
+                any |= matches;
+            }
+            empty.set_visible(!any);
+            list.set_visible(any);
+            adjustment.set_value(0.0);
+        });
+        column.append(&scroller);
     }
     let buttons = gtk::Box::builder().spacing(8).build();
     let make = gtk::Button::builder()
@@ -1156,6 +1475,290 @@ mod tests {
     use spoolframe_linux_core::testing::ready;
 
     use super::*;
+
+    #[test]
+    #[ignore = "needs a GTK display"]
+    fn playlist_rows_play_in_context_and_controls_fit() {
+        gtk::init().unwrap();
+        let drain = || {
+            let context = glib::MainContext::default();
+            while context.pending() {
+                context.iteration(false);
+            }
+        };
+        let client = FakeClient::new(None);
+        let session = client.session(&FakeClient::profile("andrey")).unwrap();
+        let list = ready(session.playlists()).unwrap().playlists;
+        let all = list.iter().find(|p| p.name == "All").unwrap();
+        let mut page = ready(session.playlist(&all.id, 0, 200)).unwrap();
+        let opened = Rc::new(Cell::new(0));
+        let played = Rc::new(Cell::new(0));
+        let cards = Rc::new(Cards {
+            open: {
+                let opened = opened.clone();
+                Rc::new(move |_| opened.set(opened.get() + 1))
+            },
+            art: None,
+            set_watched: None,
+            hide: None,
+            enqueue: None,
+            open_person: None,
+            add_to_playlist: None,
+            hearts: None,
+        });
+        let removed = Rc::new(Cell::new(false));
+        let row = entry_row(
+            1,
+            &page.entries[0],
+            None,
+            &cards,
+            {
+                let played = played.clone();
+                Rc::new(move || played.set(played.get() + 1))
+            },
+            Some({
+                let removed = removed.clone();
+                Rc::new(move || removed.set(true))
+            }),
+        );
+        button_named(row.upcast_ref(), "Remove from playlist")
+            .unwrap()
+            .emit_clicked();
+        assert!(removed.get());
+        row.emit_by_name::<()>("activated", &[]);
+        assert_eq!((played.get(), opened.get()), (1, 0));
+        page.place = Some(page.entries[0].entry);
+        if let Item::Track(track) = &mut page.entries[0].item {
+            track.title = "A very long song title ".repeat(20);
+        }
+        let requested = Rc::new(Cell::new(None));
+        let random_requested = Rc::new(Cell::new(None));
+        let actions = PageActions {
+            start_music: {
+                let requested = requested.clone();
+                Rc::new(move |from, settings| requested.set(Some((from, settings))))
+            },
+            random: {
+                let requested = random_requested.clone();
+                Rc::new(move |settings| requested.set(Some(settings)))
+            },
+            settings_changed: Rc::new(|_| {}),
+            play: {
+                let requested = requested.clone();
+                Rc::new(move |from, settings| requested.set(Some((from, settings))))
+            },
+            pin: Rc::new(|_| {}),
+            more: Rc::new(|_| {}),
+            edit: Rc::new(|_| {}),
+            done: Rc::new(|_| {}),
+            edit_entries: Rc::new(|_, _| {}),
+            update: Rc::new(|_| {}),
+            delete: Rc::new(|| {}),
+            people: None,
+            cover: None,
+        };
+        let (header_widget, _, sync_modes) =
+            header(&page, &actions, &Rc::new(Cell::new(page.settings)), None);
+        assert!(header_widget.measure(gtk::Orientation::Horizontal, -1).0 < 900);
+        fn button_named(widget: &gtk::Widget, name: &str) -> Option<gtk::Button> {
+            if let Some(button) = widget.downcast_ref::<gtk::Button>() {
+                let label = button.label().map(|s| s.to_string()).or_else(|| {
+                    button
+                        .child()?
+                        .downcast::<adw::ButtonContent>()
+                        .ok()
+                        .map(|c| c.label().to_string())
+                });
+                if label.as_deref() == Some(name) {
+                    return Some(button.clone());
+                }
+            }
+            let mut child = widget.first_child();
+            while let Some(widget) = child {
+                if let Some(button) = button_named(&widget, name) {
+                    return Some(button);
+                }
+                child = widget.next_sibling();
+            }
+            None
+        }
+        let modes = PlaySettings {
+            shuffle: true,
+            repeat: Repeat::All,
+            skip_watched: false,
+        };
+        sync_modes(modes);
+        button_named(header_widget.upcast_ref(), "Play")
+            .unwrap()
+            .emit_clicked();
+        assert_eq!(requested.get(), Some((from_start(&page), modes)));
+        assert!(button_named(header_widget.upcast_ref(), "Repeat all").is_none());
+        assert!(button_named(header_widget.upcast_ref(), "Shuffle").is_none());
+        sync_modes(PlaySettings::default());
+        button_named(header_widget.upcast_ref(), "Play random")
+            .unwrap()
+            .emit_clicked();
+        assert!(random_requested.get().unwrap().shuffle);
+
+        fn has_skip(widget: &gtk::Widget) -> bool {
+            if widget
+                .downcast_ref::<gtk::Label>()
+                .is_some_and(|label| label.text() == "Skip watched")
+            {
+                return true;
+            }
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                if has_skip(&current) {
+                    return true;
+                }
+                child = current.next_sibling();
+            }
+            false
+        }
+        assert!(!has_skip(header_widget.upcast_ref()));
+        page.playlist.kinds.episodes = true;
+        let (mixed, _, _) = header(&page, &actions, &Rc::new(Cell::new(page.settings)), None);
+        assert!(has_skip(mixed.upcast_ref()));
+        let actions = Rc::new(ListActions {
+            open: Rc::new(|_| {}),
+            play: Rc::new(|_, _| {}),
+            pin: Rc::new(|_, _| {}),
+        });
+        let mut browser_list = list.clone();
+        for playlist in &mut browser_list {
+            playlist.artwork = None;
+        }
+        let art = crate::artwork::Art::new(
+            session.clone(),
+            spoolframe_linux_core::backend::ServerKey("test".into()),
+            None,
+        );
+        let grid = browse(&browser_list, &actions, Some(&art));
+        let measure = grid.widget.first_child().unwrap();
+        measure.emit_by_name::<()>("resize", &[&1100i32, &1i32]);
+        drain();
+        let search = measure.next_sibling().unwrap();
+        let filters = search.next_sibling().unwrap();
+        let flow = filters
+            .next_sibling()
+            .unwrap()
+            .downcast::<gtk::FlowBox>()
+            .unwrap();
+        let card = flow.child_at_index(0).unwrap().child().unwrap();
+        assert_eq!(flow.max_children_per_line(), 4);
+        assert_eq!(card.width_request(), browse_dimensions(1100).1);
+        // Movies + episodes excludes the built-in music playlists.
+        let movies = filters.first_child().unwrap();
+        movies
+            .clone()
+            .downcast::<gtk::ToggleButton>()
+            .unwrap()
+            .set_active(true);
+        movies
+            .next_sibling()
+            .unwrap()
+            .downcast::<gtk::ToggleButton>()
+            .unwrap()
+            .set_active(true);
+        filters
+            .last_child()
+            .unwrap()
+            .downcast::<gtk::ToggleButton>()
+            .unwrap()
+            .set_active(false);
+        drain();
+        let count = list
+            .iter()
+            .filter(|p| p.kinds.movies || p.kinds.episodes)
+            .count();
+        assert!(flow.child_at_index(count as i32).is_none());
+        assert!(flow.child_at_index(count as i32 - 1).is_some());
+        let picture = || {
+            flow.child_at_index(0)
+                .unwrap()
+                .child()
+                .unwrap()
+                .downcast::<gtk::Button>()
+                .unwrap()
+                .child()
+                .unwrap()
+                .first_child()
+                .unwrap()
+        };
+        assert!(!picture().is::<gtk::Overlay>());
+        let target = browser_list
+            .iter_mut()
+            .find(|p| p.kinds.movies || p.kinds.episodes)
+            .unwrap();
+        target.artwork =
+            Some(ArtworkId::new(spoolframe_types::Namespace::Preview, "updated-cover").unwrap());
+        grid.update(&browser_list);
+        drain();
+        assert!(
+            picture().is::<gtk::Overlay>(),
+            "the existing browser should render the new cover"
+        );
+        assert!(
+            flow.child_at_index(count as i32).is_none(),
+            "refresh should preserve the media filters"
+        );
+        assert_eq!(flow.max_children_per_line(), 4);
+        for playlist in &mut browser_list {
+            playlist.artwork = None;
+        }
+        grid.update(&browser_list);
+        drain();
+        assert!(
+            !picture().is::<gtk::Overlay>(),
+            "removing a cover should refresh too"
+        );
+        // Transient zero-width notifications must leave the current cards
+        // alone; a subsequent real resize should still update the grid.
+        let before = flow.child_at_index(0).unwrap();
+        measure.emit_by_name::<()>("resize", &[&0i32, &1i32]);
+        drain();
+        assert_eq!(flow.child_at_index(0).unwrap(), before);
+        measure.emit_by_name::<()>("resize", &[&800i32, &1i32]);
+        measure.emit_by_name::<()>("resize", &[&1100i32, &1i32]);
+        assert_eq!(
+            flow.child_at_index(0).unwrap(),
+            before,
+            "resizing must not rebuild inside allocation"
+        );
+        drain();
+        assert_ne!(flow.child_at_index(0).unwrap(), before);
+        assert_eq!(flow.max_children_per_line(), 4);
+        let navigation = adw::NavigationView::new();
+        let browser_page = crate::pages::page("All playlists", &grid.widget);
+        navigation.add(&browser_page);
+        let window = gtk::Window::builder()
+            .default_width(1100)
+            .default_height(600)
+            .child(&navigation)
+            .build();
+        let settle = || {
+            let until = std::time::Instant::now() + std::time::Duration::from_millis(250);
+            while std::time::Instant::now() < until {
+                drain();
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        window.present();
+        settle();
+        window.set_default_size(800, 600);
+        settle();
+        navigation.push(&adw::NavigationPage::new(
+            &gtk::Label::new(Some("Playlist")),
+            "Playlist",
+        ));
+        grid.update(&browser_list);
+        settle();
+        navigation.pop();
+        settle();
+        window.close();
+        drain();
+    }
 
     fn andrey(client: &FakeClient) -> Arc<dyn Session> {
         client.session(&FakeClient::profile("andrey")).unwrap()

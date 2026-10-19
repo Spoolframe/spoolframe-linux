@@ -298,6 +298,12 @@ pub fn request_path(unique_name: &str, token: &str) -> String {
     format!("/org/freedesktop/portal/desktop/request/{sender}/{token}")
 }
 
+fn chooser_arguments(title: &str, options: glib::VariantDict) -> glib::Variant {
+    // A Rust tuple's ToVariant wraps a Variant as `v`. The portal needs
+    // the options dictionary itself (`a{sv}`) as the third argument.
+    glib::Variant::tuple_from_iter(["".to_variant(), title.to_variant(), options.end()])
+}
+
 /// Shows the portal's file chooser (`method`: SaveFile or OpenFile) and
 /// waits for the answer, on a main context of its own so it runs on any
 /// thread. The path picked, or `None` if they cancelled.
@@ -340,7 +346,7 @@ fn pick_on(
     };
     // Subscribed before asking, so the answer cannot come first.
     let mut subscription = subscribe(&path);
-    let arguments = ("", title, options.end()).to_variant();
+    let arguments = chooser_arguments(title, options);
     let asked = bus
         .call_sync(
             Some("org.freedesktop.portal.Desktop"),
@@ -386,6 +392,28 @@ fn pick_on(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chooser_arguments_have_the_portal_signature_and_options() {
+        let options = glib::VariantDict::new(None);
+        options.insert("handle_token", "spoolframe7");
+        options.insert("current_name", "alice.spoolframe-identity");
+        let arguments = chooser_arguments("Save identity", options);
+        assert_eq!(arguments.type_().as_str(), "(ssa{sv})");
+        let (parent, title, options) = arguments
+            .get::<(String, String, glib::VariantDict)>()
+            .unwrap();
+        assert_eq!(parent, "");
+        assert_eq!(title, "Save identity");
+        assert_eq!(
+            options.lookup::<String>("handle_token").unwrap().as_deref(),
+            Some("spoolframe7")
+        );
+        assert_eq!(
+            options.lookup::<String>("current_name").unwrap().as_deref(),
+            Some("alice.spoolframe-identity")
+        );
+    }
 
     #[test]
     fn a_record_name_may_be_offered() {

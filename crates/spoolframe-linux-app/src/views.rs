@@ -103,6 +103,14 @@ pub(crate) const TILE_HUES: [&str; 8] = [
 /// in the heading. The wheel over the row scrolls the row (see
 /// [`wheel_scrolls_row`]); elsewhere it scrolls the page.
 pub fn row(title: &str, cards: impl IntoIterator<Item = gtk::Widget>) -> gtk::Box {
+    row_with_action(title, cards, None)
+}
+
+pub fn row_with_action(
+    title: &str,
+    cards: impl IntoIterator<Item = gtk::Widget>,
+    action: Option<&gtk::Button>,
+) -> gtk::Box {
     // Cards keep their own width: a caption's hexpand would otherwise
     // stretch a lone card across the row.
     let cards_box = gtk::Box::builder()
@@ -126,6 +134,9 @@ pub fn row(title: &str, cards: impl IntoIterator<Item = gtk::Widget>) -> gtk::Bo
     // In line with the cards, which sit inside the row's side room.
     header.set_margin_start(LIFT_SIDE);
     header.append(&heading(title));
+    if let Some(action) = action {
+        header.append(action);
+    }
     header.append(&back);
     header.append(&forward);
 
@@ -627,6 +638,23 @@ pub fn track_go_to_entries(track: &Track, open: &Open, with_album: bool) -> Vec<
         ));
     }
     entries
+}
+
+/// Shared track actions for album and playlist rows.
+pub fn track_menu_entries(
+    track: &Track,
+    open: &Open,
+    with_album: bool,
+    enqueue: Option<Rc<dyn Fn(Enqueue)>>,
+    add: Option<&AddToPlaylist>,
+) -> Vec<Vec<MenuEntry>> {
+    let mut groups = Vec::new();
+    if let Some(enqueue) = enqueue {
+        groups.push(enqueue_entries(move |at| enqueue(at)));
+    }
+    groups.push(track_go_to_entries(track, open, with_album));
+    groups.extend(add_entry(&Item::Track(track.clone()), add).map(|entry| vec![entry]));
+    groups
 }
 
 /// "Play next" and "Add to queue", calling `run` with where.

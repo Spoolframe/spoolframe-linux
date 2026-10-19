@@ -72,7 +72,18 @@ pub fn page(playback: &Rc<Playback>, actions: Actions, cards: &Cards) -> adw::Na
         .orientation(gtk::Orientation::Vertical)
         .spacing(4)
         .build();
-    titles.append(&title);
+    let title_row = gtk::Box::builder()
+        .spacing(12)
+        .halign(gtk::Align::Center)
+        .build();
+    title_row.append(&title);
+    let follow = cards.hearts.as_ref().map(|hearts| {
+        let (heart, follow) = hearts.following();
+        heart.set_valign(gtk::Align::Center);
+        title_row.append(&heart);
+        follow
+    });
+    titles.append(&title_row);
     titles.append(&artist);
     titles.append(&detail);
 
@@ -162,14 +173,28 @@ pub fn page(playback: &Rc<Playback>, actions: Actions, cards: &Cards) -> adw::Na
             open(item);
         })
     };
-    let queue = Queue::new(playback, go_to, cards.art.clone());
+    for widget in [cover_slot.upcast_ref::<gtk::Widget>(), titles.upcast_ref()] {
+        let menu = current_track_menu(
+            &Rc::downgrade(playback),
+            &go_to,
+            cards.add_to_playlist.as_ref(),
+        );
+        crate::views::context_menu(widget, &menu);
+    }
+    let queue = Queue::new(
+        playback,
+        go_to,
+        cards.art.clone(),
+        cards.add_to_playlist.clone(),
+    );
     let body = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     body.append(&current);
     body.append(&queue.aside);
 
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&header);
-    toolbar.set_content(Some(&body));
+    let content = visualizer_view(playback, &body, &header, cards.art.clone());
+    toolbar.set_content(Some(&content));
     let page = adw::NavigationPage::builder()
         .title("Now Playing")
         .child(&toolbar)
@@ -179,6 +204,7 @@ pub fn page(playback: &Rc<Playback>, actions: Actions, cards: &Cards) -> adw::Na
         art: cards.art.clone(),
         cover_slot,
         cover_album: RefCell::new(None),
+        follow,
         title,
         artist,
         detail,
@@ -209,11 +235,229 @@ pub fn page(playback: &Rc<Playback>, actions: Actions, cards: &Cards) -> adw::Na
     page
 }
 
+/// A visualizer fills the same application page as Now Playing. The window
+/// stays in its normal mode, and returning to the cover never stops music.
+fn visualizer_view(
+    playback: &Rc<Playback>,
+    normal: &gtk::Box,
+    header: &adw::HeaderBar,
+    art: Option<Rc<Art>>,
+) -> gtk::Stack {
+    use crate::visualizer::{Canvas, Mode};
+    let stack = gtk::Stack::builder().hexpand(true).vexpand(true).build();
+    // Hidden queue contents must not impose their minimum size on the visualizer.
+    stack.set_hhomogeneous(false);
+    stack.set_vhomogeneous(false);
+    stack.add_named(normal, Some("cover"));
+    let measurements = playback.analysis(false);
+    let canvas = Canvas::new(measurements.clone().unwrap_or_default());
+    let picture = gtk::Picture::builder()
+        .paintable(playback.paintable())
+        .content_fit(gtk::ContentFit::Fill)
+        .can_shrink(true)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    let visuals = gtk::Stack::new();
+    visuals.add_named(&canvas, Some("custom"));
+    visuals.add_named(&picture, Some("gstreamer"));
+    let overlay = gtk::Overlay::new();
+    overlay.set_child(Some(&visuals));
+    let transport = Rc::new(Transport::new(playback, false));
+    transport.row.set_halign(gtk::Align::Center);
+    transport.row.set_valign(gtk::Align::End);
+    transport.row.set_margin_bottom(24);
+    transport.row.add_css_class("visualizer-controls");
+    overlay.add_overlay(&transport.row);
+    stack.add_named(&overlay, Some("visualizer"));
+    let options = gtk::Box::builder()
+        .spacing(12)
+        .halign(gtk::Align::End)
+        .valign(gtk::Align::Start)
+        .margin_top(16)
+        .margin_end(16)
+        .css_classes(["visualizer-controls"])
+        .build();
+    let peaks = gtk::CheckButton::with_label("Peak markers");
+    peaks.set_active(true);
+    let trails = gtk::CheckButton::with_label("Phosphor trails");
+    trails.set_active(true);
+    options.append(&peaks);
+    options.append(&trails);
+    options.set_visible(false);
+    overlay.add_overlay(&options);
+    {
+        let canvas = canvas.downgrade();
+        peaks.connect_toggled(move |button| {
+            if let Some(canvas) = canvas.upgrade() {
+                canvas.set_peaks(button.is_active());
+            }
+        });
+        let playback = Rc::downgrade(playback);
+        trails.connect_toggled(move |button| {
+            if let Some(playback) = playback.upgrade() {
+                playback.visualization_trails(button.is_active());
+            }
+        });
+    }
+
+    let plugins = crate::visualizer::plugins();
+    let mut labels = vec!["Album & queue".to_owned()];
+    let mut choices: Vec<(Option<Mode>, Option<String>)> = vec![(None, None)];
+    if measurements.is_some() {
+        for (label, mode) in [
+            ("Radial spectrum", Mode::Radial),
+            ("Radial waves", Mode::Rings),
+            ("VU deck", Mode::Vu),
+            ("Ambient artwork", Mode::Ambient),
+            ("Spectrum", Mode::Spectrum),
+            ("Spectrogram", Mode::Spectrogram),
+        ] {
+            labels.push(label.to_owned());
+            choices.push((Some(mode), None));
+        }
+    }
+    for (name, label) in plugins {
+        labels.push(label);
+        choices.push((None, Some(name)));
+    }
+    let selector =
+        gtk::DropDown::from_strings(&labels.iter().map(String::as_str).collect::<Vec<_>>());
+    selector.set_tooltip_text(Some("Visualizer"));
+    selector.set_sensitive(choices.len() > 1);
+    header.pack_end(&selector);
+    let plugin_selected = Rc::new(Cell::new(false));
+    let apply: Rc<dyn Fn(&gtk::DropDown)> = {
+        let plugin_selected = plugin_selected.clone();
+        let weak = Rc::downgrade(playback);
+        let stack = stack.downgrade();
+        let canvas = canvas.downgrade();
+        let visuals = visuals.downgrade();
+        Rc::new(move |selector| {
+            let (Some(playback), Some(stack), Some(canvas), Some(visuals)) = (
+                weak.upgrade(),
+                stack.upgrade(),
+                canvas.upgrade(),
+                visuals.upgrade(),
+            ) else {
+                return;
+            };
+            let Some((mode, plugin)) = choices.get(selector.selected() as usize) else {
+                return;
+            };
+            plugin_selected.set(plugin.is_some());
+            let scope = matches!(plugin.as_deref(), Some("wavescope" | "spacescope"));
+            peaks.set_visible(*mode == Some(Mode::Spectrum));
+            trails.set_visible(scope);
+            options.set_visible(*mode == Some(Mode::Spectrum) || scope);
+            playback.analysis(mode.is_some());
+            if !playback.set_visualization(plugin.as_deref()) {
+                selector.set_selected(0);
+                return;
+            }
+            if scope {
+                playback.visualization_trails(trails.is_active());
+            }
+            if let Some(mode) = mode {
+                canvas.set_mode(*mode);
+            }
+            visuals.set_visible_child_name(if mode.is_some() {
+                "custom"
+            } else {
+                "gstreamer"
+            });
+            stack.set_visible_child_name(if selector.selected() == 0 {
+                "cover"
+            } else {
+                "visualizer"
+            });
+        })
+    };
+    {
+        let apply = apply.clone();
+        selector.connect_selected_notify(move |selector| apply(selector));
+    }
+    {
+        let selector = selector.downgrade();
+        stack.connect_map(move |_| {
+            if let Some(selector) = selector.upgrade() {
+                apply(&selector);
+            }
+        });
+        let weak = Rc::downgrade(playback);
+        stack.connect_unmap(move |_| {
+            if let Some(playback) = weak.upgrade() {
+                playback.analysis(false);
+                playback.set_visualization(None);
+            }
+        });
+    }
+    let weak = Rc::downgrade(playback);
+    let canvas = canvas.downgrade();
+    let controls = Rc::downgrade(&transport);
+    let generation = Rc::new(Cell::new(0u64));
+    let selector = selector.downgrade();
+    playback.subscribe(move |change| {
+        let (Some(playback), Some(canvas), Some(controls)) =
+            (weak.upgrade(), canvas.upgrade(), controls.upgrade())
+        else {
+            return false;
+        };
+        match change {
+            Change::Item(item) => {
+                controls.show_item(&playback);
+                canvas.set_texture(None);
+                generation.set(generation.get().wrapping_add(1));
+                if let Some(art) = art.clone() {
+                    let album = playback.album();
+                    let (_, artwork) = crate::views::cover_of(item, album.as_ref());
+                    let artwork = artwork.to_vec();
+                    let version = generation.get();
+                    let generation = generation.clone();
+                    let canvas = canvas.downgrade();
+                    gtk::glib::spawn_future_local(async move {
+                        let result = art
+                            .bytes(
+                                &artwork,
+                                &[ArtworkKind::Poster, ArtworkKind::Thumb],
+                                ArtworkSize::Large,
+                            )
+                            .await;
+                        if generation.get() == version
+                            && let Some(canvas) = canvas.upgrade()
+                        {
+                            canvas.set_texture(
+                                result.and_then(|(_, bytes)| crate::artwork::decode(&bytes).ok()),
+                            );
+                        }
+                    });
+                }
+            }
+            Change::TrackFailed(_) if plugin_selected.get() && !playback.visualization_active() => {
+                if let Some(selector) = selector.upgrade() {
+                    selector.set_selected(0);
+                }
+            }
+            Change::Queue => controls.show_item(&playback),
+            Change::Playing(playing) => controls.show_playing(*playing),
+            Change::Modes { shuffle, repeat } => controls.show_modes(*shuffle, *repeat),
+            _ => {}
+        }
+        true
+    });
+    // Own the control state for exactly the life of this page.
+    stack.connect_destroy(move |_| {
+        let _ = &transport;
+    });
+    stack
+}
+
 struct View {
     art: Option<Rc<Art>>,
     cover_slot: adw::Bin,
     /// The album whose cover shows, so the next track of it keeps it.
     cover_album: RefCell<Option<spoolframe_types::MediaId>>,
+    follow: Option<crate::hearts::Follow>,
     title: gtk::Label,
     artist: gtk::Label,
     detail: gtk::Label,
@@ -230,6 +474,12 @@ impl View {
     fn update(&self, playback: &Playback, change: &Change) {
         match change {
             Change::Item(item) => {
+                if let Some(follow) = &self.follow {
+                    follow(match item {
+                        Item::Track(track) => Some(track.id.clone()),
+                        _ => None,
+                    });
+                }
                 let facts = crate::views::Facts::of(item);
                 self.title.set_label(&facts.title);
                 let album = playback.album();
@@ -478,6 +728,7 @@ enum Row {
     Queued(u64),
     /// The context's item at this position in its play order.
     Context(usize),
+    Playlist(spoolframe_linux_core::backend::EntryId),
 }
 
 /// "Up next", in three sections: "Now playing", "Next in queue" (the
@@ -495,6 +746,7 @@ struct Queue {
     playback: std::rc::Weak<Playback>,
     /// Opens a track's artist or album, leaving Now Playing.
     go_to: crate::views::Open,
+    add_to_playlist: Option<crate::views::AddToPlaylist>,
 }
 
 impl Queue {
@@ -502,6 +754,7 @@ impl Queue {
         playback: &Rc<Playback>,
         go_to: crate::views::Open,
         art: Option<Rc<crate::artwork::Art>>,
+        add_to_playlist: Option<crate::views::AddToPlaylist>,
     ) -> Self {
         let heading = gtk::Label::builder()
             .label("Up next")
@@ -540,6 +793,7 @@ impl Queue {
                 match picked {
                     Some(Row::Queued(id)) => playback.play_queued(id),
                     Some(Row::Context(pos)) => playback.play_context_at(pos),
+                    Some(Row::Playlist(entry)) => playback.play_playlist_entry(entry),
                     Some(Row::Inert) | None => {}
                 }
             });
@@ -564,6 +818,7 @@ impl Queue {
             rows,
             playback: Rc::downgrade(playback),
             go_to,
+            add_to_playlist,
         }
     }
 
@@ -595,6 +850,9 @@ impl Queue {
                 &mut rows,
             );
             row.add_css_class("playing");
+            let menu =
+                current_track_menu(&self.playback, &self.go_to, self.add_to_playlist.as_ref());
+            crate::views::context_menu(row.upcast_ref(), &menu);
         }
 
         if !up_next.queued.is_empty() {
@@ -663,6 +921,35 @@ impl Queue {
                     ]);
                 }
                 if let Item::Track(track) = item {
+                    groups.push(crate::views::track_go_to_entries(track, &self.go_to, true));
+                }
+                let menu = crate::views::menu_popover(groups);
+                crate::views::context_menu(row.upcast_ref(), &menu);
+            }
+        }
+        if let Some((heading, entries)) = playback.playlist_up_next()
+            && !entries.is_empty()
+        {
+            self.heading(&heading, false, &mut rows);
+            for entry in entries {
+                let artist = artist_of(&entry.item, None);
+                let content = queue_row(&self.thumb(&entry.item, None), &entry.item, &artist, None);
+                let row = self.append(&content, Row::Playlist(entry.entry), &mut rows);
+                let id = entry.entry;
+                let next_item = entry.item.clone();
+                let queued_item = entry.item.clone();
+                let mut groups = vec![vec![
+                    self.entry("Play now", crate::icons::PLAY, move |p| {
+                        p.play_playlist_entry(id)
+                    }),
+                    self.entry("Play next", crate::icons::PLAY_NEXT, move |p| {
+                        p.play_next(vec![next_item.clone()], None)
+                    }),
+                    self.entry("Add to queue", crate::icons::ADD_TO_QUEUE, move |p| {
+                        p.add_to_queue(vec![queued_item.clone()], None)
+                    }),
+                ]];
+                if let Item::Track(track) = &entry.item {
                     groups.push(crate::views::track_go_to_entries(track, &self.go_to, true));
                 }
                 let menu = crate::views::menu_popover(groups);
@@ -836,6 +1123,60 @@ fn queue_row(
         row.append(end);
     }
     row
+}
+
+/// Resolve the current item when an action is invoked: the large cover
+/// and title stay alive while the player advances to another song.
+fn current_track_menu(
+    playback: &std::rc::Weak<Playback>,
+    open: &crate::views::Open,
+    add: Option<&crate::views::AddToPlaylist>,
+) -> gtk::Popover {
+    let weak = playback.clone();
+    let mut groups = vec![crate::views::enqueue_entries(move |at| {
+        if let Some(p) = weak.upgrade()
+            && let Some(item) = p.current()
+        {
+            match at {
+                Enqueue::Next => p.play_next(vec![item], p.album()),
+                Enqueue::Last => p.add_to_queue(vec![item], p.album()),
+            }
+        }
+    })];
+    let mut navigation = Vec::new();
+    for (label, icon, album) in [
+        ("Go to artist", crate::icons::ARTIST, false),
+        ("Go to album", crate::icons::ALBUM, true),
+    ] {
+        let (weak, open) = (playback.clone(), open.clone());
+        navigation.push(crate::views::MenuEntry::new(label, icon, move || {
+            if let Some(p) = weak.upgrade()
+                && let Some(Item::Track(track)) = p.current()
+            {
+                open(if album {
+                    crate::views::album_of(&track)
+                } else {
+                    crate::views::artist_of(&track)
+                });
+            }
+        }));
+    }
+    groups.push(navigation);
+    if let Some(add) = add {
+        let (weak, add) = (playback.clone(), add.clone());
+        groups.push(vec![crate::views::MenuEntry::new(
+            "Add to playlist…",
+            crate::icons::PLAYLISTS,
+            move || {
+                if let Some(p) = weak.upgrade()
+                    && let Some(item) = p.current()
+                {
+                    add(item);
+                }
+            },
+        )]);
+    }
+    crate::views::menu_popover(groups)
 }
 
 #[cfg(test)]

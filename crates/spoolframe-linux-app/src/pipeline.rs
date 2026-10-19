@@ -12,7 +12,7 @@
 //! takes the pipeline to NULL on a blocking worker, and [`Drop`] hands the
 //! last reference to GstPlay to one too.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -41,6 +41,8 @@ pub struct Pipeline {
     /// Holds the external subtitle's buffers until it is shown (see
     /// [`crate::external_subtitle`]).
     external: ExternalSubtitle,
+    analyzer: Option<crate::visualizer::Analyzer>,
+    visualization_active: Cell<bool>,
 }
 
 impl Pipeline {
@@ -49,6 +51,9 @@ impl Pipeline {
         let paintable = video.gtk.property::<gtk::gdk::Paintable>("paintable");
         let renderer = gst_play::PlayVideoOverlayVideoRenderer::with_sink(&video.outer);
         let play = gst_play::Play::new(Some(renderer));
+        let analyzer = crate::visualizer::Analyzer::attach(&play.pipeline())
+            .map_err(|error| tracing::warn!(%error, "audio analysis unavailable"))
+            .ok();
         style_subtitles(&play.pipeline());
         let external = ExternalSubtitle::default();
         external.watch(&play.pipeline());
@@ -83,6 +88,8 @@ impl Pipeline {
             subtitle: RefCell::new(None),
             loading_subtitle,
             external,
+            analyzer,
+            visualization_active: Cell::new(false),
         })
     }
 
@@ -102,6 +109,50 @@ impl Pipeline {
     /// The video frames, for any number of pictures.
     pub fn paintable(&self) -> &gtk::gdk::Paintable {
         &self.paintable
+    }
+
+    pub fn set_visualization(&self, name: Option<&str>) -> Result<(), glib::BoolError> {
+        if let Some(name) = name {
+            // Construct and validate the replacement before touching the active
+            // visualizer, so an unavailable plugin cannot stop the music.
+            let visualizer = crate::visualizer::gst_visualizer(name)?;
+            self.play().set_visualization_enabled(false);
+            self.play()
+                .pipeline()
+                .set_property("vis-plugin", &visualizer);
+        }
+        self.play().set_visualization_enabled(name.is_some());
+        self.visualization_active.set(name.is_some());
+        Ok(())
+    }
+
+    pub fn visualization_active(&self) -> bool {
+        self.visualization_active.get()
+    }
+
+    pub fn visualization_trails(&self, enabled: bool) {
+        if let Some(plugin) = self
+            .play()
+            .pipeline()
+            .property::<Option<gst::Element>>("vis-plugin")
+        {
+            let effect = plugin
+                .downcast::<gst::Bin>()
+                .ok()
+                .and_then(|bin| bin.by_name("effect"));
+            if let Some(effect) = effect
+                && effect.find_property("shader").is_some()
+            {
+                effect.set_property_from_str("shader", if enabled { "fade" } else { "none" });
+            }
+        }
+    }
+
+    pub fn analysis(&self, enabled: bool) -> Option<crate::visualizer::Measurements> {
+        self.analyzer.as_ref().map(|analyzer| {
+            analyzer.enable(enabled);
+            analyzer.levels.clone()
+        })
     }
 
     /// For the diagnostics: read only.
@@ -126,7 +177,11 @@ impl Pipeline {
         let published = Published::boxed(reader);
         let uri = subtitle.map(file_uri);
         self.external.attach(uri.clone());
-        *self.loading_subtitle.lock().unwrap() = Some(uri);
+        // Setting even an empty suburi during source-setup can leave the
+        // next item's pipeline at EOS without delivering its EOS message.
+        // Touch it only to install a subtitle or clear a previous one.
+        *self.loading_subtitle.lock().unwrap() =
+            (subtitle.is_some() || self.subtitle.borrow().is_some()).then_some(uri);
         self.subtitle.replace(subtitle.map(Path::to_path_buf));
         // Shown once GstPlay lists it; see [`give_subtitle_uri`].
         if subtitle.is_some() {

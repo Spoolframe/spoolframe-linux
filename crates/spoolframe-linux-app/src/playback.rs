@@ -20,7 +20,8 @@ use gtk::glib;
 use gtk::glib::thread_guard::ThreadGuard;
 use spoolframe_client_sdk::PlaybackOptions;
 use spoolframe_linux_core::backend::{
-    BackendError, Marker, PlaybackHandle, PlaybackPlan, Selection, Session, SubtitleTiming,
+    BackendError, EntryId, Marker, PlaySettings, PlaybackHandle, PlaybackPlan, PlaylistEntry,
+    Selection, Session, SubtitleTiming,
 };
 use spoolframe_linux_core::markers;
 pub use spoolframe_linux_core::markers::Offer;
@@ -290,6 +291,9 @@ pub struct Playback {
     listeners: RefCell<Vec<Listener>>,
     /// The server's playlist being played, and the entry playing.
     from_playlist: RefCell<Option<Playing>>,
+    playlist_preview: RefCell<Option<(Vec<PlaylistEntry>, PlaySettings)>>,
+    playlist_modes: Cell<Option<PlaySettings>>,
+    playlist_modes_tail: RefCell<Option<tokio::sync::oneshot::Receiver<()>>>,
     /// Its next entry is being asked for: once at a time.
     asking_playlist: Cell<bool>,
     /// Itself, for callbacks that outlive a borrow (the track menu's).
@@ -452,7 +456,9 @@ impl Playback {
             display: playlist.display,
         };
         let playback = Self::build(playlist.session, queue, start, true)?;
+        tracing::info!(playlist = ?playlist.from_playlist, "starting playback context");
         playback.from_playlist.replace(playlist.from_playlist);
+        playback.load_playlist_preview();
         Ok(playback)
     }
 
@@ -461,12 +467,144 @@ impl Playback {
         self.from_playlist.borrow().clone()
     }
 
+    // Reading playlist pages does not advance the server's play position.
+    // NextInPlaylist does, so it must never be used to populate the sidebar.
+    fn load_playlist_preview(self: &Rc<Self>) {
+        let Some(playing) = self.playing_from() else {
+            return;
+        };
+        let session = self.session.clone();
+        let requested = playing.clone();
+        let task = relm4::spawn(async move {
+            let mut entries = Vec::new();
+            loop {
+                let page = session
+                    .playlist(&requested.id, entries.len() as u32, 200)
+                    .await?;
+                let done = page.entries.is_empty()
+                    || page.offset + page.entries.len() as u32 >= page.total;
+                entries.extend(page.entries);
+                if done {
+                    return Ok::<_, BackendError>((entries, page.settings));
+                }
+            }
+        });
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let result = task.await;
+            let Some(playback) = weak.upgrade() else {
+                return;
+            };
+            if playback.stopped.get()
+                || playback.playing_from().as_ref().map(|p| &p.id) != Some(&playing.id)
+            {
+                return;
+            }
+            match result {
+                Ok(Ok(preview)) => {
+                    if playback.playlist_modes.get().is_none() {
+                        playback.playlist_modes.set(Some(preview.1));
+                    }
+                    playback.playlist_preview.replace(Some(preview));
+                    playback.emit_modes();
+                    playback.emit(&Change::Queue);
+                }
+                error => tracing::warn!(?error, "cannot load playlist queue preview"),
+            }
+        });
+    }
+
+    /// The remaining entries, without changing the server's play position.
+    /// Shuffled playlists are shown in playlist order, explicitly labelled.
+    pub fn playlist_up_next(&self) -> Option<(String, Vec<PlaylistEntry>)> {
+        let playing = self.playing_from()?;
+        let preview = self.playlist_preview.borrow();
+        let (entries, _) = preview.as_ref()?;
+        let settings = self.playlist_settings()?;
+        let at = entries
+            .iter()
+            .position(|entry| entry.entry == playing.entry)?;
+        let heading = if settings.shuffle {
+            format!("In {} · Shuffle on", playing.name)
+        } else {
+            format!("Next from {}", playing.name)
+        };
+        let entries = entries
+            .iter()
+            .enumerate()
+            .filter(|(index, entry)| {
+                if entry.unavailable {
+                    return false;
+                }
+                if settings.skip_watched
+                    && match &entry.item {
+                        Item::Movie(item) => item.playback.watched,
+                        Item::Episode(item) => item.playback.watched,
+                        Item::Track(item) => item.playback.watched,
+                        _ => false,
+                    }
+                {
+                    return false;
+                }
+                if settings.shuffle {
+                    *index != at
+                } else {
+                    *index > at
+                }
+            })
+            .map(|(_, entry)| entry.clone())
+            .collect();
+        Some((heading, entries))
+    }
+
+    pub fn play_playlist_entry(self: &Rc<Self>, entry: EntryId) {
+        let Some(playing) = self.playing_from() else {
+            return;
+        };
+        let Some(settings) = self.playlist_settings() else {
+            return;
+        };
+        if self.asking_playlist.replace(true) {
+            return;
+        }
+        self.report_progress();
+        let session = self.session.clone();
+        let pending = self.playlist_modes_tail.borrow_mut().take();
+        let task = relm4::spawn(async move {
+            if let Some(pending) = pending {
+                let _ = pending.await;
+            }
+            session
+                .play_playlist(&playing.id, Some(entry), settings)
+                .await
+        });
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let result = task.await;
+            if let Some(playback) = weak.upgrade() {
+                playback.asking_playlist.set(false);
+                match result {
+                    Ok(answer) => playback.playlist_next(answer),
+                    Err(error) => tracing::warn!(%error, "cannot select playlist entry"),
+                }
+            }
+        });
+    }
+
+    pub fn playlist_resume(&self) -> Option<crate::saved_queue::PlaylistResume> {
+        Some(crate::saved_queue::PlaylistResume {
+            playing: self.playing_from()?,
+            settings: self.playlist_settings(),
+        })
+    }
+
     /// Brings back a queue saved at the last run (P1-23): the current item
     /// prerolled at `at`, paused, waiting for Play.
     pub fn restore(
         session: Arc<dyn Session>,
         queue: Queue,
         at: Duration,
+        playlist: Option<crate::saved_queue::PlaylistResume>,
         display: Option<spoolframe_types::DisplayCapabilities>,
     ) -> anyhow::Result<Rc<Self>> {
         let start = Start {
@@ -476,7 +614,15 @@ impl Playback {
             quality: Default::default(),
             display,
         };
-        Self::build(session, queue, start, false)
+        let playback = Self::build(session, queue, start, false)?;
+        if let Some(playlist) = playlist {
+            playback.from_playlist.replace(Some(playlist.playing));
+            if let Some(settings) = playlist.settings {
+                playback.set_playlist_settings(settings);
+            }
+            playback.load_playlist_preview();
+        }
+        Ok(playback)
     }
 
     /// The queue as it stands, to save.
@@ -510,6 +656,9 @@ impl Playback {
             listeners: RefCell::new(Vec::new()),
             from_playlist: RefCell::new(None),
             asking_playlist: Cell::new(false),
+            playlist_preview: RefCell::new(None),
+            playlist_modes: Cell::new(None),
+            playlist_modes_tail: RefCell::new(None),
             progress_tail: RefCell::new(None),
             server_name: RefCell::new("the server".to_owned()),
         });
@@ -692,10 +841,62 @@ impl Playback {
         self.emit(&Change::Queue);
     }
 
+    pub fn playlist_settings(&self) -> Option<PlaySettings> {
+        self.playing_from()?;
+        self.playlist_modes.get()
+    }
+
+    /// Save playlist modes without restarting the current stream. Serialize
+    /// writes and make Next wait for them, so it uses the chosen modes.
+    pub fn set_playlist_settings(&self, settings: PlaySettings) {
+        let Some(playing) = self.playing_from() else {
+            return;
+        };
+        if self.playlist_modes.replace(Some(settings)) == Some(settings) {
+            return;
+        }
+        let previous = self.playlist_modes_tail.borrow_mut().take();
+        let (finished, pending) = tokio::sync::oneshot::channel();
+        self.playlist_modes_tail.replace(Some(pending));
+        let session = self.session.clone();
+        let task = relm4::spawn(async move {
+            if let Some(previous) = previous {
+                let _ = previous.await;
+            }
+            let answer = session
+                .play_playlist(&playing.id, Some(playing.entry), settings)
+                .await;
+            let _ = finished.send(());
+            answer
+        });
+        let weak = self.me.clone();
+        glib::spawn_future_local(async move {
+            let answer = task.await;
+            if let Some(playback) = weak.upgrade() {
+                match answer {
+                    Ok(Ok(_)) => {}
+                    error => {
+                        tracing::warn!(?error, "cannot change playlist playback settings");
+                        playback.emit(&Change::Skipped("Couldn’t save playlist playback settings"));
+                    }
+                }
+            }
+        });
+        self.emit_modes();
+        self.emit(&Change::Queue);
+    }
+
     /// Shuffles what is still to come in the context, or puts it back in
     /// order, keeping the current item playing. The queue is never
     /// shuffled.
     pub fn toggle_shuffle(&self) {
+        if let Some(settings) = self.playlist_settings() {
+            self.set_playlist_settings(PlaySettings {
+                shuffle: !settings.shuffle,
+                ..settings
+            });
+            return;
+        }
         let on = !self.is_shuffled();
         self.queue
             .borrow_mut()
@@ -705,15 +906,31 @@ impl Playback {
     }
 
     pub fn is_shuffled(&self) -> bool {
-        self.queue.borrow().shuffle()
+        self.playlist_settings()
+            .map(|s| s.shuffle)
+            .unwrap_or_else(|| self.queue.borrow().shuffle())
     }
 
     pub fn repeat(&self) -> Repeat {
+        if let Some(settings) = self.playlist_settings() {
+            return match settings.repeat {
+                spoolframe_linux_core::backend::Repeat::All => Repeat::All,
+                spoolframe_linux_core::backend::Repeat::One => Repeat::One,
+                _ => Repeat::Off,
+            };
+        }
         self.queue.borrow().repeat()
     }
 
     /// Off, then the whole context, then the one item, then off again.
     pub fn cycle_repeat(&self) {
+        if let Some(settings) = self.playlist_settings() {
+            self.set_playlist_settings(PlaySettings {
+                repeat: crate::playlists::next_repeat(settings.repeat),
+                ..settings
+            });
+            return;
+        }
         self.queue.borrow_mut().cycle_repeat();
         self.emit_modes();
         self.emit(&Change::Queue);
@@ -741,6 +958,30 @@ impl Playback {
     /// The video frames, for any number of pictures.
     pub fn paintable(&self) -> &gtk::gdk::Paintable {
         self.pipeline.paintable()
+    }
+
+    pub fn set_visualization(&self, name: Option<&str>) -> bool {
+        match self.pipeline.set_visualization(name) {
+            Ok(()) => true,
+            Err(error) => {
+                self.emit(&Change::TrackFailed(&format!(
+                    "Could not start visualizer: {error}"
+                )));
+                false
+            }
+        }
+    }
+
+    pub fn analysis(&self, enabled: bool) -> Option<crate::visualizer::Measurements> {
+        self.pipeline.analysis(enabled)
+    }
+
+    pub fn visualization_active(&self) -> bool {
+        self.pipeline.visualization_active()
+    }
+
+    pub fn visualization_trails(&self, enabled: bool) {
+        self.pipeline.visualization_trails(enabled);
     }
 
     /// The audio and subtitle menu for `info`. A pick that fails says so
@@ -1368,9 +1609,15 @@ impl Playback {
         if self.asking_playlist.replace(true) {
             return;
         }
+        tracing::info!(playlist = %playing.id, entry = ?playing.entry, "requesting next playlist entry");
         let session = self.session.clone();
-        let asked =
-            relm4::spawn(async move { session.next_in_playlist(&playing.id, playing.entry).await });
+        let pending = self.playlist_modes_tail.borrow_mut().take();
+        let asked = relm4::spawn(async move {
+            if let Some(pending) = pending {
+                let _ = pending.await;
+            }
+            session.next_in_playlist(&playing.id, playing.entry).await
+        });
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
             let Ok(answer) = asked.await else { return };
@@ -1421,6 +1668,7 @@ impl Playback {
             Advance::Finished => {
                 if let Some(playing) = self.from_playlist.take() {
                     self.emit(&Change::PlaylistFinished(&playing));
+                    self.emit(&Change::Queue);
                 }
             }
         }
@@ -2061,6 +2309,7 @@ impl Playback {
 
     /// The item played to its end: report it, then play the next one.
     fn ended(self: &Rc<Self>) {
+        tracing::info!(item = ?self.current().map(|item| item.id().clone()), playlist = ?self.playing_from(), "playback reached end of stream");
         if let Some(length) = self.pipeline.duration() {
             self.send_progress(length);
         }
@@ -2240,6 +2489,15 @@ impl Playback {
                 // The subtitle's own source failing need not end the item.
                 if self.pipeline.subtitle_caused(&e) {
                     self.subtitle_failed(&e);
+                } else if self.pipeline.visualization_active() {
+                    // A visualizer error must not strand an otherwise playable
+                    // song. Retry the same reader/position once without video.
+                    tracing::warn!(error = %e, "visualizer failed; resuming audio without it");
+                    let _ = self.pipeline.set_visualization(None);
+                    self.read_anew(self.position());
+                    self.emit(&Change::TrackFailed(
+                        "Visualizer stopped; continuing without it",
+                    ));
                 } else {
                     self.failed(&e);
                 }
@@ -2534,6 +2792,58 @@ mod tests {
         done()
     }
 
+    #[test]
+    #[ignore = "needs a display for gtk4paintablesink"]
+    fn a_visualizer_error_resumes_the_same_song_without_the_effect() {
+        gtk::init().unwrap();
+        init().unwrap();
+        let dir = TestDir::new_blocking("spoolframe-visualizer-recovery");
+        let path = dir.join("tone.mkv");
+        let generator = gst::parse::launch(&format!(
+            "audiotestsrc num-buffers=600 ! audioconvert ! opusenc ! matroskamux ! filesink location={}", path.display()
+        )).unwrap();
+        generator.set_state(gst::State::Playing).unwrap();
+        generator
+            .bus()
+            .unwrap()
+            .timed_pop_filtered(gst::ClockTime::from_seconds(10), &[gst::MessageType::Eos])
+            .unwrap();
+        generator.set_state(gst::State::Null).unwrap();
+        let client = FakeClient::new(Some(path));
+        let session = client.session(&FakeClient::profile("andrey")).unwrap();
+        let item = first_track(&session);
+        let id = item.id().clone();
+        let playback = Playback::start(Playlist {
+            session,
+            items: vec![item],
+            index: 0,
+            queued: Vec::new(),
+            from: None,
+            selection: None,
+            tracks: None,
+            album: None,
+            quality: Default::default(),
+            display: None,
+            from_playlist: None,
+        })
+        .unwrap();
+        assert!(run_until(Duration::from_secs(8), || playback.position()
+            > Duration::from_millis(500)));
+        assert!(playback.set_visualization(Some("wavescope")));
+        let at = playback.position();
+        let uri = playback.pipeline.playback_uri().unwrap();
+        playback.on(Event::Error(
+            uri,
+            "simulated visualizer negotiation error".into(),
+        ));
+        assert!(!playback.visualization_active());
+        assert!(run_until(Duration::from_secs(8), || playback.is_playing()
+            && playback.position() > at + Duration::from_millis(250)));
+        assert_eq!(playback.current().unwrap().id(), &id);
+        assert!(playback.now().unwrap().failure.borrow().is_none());
+        playback.stop();
+    }
+
     /// Playback on the fake server, end to end. One test: GTK binds itself
     /// to the first thread that starts it, and each test has its own.
     #[test]
@@ -2585,16 +2895,77 @@ mod tests {
     /// that ends plays the server's next, and the last one ends the
     /// playlist, once.
     fn a_playlist_goes_on_to_the_servers_next_entry_then_ends() {
+        playlist_plays_to_the_end("Movie night", false, false, false);
+    }
+
+    #[test]
+    #[ignore = "needs a display for gtk4paintablesink"]
+    fn a_music_playlist_goes_on_to_the_servers_next_entry_then_ends() {
+        gtk::init().unwrap();
+        init().unwrap();
+        playlist_plays_to_the_end("All", false, false, false);
+    }
+
+    #[test]
+    #[ignore = "needs a display for gtk4paintablesink"]
+    fn selecting_a_playlist_preview_entry_keeps_playing_the_playlist() {
+        gtk::init().unwrap();
+        init().unwrap();
+        playlist_plays_to_the_end("All", true, false, false);
+    }
+
+    #[test]
+    #[ignore = "needs a display for gtk4paintablesink"]
+    fn a_playlist_plays_the_manual_queue_then_resumes_its_entries() {
+        gtk::init().unwrap();
+        init().unwrap();
+        playlist_plays_to_the_end("All", false, true, false);
+    }
+
+    #[test]
+    #[ignore = "needs a display for gtk4paintablesink"]
+    fn a_restored_playlist_plays_its_queue_then_the_remaining_songs() {
+        gtk::init().unwrap();
+        init().unwrap();
+        playlist_plays_to_the_end("All", false, true, true);
+    }
+
+    fn playlist_plays_to_the_end(
+        name: &str,
+        select_preview: bool,
+        manual_queue: bool,
+        restore: bool,
+    ) {
         use spoolframe_linux_core::backend::PlaySettings;
         use spoolframe_linux_core::playlists::Playing;
-        let dir = TestDir::new_blocking("spoolframe-playlist");
+        let dir = TestDir::new_blocking(if name == "All" {
+            "spoolframe-music-playlist"
+        } else {
+            "spoolframe-playlist"
+        });
         let path = dir.join("clip.mkv");
-        clip(&path);
+        if name == "All" {
+            let pipeline = gst::parse::launch(&format!(
+                "audiotestsrc num-buffers=40 ! audioconvert ! opusenc ! matroskamux ! filesink location={}",
+                path.display()
+            )).unwrap();
+            let bus = pipeline.bus().unwrap();
+            pipeline.set_state(gst::State::Playing).unwrap();
+            bus.timed_pop_filtered(gst::ClockTime::from_seconds(10), &[gst::MessageType::Eos])
+                .unwrap();
+            pipeline.set_state(gst::State::Null).unwrap();
+        } else {
+            clip(&path);
+        }
         let client = FakeClient::new(Some(path));
         let session = client.session(&FakeClient::profile("andrey")).unwrap();
         let context = glib::MainContext::default();
         let list = context.block_on(session.playlists()).unwrap().playlists;
-        let night = list.iter().find(|p| p.name == "Movie night").unwrap();
+        let night = list.iter().find(|p| p.name == name).unwrap();
+        let total = context
+            .block_on(session.playlist(&night.id, 0, 200))
+            .unwrap()
+            .total;
         let first = context
             .block_on(session.play_playlist(&night.id, None, PlaySettings::default()))
             .unwrap()
@@ -2617,6 +2988,92 @@ mod tests {
             }),
         })
         .unwrap();
+        assert!(run_until(Duration::from_secs(5), || playback
+            .playlist_up_next()
+            .is_some()));
+        let (_, preview) = playback.playlist_up_next().unwrap();
+        assert_eq!(preview.len(), total as usize - 1);
+        assert_eq!(playback.playing_from().unwrap().entry, first.entry);
+        let page = context
+            .block_on(playback.session.playlist(&night.id, 0, 200))
+            .unwrap();
+        assert_eq!(
+            page.place,
+            Some(first.entry),
+            "preview must not advance the server's position"
+        );
+        if name == "All" && !select_preview {
+            let current = playback.current().unwrap().id().clone();
+            playback.toggle_shuffle();
+            playback.cycle_repeat();
+            assert!(playback.is_shuffled());
+            assert_eq!(playback.repeat(), Repeat::All);
+            let pending = playback.playlist_modes_tail.borrow_mut().take().unwrap();
+            context.block_on(pending).unwrap();
+            let saved = context
+                .block_on(playback.session.playlist(&night.id, 0, 1))
+                .unwrap();
+            assert!(saved.settings.shuffle);
+            assert_eq!(
+                saved.settings.repeat,
+                spoolframe_linux_core::backend::Repeat::All
+            );
+            assert_eq!(playback.current().unwrap().id(), &current);
+            assert_eq!(saved.place, Some(first.entry));
+            playback.toggle_shuffle();
+            playback.cycle_repeat();
+            assert_eq!(playback.repeat(), Repeat::One);
+            playback.cycle_repeat();
+            assert_eq!(playback.repeat(), Repeat::Off);
+            let pending = playback.playlist_modes_tail.borrow_mut().take().unwrap();
+            context.block_on(pending).unwrap();
+        }
+        if select_preview {
+            let chosen = preview[1].entry;
+            playback.play_playlist_entry(chosen);
+            assert!(run_until(Duration::from_secs(5), || playback
+                .playing_from()
+                .is_some_and(|p| p.entry == chosen)));
+            assert_eq!(
+                playback.playlist_up_next().unwrap().1.len(),
+                total as usize - 3
+            );
+        }
+        let mut expected = Vec::new();
+        if manual_queue {
+            let next = preview[preview.len() - 2].item.clone();
+            let last = preview[preview.len() - 1].item.clone();
+            playback.add_to_queue(vec![last.clone()], None);
+            playback.play_next(vec![next.clone()], None);
+            assert_eq!(playback.up_next().queued.len(), 2);
+            assert_eq!(playback.playlist_up_next().unwrap().1.len(), preview.len());
+            expected.push(first.item.id().clone());
+            expected.push(next.id().clone());
+            expected.push(last.id().clone());
+            expected.extend(preview.iter().map(|e| e.item.id().clone()));
+        }
+        let playback = if restore {
+            let bytes =
+                serde_json::to_vec(&(playback.snapshot(), playback.playlist_resume())).unwrap();
+            let (queue, playlist) = serde_json::from_slice(&bytes).unwrap();
+            let session = playback.session.clone();
+            playback.stop();
+            let restored =
+                Playback::restore(session, queue, Duration::ZERO, playlist, None).unwrap();
+            assert!(restored.has_next());
+            assert_eq!(restored.playing_from().unwrap().id, night.id);
+            assert_eq!(restored.up_next().queued.len(), 2);
+            assert!(run_until(Duration::from_secs(10), || restored
+                .pipeline
+                .element()
+                .current_state()
+                == gst::State::Paused
+                && restored.pipeline.duration().is_some()));
+            assert!(!restored.is_playing());
+            restored
+        } else {
+            playback
+        };
         let (played, finished) = (Rc::new(RefCell::new(Vec::new())), Rc::new(Cell::new(0)));
         {
             let (played, finished) = (played.clone(), finished.clone());
@@ -2629,14 +3086,30 @@ mod tests {
                 true
             });
         }
+        if restore {
+            playback.toggle();
+        }
         assert!(
             run_until(Duration::from_secs(60), || finished.get() == 1),
-            "the playlist did not end (played {:?})",
-            played.borrow()
+            "the playlist did not end (played {:?}, position {:?}, state {:?}, reader {:?})",
+            played.borrow(),
+            playback.pipeline.position(),
+            playback.pipeline.element().current_state(),
+            playback.reader_status()
         );
         let mut seen = played.borrow().clone();
         seen.dedup();
-        assert_eq!(seen.len(), 3, "played {seen:?}");
+        assert_eq!(
+            seen.len(),
+            total as usize - if select_preview { 2 } else { 0 } + if manual_queue { 2 } else { 0 },
+            "played {seen:?}"
+        );
+        if manual_queue {
+            assert_eq!(
+                seen, expected,
+                "manual queue must play before the remaining playlist entries"
+            );
+        }
         assert!(playback.playing_from().is_none());
         playback.stop();
     }
@@ -2909,7 +3382,8 @@ mod tests {
         let session = client.session(&profile).unwrap();
         let item = first_movie(&session);
         let queue = Queue::new(vec![item], 0, None, Vec::new());
-        let playback = Playback::restore(session, queue, Duration::from_secs(2), None).unwrap();
+        let playback =
+            Playback::restore(session, queue, Duration::from_secs(2), None, None).unwrap();
         let played = Rc::new(Cell::new(Duration::ZERO));
         {
             let played = played.clone();

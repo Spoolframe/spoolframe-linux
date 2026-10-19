@@ -13,11 +13,19 @@ use spoolframe_linux_core::storage::DataStore;
 
 use crate::queue::Queue;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlaylistResume {
+    pub playing: spoolframe_linux_core::playlists::Playing,
+    pub settings: Option<spoolframe_linux_core::backend::PlaySettings>,
+}
+
 #[derive(Serialize, Deserialize)]
 struct Saved {
     queue: Queue,
     /// Where the current item was, in milliseconds.
     position_ms: u64,
+    #[serde(default)]
+    playlist: Option<PlaylistResume>,
 }
 
 pub struct SavedQueue {
@@ -48,7 +56,7 @@ impl SavedQueue {
 
     /// The saved queue and position; `None` when nothing was saved, or the
     /// file cannot be read (logged: a queue is not worth failing for).
-    pub fn load(&self) -> Option<(Queue, Duration)> {
+    pub fn load(&self) -> Option<(Queue, Duration, Option<PlaylistResume>)> {
         let bytes = match self.store.get(&self.key) {
             Ok(bytes) => bytes?,
             Err(e) => {
@@ -57,7 +65,11 @@ impl SavedQueue {
             }
         };
         match serde_json::from_slice::<Saved>(&bytes) {
-            Ok(saved) => Some((saved.queue, Duration::from_millis(saved.position_ms))),
+            Ok(saved) => Some((
+                saved.queue,
+                Duration::from_millis(saved.position_ms),
+                saved.playlist,
+            )),
             Err(e) => {
                 tracing::warn!(error = %e, "the saved queue is unreadable; starting without it");
                 None
@@ -65,8 +77,9 @@ impl SavedQueue {
         }
     }
 
-    pub fn save(&self, queue: &Queue, position: Duration) {
+    pub fn save(&self, queue: &Queue, position: Duration, playlist: Option<PlaylistResume>) {
         let saved = Saved {
+            playlist,
             queue: queue.clone(),
             position_ms: position.as_millis() as u64,
         };
@@ -146,12 +159,42 @@ mod tests {
         let saved = SavedQueue::in_store(DataStore::new(store.path()), &profile("Andrey"));
         let mut queue = Queue::new(vec![song("a"), song("b")], 1, None, Vec::new());
         queue.add(vec![song("x")], None);
-        saved.save(&queue, Duration::from_millis(61_500));
-        let (restored, position) = saved.load().unwrap();
+        saved.save(&queue, Duration::from_millis(61_500), None);
+        let (restored, position, playlist) = saved.load().unwrap();
+        assert!(playlist.is_none());
         assert_eq!(
             (titles(&restored), position),
             (titles(&queue), Duration::from_millis(61_500))
         );
+    }
+
+    #[test]
+    fn a_playlist_context_and_modes_survive_restarting_and_old_saves_still_load() {
+        let store = dir("playlist");
+        let saved = SavedQueue::in_store(DataStore::new(store.path()), &profile("andrey"));
+        let queue = Queue::new(vec![song("a")], 0, None, Vec::new());
+        let playlist = PlaylistResume {
+            playing: spoolframe_linux_core::playlists::Playing {
+                id: "playlist-id".into(),
+                name: "Favorites".into(),
+                entry: 42,
+            },
+            settings: Some(spoolframe_linux_core::backend::PlaySettings {
+                shuffle: true,
+                repeat: spoolframe_linux_core::backend::Repeat::All,
+                skip_watched: false,
+            }),
+        };
+        saved.save(&queue, Duration::from_secs(12), Some(playlist.clone()));
+        let reopened = SavedQueue::in_store(DataStore::new(store.path()), &profile("andrey"));
+        let (_, at, restored) = reopened.load().unwrap();
+        assert_eq!(at, Duration::from_secs(12));
+        assert_eq!(restored, Some(playlist));
+        let old = serde_json::json!({ "queue": queue, "position_ms": 12000 });
+        DataStore::new(store.path())
+            .set(&saved.key, Some(&serde_json::to_vec(&old).unwrap()))
+            .unwrap();
+        assert!(reopened.load().unwrap().2.is_none());
     }
 
     #[test]
@@ -162,6 +205,7 @@ mod tests {
         andrey.save(
             &Queue::new(vec![song("a")], 0, None, Vec::new()),
             Duration::ZERO,
+            None,
         );
         assert!(alice.load().is_none());
     }

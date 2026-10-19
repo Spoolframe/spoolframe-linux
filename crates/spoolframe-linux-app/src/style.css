@@ -1393,6 +1393,10 @@ button.alert-response.destructive {
   padding: 8px;
 }
 
+.playlist-browser-grid > flowboxchild {
+  padding: 0;
+}
+
 .tile-placeholder {
   background-color: var(--card-bg-color);
 }
@@ -1873,4 +1877,10 @@ label.warning {
 
 label.accent {
   color: var(--accent-color);
+}
+
+.visualizer-controls {
+  background: alpha(var(--window-bg-color), 0.85);
+  border-radius: 32px;
+  padding: 12px 20px;
 }
