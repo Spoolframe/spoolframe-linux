@@ -130,6 +130,12 @@ impl Pipeline {
         self.visualization_active.get()
     }
 
+    /// Whether `message`, a GstPlay error, is the visualizer's, shown
+    /// now over `music` or not (see [`crate::visualizer::caused`]).
+    pub fn visualization_caused(&self, message: &str, music: bool) -> bool {
+        self.visualization_active.get() && crate::visualizer::caused(message, music)
+    }
+
     pub fn visualization_trails(&self, enabled: bool) {
         if let Some(plugin) = self
             .play()

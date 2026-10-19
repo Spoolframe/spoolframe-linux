@@ -496,6 +496,8 @@ impl MiniBar {
 
 /// Clip long text to its slot and gently pan back and forth, pausing at
 /// either end. The viewport never contributes the text's natural width.
+/// The pan runs on the frame clock only while the text overflows and is
+/// shown: text that fits costs no frames.
 fn scrolling_label(label: &gtk::Label) -> gtk::ScrolledWindow {
     let viewport = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::External)
@@ -506,50 +508,111 @@ fn scrolling_label(label: &gtk::Label) -> gtk::ScrolledWindow {
         .can_focus(false)
         .child(label)
         .build();
-    let start = Rc::new(Cell::new(None::<i64>));
+    let pan = Rc::new(Pan::default());
+    let update = {
+        let (pan, viewport) = (pan.clone(), viewport.downgrade());
+        move || {
+            if let Some(viewport) = viewport.upgrade() {
+                pan.update(&pan, &viewport);
+            }
+        }
+    };
     {
-        let start = start.clone();
+        let (pan, update) = (pan.clone(), update.clone());
         let adjustment = viewport.hadjustment();
         label.connect_label_notify(move |_| {
-            start.set(None);
+            pan.start.set(None);
             adjustment.set_value(0.0);
+            update();
         });
     }
-    let previous_range = Cell::new(-1.0_f64);
-    viewport.add_tick_callback(move |viewport, clock| {
+    {
+        // The text's width or the slot's changed.
+        let update = update.clone();
+        viewport.hadjustment().connect_changed(move |_| update());
+    }
+    viewport.connect_map(move |_| update());
+    viewport.connect_unmap(move |viewport| pan.stop(viewport));
+    viewport
+}
+
+/// A scrolling label's pan: when it began, and its tick while it runs.
+#[derive(Default)]
+struct Pan {
+    start: Cell<Option<i64>>,
+    previous_range: Cell<f64>,
+    tick: RefCell<Option<gtk::TickCallbackId>>,
+}
+
+impl Pan {
+    /// How far the text overflows, if it is to pan at all.
+    fn overflow(viewport: &gtk::ScrolledWindow) -> Option<f64> {
         let adjustment = viewport.hadjustment();
         let range = (adjustment.upper() - adjustment.page_size()).max(0.0);
         let animations = viewport.settings().is_gtk_enable_animations();
-        if !animations || range <= 0.5 {
-            start.set(None);
-            adjustment.set_value(0.0);
-            return gtk::glib::ControlFlow::Continue;
+        (animations && range > 0.5 && viewport.is_mapped()).then_some(range)
+    }
+
+    /// Starts the tick if the text overflows now, or stops it.
+    fn update(&self, me: &Rc<Self>, viewport: &gtk::ScrolledWindow) {
+        if Self::overflow(viewport).is_none() {
+            return self.stop(viewport);
         }
-        if (previous_range.replace(range) - range).abs() > 0.5 {
-            start.set(None);
+        if self.tick.borrow().is_some() {
+            return;
         }
-        let now = clock.frame_time();
-        let began = start.get().unwrap_or_else(|| {
-            start.set(Some(now));
-            now
+        let pan = Rc::downgrade(me);
+        let tick = viewport.add_tick_callback(move |viewport, clock| {
+            let Some(pan) = pan.upgrade() else {
+                return gtk::glib::ControlFlow::Break;
+            };
+            let Some(range) = Self::overflow(viewport) else {
+                // Returning Break removes it: the id is only let go.
+                pan.tick.take();
+                pan.start.set(None);
+                viewport.hadjustment().set_value(0.0);
+                return gtk::glib::ControlFlow::Break;
+            };
+            if (pan.previous_range.replace(range) - range).abs() > 0.5 {
+                pan.start.set(None);
+            }
+            let now = clock.frame_time();
+            let began = pan.start.get().unwrap_or_else(|| {
+                pan.start.set(Some(now));
+                now
+            });
+            let elapsed = (now - began) as f64 / 1_000_000.0;
+            viewport.hadjustment().set_value(pan_offset(elapsed, range));
+            gtk::glib::ControlFlow::Continue
         });
-        let elapsed = (now - began) as f64 / 1_000_000.0;
-        let pause = 1.8;
-        let travel = range / 28.0;
-        let phase = elapsed % (2.0 * (pause + travel));
-        let offset = if phase < pause {
-            0.0
-        } else if phase < pause + travel {
-            (phase - pause) * 28.0
-        } else if phase < 2.0 * pause + travel {
-            range
-        } else {
-            range - (phase - 2.0 * pause - travel) * 28.0
-        };
-        adjustment.set_value(offset.clamp(0.0, range));
-        gtk::glib::ControlFlow::Continue
-    });
-    viewport
+        self.tick.replace(Some(tick));
+    }
+
+    fn stop(&self, viewport: &gtk::ScrolledWindow) {
+        if let Some(tick) = self.tick.take() {
+            tick.remove();
+        }
+        self.start.set(None);
+        viewport.hadjustment().set_value(0.0);
+    }
+}
+
+/// Where the pan is `elapsed` seconds in, over text `range` px too wide:
+/// a pause, 28 px a second along, a pause, and back.
+fn pan_offset(elapsed: f64, range: f64) -> f64 {
+    let pause = 1.8;
+    let travel = range / 28.0;
+    let phase = elapsed % (2.0 * (pause + travel));
+    let offset = if phase < pause {
+        0.0
+    } else if phase < pause + travel {
+        (phase - pause) * 28.0
+    } else if phase < 2.0 * pause + travel {
+        range
+    } else {
+        range - (phase - 2.0 * pause - travel) * 28.0
+    };
+    offset.clamp(0.0, range)
 }
 
 #[cfg(test)]

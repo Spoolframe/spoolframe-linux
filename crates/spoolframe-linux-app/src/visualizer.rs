@@ -55,6 +55,29 @@ pub fn gst_visualizer(name: &str) -> Result<gst::Bin, glib::BoolError> {
     Ok(bin)
 }
 
+/// Whether `message`, a GstPlay error ("Error from element <path>: …"),
+/// comes from the visualizer's branch: playsink's vis chain, which holds
+/// the effect, or, for `music`, the video sink the effect draws into
+/// (music has no other picture).
+pub fn caused(message: &str, music: bool) -> bool {
+    let Some((path, _)) = message
+        .strip_prefix("Error from element ")
+        .and_then(|rest| rest.split_once(": "))
+    else {
+        return false;
+    };
+    let names: Vec<_> = path
+        .split('/')
+        .map(|segment| segment.rsplit_once(':').map_or(segment, |(_, name)| name))
+        .collect();
+    names.windows(2).any(|pair| match pair {
+        [parent, chain] if parent.starts_with("playsink") => {
+            *chain == "visbin" || (music && *chain == "vbin")
+        }
+        _ => false,
+    })
+}
+
 pub const BANDS: usize = 64;
 #[derive(Clone)]
 pub struct Levels {
@@ -264,24 +287,72 @@ fn spectrum_time(source: &gst::Element, structure: &gst::StructureRef, duration:
     }
 }
 
+/// The rhythm worker's input, while a visualizer is shown: the worker
+/// thread lives exactly as long as it.
+type Rhythm = Arc<Mutex<Option<RhythmInput>>>;
+
 pub struct Analyzer {
     pub levels: Measurements,
+    /// Closed (dropping) while no visualizer is shown: the music passes
+    /// the analysis by, and nothing is converted or measured.
+    valve: gst::Element,
     spectrum: gst::Element,
     level: gst::Element,
     beats: Arc<std::sync::atomic::AtomicU64>,
+    rhythm: Rhythm,
 }
 impl Analyzer {
+    /// Puts the analysis in `playbin`'s audio filter, closed: the audio
+    /// goes through a tee to the sink as it is, and a second branch, a
+    /// valve that drops everything until [`Self::enable`], leads to the
+    /// measurements. The filter stays in place for good, so turning a
+    /// visualizer on or off never touches the audio's own path, and
+    /// video plays past a closed valve.
+    ///
+    /// The branch ends unlinked, not in a sink: a sink's EOS is waited
+    /// for, and a closed valve drops it, so the item would never end.
+    /// The tee takes the branch's "not linked" for fine.
     pub fn attach(playbin: &gst::Element) -> anyhow::Result<Self> {
-        let filter = gst::parse::bin_from_description(
+        let filter = gst::Bin::with_name("visual-analysis");
+        let split = gst::ElementFactory::make("tee")
+            .property("allow-not-linked", true)
+            .build()?;
+        let valve = gst::ElementFactory::make("valve")
+            .property("drop", true)
+            .build()?;
+        let analysis = gst::parse::bin_from_description(
             "audioconvert ! spectrum name=visual-spectrum bands=8193 threshold=-60 interval=33333333 post-messages=false ! level name=visual-level interval=33333333 post-messages=false",
             true,
         )?;
-        let spectrum = filter.by_name("visual-spectrum").unwrap();
-        let level = filter.by_name("visual-level").unwrap();
+        filter.add_many([&split, &valve, analysis.upcast_ref()])?;
+        // The audio's pad first: the tee pushes to it before the analysis.
+        let pad = || {
+            split
+                .request_pad_simple("src_%u")
+                .ok_or_else(|| anyhow::anyhow!("the tee gives no pad"))
+        };
+        let (audio, analysed) = (pad()?, pad()?);
+        analysed.link(&valve.static_pad("sink").unwrap())?;
+        valve.link(&analysis)?;
+        // Named as playsink looks for them.
+        let sink = split.static_pad("sink").unwrap();
+        filter.add_pad(
+            &gst::GhostPad::builder_with_target(&sink)?
+                .name("sink")
+                .build(),
+        )?;
+        filter.add_pad(
+            &gst::GhostPad::builder_with_target(&audio)?
+                .name("src")
+                .build(),
+        )?;
+        let spectrum = analysis.by_name("visual-spectrum").unwrap();
+        let level = analysis.by_name("visual-level").unwrap();
         let levels = Measurements::default();
         let output = levels.clone();
         let beats = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let rhythm = Mutex::new(rhythm_worker(levels.clone(), beats.clone()));
+        let rhythm: Rhythm = Arc::default();
+        let input = rhythm.clone();
         let epoch = beats.clone();
         let reset_output = levels.clone();
         spectrum.static_pad("sink").unwrap().add_probe(
@@ -326,8 +397,9 @@ impl Analyzer {
                     values.bands = logarithmic_bands(&raw, rate);
                     if let (Ok(timestamp), Ok(duration)) =
                         (s.get::<u64>("timestamp"), s.get::<u64>("duration"))
+                        && let Some(rhythm) = input.lock().unwrap().as_mut()
                     {
-                        rhythm.lock().unwrap().push(
+                        rhythm.push(
                             &raw,
                             timestamp,
                             duration,
@@ -354,11 +426,16 @@ impl Analyzer {
         playbin.set_property("audio-filter", &filter);
         Ok(Self {
             levels,
+            valve,
             spectrum,
             level,
             beats,
+            rhythm,
         })
     }
+    /// Analyses the audio while a visualizer is shown, and starts the
+    /// rhythm worker for it; off, the valve drops the audio before any
+    /// analysis and the worker's thread ends.
     pub fn enable(&self, enabled: bool) {
         use std::sync::atomic::Ordering;
         let _ = self
@@ -366,11 +443,27 @@ impl Analyzer {
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
                 Some(((old + 2) & !1) | u64::from(enabled))
             });
+        {
+            let mut rhythm = self.rhythm.lock().unwrap();
+            if !enabled {
+                // Its sender gone, the worker's thread ends.
+                *rhythm = None;
+            } else if rhythm.is_none() {
+                *rhythm = Some(rhythm_worker(self.levels.clone(), self.beats.clone()));
+            }
+        }
         self.spectrum.set_property("post-messages", enabled);
         self.level.set_property("post-messages", enabled);
+        self.valve.set_property("drop", !enabled);
         if !enabled {
             *self.levels.lock().unwrap() = Levels::default();
         }
+    }
+
+    /// Whether the rhythm worker runs.
+    #[cfg(test)]
+    fn rhythm_running(&self) -> bool {
+        self.rhythm.lock().unwrap().is_some()
     }
 }
 
@@ -403,6 +496,10 @@ mod imp {
         pub history_texture: RefCell<Option<gdk::MemoryTexture>>,
         pub color: Cell<(f64, f64, f64)>,
         pub punch: Cell<f64>,
+        /// The frame clock's callback, while it runs (see
+        /// [`super::Canvas::set_playing`]).
+        pub tick: RefCell<Option<gtk::TickCallbackId>>,
+        pub playing: Cell<bool>,
     }
     #[glib::object_subclass]
     impl ObjectSubclass for Canvas {
@@ -635,7 +732,41 @@ impl Canvas {
         obj.imp().show_peaks.set(true);
         obj.set_hexpand(true);
         obj.set_vexpand(true);
-        obj.add_tick_callback(|obj, clock| {
+        // Shown only while a visualizer mode is: the stacks unmap it
+        // for the cover or a GStreamer effect.
+        obj.connect_map(|obj| obj.run());
+        obj.connect_unmap(|obj| obj.halt());
+        obj
+    }
+
+    /// Whether the music plays: paused, the canvas stops drawing once
+    /// what it shows has settled.
+    pub fn set_playing(&self, playing: bool) {
+        self.imp().playing.set(playing);
+        self.run();
+    }
+
+    /// Draws on the frame clock, if shown and not running already.
+    fn run(&self) {
+        let imp = self.imp();
+        if !self.is_mapped() || imp.tick.borrow().is_some() {
+            return;
+        }
+        let tick = self.add_tick_callback(|obj, clock| obj.step(clock));
+        imp.tick.replace(Some(tick));
+    }
+
+    fn halt(&self) {
+        if let Some(tick) = self.imp().tick.take() {
+            tick.remove();
+        }
+    }
+
+    /// One frame: the measurements eased in, and a draw. Paused and
+    /// settled, it ends (the id is only let go: Break removes it).
+    fn step(&self, clock: &gdk::FrameClock) -> glib::ControlFlow {
+        let obj = self;
+        {
             let imp = obj.imp();
             let target = imp.levels.borrow().lock().unwrap().clone();
             let now = clock.frame_time() as f64 / 1_000_000.;
@@ -696,10 +827,14 @@ impl Canvas {
                 }
                 imp.history_offset.set((elapsed * 30.).fract());
             }
-            obj.queue_draw();
-            glib::ControlFlow::Continue
-        });
-        obj
+        }
+        obj.queue_draw();
+        let imp = obj.imp();
+        if !imp.playing.get() && settled(&imp.frame.borrow(), imp.punch.get()) {
+            imp.tick.take();
+            return glib::ControlFlow::Break;
+        }
+        glib::ControlFlow::Continue
     }
     pub fn set_mode(&self, mode: Mode) {
         self.imp().mode.set(mode);
@@ -863,6 +998,16 @@ fn spectrogram_color(value: f64) -> (f64, f64, f64) {
     (r + (nr - r) * mix, g + (ng - g) * mix, b + (nb - b) * mix)
 }
 
+/// Whether nothing on the canvas moves any more: every level at rest.
+fn settled(frame: &Levels, punch: f64) -> bool {
+    frame
+        .bands
+        .iter()
+        .chain(&frame.rms)
+        .chain([&punch])
+        .all(|v| *v < 0.001)
+}
+
 fn smooth(out: &mut f64, target: f64, dt: f64) {
     let speed = if target > *out { 22. } else { 7. };
     *out += (target - *out) * (1. - (-dt * speed).exp());
@@ -975,6 +1120,181 @@ mod tests {
             received,
             "GstPlay should deliver spectrum and RMS measurements"
         );
+    }
+
+    /// With no visualizer shown, the music goes by the analysis: nothing
+    /// reaches the spectrum and no rhythm thread runs, while the audio
+    /// sink plays on through turning it on and off again.
+    #[test]
+    fn audio_is_analysed_only_while_a_visualizer_is_shown() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        gst::init().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tone.flac");
+        let generator = gst::parse::launch(&format!(
+            "audiotestsrc num-buffers=900 freq=440 volume=0.5 ! audioconvert ! flacenc ! filesink location={}",
+            path.display()
+        ))
+        .unwrap();
+        generator.set_state(gst::State::Playing).unwrap();
+        generator
+            .bus()
+            .unwrap()
+            .timed_pop_filtered(gst::ClockTime::from_seconds(10), &[gst::MessageType::Eos]);
+        generator.set_state(gst::State::Null).unwrap();
+        let video = gst::ElementFactory::make("fakesink").build().unwrap();
+        let renderer = gst_play::PlayVideoOverlayVideoRenderer::with_sink(&video);
+        let play = gst_play::Play::new(Some(renderer));
+        let sink = gst::ElementFactory::make("fakesink")
+            .property("sync", true)
+            .property("signal-handoffs", true)
+            .build()
+            .unwrap();
+        let played = Arc::new(AtomicUsize::new(0));
+        {
+            let played = played.clone();
+            sink.connect("handoff", false, move |_| {
+                played.fetch_add(1, Ordering::Relaxed);
+                None
+            });
+        }
+        play.pipeline().set_property("audio-sink", &sink);
+        let analyzer = Analyzer::attach(&play.pipeline()).unwrap();
+        let analysed = Arc::new(AtomicUsize::new(0));
+        {
+            let analysed = analysed.clone();
+            analyzer.spectrum.static_pad("sink").unwrap().add_probe(
+                gst::PadProbeType::BUFFER,
+                move |_, _| {
+                    analysed.fetch_add(1, Ordering::Relaxed);
+                    gst::PadProbeReturn::Ok
+                },
+            );
+        }
+        play.set_uri(Some(gtk::gio::File::for_path(&path).uri().as_str()));
+        play.play();
+        let plays_on = |within: u64| {
+            let before = played.load(Ordering::Relaxed);
+            let deadline = Instant::now() + std::time::Duration::from_secs(within);
+            while played.load(Ordering::Relaxed) < before + 10 && Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            played.load(Ordering::Relaxed) >= before + 10
+        };
+        assert!(plays_on(5), "the music does not play");
+        assert_eq!(analysed.load(Ordering::Relaxed), 0);
+        assert!(!analyzer.rhythm_running());
+        analyzer.enable(true);
+        assert!(analyzer.rhythm_running());
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while analyzer.levels.lock().unwrap().rms[0] < 0.5 && Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(analyzer.levels.lock().unwrap().rms[0] >= 0.5);
+        assert!(plays_on(2), "turning the analysis on stopped the music");
+        analyzer.enable(false);
+        assert!(!analyzer.rhythm_running());
+        assert!(plays_on(2), "turning the analysis off stopped the music");
+        let after = analysed.load(Ordering::Relaxed);
+        assert!(plays_on(2));
+        assert_eq!(analysed.load(Ordering::Relaxed), after);
+        play.stop();
+        play.pipeline().set_state(gst::State::Null).unwrap();
+    }
+
+    /// GstPlay's error from an element at `path`.
+    fn error_from(path: &str) -> String {
+        format!("Error from element {path}: Internal data stream error.")
+    }
+
+    const PLAYSINK: &str = "/GstPlayBin3:playbin3/GstPlaySink:playsink";
+
+    #[test]
+    fn an_error_inside_the_vis_chain_is_the_visualizers() {
+        for element in [
+            "/GstBin:visbin/GstQueue:visqueue",
+            "/GstBin:visbin/GstBin:bin0/GstWaveScope:effect",
+        ] {
+            assert!(caused(&error_from(&format!("{PLAYSINK}{element}")), false));
+        }
+    }
+
+    #[test]
+    fn an_error_from_the_audio_sink_is_not_the_visualizers() {
+        let message = error_from(&format!("{PLAYSINK}/GstBin:abin/GstPulseSink:pulsesink0"));
+        assert!(!caused(&message, true));
+    }
+
+    #[test]
+    fn an_error_from_the_media_is_not_the_visualizers() {
+        let message = error_from(
+            "/GstPlayBin3:playbin3/GstURIDecodeBin3:uridecodebin3/GstDecodebin3:decodebin3-0",
+        );
+        assert!(!caused(&message, true));
+    }
+
+    #[test]
+    fn the_video_sink_is_the_visualizers_only_for_music() {
+        let message = error_from(&format!("{PLAYSINK}/GstBin:vbin/GstVideoConvert:vconv"));
+        assert_eq!(
+            (caused(&message, true), caused(&message, false)),
+            (true, false)
+        );
+    }
+
+    #[test]
+    fn a_message_without_an_element_is_not_the_visualizers() {
+        assert!(!caused("Error from element : visbin", true));
+        assert!(!caused("the server went away", true));
+    }
+
+    /// Where playbin really puts a visualizer, and the audio sink.
+    #[test]
+    fn playbins_own_paths_are_told_apart() {
+        gst::init().unwrap();
+        let video = gst::ElementFactory::make("fakesink").build().unwrap();
+        let renderer = gst_play::PlayVideoOverlayVideoRenderer::with_sink(&video);
+        let play = gst_play::Play::new(Some(renderer));
+        let sink = gst::ElementFactory::make("fakesink")
+            .property("sync", true)
+            .build()
+            .unwrap();
+        play.pipeline().set_property("audio-sink", &sink);
+        let effect = gst_visualizer("wavescope").unwrap();
+        play.pipeline().set_property("vis-plugin", &effect);
+        play.set_visualization_enabled(true);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tone.flac");
+        let generator = gst::parse::launch(&format!(
+            "audiotestsrc num-buffers=300 ! audioconvert ! flacenc ! filesink location={}",
+            path.display()
+        ))
+        .unwrap();
+        generator.set_state(gst::State::Playing).unwrap();
+        generator
+            .bus()
+            .unwrap()
+            .timed_pop_filtered(gst::ClockTime::from_seconds(10), &[gst::MessageType::Eos]);
+        generator.set_state(gst::State::Null).unwrap();
+        play.set_uri(Some(gtk::gio::File::for_path(&path).uri().as_str()));
+        play.pause();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while effect.parent().is_none() && Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let inner = effect.by_name("effect").unwrap();
+        assert!(
+            caused(&error_from(&inner.path_string()), false),
+            "{}",
+            inner.path_string()
+        );
+        assert!(
+            !caused(&error_from(&sink.path_string()), true),
+            "{}",
+            sink.path_string()
+        );
+        play.stop();
+        play.pipeline().set_state(gst::State::Null).unwrap();
     }
 
     #[test]
@@ -1189,6 +1509,29 @@ mod tests {
                 "blank row at {rate} Hz: {flat:?}"
             );
         }
+    }
+
+    /// Paused, the canvas draws until the bars have fallen, then stops.
+    #[test]
+    fn a_paused_canvas_settles_once_its_bars_have_fallen() {
+        let mut frame = Levels {
+            bands: [1.; BANDS],
+            rms: [1.; 2],
+            ..Levels::default()
+        };
+        let mut frames = 0;
+        while !settled(&frame, 0.) {
+            for out in frame.bands.iter_mut().chain(&mut frame.rms) {
+                smooth(out, 0., 1. / 60.);
+            }
+            frames += 1;
+            assert!(frames < 10 * 60, "never settles");
+        }
+        assert!(frames > 1, "settled while still lit");
+        assert!(
+            !settled(&Levels::default(), 0.2),
+            "a beat's punch still moves"
+        );
     }
 
     #[test]

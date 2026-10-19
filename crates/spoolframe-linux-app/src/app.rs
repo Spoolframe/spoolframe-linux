@@ -78,9 +78,9 @@ pub struct PlayRequest {
     pub shuffle: bool,
     /// The quality chosen on the item page (P6-06); Auto otherwise.
     pub quality: spoolframe_client_sdk::PlaybackQuality,
-    /// The server's playlist it plays from (PX-40); anything else played
-    /// leaves it.
-    pub playlist: Option<playlist_rules::Playing>,
+    /// The server's playlist it plays from (PX-40), with the settings it
+    /// was started with; anything else played leaves it.
+    pub playlist: Option<crate::saved_queue::PlaylistResume>,
 }
 
 impl PlayRequest {
@@ -654,9 +654,13 @@ pub enum Loaded {
     /// A playlist deleted, by name.
     PlaylistDeleted(String, Result<(), BackendError>),
     PinChanged(Result<(), BackendError>),
-    /// What the server picked to play from a playlist.
-    /// What the server picked to play first from playlist (id, name).
-    PlaylistStarted(String, String, Result<Option<PlaylistNext>, BackendError>),
+    /// What the server picked to play first from playlist (id, name), and
+    /// the settings it was asked to play with.
+    PlaylistStarted(
+        String,
+        String,
+        Result<Option<(PlaylistNext, PlaySettings)>, BackendError>,
+    ),
 }
 
 impl Loaded {
@@ -1737,7 +1741,6 @@ impl Component for App {
                 }
             }
             Msg::PlayPlaylist(id, how) => {
-                let current_shuffle = self.playback.as_ref().map(|p| p.is_shuffled());
                 let Some(session) = self.playlist_session() else {
                     return;
                 };
@@ -1755,14 +1758,10 @@ impl Component for App {
                 self.command(&sender, async move {
                     let started = async {
                         let (from, settings) = match how {
-                            PlaylistPlay::Page { from, settings } => (from, settings),
-                            PlaylistPlay::Music { from, settings } => (
-                                from,
-                                PlaySettings {
-                                    shuffle: current_shuffle.unwrap_or(settings.shuffle),
-                                    ..settings
-                                },
-                            ),
+                            // The page's settings, shuffle as well as repeat:
+                            // what plays now may be something else entirely.
+                            PlaylistPlay::Page { from, settings }
+                            | PlaylistPlay::Music { from, settings } => (from, settings),
                             PlaylistPlay::Random { settings } => {
                                 let mut offset = 0;
                                 let mut choices = Vec::new();
@@ -1804,7 +1803,8 @@ impl Component for App {
                                 (None, PlaySettings { shuffle, ..kept })
                             }
                         };
-                        session.play_playlist(&id, from, settings).await
+                        let next = session.play_playlist(&id, from, settings).await?;
+                        Ok(next.map(|next| (next, settings)))
                     }
                     .await;
                     Loaded::PlaylistStarted(id, name, started)
@@ -3225,7 +3225,7 @@ impl Component for App {
             }
             // The entry the server picked plays, from where the user
             // stopped in it; the playback asks the server for each next.
-            Loaded::PlaylistStarted(id, name, Ok(Some(next))) => {
+            Loaded::PlaylistStarted(id, name, Ok(Some((next, settings)))) => {
                 if let Some(hearts) = &cards.hearts
                     && matches!(next.item, Item::Track(_))
                 {
@@ -3238,7 +3238,10 @@ impl Component for App {
                     entry: next.entry,
                 };
                 sender.input(Msg::Play(Box::new(PlayRequest {
-                    playlist: Some(playing),
+                    playlist: Some(crate::saved_queue::PlaylistResume {
+                        playing,
+                        settings: Some(settings),
+                    }),
                     ..PlayRequest::one(next.item, from, None, None)
                 })));
             }

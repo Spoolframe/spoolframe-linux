@@ -221,9 +221,9 @@ pub struct ListActions {
     pub pin: Rc<dyn Fn(String, bool)>,
 }
 
-/// The Playlists section: Music (Liked and All, PX-43), My playlists,
-/// Shared with me and Server-wide, each a row of cards; a group with none
-/// is left out.
+/// The Playlists section: Browse all over Music (Liked and All, PX-43),
+/// My playlists, Shared with me and Server-wide, each a row of cards; a
+/// group with none is left out.
 pub fn section(
     list: &[PlaylistSummary],
     actions: &Rc<ListActions>,
@@ -239,25 +239,19 @@ pub fn section(
     ]
     .into_iter()
     .filter(|(_, group)| !group.is_empty())
-    .map(|(title, group)| {
-        let button = (title == "My playlists").then(|| {
-            let button = gtk::Button::builder()
-                .label("Browse all")
-                .css_classes(["flat"])
-                .build();
-            let browse = browse.clone();
-            button.connect_clicked(move |_| browse());
-            button
-        });
-        views::row_with_action(
-            title,
-            group.into_iter().map(|p| card(p, actions, art)),
-            button.as_ref(),
-        )
-    })
+    .map(|(title, group)| views::row(title, group.into_iter().map(|p| card(p, actions, art))))
     .collect();
     if !rows.is_empty() {
-        return rows;
+        // The section's own, over whichever groups there are: someone
+        // with no playlists of their own browses the others too.
+        let button = gtk::Button::builder()
+            .label("Browse all")
+            .css_classes(["flat"])
+            .build();
+        button.connect_clicked(move |_| browse());
+        let bar = gtk::Box::builder().halign(gtk::Align::End).build();
+        bar.append(&button);
+        return std::iter::once(bar).chain(rows).collect();
     }
     let empty = gtk::Box::new(gtk::Orientation::Vertical, 0);
     empty.append(
@@ -1028,12 +1022,18 @@ fn header(
         .valign(gtk::Align::Center)
         .build();
     {
+        // As Shuffle and Repeat: the playback playing this playlist takes
+        // it, or a later sync of its modes would put the switch back.
         let settings = settings.clone();
+        let changed = actions.settings_changed.clone();
         skip.connect_active_notify(move |switch| {
-            settings.set(PlaySettings {
+            let now = PlaySettings {
                 skip_watched: switch.is_active(),
                 ..settings.get()
-            })
+            };
+            if settings.replace(now) != now {
+                changed(now);
+            }
         });
     }
     let skip_box = gtk::Box::builder().spacing(10).margin_start(8).build();
@@ -1533,6 +1533,7 @@ mod tests {
         }
         let requested = Rc::new(Cell::new(None));
         let random_requested = Rc::new(Cell::new(None));
+        let changed = Rc::new(Cell::new(None));
         let actions = PageActions {
             start_music: {
                 let requested = requested.clone();
@@ -1542,7 +1543,10 @@ mod tests {
                 let requested = random_requested.clone();
                 Rc::new(move |settings| requested.set(Some(settings)))
             },
-            settings_changed: Rc::new(|_| {}),
+            settings_changed: {
+                let changed = changed.clone();
+                Rc::new(move |settings| changed.set(Some(settings)))
+            },
             play: {
                 let requested = requested.clone();
                 Rc::new(move |from, settings| requested.set(Some((from, settings))))
@@ -1620,6 +1624,26 @@ mod tests {
         page.playlist.kinds.episodes = true;
         let (mixed, _, _) = header(&page, &actions, &Rc::new(Cell::new(page.settings)), None);
         assert!(has_skip(mixed.upcast_ref()));
+        fn switch_in(widget: &gtk::Widget) -> Option<gtk::Switch> {
+            if let Some(switch) = widget.downcast_ref::<gtk::Switch>() {
+                return Some(switch.clone());
+            }
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                if let Some(switch) = switch_in(&current) {
+                    return Some(switch);
+                }
+                child = current.next_sibling();
+            }
+            None
+        }
+        // Skip watched reaches the playback, as Shuffle and Repeat do.
+        let skip = switch_in(mixed.upcast_ref()).unwrap();
+        skip.set_active(!skip.is_active());
+        assert_eq!(
+            changed.get().map(|settings| settings.skip_watched),
+            Some(skip.is_active())
+        );
         let actions = Rc::new(ListActions {
             open: Rc::new(|_| {}),
             play: Rc::new(|_, _| {}),
@@ -1758,6 +1782,50 @@ mod tests {
         settle();
         window.close();
         drain();
+    }
+
+    #[test]
+    #[ignore = "needs a GTK display"]
+    fn browse_all_is_offered_without_playlists_of_ones_own() {
+        gtk::init().unwrap();
+        let client = FakeClient::new(None);
+        let list: Vec<_> = ready(andrey(&client).playlists())
+            .unwrap()
+            .playlists
+            .into_iter()
+            .filter(|p| p.builtin.is_some())
+            .collect();
+        assert!(!list.is_empty());
+        let browsed = Rc::new(Cell::new(false));
+        let actions = Rc::new(ListActions {
+            open: Rc::new(|_| {}),
+            play: Rc::new(|_, _| {}),
+            pin: Rc::new(|_, _| {}),
+        });
+        let rows = section(&list, &actions, None, {
+            let browsed = browsed.clone();
+            Rc::new(move || browsed.set(true))
+        });
+        fn browse_button(widget: &gtk::Widget) -> Option<gtk::Button> {
+            if let Some(button) = widget.downcast_ref::<gtk::Button>()
+                && button.label().as_deref() == Some("Browse all")
+            {
+                return Some(button.clone());
+            }
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                if let Some(button) = browse_button(&current) {
+                    return Some(button);
+                }
+                child = current.next_sibling();
+            }
+            None
+        }
+        rows.iter()
+            .find_map(|row| browse_button(row.upcast_ref()))
+            .expect("Browse all")
+            .emit_clicked();
+        assert!(browsed.get());
     }
 
     fn andrey(client: &FakeClient) -> Arc<dyn Session> {

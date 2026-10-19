@@ -439,7 +439,10 @@ fn visualizer_view(
                 }
             }
             Change::Queue => controls.show_item(&playback),
-            Change::Playing(playing) => controls.show_playing(*playing),
+            Change::Playing(playing) => {
+                controls.show_playing(*playing);
+                canvas.set_playing(*playing);
+            }
             Change::Modes { shuffle, repeat } => controls.show_modes(*shuffle, *repeat),
             _ => {}
         }
