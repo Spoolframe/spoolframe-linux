@@ -24,6 +24,49 @@ pub enum Repeat {
     One,
 }
 
+impl Repeat {
+    /// The Repeat button's next state on a click: off, the whole
+    /// context, the one item, off again.
+    pub fn next(self) -> Self {
+        match self {
+            Repeat::Off => Repeat::All,
+            Repeat::All => Repeat::One,
+            Repeat::One => Repeat::Off,
+        }
+    }
+
+    /// The Repeat button's icon.
+    pub fn icon(self) -> &'static str {
+        match self {
+            Repeat::One => crate::icons::REPEAT_ONE,
+            Repeat::Off | Repeat::All => crate::icons::REPEAT,
+        }
+    }
+}
+
+/// A server playlist's repeat (PX-40). A kind this build does not know
+/// plays as off, so it shows as off, and the next click goes on from off.
+impl From<spoolframe_linux_core::backend::Repeat> for Repeat {
+    fn from(repeat: spoolframe_linux_core::backend::Repeat) -> Self {
+        use spoolframe_linux_core::backend::Repeat as Server;
+        match repeat {
+            Server::All => Repeat::All,
+            Server::One => Repeat::One,
+            Server::Off | Server::Unknown => Repeat::Off,
+        }
+    }
+}
+
+impl From<Repeat> for spoolframe_linux_core::backend::Repeat {
+    fn from(repeat: Repeat) -> Self {
+        match repeat {
+            Repeat::Off => Self::Off,
+            Repeat::All => Self::All,
+            Repeat::One => Self::One,
+        }
+    }
+}
+
 /// A hand-added item, with the album it is from for its cover and name.
 /// The id stays with it as the queue is reordered, so a view can name it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -345,11 +388,7 @@ impl Queue {
 
     /// Off, then the whole context, then the one item, then off again.
     pub fn cycle_repeat(&mut self) {
-        self.repeat = match self.repeat {
-            Repeat::Off => Repeat::All,
-            Repeat::All => Repeat::One,
-            Repeat::One => Repeat::Off,
-        };
+        self.repeat = self.repeat.next();
     }
 }
 
@@ -523,6 +562,29 @@ mod tests {
         queue.next(); // c
         queue.set_shuffle(false, first);
         assert_eq!(played(&mut queue), "c d");
+    }
+
+    #[test]
+    fn repeat_goes_round_off_all_one() {
+        let mut seen = vec![Repeat::Off];
+        for _ in 0..3 {
+            seen.push(seen.last().unwrap().next());
+        }
+        assert_eq!(seen, [Repeat::Off, Repeat::All, Repeat::One, Repeat::Off]);
+    }
+
+    #[test]
+    fn a_playlists_repeat_comes_back_as_it_went_and_an_unknown_one_is_off() {
+        use spoolframe_linux_core::backend::Repeat as Server;
+        let back: Vec<Server> = [Repeat::Off, Repeat::All, Repeat::One]
+            .into_iter()
+            .map(Server::from)
+            .map(|server| Server::from(Repeat::from(server)))
+            .collect();
+        assert_eq!(
+            (back, Repeat::from(Server::Unknown)),
+            (vec![Server::Off, Server::All, Server::One], Repeat::Off)
+        );
     }
 
     #[test]

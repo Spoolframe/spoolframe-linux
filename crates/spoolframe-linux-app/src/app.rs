@@ -268,6 +268,9 @@ const PLAYLIST_PAGE: u32 = playlist_rules::PAGE;
 /// The tag of a playlist's page on the stack.
 const PLAYLIST_TAG: &str = "playlist";
 
+/// The tag of All playlists (Browse all) on the stack.
+const PLAYLIST_BROWSER_TAG: &str = "playlist-browser";
+
 /// The sidebar's choice.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Root {
@@ -400,7 +403,9 @@ pub enum Msg {
     MorePlaylist(String, u32),
     PlayPlaylist(String, PlaylistPlay),
     PlaylistSettings(String, PlaySettings),
-    SyncPlaylistSettings(String, PlaySettings),
+    /// The playback's playlist modes changed: its page, if shown, shows
+    /// them.
+    SyncPlaylistSettings,
     /// Pin a playlist last (`true`), or unpin it.
     PinPlaylist(String, bool),
     /// The pinned one at the first index dropped on the second's row.
@@ -1728,18 +1733,12 @@ impl Component for App {
             }
             Msg::PlaylistSettings(id, settings) => {
                 if let Some(playback) = &self.playback
-                    && playback.playing_from().is_some_and(|p| p.id == id)
+                    && playback.plays_playlist(&id)
                 {
                     playback.set_playlist_settings(settings);
                 }
             }
-            Msg::SyncPlaylistSettings(id, settings) => {
-                if let Some(shown) = &self.shown_playlist
-                    && shown.view.id == id
-                {
-                    shown.view.set_play_settings(settings);
-                }
-            }
+            Msg::SyncPlaylistSettings => self.sync_playlist_view(),
             Msg::PlayPlaylist(id, how) => {
                 let Some(session) = self.playlist_session() else {
                     return;
@@ -1763,29 +1762,18 @@ impl Component for App {
                             PlaylistPlay::Page { from, settings }
                             | PlaylistPlay::Music { from, settings } => (from, settings),
                             PlaylistPlay::Random { settings } => {
-                                let mut offset = 0;
-                                let mut choices = Vec::new();
-                                loop {
-                                    let page = session.playlist(&id, offset, PLAYLIST_PAGE).await?;
-                                    offset += page.entries.len() as u32;
-                                    let done = page.entries.is_empty() || offset >= page.total;
-                                    choices.extend(
-                                        page.entries
-                                            .into_iter()
-                                            .filter(|e| !e.unavailable)
-                                            .map(|e| e.entry),
-                                    );
-                                    if done {
-                                        break;
-                                    }
-                                }
-                                if choices.is_empty() {
+                                let random = |n: u32| {
+                                    gtk::glib::random_int_range(0, n.min(i32::MAX as u32) as i32)
+                                        as u32
+                                };
+                                let Some(entry) =
+                                    playlist_rules::random_entry(session.as_ref(), &id, random)
+                                        .await?
+                                else {
                                     return Ok(None);
-                                }
-                                let index =
-                                    gtk::glib::random_int_range(0, choices.len() as i32) as usize;
+                                };
                                 (
-                                    Some(choices[index]),
+                                    Some(entry),
                                     PlaySettings {
                                         shuffle: true,
                                         ..settings
@@ -2045,6 +2033,14 @@ impl Component for App {
                 // Changed elsewhere, or here: what is kept may be older.
                 self.clear_catalog();
                 let Some(server) = &self.server else { return };
+                // The playlist playing: what comes up in it may have moved.
+                if event.server == server.key.0
+                    && let spoolframe_linux_core::backend::PlaylistChange::Changed { id, .. } =
+                        &event.change
+                    && let Some(playback) = &self.playback
+                {
+                    playback.playlist_changed(id);
+                }
                 let shown = self.shown_playlist_id(widgets);
                 let refresh = playlist_rules::refresh_for(&event, &server.key.0, shown.as_deref());
                 if refresh.list {
@@ -2076,6 +2072,11 @@ impl Component for App {
             }
             Msg::PlaylistsLagged => {
                 self.clear_catalog();
+                if let Some(playback) = &self.playback
+                    && let Some(playing) = playback.playing_from()
+                {
+                    playback.playlist_changed(&playing.id);
+                }
                 self.load_playlists(&sender);
                 if let Some(id) = self.shown_playlist_id(widgets) {
                     self.reload_playlist(id, &sender);
@@ -3014,7 +3015,7 @@ impl Component for App {
                 {
                     shown.view.set_pinned(playlist.pinned.is_some());
                 }
-                if widgets.stack.find_page("playlist-browser").is_some()
+                if widgets.stack.find_page(PLAYLIST_BROWSER_TAG).is_some()
                     && let Some(browser) = self.playlist_browser.borrow().as_ref()
                 {
                     browser.update(&list.playlists);
@@ -3072,12 +3073,6 @@ impl Component for App {
                     self.cards.clone(),
                     Mode::View,
                 );
-                if let Some(playback) = &self.playback
-                    && playback.playing_from().is_some_and(|p| p.id == id)
-                    && let Some(settings) = playback.playlist_settings()
-                {
-                    view.set_play_settings(settings);
-                }
                 let body = adw::Bin::builder().child(&view.widget).build();
                 let nav_page = pages::page(&page.playlist.name, &body);
                 nav_page.set_tag(Some(PLAYLIST_TAG));
@@ -3089,7 +3084,7 @@ impl Component for App {
                 }
                 let browser = widgets
                     .stack
-                    .find_page("playlist-browser")
+                    .find_page(PLAYLIST_BROWSER_TAG)
                     .filter(|browser| {
                         widgets.stack.visible_page().is_some_and(|visible| {
                             &visible == browser
@@ -3118,6 +3113,7 @@ impl Component for App {
                     place,
                     editing: false,
                 });
+                self.sync_playlist_view();
             }
             Loaded::PlaylistPage(id, refresh, Err(e)) => {
                 if !refresh
@@ -3599,6 +3595,17 @@ impl App {
 
     /// The session, if its server has playlists: nothing of them is sent
     /// to one without.
+    /// The playlist page shown with the modes of the playback playing
+    /// it, when one does: they are the user's latest.
+    fn sync_playlist_view(&self) {
+        if let (Some(shown), Some(playback)) = (&self.shown_playlist, &self.playback)
+            && playback.plays_playlist(&shown.view.id)
+            && let Some(settings) = playback.playlist_settings()
+        {
+            shown.view.set_play_settings(settings);
+        }
+    }
+
     fn playlist_session(&self) -> Option<Arc<dyn Session>> {
         self.session.clone().filter(|s| s.has_playlists())
     }
@@ -3665,7 +3672,7 @@ impl App {
             body.set_margin_top(24);
             body.set_margin_bottom(28);
             let page = pages::page("All playlists", body);
-            page.set_tag(Some("playlist-browser"));
+            page.set_tag(Some(PLAYLIST_BROWSER_TAG));
             widgets.stack.push(&page);
             self.playlist_browser.replace(Some(browser));
             return;
@@ -3871,11 +3878,11 @@ impl App {
         playback.subscribe(move |change| {
             match change {
                 Change::Modes { .. } => {
-                    if let Some(playback) = weak.upgrade()
-                        && let Some(playing) = playback.playing_from()
-                        && let Some(settings) = playback.playlist_settings()
+                    if weak
+                        .upgrade()
+                        .is_some_and(|p| p.playlist_settings().is_some())
                     {
-                        stop.input(Msg::SyncPlaylistSettings(playing.id, settings));
+                        stop.input(Msg::SyncPlaylistSettings);
                     }
                 }
                 Change::Item(item) => {
@@ -4533,25 +4540,44 @@ const SAVE_POSITION_EVERY: std::time::Duration = std::time::Duration::from_secs(
 /// Saves the queue and position whenever what plays changes, on pause,
 /// and every few seconds while playing. Music only, for now (P1-23): a
 /// film started from the library leaves the music saved last alone.
+///
+/// The changes a step makes come together (the item, then the queue;
+/// the modes, then the queue), so they are saved once, when the main
+/// loop is next idle; a pause is saved at once.
 fn save_queue_on_changes(playback: &Rc<Playback>, saved: Rc<SavedQueue>) {
     let weak = Rc::downgrade(playback);
-    let last = std::cell::Cell::new(std::time::Instant::now());
-    playback.subscribe(move |change| {
-        let Some(playback) = weak.upgrade() else {
-            return false;
-        };
-        let due = match change {
-            Change::Item(_) | Change::Queue | Change::Modes { .. } | Change::Playing(false) => true,
-            Change::Position { .. } => last.get().elapsed() >= SAVE_POSITION_EVERY,
-            _ => false,
-        };
-        if due && !playback.is_video() {
+    let last = Rc::new(std::cell::Cell::new(std::time::Instant::now()));
+    let pending = Rc::new(std::cell::Cell::new(false));
+    let since = last.clone();
+    let save = Rc::new(move |playback: &Playback| {
+        if !playback.is_video() {
             saved.save(
                 &playback.snapshot(),
                 playback.position(),
                 playback.playlist_resume(),
             );
-            last.set(std::time::Instant::now());
+        }
+        last.set(std::time::Instant::now());
+    });
+    playback.subscribe(move |change| {
+        let Some(playback) = weak.upgrade() else {
+            return false;
+        };
+        match change {
+            Change::Playing(false) => save(&playback),
+            Change::Position { .. } if since.get().elapsed() >= SAVE_POSITION_EVERY => {
+                save(&playback)
+            }
+            Change::Item(_) | Change::Queue | Change::Modes { .. } if !pending.replace(true) => {
+                let (weak, pending, save) = (weak.clone(), pending.clone(), save.clone());
+                gtk::glib::idle_add_local_once(move || {
+                    pending.set(false);
+                    if let Some(playback) = weak.upgrade() {
+                        save(&playback);
+                    }
+                });
+            }
+            _ => {}
         }
         true
     });
@@ -5510,6 +5536,7 @@ mod tests {
             playlist_sharing: true,
             play_history: true,
             playlist_art: true,
+            playlist_upcoming: true,
             subtitle_sync: true,
             subtitle_search: true,
         };

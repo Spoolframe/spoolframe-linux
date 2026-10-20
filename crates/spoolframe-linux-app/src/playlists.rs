@@ -289,6 +289,18 @@ impl PlaylistBrowser {
     }
 }
 
+/// Which of the browser's kinds are ticked: movies, episodes, music.
+type Ticked = [bool; 3];
+
+/// Whether a playlist of `kinds` shows with `ticked`: it holds one of
+/// them.
+fn ticked_holds(ticked: Ticked, kinds: Kinds) -> bool {
+    (ticked[0] && kinds.movies) || (ticked[1] && kinds.episodes) || (ticked[2] && kinds.tracks)
+}
+
+/// All playlists, as cards: a search by name and the kinds they hold
+/// filter them. The cards are made once for each list and width; the
+/// search and the kinds only hide and show them.
 pub fn browse(
     list: &[PlaylistSummary],
     actions: &Rc<ListActions>,
@@ -328,11 +340,34 @@ pub fn browse(
         buttons.each_ref().map(|button| button.is_active()),
     ));
     let list = Rc::new(RefCell::new(list.to_vec()));
+    // Each card's name, as a search compares it, and kinds, in the
+    // flow's order.
+    let shown: Rc<RefCell<Vec<(String, Kinds)>>> = Rc::default();
+    {
+        let (shown, query, selected) = (shown.clone(), query.clone(), selected.clone());
+        flow.set_filter_func(move |child| {
+            let shown = shown.borrow();
+            let Some((name, kinds)) = shown.get(child.index() as usize) else {
+                return false;
+            };
+            playlists::matches_query(name, &query.borrow()) && ticked_holds(selected.get(), *kinds)
+        });
+    }
+    let filter: Rc<dyn Fn()> = {
+        let (flow, empty, shown) = (flow.clone(), empty.clone(), shown.clone());
+        let (query, selected) = (query.clone(), selected.clone());
+        Rc::new(move || {
+            flow.invalidate_filter();
+            let (query, ticked) = (query.borrow(), selected.get());
+            let any = shown.borrow().iter().any(|(name, kinds)| {
+                playlists::matches_query(name, &query) && ticked_holds(ticked, *kinds)
+            });
+            empty.set_visible(!any);
+        })
+    };
     let rebuild: Rc<dyn Fn()> = {
         let (list, actions, art) = (list.clone(), actions.clone(), art.cloned());
-        let (flow, empty, width, selected) =
-            (flow.clone(), empty.clone(), width.clone(), selected.clone());
-        let query = query.clone();
+        let (flow, width, filter) = (flow.clone(), width.clone(), filter.clone());
         Rc::new(move || {
             if width.get() <= 0 {
                 return;
@@ -343,23 +378,16 @@ pub fn browse(
             let (columns, size) = browse_dimensions(width.get());
             flow.set_min_children_per_line(1);
             flow.set_max_children_per_line(columns);
-            let mut count = 0;
-            let selected = selected.get();
-            let query = query.borrow();
-            for playlist in list.borrow().iter() {
-                if !playlist.name.to_lowercase().contains(query.as_str()) {
-                    continue;
-                }
-                let kinds = playlist.kinds;
-                if (selected[0] && kinds.movies)
-                    || (selected[1] && kinds.episodes)
-                    || (selected[2] && kinds.tracks)
-                {
-                    flow.append(&sized_card(playlist, &actions, art.as_ref(), size));
-                    count += 1;
-                }
+            let list = list.borrow();
+            shown.replace(
+                list.iter()
+                    .map(|p| (playlists::search_text(&p.name), p.kinds))
+                    .collect(),
+            );
+            for playlist in list.iter() {
+                flow.append(&sized_card(playlist, &actions, art.as_ref(), size));
             }
-            empty.set_visible(count == 0);
+            filter();
         })
     };
     // A resize is emitted during GTK allocation. Replacing the flow's
@@ -377,20 +405,19 @@ pub fn browse(
         });
     });
     {
-        let populate = populate.clone();
+        let filter = filter.clone();
         search.connect_changed(move |entry| {
-            *query.borrow_mut() = entry.text().trim().to_lowercase();
-            populate();
+            *query.borrow_mut() = playlists::search_text(&entry.text());
+            filter();
         });
     }
     for (index, button) in buttons.iter().enumerate() {
-        let populate = populate.clone();
-        let selected = selected.clone();
+        let (filter, selected) = (filter.clone(), selected.clone());
         button.connect_toggled(move |button| {
             let mut kinds = selected.get();
             kinds[index] = button.is_active();
             selected.set(kinds);
-            populate();
+            filter();
         });
     }
     // Watch the available width rather than the cards' natural widths,
@@ -510,21 +537,15 @@ pub fn from_start(page: &PlaylistPage) -> Option<EntryId> {
         .map(|e| e.entry)
 }
 
-/// The Repeat button's next state on a click: off, all, one, off.
-pub fn next_repeat(repeat: Repeat) -> Repeat {
-    match repeat {
-        Repeat::Off | Repeat::Unknown => Repeat::All,
-        Repeat::All => Repeat::One,
-        Repeat::One => Repeat::Off,
-    }
-}
-
+/// What the Repeat button says and shows for a playlist's `repeat`.
 fn repeat_label(repeat: Repeat) -> (&'static str, &'static str) {
-    match repeat {
-        Repeat::All => ("Repeat all", crate::icons::REPEAT),
-        Repeat::One => ("Repeat one", crate::icons::REPEAT_ONE),
-        Repeat::Off | Repeat::Unknown => ("Repeat", crate::icons::REPEAT),
-    }
+    let repeat = crate::queue::Repeat::from(repeat);
+    let text = match repeat {
+        crate::queue::Repeat::All => "Repeat all",
+        crate::queue::Repeat::One => "Repeat one",
+        crate::queue::Repeat::Off => "Repeat",
+    };
+    (text, repeat.icon())
 }
 
 /// The line under the name: its counts and whose it is.
@@ -752,10 +773,7 @@ impl PlaylistView {
             syncing: Cell::new(false),
             shown: Cell::new(0),
             total: page.total,
-            up_next: if page.playlist.kinds.tracks
-                && !page.playlist.kinds.movies
-                && !page.playlist.kinds.episodes
-            {
+            up_next: if playlists::music_only(page.playlist.kinds) {
                 None
             } else {
                 playlists::up_next(page)
@@ -899,8 +917,7 @@ fn header(
         .margin_top(6)
         .build();
     let playable = page.playable > 0;
-    let music_only =
-        page.playlist.kinds.tracks && !page.playlist.kinds.movies && !page.playlist.kinds.episodes;
+    let music_only = playlists::music_only(page.playlist.kinds);
     let play = gtk::Button::builder()
         .child(
             &adw::ButtonContent::builder()
@@ -966,16 +983,12 @@ fn header(
         .css_classes(["action", "compact", "outlined"])
         .build();
     {
-        let settings = settings.clone();
-        let changed = actions.settings_changed.clone();
+        let (settings, changed) = (settings.clone(), actions.settings_changed.clone());
         shuffle.connect_toggled(move |button| {
-            let now = PlaySettings {
+            change_settings(&settings, &*changed, |now| PlaySettings {
                 shuffle: button.is_active(),
-                ..settings.get()
-            };
-            if settings.replace(now) != now {
-                changed(now);
-            }
+                ..now
+            });
         });
     }
     if !music_only {
@@ -992,7 +1005,7 @@ fn header(
             let (text, icon) = repeat_label(repeat);
             content.set_label(text);
             content.set_icon_name(icon);
-            if matches!(repeat, Repeat::Off | Repeat::Unknown) {
+            if crate::queue::Repeat::from(repeat) == crate::queue::Repeat::Off {
                 button.remove_css_class("on");
             } else {
                 button.add_css_class("on");
@@ -1001,17 +1014,14 @@ fn header(
     };
     show_repeat(page.settings.repeat);
     {
-        let settings = settings.clone();
-        let changed = actions.settings_changed.clone();
+        let (settings, changed) = (settings.clone(), actions.settings_changed.clone());
         let show_repeat = show_repeat.clone();
         repeat.connect_clicked(move |_| {
-            let now = PlaySettings {
-                repeat: next_repeat(settings.get().repeat),
-                ..settings.get()
-            };
-            settings.set(now);
+            let now = change_settings(&settings, &*changed, |now| PlaySettings {
+                repeat: crate::queue::Repeat::from(now.repeat).next().into(),
+                ..now
+            });
             show_repeat(now.repeat);
-            changed(now);
         });
     }
     if !music_only {
@@ -1024,16 +1034,12 @@ fn header(
     {
         // As Shuffle and Repeat: the playback playing this playlist takes
         // it, or a later sync of its modes would put the switch back.
-        let settings = settings.clone();
-        let changed = actions.settings_changed.clone();
+        let (settings, changed) = (settings.clone(), actions.settings_changed.clone());
         skip.connect_active_notify(move |switch| {
-            let now = PlaySettings {
+            change_settings(&settings, &*changed, |now| PlaySettings {
                 skip_watched: switch.is_active(),
-                ..settings.get()
-            };
-            if settings.replace(now) != now {
-                changed(now);
-            }
+                ..now
+            });
         });
     }
     let skip_box = gtk::Box::builder().spacing(10).margin_start(8).build();
@@ -1072,6 +1078,21 @@ fn header(
         skip.set_active(now.skip_watched);
     });
     (header, pin, sync)
+}
+
+/// The settings shown, changed by `change`: kept, and told on when that
+/// changed them (not when a sync from the playback set a control to what
+/// they are already). What they are now.
+fn change_settings(
+    settings: &Cell<PlaySettings>,
+    changed: &dyn Fn(PlaySettings),
+    change: impl FnOnce(PlaySettings) -> PlaySettings,
+) -> PlaySettings {
+    let now = change(settings.get());
+    if settings.replace(now) != now {
+        changed(now);
+    }
+    now
 }
 
 /// An entry: its number, still, title, where it is from, and its note;
@@ -1285,7 +1306,7 @@ pub fn add_dialog(
                 art,
                 32,
             ));
-            searchable.push((row.name.to_lowercase(), line.clone()));
+            searchable.push((playlists::search_text(&row.name), line.clone()));
             let (add, closing) = (add.clone(), dialog.downgrade());
             line.connect_activated(move |_| {
                 if let Some(dialog) = closing.upgrade() {
@@ -1309,10 +1330,10 @@ pub fn add_dialog(
             .build();
         let adjustment = scroller.vadjustment();
         search.connect_changed(move |search| {
-            let query = search.text().trim().to_lowercase();
+            let query = playlists::search_text(&search.text());
             let mut any = false;
             for (name, row) in &searchable {
-                let matches = name.contains(&query);
+                let matches = playlists::matches_query(name, &query);
                 row.set_visible(matches);
                 any |= matches;
             }
@@ -2100,12 +2121,25 @@ mod tests {
     }
 
     #[test]
-    fn repeat_goes_round_off_all_one() {
-        let mut seen = vec![Repeat::Off];
-        for _ in 0..3 {
-            seen.push(next_repeat(*seen.last().unwrap()));
-        }
-        assert_eq!(seen, [Repeat::Off, Repeat::All, Repeat::One, Repeat::Off]);
+    fn browse_all_shows_a_playlist_holding_any_kind_ticked() {
+        let music = Kinds {
+            tracks: true,
+            ..Kinds::default()
+        };
+        let mixed = Kinds {
+            movies: true,
+            episodes: true,
+            tracks: false,
+        };
+        assert_eq!(
+            [
+                ticked_holds([false, false, true], music),
+                ticked_holds([false, false, true], mixed),
+                ticked_holds([false, true, false], mixed),
+                ticked_holds([false, false, false], music),
+            ],
+            [true, false, true, false]
+        );
     }
 
     #[test]

@@ -468,6 +468,10 @@ pub use spoolframe_protocol::playlists::{
     PlaylistEntry, PlaylistNext, PlaylistOwnerKind, PlaylistPage, PlaylistRef, PlaylistShare,
     PlaylistSummary, Repeat, ShareCandidate, ShareCandidatePage, UserKind, Visibility,
 };
+/// The most entries one [`Session::upcoming_in_playlist`] gives, as on
+/// the server.
+pub const MAX_UPCOMING: u32 = 100;
+
 /// The most a playlist's cover may be (PX-53): bytes, and pixels by its
 /// header.
 pub use spoolframe_protocol::playlists::{MAX_ART_BYTES, MAX_ART_PIXELS};
@@ -1314,6 +1318,14 @@ pub trait Session: Send + Sync {
     /// `artwork`, and the app draws its own mosaic.
     fn has_playlist_art(&self) -> bool;
 
+    /// Whether the server says what comes up in a playlist and saves its
+    /// play settings alone (`spoolframe:playlist-upcoming`):
+    /// [`Session::upcoming_in_playlist`] and
+    /// [`Session::set_playlist_settings`]. Never without playlists.
+    /// Without it Up next shows a playlist in its own order, and the
+    /// settings are saved by playing.
+    fn has_playlist_upcoming(&self) -> bool;
+
     /// Whether external text subtitles are synced and offset on the server
     /// (PX-03, `spoolframe:subtitle-sync`): a track's `timing`, and Sync,
     /// Use original timing and the offset control.
@@ -1494,6 +1506,33 @@ pub trait Session: Send + Sync {
         id: &'a str,
         after: EntryId,
     ) -> BoxFuture<'a, Result<Option<PlaylistNext>, BackendError>>;
+
+    /// What plays next in playlist `id`, without playing it: at most
+    /// `limit` ([`MAX_UPCOMING`]) entries after the user's place, each the
+    /// one [`Session::next_in_playlist`] would give after the one before.
+    /// The place's own entry is not among them, except with Repeat One,
+    /// when it alone is (it plays again). The shuffled round's order
+    /// while shuffling, else the playlist's; from the top again with
+    /// Repeat All, so an entry may come more than once. With no place,
+    /// from the top. Without [`Session::has_playlist_upcoming`],
+    /// [`BackendError::Unsupported`], unsent.
+    fn upcoming_in_playlist<'a>(
+        &'a self,
+        id: &'a str,
+        limit: u32,
+    ) -> BoxFuture<'a, Result<Vec<PlaylistEntry>, BackendError>>;
+
+    /// Keeps `settings` as how the user plays playlist `id`, playing
+    /// nothing: the place and the shuffled round stay. Shuffle turned on
+    /// shuffles anew from the place, so the whole playlist is ahead;
+    /// turned off, the playlist's order from the place. Without
+    /// [`Session::has_playlist_upcoming`], [`BackendError::Unsupported`],
+    /// unsent.
+    fn set_playlist_settings<'a>(
+        &'a self,
+        id: &'a str,
+        settings: PlaySettings,
+    ) -> BoxFuture<'a, Result<(), BackendError>>;
 }
 
 #[cfg(test)]

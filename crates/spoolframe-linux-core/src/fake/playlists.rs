@@ -11,6 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use spoolframe_policy::playlists as policy;
 use spoolframe_types::{ArtworkId, Item, MediaId};
 use tokio::sync::broadcast;
 
@@ -30,8 +31,8 @@ pub use spoolframe_protocol::playlists::{MAX_ART_BYTES, MAX_ART_PIXELS};
 fn art_of(stored: &Stored) -> ArtworkId {
     let key = match (&stored.cover, stored.builtin) {
         (Some(cover), _) => format!("playlist/{cover}"),
-        (None, Some(Builtin::Liked)) => "tile/liked/1".to_owned(),
-        (None, Some(_)) => "tile/all/1".to_owned(),
+        (None, Some(Builtin::Liked)) => "tile/liked/2".to_owned(),
+        (None, Some(_)) => "tile/all/2".to_owned(),
         (None, None) if stored.entries.is_empty() => "tile/empty/1".to_owned(),
         (None, None) => {
             let mut hasher = std::hash::DefaultHasher::new();
@@ -110,6 +111,9 @@ pub(super) struct Store {
     /// Each user's place and settings in each playlist.
     places: HashMap<(String, String), EntryId>,
     settings: HashMap<(String, String), PlaySettings>,
+    /// Each user's shuffled round in each playlist, as the server keeps
+    /// it: the order this pass through it plays in.
+    rounds: HashMap<(String, String), Vec<EntryId>>,
     /// Items still in the library whose file cannot be read now.
     pub unavailable: HashSet<MediaId>,
     /// Every track in the library, in order: what each user's All holds.
@@ -130,6 +134,7 @@ impl Store {
                 playlist_sharing: true,
                 play_history: true,
                 playlist_art: true,
+                playlist_upcoming: true,
                 subtitle_sync: true,
                 subtitle_search: true,
             },
@@ -141,6 +146,7 @@ impl Store {
             notes: HashMap::new(),
             places: HashMap::new(),
             settings: HashMap::new(),
+            rounds: HashMap::new(),
             unavailable: HashSet::new(),
             all_tracks: Vec::new(),
             people: Vec::new(),
@@ -860,7 +866,12 @@ impl Store {
 
     /// The entry to play: `from`, else the user's place (or the one after
     /// it, once its item is watched), else the first; passing unavailable
-    /// entries, and watched ones with Skip watched. Keeps the settings.
+    /// entries, and watched ones with Skip watched (never `from`, nor a
+    /// place resumed unfinished). Keeps the settings.
+    ///
+    /// Shuffled, it plays in a round as the server's does (0.13): a new
+    /// one when shuffle is turned on, starting at the place, or at `from`
+    /// whenever it is given; else the round kept.
     pub fn play(
         &mut self,
         id: &str,
@@ -872,33 +883,72 @@ impl Store {
         self.check()?;
         self.seen(id, viewer)?;
         let key = (viewer.username.to_owned(), id.to_owned());
-        self.settings.insert(key.clone(), settings);
-        let order = self.order(id, settings);
-        let playable = |entry: &(EntryId, MediaId)| {
-            !self.unavailable.contains(&entry.1) && !(settings.skip_watched && watched(&entry.1))
+        self.choose(id, &key, settings, from);
+        let order = self.order(id, &key);
+        let ids: Vec<EntryId> = order.iter().map(|(e, _)| *e).collect();
+        let tries = match (from, self.places.get(&key).copied()) {
+            (Some(from), _) => policy::again_from(&ids, from, settings.repeat),
+            (None, Some(at)) => match order.iter().find(|(e, _)| *e == at) {
+                Some((_, item)) if !watched(item) => policy::again_from(&ids, at, settings.repeat),
+                // Heard to its end, or gone: what follows it.
+                _ => policy::next_from(&ids, Some(at), settings.repeat),
+            },
+            (None, None) => policy::next_from(&ids, None, settings.repeat),
         };
-        let start = match from.or_else(|| self.places.get(&key).copied()) {
-            Some(entry) => order.iter().position(|(e, _)| *e == entry).map(|at| {
-                let resumed = from.is_some() || !watched(&order[at].1);
-                if resumed { at } else { at + 1 }
-            }),
-            None => Some(0),
-        }
-        .unwrap_or(0);
-        let next = order[start.min(order.len())..]
-            .iter()
-            .find(|entry| playable(entry))
-            .cloned();
-        match &next {
-            Some((entry, _)) => self.places.insert(key, *entry),
-            None => self.places.remove(&key),
-        };
+        let next = self.play_on(&order, &tries, settings, &watched);
+        self.moved(key, next.as_ref());
         Ok(next)
     }
 
-    /// What plays after `after`: the next playable one; at the end, the
-    /// first again with Repeat all, else nothing and the place cleared.
-    /// Repeat one plays `after` again.
+    /// The round rule, for `key` now played with `settings`, `from`
+    /// picked or not: one round per turn-on, kept until shuffle is turned
+    /// off. A new one when shuffling starts (at the place, so the whole
+    /// playlist is ahead) or when there is none, and when an entry is
+    /// picked, that entry first. The settings are kept.
+    fn choose(
+        &mut self,
+        id: &str,
+        key: &(String, String),
+        settings: PlaySettings,
+        from: Option<EntryId>,
+    ) {
+        let shuffling_already = self.settings.get(key).is_some_and(|s| s.shuffle);
+        let entries = self.entry_ids(id);
+        let round = match (settings.shuffle, from, self.rounds.get(key)) {
+            (false, _, _) => None,
+            (true, Some(from), _) => Some(round_from(&entries, Some(from))),
+            (true, None, Some(kept)) if shuffling_already => Some(kept.clone()),
+            (true, None, _) => Some(round_from(&entries, self.places.get(key).copied())),
+        };
+        self.keep_round(key, round);
+        self.settings.insert(key.clone(), settings);
+    }
+
+    /// The user's place on `next`, or, at the end, no place: the next
+    /// play starts at the top, of the same round.
+    fn moved(&mut self, key: (String, String), next: Option<&(EntryId, MediaId)>) {
+        match next {
+            Some((entry, _)) => {
+                self.places.insert(key, *entry);
+            }
+            None => {
+                self.places.remove(&key);
+            }
+        }
+    }
+
+    fn keep_round(&mut self, key: &(String, String), round: Option<Vec<EntryId>>) {
+        match round {
+            Some(round) => self.rounds.insert(key.clone(), round),
+            None => self.rounds.remove(key),
+        };
+    }
+
+    /// What plays after `after`: the next playable one; at the end, with
+    /// Repeat All, the same order again from its top, else nothing and
+    /// the place cleared. Repeat One plays `after` again. An `after` no
+    /// longer in the list goes on from the top of the order, as on the
+    /// server.
     pub fn next(
         &mut self,
         id: &str,
@@ -910,45 +960,147 @@ impl Store {
         self.seen(id, viewer)?;
         let key = (viewer.username.to_owned(), id.to_owned());
         let settings = self.settings.get(&key).copied().unwrap_or_default();
-        let order = self.order(id, settings);
-        let playable = |entry: &&(EntryId, MediaId)| {
-            !self.unavailable.contains(&entry.1) && !(settings.skip_watched && watched(&entry.1))
-        };
-        let at = order.iter().position(|(e, _)| *e == after);
-        let next = match (settings.repeat, at) {
-            (Repeat::One, Some(at)) => Some(order[at].clone()),
-            (_, Some(at)) => order[at + 1..].iter().find(playable).cloned().or_else(|| {
-                matches!(settings.repeat, Repeat::All)
-                    .then(|| order.iter().find(playable).cloned())
-                    .flatten()
-            }),
-            (_, None) => None,
-        };
-        match &next {
-            Some((entry, _)) => self.places.insert(key, *entry),
-            None => self.places.remove(&key),
-        };
+        let order = self.order(id, &key);
+        let ids: Vec<EntryId> = order.iter().map(|(e, _)| *e).collect();
+        let tries = policy::next_from(&ids, Some(after), settings.repeat);
+        let next = self.play_on(&order, &tries, settings, &watched);
+        self.moved(key, next.as_ref());
         Ok(next)
     }
 
-    /// The order a playlist plays in: its own, or with Shuffle a fixed
-    /// one of its own (odd places first, then even), so a test knows it.
-    fn order(&self, id: &str, settings: PlaySettings) -> Vec<(EntryId, MediaId)> {
+    /// The next `limit` (100) entries `viewer` plays in playlist `id`
+    /// after their place, each the one [`Store::next`] would give after
+    /// the one before, as the server lists them: with Repeat One the
+    /// place's entry alone; with no place, from the top.
+    pub fn upcoming(
+        &mut self,
+        id: &str,
+        limit: u32,
+        viewer: Viewer<'_>,
+        watched: impl Fn(&MediaId) -> bool,
+    ) -> Result<Vec<(EntryId, MediaId)>, BackendError> {
+        self.check_upcoming()?;
+        self.check()?;
+        self.seen(id, viewer)?;
+        let key = (viewer.username.to_owned(), id.to_owned());
+        let settings = self.settings.get(&key).copied().unwrap_or_default();
+        let order = self.order(id, &key);
+        let ids: Vec<EntryId> = order.iter().map(|(e, _)| *e).collect();
+        let mut after = self.places.get(&key).copied();
+        let mut upcoming = Vec::new();
+        while upcoming.len() < limit.min(crate::backend::MAX_UPCOMING) as usize {
+            let tries = policy::next_from(&ids, after, settings.repeat);
+            let Some(next) = self.play_on(&order, &tries, settings, &watched) else {
+                break;
+            };
+            after = Some(next.0);
+            upcoming.push(next);
+            if settings.repeat == Repeat::One {
+                break;
+            }
+        }
+        Ok(upcoming)
+    }
+
+    /// Keeps `settings` as how `viewer` plays playlist `id`, playing
+    /// nothing: the place stays, and the round by [`Store::choose`].
+    pub fn set_settings(
+        &mut self,
+        id: &str,
+        settings: PlaySettings,
+        viewer: Viewer<'_>,
+    ) -> Result<(), BackendError> {
+        self.check_upcoming()?;
+        self.check()?;
+        self.seen(id, viewer)?;
+        let key = (viewer.username.to_owned(), id.to_owned());
+        self.choose(id, &key, settings, None);
+        Ok(())
+    }
+
+    /// Refuses what comes up and settings saved alone without the
+    /// feature, unsent.
+    fn check_upcoming(&self) -> Result<(), BackendError> {
+        match self.features.playlist_upcoming {
+            true => Ok(()),
+            false => Err(BackendError::Unsupported(
+                spoolframe_protocol::features::PLAYLIST_UPCOMING.into(),
+            )),
+        }
+    }
+
+    /// What plays by `tries` in `order`: the first of its entries that
+    /// can play, else, with Repeat All, the first of the same order again
+    /// from its top.
+    fn play_on(
+        &self,
+        order: &[(EntryId, MediaId)],
+        tries: &policy::Tries,
+        settings: PlaySettings,
+        watched: &impl Fn(&MediaId) -> bool,
+    ) -> Option<(EntryId, MediaId)> {
+        let first = |tried: &mut dyn Iterator<Item = EntryId>, regardless: Option<EntryId>| {
+            tried
+                .filter_map(|e| order.iter().find(|(x, _)| *x == e))
+                .find(|(e, item)| {
+                    !self.unavailable.contains(item)
+                        && !(settings.skip_watched && watched(item) && regardless != Some(*e))
+                })
+                .cloned()
+        };
+        first(&mut tries.tried.iter().copied(), tries.regardless).or_else(|| {
+            tries
+                .wraps
+                .then(|| first(&mut order.iter().map(|(e, _)| *e), None))
+                .flatten()
+        })
+    }
+
+    fn entry_ids(&self, id: &str) -> Vec<EntryId> {
+        self.playlists
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| p.entries.iter().map(|(e, _)| *e).collect())
+            .unwrap_or_default()
+    }
+
+    /// The order playlist `id` plays in for `key`: its own, or its round
+    /// while shuffled, brought up to date as the server's is (and kept
+    /// so): entries taken out leave it, and those added since go among
+    /// the ones not played yet.
+    fn order(&mut self, id: &str, key: &(String, String)) -> Vec<(EntryId, MediaId)> {
         let entries = self
             .playlists
             .iter()
             .find(|p| p.id == id)
             .map(|p| p.entries.clone())
             .unwrap_or_default();
-        if !settings.shuffle {
+        let Some(round) = self.rounds.get(key) else {
             return entries;
-        }
-        let (odd, even): (Vec<_>, Vec<_>) = entries
-            .into_iter()
-            .enumerate()
-            .partition(|(at, _)| at % 2 == 1);
-        odd.into_iter().chain(even).map(|(_, e)| e).collect()
+        };
+        let now: Vec<EntryId> = entries.iter().map(|(e, _)| *e).collect();
+        // A fixed seed: a test knows where an added entry goes.
+        let round = policy::reconciled(round, &now, self.places.get(key).copied(), 0);
+        let order = round
+            .iter()
+            .filter_map(|e| entries.iter().find(|(x, _)| x == e).cloned())
+            .collect();
+        self.rounds.insert(key.clone(), round);
+        order
     }
+}
+
+/// A shuffled round of `entries`, as the server makes one: `first`, if
+/// it is there, then the rest in a fixed order of their own (odd places
+/// first, then even), so a test knows it.
+fn round_from(entries: &[EntryId], first: Option<EntryId>) -> Vec<EntryId> {
+    let first = first.filter(|f| entries.contains(f));
+    let rest = entries.iter().copied().filter(|e| Some(*e) != first);
+    let (odd, even): (Vec<_>, Vec<_>) = rest.enumerate().partition(|(at, _)| at % 2 == 1);
+    first
+        .into_iter()
+        .chain(odd.into_iter().chain(even).map(|(_, e)| e))
+        .collect()
 }
 
 /// Where an add or move of an entry goes: before `before`, or at the end

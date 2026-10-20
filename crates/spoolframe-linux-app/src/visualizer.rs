@@ -60,10 +60,7 @@ pub fn gst_visualizer(name: &str) -> Result<gst::Bin, glib::BoolError> {
 /// the effect, or, for `music`, the video sink the effect draws into
 /// (music has no other picture).
 pub fn caused(message: &str, music: bool) -> bool {
-    let Some((path, _)) = message
-        .strip_prefix("Error from element ")
-        .and_then(|rest| rest.split_once(": "))
-    else {
+    let Some(path) = crate::pipeline::error_element_path(message) else {
         return false;
     };
     let names: Vec<_> = path
@@ -85,7 +82,6 @@ pub struct Levels {
     pub rms: [f64; 2],
     pub updated: Instant,
     pub clock: Option<BeatClock>,
-    pub bpm: Option<f64>,
 }
 impl Default for Levels {
     fn default() -> Self {
@@ -94,7 +90,6 @@ impl Default for Levels {
             rms: [0.; 2],
             updated: Instant::now(),
             clock: None,
-            bpm: None,
         }
     }
 }
@@ -146,34 +141,110 @@ fn analyze_rhythm(frames: &[Vec<f32>], interval: f64) -> Option<(f64, f64)> {
     Some((tempo.bpm as f64, last))
 }
 
+/// Where the analysis is: bumped by each reset (a new stream, segment
+/// or format, and each turn on or off), and whether it is on. Rhythm
+/// read in one epoch is stale in the next.
+#[derive(Clone, Default)]
+struct Epoch(Arc<std::sync::atomic::AtomicU64>);
+
+/// An [`Epoch`] as read at one moment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Stamp(u64);
+
+impl Stamp {
+    fn is_on(self) -> bool {
+        self.0 & 1 == 1
+    }
+}
+
+impl Epoch {
+    fn now(&self) -> Stamp {
+        Stamp(self.0.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// A reset, on or off as it was.
+    fn bump(&self) {
+        self.0.fetch_add(2, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// A reset that turns it `on` or off.
+    fn turn(&self, on: bool) {
+        use std::sync::atomic::Ordering;
+        let _ = self
+            .0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+                Some(((old + 2) & !1) | u64::from(on))
+            });
+    }
+}
+
+/// How many frames the rhythm is read from at most: twelve seconds.
+const RHYTHM_FRAMES: usize = 360;
+
 struct RhythmWindow {
-    frames: Vec<Vec<f32>>,
+    /// The frames end to end, `width` values each, oldest first: one
+    /// copy, split on the worker's thread.
+    frames: Vec<f32>,
+    width: usize,
     interval: f64,
     observed: Instant,
-    generation: u64,
+    generation: Stamp,
 }
+
+impl RhythmWindow {
+    /// The frames one by one, as the rhythm analysis takes them.
+    fn split(&self) -> Vec<Vec<f32>> {
+        self.frames
+            .chunks(self.width.max(1))
+            .map(<[f32]>::to_vec)
+            .collect()
+    }
+}
+
 struct RhythmInput {
-    frames: std::collections::VecDeque<Vec<f32>>,
+    /// The last [`RHYTHM_FRAMES`] frames, `width` values each, end to
+    /// end, oldest first.
+    frames: std::collections::VecDeque<f32>,
+    width: usize,
     count: usize,
-    generation: u64,
+    generation: Stamp,
     last_time: Option<u64>,
     interval: f64,
     sender: std::sync::mpsc::SyncSender<RhythmWindow>,
 }
 impl RhythmInput {
+    fn new(sender: std::sync::mpsc::SyncSender<RhythmWindow>) -> Self {
+        Self {
+            frames: Default::default(),
+            width: 0,
+            count: 0,
+            generation: Stamp::default(),
+            last_time: None,
+            interval: 0.,
+            sender,
+        }
+    }
+
+    /// One spectrum's linear `power` (see [`power_spectrum`]), at
+    /// `timestamp` for `duration`.
     fn push(
         &mut self,
-        raw: &[f64],
+        power: &[f64],
         timestamp: u64,
         duration: u64,
-        generation: u64,
+        generation: Stamp,
         observed: Instant,
     ) {
         let interval = duration as f64 / 1e9;
-        if duration == 0 || generation & 1 == 0 {
+        if duration == 0 || !generation.is_on() {
             return;
         }
+        // Pool linear magnitudes for rhythm analysis; spectrum rendering retains
+        // the full FFT. This bounds window memory and background CPU use.
+        let chunks = power.chunks(power.len().div_ceil(256).max(1));
+        let width = chunks.len();
         if generation != self.generation
+            || width != self.width
             || (interval - self.interval).abs() > 0.001
             || self.last_time.is_some_and(|last| {
                 timestamp.abs_diff(last.saturating_add(duration)) > duration / 2
@@ -183,35 +254,21 @@ impl RhythmInput {
             self.count = 0;
         }
         self.generation = generation;
+        self.width = width;
         self.last_time = Some(timestamp);
         self.interval = interval;
-        // Pool linear magnitudes for rhythm analysis; spectrum rendering retains
-        // the full FFT. This bounds window memory and background CPU use.
-        let frame = raw
-            .chunks(raw.len().div_ceil(256).max(1))
-            .map(|chunk| {
-                (chunk
-                    .iter()
-                    .map(|db| {
-                        if db.is_finite() && *db > -60. {
-                            10f64.powf(db.min(0.) / 10.)
-                        } else {
-                            0.
-                        }
-                    })
-                    .sum::<f64>()
-                    / chunk.len() as f64)
-                    .sqrt() as f32
-            })
-            .collect();
-        self.frames.push_back(frame);
-        while self.frames.len() > 360 {
-            self.frames.pop_front();
+        self.frames.extend(
+            chunks.map(|chunk| (chunk.iter().sum::<f64>() / chunk.len() as f64).sqrt() as f32),
+        );
+        let full = RHYTHM_FRAMES * width;
+        if self.frames.len() > full {
+            self.frames.drain(..self.frames.len() - full);
         }
         self.count += 1;
-        if self.frames.len() >= 180 && self.count.is_multiple_of(60) {
+        if self.frames.len() >= RHYTHM_FRAMES / 2 * width && self.count.is_multiple_of(60) {
             let _ = self.sender.try_send(RhythmWindow {
-                frames: self.frames.iter().cloned().collect(),
+                frames: self.frames.iter().copied().collect(),
+                width,
                 interval,
                 observed,
                 generation,
@@ -219,22 +276,22 @@ impl RhythmInput {
         }
     }
 }
-fn rhythm_worker(output: Measurements, epoch: Arc<std::sync::atomic::AtomicU64>) -> RhythmInput {
+fn rhythm_worker(output: Measurements, epoch: Epoch) -> RhythmInput {
     let (sender, receiver) = std::sync::mpsc::sync_channel::<RhythmWindow>(1);
     std::thread::spawn(move || {
-        use std::sync::atomic::Ordering;
         while let Ok(window) = receiver.recv() {
-            if epoch.load(Ordering::Acquire) != window.generation {
+            if epoch.now() != window.generation {
                 continue;
             }
-            let result = analyze_rhythm(&window.frames, window.interval);
+            let frames = window.split();
+            let result = analyze_rhythm(&frames, window.interval);
             let mut levels = output.lock().unwrap();
-            if epoch.load(Ordering::Acquire) != window.generation {
+            if epoch.now() != window.generation {
                 continue;
             }
             levels.clock = result.and_then(|(bpm, last)| {
-                let age = (window.frames.len() - 1) as f64 * window.interval - last;
-                if age < 0. || age > window.frames.len() as f64 * window.interval {
+                let age = (frames.len() - 1) as f64 * window.interval - last;
+                if age < 0. || age > frames.len() as f64 * window.interval {
                     return None;
                 }
                 Some(BeatClock {
@@ -244,17 +301,9 @@ fn rhythm_worker(output: Measurements, epoch: Arc<std::sync::atomic::AtomicU64>)
                     updated: window.observed,
                 })
             });
-            levels.bpm = result.map(|(bpm, _)| bpm);
         }
     });
-    RhythmInput {
-        frames: Default::default(),
-        count: 0,
-        generation: 0,
-        last_time: None,
-        interval: 0.,
-        sender,
-    }
+    RhythmInput::new(sender)
 }
 
 /// Spectrum messages arrive before the sink presents their audio. Use the
@@ -298,7 +347,7 @@ pub struct Analyzer {
     valve: gst::Element,
     spectrum: gst::Element,
     level: gst::Element,
-    beats: Arc<std::sync::atomic::AtomicU64>,
+    epoch: Epoch,
     rhythm: Rhythm,
 }
 impl Analyzer {
@@ -350,64 +399,95 @@ impl Analyzer {
         let level = analysis.by_name("visual-level").unwrap();
         let levels = Measurements::default();
         let output = levels.clone();
-        let beats = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let epoch = Epoch::default();
         let rhythm: Rhythm = Arc::default();
         let input = rhythm.clone();
-        let epoch = beats.clone();
+        let reset = epoch.clone();
         let reset_output = levels.clone();
+        // The audio's sample rate, from its caps as they come; 0 until
+        // known.
+        let rate = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let caps_rate = rate.clone();
         spectrum.static_pad("sink").unwrap().add_probe(
             gst::PadProbeType::EVENT_DOWNSTREAM,
             move |_, info| {
-                if info.event().is_some_and(|event| {
-                    matches!(
-                        event.view(),
-                        gst::EventView::Segment(_)
-                            | gst::EventView::StreamStart(_)
-                            | gst::EventView::Caps(_)
-                    )
-                }) {
-                    epoch.fetch_add(2, std::sync::atomic::Ordering::AcqRel);
+                let Some(event) = info.event() else {
+                    return gst::PadProbeReturn::Ok;
+                };
+                let reset_here = match event.view() {
+                    gst::EventView::Caps(caps) => {
+                        let known = caps
+                            .caps()
+                            .structure(0)
+                            .and_then(|s| s.get::<i32>("rate").ok());
+                        caps_rate.store(
+                            known.unwrap_or(0).max(0) as u32,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        true
+                    }
+                    gst::EventView::Segment(_) | gst::EventView::StreamStart(_) => true,
+                    _ => false,
+                };
+                if reset_here {
+                    reset.bump();
                     *reset_output.lock().unwrap() = Levels::default();
                 }
                 gst::PadProbeReturn::Ok
             },
         );
-        let epoch = beats.clone();
+        let stamp = epoch.clone();
         let bus = playbin.bus().unwrap();
         let spectrum_source = spectrum.clone();
         let level_source = level.clone();
         bus.enable_sync_message_emission();
+        // The spectrum's power, kept from message to message.
+        let scratch = Mutex::new(Vec::new());
+        // What a message measured goes out under the lock alone, and only
+        // in the epoch it was measured in: a reset or a turn meanwhile,
+        // which clears the levels, is not undone by it.
+        let store = move |since: Stamp, write: &dyn Fn(&mut Levels)| {
+            let mut values = output.lock().unwrap();
+            if stamp.now() == since {
+                write(&mut values);
+                values.updated = Instant::now();
+            }
+        };
+        let now = epoch.clone();
         bus.connect_sync_message(Some("element"), move |_, message| {
             let Some(s) = message.structure() else {
                 return;
             };
-            let mut values = output.lock().unwrap();
+            let since = now.now();
             if message.src() == Some(spectrum_source.upcast_ref()) {
-                if let Ok(bands) = s.get::<gst::List>("magnitude") {
-                    let raw: Vec<f64> = bands
+                let Ok(magnitudes) = s.get::<gst::List>("magnitude") else {
+                    return;
+                };
+                let mut power = scratch.lock().unwrap();
+                power_spectrum(
+                    magnitudes
                         .iter()
-                        .map(|v| v.get::<f32>().unwrap_or(-60.) as f64)
-                        .collect();
-                    values.updated = Instant::now();
-                    let rate = spectrum_source
-                        .static_pad("sink")
-                        .and_then(|p| p.current_caps())
-                        .and_then(|caps| caps.structure(0)?.get::<i32>("rate").ok())
-                        .unwrap_or(44100) as f64;
-                    values.bands = logarithmic_bands(&raw, rate);
-                    if let (Ok(timestamp), Ok(duration)) =
-                        (s.get::<u64>("timestamp"), s.get::<u64>("duration"))
-                        && let Some(rhythm) = input.lock().unwrap().as_mut()
-                    {
-                        rhythm.push(
-                            &raw,
-                            timestamp,
-                            duration,
-                            epoch.load(std::sync::atomic::Ordering::Acquire),
-                            spectrum_time(&spectrum_source, s, duration),
-                        );
-                    }
+                        .map(|v| v.get::<f32>().unwrap_or(-60.) as f64),
+                    &mut power,
+                );
+                let rate = match rate.load(std::sync::atomic::Ordering::Relaxed) {
+                    0 => 44100.,
+                    known => known as f64,
+                };
+                let bands = logarithmic_bands(&power, rate);
+                if let (Ok(timestamp), Ok(duration)) =
+                    (s.get::<u64>("timestamp"), s.get::<u64>("duration"))
+                    && let Some(rhythm) = input.lock().unwrap().as_mut()
+                {
+                    rhythm.push(
+                        &power,
+                        timestamp,
+                        duration,
+                        since,
+                        spectrum_time(&spectrum_source, s, duration),
+                    );
                 }
+                store(since, &|values| values.bands = bands);
             } else if message.src() == Some(level_source.upcast_ref())
                 && let Ok(channels) = s.get::<glib::ValueArray>("rms")
             {
@@ -419,8 +499,8 @@ impl Analyzer {
                     .get(1)
                     .and_then(|v| v.get::<f64>().ok())
                     .unwrap_or(first);
-                values.rms = [normalized(first), normalized(second)];
-                values.updated = Instant::now();
+                let rms = [normalized(first), normalized(second)];
+                store(since, &|values| values.rms = rms);
             }
         });
         playbin.set_property("audio-filter", &filter);
@@ -429,7 +509,7 @@ impl Analyzer {
             valve,
             spectrum,
             level,
-            beats,
+            epoch,
             rhythm,
         })
     }
@@ -437,19 +517,14 @@ impl Analyzer {
     /// rhythm worker for it; off, the valve drops the audio before any
     /// analysis and the worker's thread ends.
     pub fn enable(&self, enabled: bool) {
-        use std::sync::atomic::Ordering;
-        let _ = self
-            .beats
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
-                Some(((old + 2) & !1) | u64::from(enabled))
-            });
+        self.epoch.turn(enabled);
         {
             let mut rhythm = self.rhythm.lock().unwrap();
             if !enabled {
                 // Its sender gone, the worker's thread ends.
                 *rhythm = None;
             } else if rhythm.is_none() {
-                *rhythm = Some(rhythm_worker(self.levels.clone(), self.beats.clone()));
+                *rhythm = Some(rhythm_worker(self.levels.clone(), self.epoch.clone()));
             }
         }
         self.spectrum.set_property("post-messages", enabled);
@@ -467,7 +542,18 @@ impl Analyzer {
     }
 }
 
-#[derive(Clone, Copy, Default, PartialEq)]
+/// What Now Playing shows over the music.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Choice {
+    /// No visualizer: the cover and the queue.
+    Cover,
+    /// One of the canvas's own modes, drawn from the measurements.
+    Canvas(Mode),
+    /// A GStreamer effect from [`plugins`], by its element's name.
+    Effect(String),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub enum Mode {
     #[default]
     Radial,
@@ -476,6 +562,18 @@ pub enum Mode {
     Spectrum,
     Spectrogram,
     Rings,
+}
+
+impl Mode {
+    /// Whether it draws the album's cover.
+    pub fn draws_cover(self) -> bool {
+        matches!(self, Mode::Radial | Mode::Ambient | Mode::Rings)
+    }
+
+    /// Whether its colours are tinted by the album's cover.
+    pub fn tinted(self) -> bool {
+        matches!(self, Mode::Radial | Mode::Rings | Mode::Spectrum)
+    }
 }
 
 mod imp {
@@ -490,10 +588,10 @@ mod imp {
         pub phase: Cell<f64>,
         pub peaks: RefCell<Vec<f64>>,
         pub show_peaks: Cell<bool>,
-        pub history: RefCell<std::collections::VecDeque<[f64; BANDS]>>,
-        pub history_time: Cell<f64>,
-        pub history_offset: Cell<f64>,
-        pub history_texture: RefCell<Option<gdk::MemoryTexture>>,
+        pub waterfall: RefCell<Waterfall>,
+        /// The VU deck's scale labels' widths, measured on its first draw:
+        /// their font does not change.
+        pub vu_labels: Cell<Option<[f64; 4]>>,
         pub color: Cell<(f64, f64, f64)>,
         pub punch: Cell<f64>,
         /// The frame clock's callback, while it runs (see
@@ -519,205 +617,379 @@ mod imp {
             let bounds = graphene::Rect::new(0., 0., w, h);
             snapshot.append_color(&gdk::RGBA::new(0.025, 0.03, 0.05, 1.), &bounds);
             let values = self.frame.borrow();
-            let bass = values.bands[..16].iter().sum::<f64>() / 16.;
-            let energy = (values.rms[0] + values.rms[1]) / 2.;
-            let size = w.min(h) * 0.38;
             let texture = self.texture.borrow();
-            if self.mode.get() == Mode::Ambient
+            let mode = self.mode.get();
+            if mode == Mode::Ambient
                 && let Some(texture) = texture.as_ref()
             {
-                let drift = self.phase.get();
-                let zoom = 1.25 + bass as f32 * 0.16;
-                let width = w * zoom;
-                let height = h * zoom;
-                snapshot.push_clip(&bounds);
-                snapshot.push_blur(48.);
-                snapshot.append_texture(
-                    texture,
-                    &graphene::Rect::new(
-                        (w - width) / 2. + drift.sin() as f32 * w * 0.04,
-                        (h - height) / 2. + (drift * 0.7).cos() as f32 * h * 0.04,
-                        width,
-                        height,
-                    ),
-                );
-                snapshot.pop();
-                snapshot.pop();
-                snapshot.append_color(
-                    &gdk::RGBA::new(0., 0., 0., (0.42 - energy * 0.15) as f32),
-                    &bounds,
-                );
+                draw_ambient(snapshot, &bounds, texture, &values, self.phase.get());
             }
-            if matches!(self.mode.get(), Mode::Radial | Mode::Ambient | Mode::Rings) {
-                let rect = graphene::Rect::new((w - size) / 2., (h - size) / 2., size, size);
-                snapshot.push_rounded_clip(&gtk::gsk::RoundedRect::from_rect(rect, 18.));
-                if let Some(texture) = texture.as_ref() {
-                    snapshot.append_texture(texture, &rect);
-                } else {
-                    snapshot.append_color(&gdk::RGBA::new(0.18, 0.22, 0.32, 1.), &rect);
-                }
-                snapshot.pop();
+            if mode.draws_cover() {
+                draw_cover(snapshot, w, h, texture.as_ref());
             }
-            if self.mode.get() == Mode::Spectrogram {
-                if self.history_texture.borrow().is_none() {
-                    *self.history_texture.borrow_mut() =
-                        Some(waterfall_texture(&self.history.borrow()));
-                }
-                let step = w / 180.;
-                snapshot.push_clip(&bounds);
-                snapshot.append_texture(
-                    self.history_texture.borrow().as_ref().unwrap(),
-                    &graphene::Rect::new(
-                        -step * (1. + self.history_offset.get() as f32),
-                        0.,
-                        step * 182.,
+            let color = self.color.get();
+            match mode {
+                Mode::Ambient => {}
+                Mode::Spectrogram => self.waterfall.borrow_mut().draw(snapshot, &bounds),
+                Mode::Radial => draw_radial(&snapshot.append_cairo(&bounds), w, h, &values, color),
+                Mode::Rings => draw_rings(
+                    &snapshot.append_cairo(&bounds),
+                    w,
+                    h,
+                    &values,
+                    color,
+                    (self.phase.get(), self.punch.get()),
+                ),
+                Mode::Spectrum => {
+                    let peaks = self.peaks.borrow();
+                    draw_spectrum(
+                        &snapshot.append_cairo(&bounds),
+                        w,
                         h,
-                    ),
-                );
-                snapshot.pop();
-                return;
-            }
-            let cr = snapshot.append_cairo(&bounds);
-            if self.mode.get() == Mode::Radial {
-                let radius = size as f64 * 0.76;
-                cr.set_line_width((w.min(h) as f64 * 0.006).max(2.));
-                cr.set_line_cap(gtk::cairo::LineCap::Round);
-                for (i, value) in values.bands.iter().enumerate() {
-                    let angle = i as f64 / BANDS as f64 * std::f64::consts::TAU
-                        - std::f64::consts::FRAC_PI_2;
-                    let length = 4. + value * w.min(h) as f64 * 0.14;
-                    let (r, g, b) = band_color(self.color.get(), i as f64 / BANDS as f64, *value);
-                    cr.set_source_rgb(r, g, b);
-                    cr.move_to(
-                        w as f64 / 2. + angle.cos() * radius,
-                        h as f64 / 2. + angle.sin() * radius,
+                        &values,
+                        color,
+                        self.show_peaks.get().then_some(peaks.as_slice()),
                     );
-                    cr.line_to(
-                        w as f64 / 2. + angle.cos() * (radius + length),
-                        h as f64 / 2. + angle.sin() * (radius + length),
-                    );
-                    let _ = cr.stroke();
                 }
-            } else if self.mode.get() == Mode::Rings {
-                let unit = w.min(h) as f64;
-                let phase = self.phase.get();
-                let punch = self.punch.get();
-                cr.set_line_width((unit * 0.0035).max(1.5));
-                for ring in 0..5 {
-                    let first = ring * 12;
-                    let energy = values.bands[first..first + 12].iter().sum::<f64>() / 12.;
-                    let radius = size as f64 * 0.76
-                        + ring as f64 * unit * 0.025
-                        + punch * unit * 0.008 * (1. + ring as f64 * 0.12);
-                    let (r, g, b) = band_color(self.color.get(), ring as f64 / 5., energy);
-                    cr.set_source_rgba(r, g, b, 0.65 + energy * 0.35);
-                    for point in 0..=256 {
-                        let angle = point as f64 / 256. * std::f64::consts::TAU;
-                        let rotation = phase
-                            * (1. + ring as f64 * 0.15)
-                            * if ring % 2 == 0 { 1. } else { -1. };
-                        let rotated = angle + rotation;
-                        let wave = (rotated * (3. + ring as f64 * 2.)).sin()
-                            + 0.3 * (rotated * (7. + ring as f64)).sin();
-                        let distance =
-                            radius + wave * unit * (0.012 + energy * 0.004 + punch * 0.006);
-                        let x = w as f64 / 2. + angle.cos() * distance;
-                        let y = h as f64 / 2. + angle.sin() * distance;
-                        if point == 0 {
-                            cr.move_to(x, y);
-                        } else {
-                            cr.line_to(x, y);
-                        }
-                    }
-                    cr.close_path();
-                    let _ = cr.stroke();
-                }
-            } else if self.mode.get() == Mode::Spectrum {
-                let margin = (w as f64 * 0.06).max(16.);
-                let bottom = h as f64 * 0.78;
-                let height = h as f64 * 0.55;
-                let step = (w as f64 - 2. * margin) / BANDS as f64;
-                let (r, g, b) = self.color.get();
-                let peaks = self.peaks.borrow();
-                for (i, value) in values.bands.iter().enumerate() {
-                    let (r, g, b) = band_color((r, g, b), i as f64 / BANDS as f64, *value);
-                    let gradient = gtk::cairo::LinearGradient::new(0., bottom, 0., bottom - height);
-                    gradient.add_color_stop_rgb(0., r * 0.4, g * 0.4, b * 0.4);
-                    gradient.add_color_stop_rgb(0.55, r, g, b);
-                    gradient.add_color_stop_rgb(
-                        1.,
-                        (r + 0.35).min(1.),
-                        (g + 0.35).min(1.),
-                        (b + 0.35).min(1.),
-                    );
-                    let _ = cr.set_source(&gradient);
-                    cr.rectangle(
-                        margin + i as f64 * step,
-                        bottom - value * height,
-                        (step - 3.).max(1.),
-                        (value * height).max(1.),
-                    );
-                    let _ = cr.fill();
-                    if self.show_peaks.get()
-                        && let Some(peak) = peaks.get(i)
-                    {
-                        cr.set_source_rgba(0.95, 0.97, 1., 0.8);
-                        cr.rectangle(
-                            margin + i as f64 * step,
-                            bottom - peak * height - 3.,
-                            (step - 3.).max(1.),
-                            2.,
-                        );
-                        let _ = cr.fill();
-                    }
-                }
-            } else if self.mode.get() == Mode::Vu {
-                let width = (w as f64 * 0.8).min(950.);
-                let x = (w as f64 - width) / 2.;
-                let y = h as f64 / 2.;
-                cr.select_font_face(
-                    "Sans",
-                    gtk::cairo::FontSlant::Normal,
-                    gtk::cairo::FontWeight::Bold,
-                );
-                cr.set_font_size(18.);
-                for (channel, level) in values.rms.iter().enumerate() {
-                    let cy = y + (channel as f64 - 0.5) * 90.;
-                    cr.set_source_rgb(0.75, 0.8, 0.85);
-                    cr.move_to(x, cy + 22.);
-                    let _ = cr.show_text(if channel == 0 { "L" } else { "R" });
-                    for segment in 0..40 {
-                        let amount = segment as f64 / 40.;
-                        let lit = amount < *level;
-                        let color = if segment > 35 {
-                            (1., 0.2, 0.25)
-                        } else if segment > 28 {
-                            (1., 0.75, 0.2)
-                        } else {
-                            (0.2, 0.9, 0.6)
-                        };
-                        cr.set_source_rgba(color.0, color.1, color.2, if lit { 1. } else { 0.12 });
-                        cr.rectangle(
-                            x + 32. + segment as f64 * (width - 32.) / 40.,
-                            cy,
-                            (width - 32.) / 40. - 4.,
-                            32.,
-                        );
-                        let _ = cr.fill();
-                    }
-                }
-                cr.set_source_rgb(0.55, 0.6, 0.65);
-                cr.set_font_size(14.);
-                for (i, label) in ["−60", "−40", "−20", "0 dBFS"].iter().enumerate() {
-                    let label_width = cr.text_extents(label).map(|e| e.width()).unwrap_or(0.);
-                    cr.move_to(
-                        x + 32. + i as f64 * (width - 32. - label_width) / 3.,
-                        y + 115.,
-                    );
-                    let _ = cr.show_text(label);
-                }
+                Mode::Vu => draw_vu(
+                    &snapshot.append_cairo(&bounds),
+                    w,
+                    h,
+                    &values,
+                    &self.vu_labels,
+                ),
             }
         }
+    }
+}
+
+/// The cover's side, in the middle of a `w`×`h` canvas.
+fn cover_size(w: f32, h: f32) -> f32 {
+    w.min(h) * 0.38
+}
+
+/// The album's cover, blurred, filling the canvas: it swells with the
+/// bass and drifts with `drift`, darkened less as the music is louder.
+fn draw_ambient(
+    snapshot: &gtk::Snapshot,
+    bounds: &graphene::Rect,
+    texture: &gdk::Texture,
+    values: &Levels,
+    drift: f64,
+) {
+    let (w, h) = (bounds.width(), bounds.height());
+    let bass = values.bands[..16].iter().sum::<f64>() / 16.;
+    let energy = (values.rms[0] + values.rms[1]) / 2.;
+    let zoom = 1.25 + bass as f32 * 0.16;
+    let width = w * zoom;
+    let height = h * zoom;
+    snapshot.push_clip(bounds);
+    snapshot.push_blur(48.);
+    snapshot.append_texture(
+        texture,
+        &graphene::Rect::new(
+            (w - width) / 2. + drift.sin() as f32 * w * 0.04,
+            (h - height) / 2. + (drift * 0.7).cos() as f32 * h * 0.04,
+            width,
+            height,
+        ),
+    );
+    snapshot.pop();
+    snapshot.pop();
+    snapshot.append_color(
+        &gdk::RGBA::new(0., 0., 0., (0.42 - energy * 0.15) as f32),
+        bounds,
+    );
+}
+
+/// The cover in the middle, rounded; a plain tile until it loads.
+fn draw_cover(snapshot: &gtk::Snapshot, w: f32, h: f32, texture: Option<&gdk::Texture>) {
+    let size = cover_size(w, h);
+    let rect = graphene::Rect::new((w - size) / 2., (h - size) / 2., size, size);
+    snapshot.push_rounded_clip(&gtk::gsk::RoundedRect::from_rect(rect, 18.));
+    if let Some(texture) = texture {
+        snapshot.append_texture(texture, &rect);
+    } else {
+        snapshot.append_color(&gdk::RGBA::new(0.18, 0.22, 0.32, 1.), &rect);
+    }
+    snapshot.pop();
+}
+
+/// A spoke per band around the cover, as long as the band is loud.
+fn draw_radial(cr: &gtk::cairo::Context, w: f32, h: f32, values: &Levels, color: (f64, f64, f64)) {
+    let radius = cover_size(w, h) as f64 * 0.76;
+    cr.set_line_width((w.min(h) as f64 * 0.006).max(2.));
+    cr.set_line_cap(gtk::cairo::LineCap::Round);
+    for (i, value) in values.bands.iter().enumerate() {
+        let angle = i as f64 / BANDS as f64 * std::f64::consts::TAU - std::f64::consts::FRAC_PI_2;
+        let length = 4. + value * w.min(h) as f64 * 0.14;
+        let (r, g, b) = band_color(color, i as f64 / BANDS as f64, *value);
+        cr.set_source_rgb(r, g, b);
+        cr.move_to(
+            w as f64 / 2. + angle.cos() * radius,
+            h as f64 / 2. + angle.sin() * radius,
+        );
+        cr.line_to(
+            w as f64 / 2. + angle.cos() * (radius + length),
+            h as f64 / 2. + angle.sin() * (radius + length),
+        );
+        let _ = cr.stroke();
+    }
+}
+
+/// How many points each of the rings is drawn through.
+const RING_POINTS: usize = 256;
+
+/// The cosine and sine of each of a ring's points, once.
+fn ring_points() -> &'static [(f64, f64); RING_POINTS + 1] {
+    static POINTS: std::sync::OnceLock<[(f64, f64); RING_POINTS + 1]> = std::sync::OnceLock::new();
+    POINTS.get_or_init(|| {
+        std::array::from_fn(|point| {
+            let angle = point as f64 / RING_POINTS as f64 * std::f64::consts::TAU;
+            (angle.cos(), angle.sin())
+        })
+    })
+}
+
+/// Five waving rings around the cover, each from a fifth of the bands,
+/// turning by `phase` and pushed out by the beat's `punch`.
+fn draw_rings(
+    cr: &gtk::cairo::Context,
+    w: f32,
+    h: f32,
+    values: &Levels,
+    color: (f64, f64, f64),
+    (phase, punch): (f64, f64),
+) {
+    let unit = w.min(h) as f64;
+    let size = cover_size(w, h) as f64;
+    cr.set_line_width((unit * 0.0035).max(1.5));
+    for ring in 0..5 {
+        let first = ring * 12;
+        let energy = values.bands[first..first + 12].iter().sum::<f64>() / 12.;
+        let radius = size * 0.76
+            + ring as f64 * unit * 0.025
+            + punch * unit * 0.008 * (1. + ring as f64 * 0.12);
+        let (r, g, b) = band_color(color, ring as f64 / 5., energy);
+        cr.set_source_rgba(r, g, b, 0.65 + energy * 0.35);
+        let rotation = phase * (1. + ring as f64 * 0.15) * if ring % 2 == 0 { 1. } else { -1. };
+        for (point, (cos, sin)) in ring_points().iter().enumerate() {
+            let angle = point as f64 / RING_POINTS as f64 * std::f64::consts::TAU;
+            let rotated = angle + rotation;
+            let wave = (rotated * (3. + ring as f64 * 2.)).sin()
+                + 0.3 * (rotated * (7. + ring as f64)).sin();
+            let distance = radius + wave * unit * (0.012 + energy * 0.004 + punch * 0.006);
+            let x = w as f64 / 2. + cos * distance;
+            let y = h as f64 / 2. + sin * distance;
+            if point == 0 {
+                cr.move_to(x, y);
+            } else {
+                cr.line_to(x, y);
+            }
+        }
+        cr.close_path();
+        let _ = cr.stroke();
+    }
+}
+
+/// A bar per band, lit from below, with each band's falling peak over
+/// it when `peaks` are shown.
+fn draw_spectrum(
+    cr: &gtk::cairo::Context,
+    w: f32,
+    h: f32,
+    values: &Levels,
+    color: (f64, f64, f64),
+    peaks: Option<&[f64]>,
+) {
+    let margin = (w as f64 * 0.06).max(16.);
+    let bottom = h as f64 * 0.78;
+    let height = h as f64 * 0.55;
+    let step = (w as f64 - 2. * margin) / BANDS as f64;
+    let bar = (step - 3.).max(1.);
+    for (i, value) in values.bands.iter().enumerate() {
+        let x = margin + i as f64 * step;
+        let (r, g, b) = band_color(color, i as f64 / BANDS as f64, *value);
+        let gradient = gtk::cairo::LinearGradient::new(0., bottom, 0., bottom - height);
+        gradient.add_color_stop_rgb(0., r * 0.4, g * 0.4, b * 0.4);
+        gradient.add_color_stop_rgb(0.55, r, g, b);
+        gradient.add_color_stop_rgb(
+            1.,
+            (r + 0.35).min(1.),
+            (g + 0.35).min(1.),
+            (b + 0.35).min(1.),
+        );
+        let _ = cr.set_source(&gradient);
+        cr.rectangle(x, bottom - value * height, bar, (value * height).max(1.));
+        let _ = cr.fill();
+        if let Some(peak) = peaks.and_then(|peaks| peaks.get(i)) {
+            cr.set_source_rgba(0.95, 0.97, 1., 0.8);
+            cr.rectangle(x, bottom - peak * height - 3., bar, 2.);
+            let _ = cr.fill();
+        }
+    }
+}
+
+/// The VU deck's scale, under its meters.
+const VU_LABELS: [&str; 4] = ["−60", "−40", "−20", "0 dBFS"];
+
+/// Two segmented meters, left and right, over a dBFS scale. `labels`
+/// keeps the scale's widths once measured.
+fn draw_vu(
+    cr: &gtk::cairo::Context,
+    w: f32,
+    h: f32,
+    values: &Levels,
+    labels: &Cell<Option<[f64; 4]>>,
+) {
+    let width = (w as f64 * 0.8).min(950.);
+    let x = (w as f64 - width) / 2.;
+    let y = h as f64 / 2.;
+    cr.select_font_face(
+        "Sans",
+        gtk::cairo::FontSlant::Normal,
+        gtk::cairo::FontWeight::Bold,
+    );
+    cr.set_font_size(18.);
+    for (channel, level) in values.rms.iter().enumerate() {
+        let cy = y + (channel as f64 - 0.5) * 90.;
+        cr.set_source_rgb(0.75, 0.8, 0.85);
+        cr.move_to(x, cy + 22.);
+        let _ = cr.show_text(if channel == 0 { "L" } else { "R" });
+        for segment in 0..40 {
+            let amount = segment as f64 / 40.;
+            let lit = amount < *level;
+            let color = if segment > 35 {
+                (1., 0.2, 0.25)
+            } else if segment > 28 {
+                (1., 0.75, 0.2)
+            } else {
+                (0.2, 0.9, 0.6)
+            };
+            cr.set_source_rgba(color.0, color.1, color.2, if lit { 1. } else { 0.12 });
+            cr.rectangle(
+                x + 32. + segment as f64 * (width - 32.) / 40.,
+                cy,
+                (width - 32.) / 40. - 4.,
+                32.,
+            );
+            let _ = cr.fill();
+        }
+    }
+    cr.set_source_rgb(0.55, 0.6, 0.65);
+    cr.set_font_size(14.);
+    let widths = labels.get().unwrap_or_else(|| {
+        let widths = VU_LABELS.map(|label| cr.text_extents(label).map(|e| e.width()).unwrap_or(0.));
+        labels.set(Some(widths));
+        widths
+    });
+    for (i, (label, label_width)) in VU_LABELS.iter().zip(widths).enumerate() {
+        cr.move_to(
+            x + 32. + i as f64 * (width - 32. - label_width) / 3.,
+            y + 115.,
+        );
+        let _ = cr.show_text(label);
+    }
+}
+
+/// How many columns the spectrogram's texture has: 181 thirtieths of a
+/// second, and the newest again, for scrolling between them.
+const WATERFALL_COLUMNS: usize = 182;
+
+/// The spectrogram: the bands over the last six seconds, the newest on
+/// the right, kept as the pixels of a small texture. A new column is
+/// coloured once, as it comes in; the rest move over.
+pub struct Waterfall {
+    /// RGBA, [`WATERFALL_COLUMNS`] wide and [`BANDS`] high, the highest
+    /// band on top.
+    pixels: Vec<u8>,
+    /// Made from `pixels` once drawn after a change.
+    texture: Option<gdk::MemoryTexture>,
+    /// When, on the frame clock, the last column came in; 0 before one.
+    time: f64,
+    /// How far towards the next column it has scrolled, 0 to 1.
+    offset: f64,
+}
+
+impl Default for Waterfall {
+    fn default() -> Self {
+        let [r, g, b] = spectrogram_rgb(0.);
+        Self {
+            pixels: [r, g, b, 255].repeat(WATERFALL_COLUMNS * BANDS),
+            texture: None,
+            time: 0.,
+            offset: 0.,
+        }
+    }
+}
+
+impl Waterfall {
+    /// Empty, as for a new song.
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Scrolls on from the next frame, as for a mode just shown.
+    fn rewind(&mut self) {
+        self.time = 0.;
+        self.offset = 0.;
+    }
+
+    /// Moves on to `now`, `frame` coming in for each thirtieth of a
+    /// second since the last column. The fraction left over is kept:
+    /// snapping to `now` drifts against the display clock and scrolls
+    /// unevenly.
+    fn advance(&mut self, now: f64, frame: &[f64; BANDS]) {
+        let elapsed = if self.time == 0. {
+            1. / 30.
+        } else {
+            (now - self.time).max(0.)
+        };
+        let steps = (elapsed * 30.).floor() as usize;
+        if steps > 0 {
+            self.time = now - (elapsed * 30.).fract() / 30.;
+            for _ in 0..steps.min(WATERFALL_COLUMNS - 1) {
+                self.push(frame);
+            }
+        }
+        self.offset = (elapsed * 30.).fract();
+    }
+
+    /// `frame` as the newest column, the others one to the left.
+    fn push(&mut self, frame: &[f64; BANDS]) {
+        let row = WATERFALL_COLUMNS * 4;
+        for (line, value) in self.pixels.chunks_exact_mut(row).zip(frame.iter().rev()) {
+            line.copy_within(4.., 0);
+            let [r, g, b] = spectrogram_rgb(*value);
+            for pixel in line[row - 8..].as_chunks_mut::<4>().0 {
+                *pixel = [r, g, b, 255];
+            }
+        }
+        self.texture = None;
+    }
+
+    fn draw(&mut self, snapshot: &gtk::Snapshot, bounds: &graphene::Rect) {
+        let texture = self.texture.get_or_insert_with(|| {
+            gdk::MemoryTexture::new(
+                WATERFALL_COLUMNS as i32,
+                BANDS as i32,
+                gdk::MemoryFormat::R8g8b8a8,
+                &glib::Bytes::from(self.pixels.as_slice()),
+                WATERFALL_COLUMNS * 4,
+            )
+        });
+        let step = bounds.width() / 180.;
+        snapshot.push_clip(bounds);
+        snapshot.append_texture(
+            &*texture,
+            &graphene::Rect::new(
+                -step * (1. + self.offset as f32),
+                0.,
+                step * WATERFALL_COLUMNS as f32,
+                bounds.height(),
+            ),
+        );
+        snapshot.pop();
     }
 }
 glib::wrapper! {
@@ -728,7 +1000,7 @@ impl Canvas {
     pub fn new(levels: Measurements) -> Self {
         let obj: Self = glib::Object::builder().build();
         *obj.imp().levels.borrow_mut() = levels;
-        obj.imp().color.set((0.4, 0.65, 0.95));
+        obj.imp().color.set(DEFAULT_TINT);
         obj.imp().show_peaks.set(true);
         obj.set_hexpand(true);
         obj.set_vexpand(true);
@@ -805,27 +1077,7 @@ impl Canvas {
                 }
             }
             if imp.mode.get() == Mode::Spectrogram {
-                let previous = imp.history_time.get();
-                let elapsed = if previous == 0. {
-                    1. / 30.
-                } else {
-                    (now - previous).max(0.)
-                };
-                let steps = (elapsed * 30.).floor() as usize;
-                if steps > 0 {
-                    // Preserve the fractional remainder; snapping to `now` drifts
-                    // against the display clock and produces uneven scrolling.
-                    imp.history_time.set(now - (elapsed * 30.).fract() / 30.);
-                    let mut history = imp.history.borrow_mut();
-                    for _ in 0..steps.min(181) {
-                        history.push_back(frame.bands);
-                        if history.len() > 181 {
-                            history.pop_front();
-                        }
-                    }
-                    imp.history_texture.borrow_mut().take();
-                }
-                imp.history_offset.set((elapsed * 30.).fract());
+                imp.waterfall.borrow_mut().advance(now, &frame.bands);
             }
         }
         obj.queue_draw();
@@ -838,44 +1090,61 @@ impl Canvas {
     }
     pub fn set_mode(&self, mode: Mode) {
         self.imp().mode.set(mode);
-        self.imp().history_time.set(0.);
-        self.imp().history_offset.set(0.);
+        self.imp().waterfall.borrow_mut().rewind();
         self.queue_draw();
     }
     pub fn set_peaks(&self, enabled: bool) {
         self.imp().show_peaks.set(enabled);
     }
-    pub fn set_texture(&self, texture: Option<gdk::Texture>) {
-        self.imp()
-            .color
-            .set(texture.as_ref().map(art_color).unwrap_or((0.4, 0.65, 0.95)));
-        self.imp().history.borrow_mut().clear();
-        self.imp().history_texture.borrow_mut().take();
-        self.imp().history_time.set(0.);
-        self.imp().history_offset.set(0.);
+    pub fn mode(&self) -> Mode {
+        self.imp().mode.get()
+    }
+
+    /// A new song: the spectrogram starts empty.
+    pub fn new_song(&self) {
+        self.imp().waterfall.borrow_mut().reset();
+        self.queue_draw();
+    }
+
+    /// The album's cover, for the modes that draw it; a plain tile
+    /// without.
+    pub fn set_cover(&self, texture: Option<gdk::Texture>) {
         *self.imp().texture.borrow_mut() = texture;
         self.queue_draw();
     }
+
+    /// The colours' tint, from the album's cover (a small one does), or
+    /// the canvas's own blue without.
+    pub fn set_tint(&self, cover: Option<&gdk::Texture>) {
+        self.imp()
+            .color
+            .set(cover.map(art_color).unwrap_or(DEFAULT_TINT));
+        self.queue_draw();
+    }
 }
+/// The linear power of each of the spectrum's `levels` (dB, with -60
+/// its floor), into `out`: what the bands and the rhythm are read from.
+fn power_spectrum(levels: impl IntoIterator<Item = f64>, out: &mut Vec<f64>) {
+    out.clear();
+    out.extend(levels.into_iter().map(|db| {
+        if db.is_finite() && db > -60. {
+            10f64.powf(db.min(0.) / 10.)
+        } else {
+            0.
+        }
+    }));
+}
+
 /// Integrate linearly interpolated FFT power over each logarithmic band.
 /// This includes partial bins, so bands narrower than the FFT resolution do
 /// not become artificial black stripes. It does not invent extra resolution.
-fn logarithmic_bands(raw: &[f64], rate: f64) -> [f64; BANDS] {
-    if raw.len() < 2 || !rate.is_finite() || rate <= 40. {
+/// The first bin, the DC offset, counts for nothing.
+fn logarithmic_bands(power: &[f64], rate: f64) -> [f64; BANDS] {
+    if power.len() < 2 || !rate.is_finite() || rate <= 40. {
         return [0.; BANDS];
     }
-    let bin_hz = rate / (2. * (raw.len() - 1) as f64);
-    let power: Vec<_> = raw
-        .iter()
-        .enumerate()
-        .map(|(i, db)| {
-            if i > 0 && db.is_finite() && *db > -60. {
-                10f64.powf(db.min(0.) / 10.)
-            } else {
-                0.
-            }
-        })
-        .collect();
+    let bin_hz = rate / (2. * (power.len() - 1) as f64);
+    let at = |bin: usize| if bin == 0 { 0. } else { power[bin] };
     std::array::from_fn(|i| {
         let low = 20. * 1000f64.powf(i as f64 / BANDS as f64);
         let high = (20. * 1000f64.powf((i + 1) as f64 / BANDS as f64)).min(rate / 2.);
@@ -885,11 +1154,11 @@ fn logarithmic_bands(raw: &[f64], rate: f64) -> [f64; BANDS] {
         let start = low / bin_hz;
         let end = high / bin_hz;
         let mut integral = 0.;
-        for bin in start.floor() as usize..(end.ceil() as usize).min(raw.len() - 1) {
+        for bin in start.floor() as usize..(end.ceil() as usize).min(power.len() - 1) {
             let left = (start - bin as f64).max(0.);
             let right = (end - bin as f64).min(1.);
-            let slope = power[bin + 1] - power[bin];
-            integral += (right - left) * (power[bin] + slope * (left + right) / 2.);
+            let slope = at(bin + 1) - at(bin);
+            integral += (right - left) * (at(bin) + slope * (left + right) / 2.);
         }
         let average = integral / (end - start);
         if average > 0. {
@@ -900,35 +1169,13 @@ fn logarithmic_bands(raw: &[f64], rate: f64) -> [f64; BANDS] {
     })
 }
 
-/// One small texture per analysis update, instead of thousands of Cairo draws
-/// per display frame. Extra columns permit seamless fractional scrolling.
-fn waterfall_texture(history: &std::collections::VecDeque<[f64; BANDS]>) -> gdk::MemoryTexture {
-    let mut pixels = Vec::with_capacity(182 * BANDS * 4);
-    for band in (0..BANDS).rev() {
-        for column in 0..182usize {
-            let index = column
-                .min(180)
-                .checked_sub(181usize.saturating_sub(history.len()));
-            let value = index
-                .and_then(|i| history.get(i))
-                .map(|frame| frame[band])
-                .unwrap_or(0.);
-            let (r, g, b) = spectrogram_color(value);
-            pixels.extend([(r * 255.) as u8, (g * 255.) as u8, (b * 255.) as u8, 255]);
-        }
-    }
-    gdk::MemoryTexture::new(
-        182,
-        BANDS as i32,
-        gdk::MemoryFormat::R8g8b8a8,
-        &glib::Bytes::from_owned(pixels),
-        182 * 4,
-    )
-}
+/// The canvas's colours without a cover to tint them.
+const DEFAULT_TINT: (f64, f64, f64) = (0.4, 0.65, 0.95);
+
+/// The cover's colour: its pixels on a 32×32 grid, the more saturated
+/// counting more.
 fn art_color(texture: &gdk::Texture) -> (f64, f64, f64) {
-    let mut downloader = gdk::TextureDownloader::new(texture);
-    downloader.set_format(gdk::MemoryFormat::R8g8b8a8);
-    let (bytes, stride) = downloader.download_bytes();
+    let (bytes, stride) = crate::artwork::pixels(texture, gdk::MemoryFormat::R8g8b8a8);
     let mut sum = [0.; 3];
     let mut count = 0.;
     for y in (0..texture.height() as usize).step_by((texture.height() as usize / 32).max(1)) {
@@ -952,7 +1199,7 @@ fn art_color(texture: &gdk::Texture) -> (f64, f64, f64) {
     }
     let max = sum.iter().copied().fold(0., f64::max);
     if count == 0. || max == 0. {
-        return (0.4, 0.65, 0.95);
+        return DEFAULT_TINT;
     }
     // Keep even dark album colors legible against the dark canvas.
     let scale = (0.85 / (max / count)).max(1.);
@@ -976,6 +1223,29 @@ fn band_color(album: (f64, f64, f64), band: f64, energy: f64) -> (f64, f64, f64)
         channel(2. / 3., album.1),
         channel(1. / 3., album.2),
     )
+}
+
+/// How finely [`spectrogram_rgb`] tells levels apart.
+const SPECTROGRAM_SHADES: usize = 1024;
+
+/// [`spectrogram_color`] as a pixel's bytes, from a table made once: a
+/// column of the spectrogram is coloured without a `powf` per pixel.
+fn spectrogram_rgb(value: f64) -> [u8; 3] {
+    static SHADES: std::sync::OnceLock<Vec<[u8; 3]>> = std::sync::OnceLock::new();
+    let shades = SHADES.get_or_init(|| {
+        (0..=SPECTROGRAM_SHADES)
+            .map(|i| {
+                let (r, g, b) = spectrogram_color(i as f64 / SPECTROGRAM_SHADES as f64);
+                [(r * 255.) as u8, (g * 255.) as u8, (b * 255.) as u8]
+            })
+            .collect()
+    });
+    let value = if value.is_finite() {
+        value.clamp(0., 1.)
+    } else {
+        0.
+    };
+    shades[(value * SPECTROGRAM_SHADES as f64).round() as usize]
 }
 
 /// A brighter heat map with a gentle lift for quiet detail. Silence remains
@@ -1314,7 +1584,9 @@ mod tests {
             ]),
             8,
         );
-        canvas.set_texture(Some(texture.upcast()));
+        let texture: gdk::Texture = texture.upcast();
+        canvas.set_tint(Some(&texture));
+        canvas.set_cover(Some(texture));
         let bands = std::array::from_fn(|i| ((i as f64 * 0.3).sin() * 0.35 + 0.5).max(0.));
         canvas.imp().frame.borrow_mut().bands = bands;
         canvas.imp().frame.borrow_mut().rms = [0.68, 0.82];
@@ -1322,9 +1594,9 @@ mod tests {
         for i in 0..180 {
             canvas
                 .imp()
-                .history
+                .waterfall
                 .borrow_mut()
-                .push_back(std::array::from_fn(|j| {
+                .push(&std::array::from_fn(|j| {
                     ((i as f64 * 0.1 + j as f64 * 0.15).sin() * 0.4 + 0.5).max(0.)
                 }));
         }
@@ -1439,14 +1711,8 @@ mod tests {
         );
         let _ = input.emit_by_name::<gst::FlowReturn>("end-of-stream", &[]);
         let (sender, receiver) = std::sync::mpsc::sync_channel(10);
-        let mut collector = RhythmInput {
-            frames: Default::default(),
-            count: 0,
-            generation: 0,
-            last_time: None,
-            interval: 0.,
-            sender,
-        };
+        let mut collector = RhythmInput::new(sender);
+        let mut power = Vec::new();
         let bus = pipeline.bus().unwrap();
         loop {
             let message = bus
@@ -1458,15 +1724,15 @@ mod tests {
                 gst::MessageView::Element(_) => {
                     let structure = message.structure().unwrap();
                     if let Ok(magnitudes) = structure.get::<gst::List>("magnitude") {
-                        let raw: Vec<f64> = magnitudes
-                            .iter()
-                            .map(|v| v.get::<f32>().unwrap() as f64)
-                            .collect();
+                        power_spectrum(
+                            magnitudes.iter().map(|v| v.get::<f32>().unwrap() as f64),
+                            &mut power,
+                        );
                         collector.push(
-                            &raw,
+                            &power,
                             structure.get("timestamp").unwrap(),
                             structure.get("duration").unwrap(),
-                            1,
+                            Stamp(1),
                             Instant::now(),
                         );
                     }
@@ -1476,7 +1742,7 @@ mod tests {
         }
         pipeline.set_state(gst::State::Null).unwrap();
         let window = receiver.try_iter().last().expect("analysis window");
-        let result = analyze_rhythm(&window.frames, window.interval);
+        let result = analyze_rhythm(&window.split(), window.interval);
         eprintln!("PCM clicks through GStreamer: {result:?}");
         let (bpm, _) = result.expect("beat grid");
         assert!((bpm - 120.).abs() < 5.);
@@ -1489,7 +1755,7 @@ mod tests {
                 let mut raw = vec![f64::NEG_INFINITY; 8192];
                 let bin = (hz * 2. * raw.len() as f64 / rate).round() as usize;
                 raw[bin] = 0.;
-                let bands = logarithmic_bands(&raw, rate);
+                let bands = logarithmic_bands(&power_of(&raw), rate);
                 let active: Vec<_> = bands.iter().enumerate().filter(|(_, v)| **v > 0.).collect();
                 assert!(!active.is_empty());
                 assert!(active.len() <= 3, "one tone should remain localized");
@@ -1501,14 +1767,49 @@ mod tests {
         assert_eq!(logarithmic_bands(&[], 44100.), [0.; BANDS]);
         let mut dc = vec![f64::NEG_INFINITY; 8192];
         dc[0] = 0.;
-        assert_eq!(logarithmic_bands(&dc, 44100.), [0.; BANDS]);
+        assert_eq!(logarithmic_bands(&power_of(&dc), 44100.), [0.; BANDS]);
         for rate in [44100., 48000., 96000., 192000.] {
-            let flat = logarithmic_bands(&vec![-30.; 8193], rate);
+            let flat = logarithmic_bands(&power_of(&vec![-30.; 8193]), rate);
             assert!(
                 flat.iter().all(|v| (*v - 0.5).abs() < 1e-9),
                 "blank row at {rate} Hz: {flat:?}"
             );
         }
+    }
+
+    fn power_of(levels: &[f64]) -> Vec<f64> {
+        let mut power = Vec::new();
+        power_spectrum(levels.iter().copied(), &mut power);
+        power
+    }
+
+    /// The rhythm gets the last twelve seconds of frames, oldest first,
+    /// in one piece, and starts again on a spectrum of another size.
+    #[test]
+    fn the_rhythm_window_is_the_last_frames_in_order() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(100);
+        let mut input = RhythmInput::new(sender);
+        let frame = 33_333_333;
+        let push = |input: &mut RhythmInput, n: u64, size: usize| {
+            let power = vec![(n as f64).powi(2); size];
+            input.push(&power, n * frame, frame, Stamp(1), Instant::now());
+        };
+        for n in 0..420 {
+            push(&mut input, n, 512);
+        }
+        let window = receiver.try_iter().last().expect("a window");
+        let frames = window.split();
+        assert_eq!(
+            (
+                frames.len(),
+                frames[0].len(),
+                frames[0][0],
+                frames[359][255]
+            ),
+            (RHYTHM_FRAMES, 256, 60., 419.)
+        );
+        push(&mut input, 420, 8193);
+        assert_eq!((input.width, input.frames.len()), (249, 249));
     }
 
     /// Paused, the canvas draws until the bars have fallen, then stops.
@@ -1532,6 +1833,110 @@ mod tests {
             !settled(&Levels::default(), 0.2),
             "a beat's punch still moves"
         );
+    }
+
+    /// The spectrogram's colours from the table are those worked out
+    /// for each pixel, to a few shades in the darkest quiet.
+    #[test]
+    fn the_spectrograms_shades_are_its_colours() {
+        let exact = |value: f64| {
+            let (r, g, b) = spectrogram_color(value);
+            [r, g, b].map(|c| (c * 255.) as u8 as i32)
+        };
+        for i in 0..=10_000 {
+            let value = i as f64 / 10_000.;
+            let shade = spectrogram_rgb(value).map(i32::from);
+            let off = shade
+                .iter()
+                .zip(exact(value))
+                .map(|(a, b)| (a - b).abs())
+                .max()
+                .unwrap();
+            let allowed = if value < 0.01 { 5 } else { 1 };
+            assert!(off <= allowed, "{value}: {shade:?} for {:?}", exact(value));
+        }
+        assert_eq!(spectrogram_rgb(f64::NAN), spectrogram_rgb(0.));
+        assert_eq!(spectrogram_rgb(2.), spectrogram_rgb(1.));
+    }
+
+    /// The colour of each column of the spectrogram's top row.
+    fn top_row(waterfall: &Waterfall) -> Vec<[u8; 3]> {
+        waterfall.pixels[..WATERFALL_COLUMNS * 4]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|p| [p[0], p[1], p[2]])
+            .collect()
+    }
+
+    #[test]
+    fn a_new_column_comes_in_on_the_right_and_the_rest_move_left() {
+        let mut waterfall = Waterfall::default();
+        let silence = spectrogram_rgb(0.);
+        let (mut loud, mut soft) = ([0.; BANDS], [0.; BANDS]);
+        loud[BANDS - 1] = 1.;
+        soft[BANDS - 1] = 0.5;
+        waterfall.push(&loud);
+        waterfall.push(&soft);
+        let row = top_row(&waterfall);
+        let last = WATERFALL_COLUMNS - 1;
+        assert_eq!(
+            (row[last], row[last - 1], row[last - 2], row[last - 3]),
+            (
+                spectrogram_rgb(0.5),
+                spectrogram_rgb(0.5),
+                spectrogram_rgb(1.),
+                silence
+            )
+        );
+        // The lowest band is the bottom row.
+        let bottom = &waterfall.pixels[(BANDS - 1) * WATERFALL_COLUMNS * 4..];
+        assert_eq!(bottom[(last) * 4..last * 4 + 3], silence);
+    }
+
+    #[test]
+    fn a_reset_spectrogram_is_silent_and_scrolls_from_its_next_frame() {
+        let mut waterfall = Waterfall::default();
+        waterfall.advance(10., &[1.; BANDS]);
+        waterfall.advance(10.05, &[1.; BANDS]);
+        assert_eq!(top_row(&waterfall).last(), Some(&spectrogram_rgb(1.)));
+        assert!(waterfall.offset > 0.);
+        waterfall.reset();
+        assert!(
+            top_row(&waterfall)
+                .iter()
+                .all(|c| *c == spectrogram_rgb(0.))
+        );
+        assert_eq!((waterfall.time, waterfall.offset), (0., 0.));
+    }
+
+    /// A stall of seconds fills the spectrogram once over, no more.
+    #[test]
+    fn a_long_gap_adds_no_more_columns_than_there_are() {
+        let mut waterfall = Waterfall::default();
+        waterfall.advance(1., &[0.; BANDS]);
+        waterfall.advance(100., &[1.; BANDS]);
+        assert!(
+            top_row(&waterfall)
+                .iter()
+                .all(|c| *c == spectrogram_rgb(1.))
+        );
+    }
+
+    #[test]
+    fn each_reset_starts_a_new_epoch_and_turning_keeps_whether_it_is_on() {
+        let epoch = Epoch::default();
+        let off = epoch.now();
+        epoch.turn(true);
+        let on = epoch.now();
+        epoch.bump();
+        let reset = epoch.now();
+        epoch.turn(false);
+        assert_eq!(
+            [off.is_on(), on.is_on(), reset.is_on(), epoch.now().is_on()],
+            [false, true, true, false]
+        );
+        assert!(off != on && on != reset && reset != epoch.now());
     }
 
     #[test]

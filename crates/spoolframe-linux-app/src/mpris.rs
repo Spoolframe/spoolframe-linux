@@ -269,6 +269,7 @@ impl Mpris {
             | Change::Stopped
             | Change::SignedOut
             | Change::PlaylistFinished(_)
+            | Change::VisualizerStopped
             | Change::Skipped(_)
             | Change::TrackFailed(_)
             | Change::Offer(_)

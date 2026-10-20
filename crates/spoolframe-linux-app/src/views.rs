@@ -1,6 +1,7 @@
 //! Widgets built from the media model, laid out as in the UI mockups. Tiles
 //! start as coloured placeholders; artwork replaces them as it loads.
 
+use std::cell::RefCell;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::rc::Rc;
 
@@ -103,14 +104,6 @@ pub(crate) const TILE_HUES: [&str; 8] = [
 /// in the heading. The wheel over the row scrolls the row (see
 /// [`wheel_scrolls_row`]); elsewhere it scrolls the page.
 pub fn row(title: &str, cards: impl IntoIterator<Item = gtk::Widget>) -> gtk::Box {
-    row_with_action(title, cards, None)
-}
-
-pub fn row_with_action(
-    title: &str,
-    cards: impl IntoIterator<Item = gtk::Widget>,
-    action: Option<&gtk::Button>,
-) -> gtk::Box {
     // Cards keep their own width: a caption's hexpand would otherwise
     // stretch a lone card across the row.
     let cards_box = gtk::Box::builder()
@@ -134,9 +127,6 @@ pub fn row_with_action(
     // In line with the cards, which sit inside the row's side room.
     header.set_margin_start(LIFT_SIDE);
     header.append(&heading(title));
-    if let Some(action) = action {
-        header.append(action);
-    }
     header.append(&back);
     header.append(&forward);
 
@@ -736,6 +726,28 @@ pub fn menu_button(popover: &gtk::Popover, tooltip: &str) -> gtk::MenuButton {
 /// `widget`. While it shows, the widget keeps its hover look (a card stays
 /// lifted).
 pub fn context_menu(widget: &gtk::Widget, popover: &gtk::Popover) {
+    attach_menu(widget, popover);
+    let popover = popover.clone();
+    menu_gestures(widget, move |_| Some(popover.clone()));
+}
+
+/// [`context_menu`] with the popover built by `build` when it is first
+/// opened: each row of a long list need not make one it may never show.
+pub fn lazy_context_menu(widget: &gtk::Widget, build: impl Fn() -> gtk::Popover + 'static) {
+    let built: RefCell<Option<gtk::Popover>> = RefCell::default();
+    menu_gestures(widget, move |widget| {
+        let mut built = built.borrow_mut();
+        let popover = built.get_or_insert_with(|| {
+            let popover = build();
+            attach_menu(widget, &popover);
+            popover
+        });
+        Some(popover.clone())
+    });
+}
+
+/// `popover` as `widget`'s menu: its child, marking it while open.
+fn attach_menu(widget: &gtk::Widget, popover: &gtk::Popover) {
     popover.set_parent(widget);
     {
         let widget = widget.downgrade();
@@ -754,9 +766,20 @@ pub fn context_menu(widget: &gtk::Widget, popover: &gtk::Popover) {
         let popover = popover.clone();
         widget.connect_destroy(move |_| popover.unparent());
     }
+}
+
+/// Opens the popover `menu` gives for `widget` where it is right-clicked
+/// or long-pressed.
+fn menu_gestures(
+    widget: &gtk::Widget,
+    menu: impl Fn(&gtk::Widget) -> Option<gtk::Popover> + 'static,
+) {
     let open_at = {
-        let popover = popover.clone();
+        let (widget, menu) = (widget.downgrade(), Rc::new(menu));
         move |x: f64, y: f64| {
+            let Some(popover) = widget.upgrade().and_then(|widget| menu(&widget)) else {
+                return;
+            };
             popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
             popover.popup();
         }

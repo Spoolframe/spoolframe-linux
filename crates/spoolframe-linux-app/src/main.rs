@@ -213,6 +213,7 @@ const FEATURES: sdk::Features = sdk::Features {
     playlist_sharing: true,
     play_history: true,
     playlist_art: true,
+    playlist_upcoming: true,
     subtitle_sync: true,
     subtitle_search: true,
 };
@@ -293,6 +294,7 @@ mod tests {
                 playlist_sharing: true,
                 play_history: true,
                 playlist_art: true,
+                playlist_upcoming: true,
                 subtitle_sync: true,
                 subtitle_search: true,
             }

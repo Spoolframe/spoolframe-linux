@@ -8,6 +8,7 @@
 //! so lines from a summary say whose it is and what it holds, never how
 //! many.
 
+use std::ops::ControlFlow;
 use std::time::Duration;
 
 use spoolframe_types::{Item, MediaId, MediaKind};
@@ -21,13 +22,32 @@ use crate::backend::{
 /// The most entries a page of a playlist holds.
 pub const PAGE: u32 = 200;
 
+/// A playlist's name, or what is typed to search them, as a search
+/// compares it: lowercase, without the spaces around it.
+pub fn search_text(text: &str) -> String {
+    text.trim().to_lowercase()
+}
+
+/// Whether a playlist whose name is `name` shows for a search of `query`,
+/// both as [`search_text`] gives them: its name holds what is typed. An
+/// empty search shows every one.
+pub fn matches_query(name: &str, query: &str) -> bool {
+    name.contains(query)
+}
+
+/// Whether a playlist of `kinds` holds music and nothing else: it plays
+/// as music does, with no place kept and no watched to skip.
+pub fn music_only(kinds: Kinds) -> bool {
+    kinds.tracks && !kinds.movies && !kinds.episodes
+}
+
 /// Watch-state skipping is a video option. Clear a previously saved value
 /// for music-only playlists as well as hiding its control in the UI.
 pub fn play_settings(
     kinds: Kinds,
     mut settings: crate::backend::PlaySettings,
 ) -> crate::backend::PlaySettings {
-    if kinds.tracks && !kinds.movies && !kinds.episodes {
+    if music_only(kinds) {
         settings.skip_watched = false;
     }
     settings
@@ -305,7 +325,8 @@ pub fn title(item: &Item) -> String {
     }
 }
 
-fn watched(item: &Item) -> bool {
+/// Whether the user has watched (or played to its end) `item`.
+pub fn watched(item: &Item) -> bool {
     match item {
         Item::Movie(m) => m.playback.watched,
         Item::Episode(e) => e.playback.watched,
@@ -504,16 +525,78 @@ pub async fn add_item(
     }];
     edit_retrying(session, id, head.playlist.revision, add).await?;
     let mut after = Vec::new();
+    for_each_page(session, id, from, PAGE, |page| {
+        after.extend(entry_ids(&page));
+        ControlFlow::<()>::Continue(())
+    })
+    .await?;
+    Ok(added_entries(&before, &after))
+}
+
+/// Reads playlist `id` from entry `from` to its end, `size` entries a
+/// page, handing each page to `each` until it breaks: what it broke
+/// with, or `None` at the end.
+pub async fn for_each_page<B>(
+    session: &dyn Session,
+    id: &str,
+    from: u32,
+    size: u32,
+    mut each: impl FnMut(PlaylistPage) -> ControlFlow<B>,
+) -> Result<Option<B>, BackendError> {
     let mut offset = from;
     loop {
-        let page = session.playlist(id, offset, PAGE).await?;
-        after.extend(entry_ids(&page));
-        offset += page.entries.len() as u32;
-        if page.entries.is_empty() || offset >= page.total {
-            break;
+        let page = session.playlist(id, offset, size).await?;
+        let read = page.offset + page.entries.len() as u32;
+        let end = page.entries.is_empty() || read >= page.total;
+        if let ControlFlow::Break(done) = each(page) {
+            return Ok(Some(done));
         }
+        if end {
+            return Ok(None);
+        }
+        offset = read;
     }
-    Ok(added_entries(&before, &after))
+}
+
+/// How many entries from a random place Play random looks through for
+/// one that can play, before it reads the whole list for one.
+const RANDOM_LOOK: u32 = 20;
+
+/// An entry of playlist `id` that can play, at random (Play random);
+/// `random(n)` is a number below `n`. It reads one page from a random
+/// place, not the whole list: an entry that cannot play gives the next
+/// that can. Only past [`RANDOM_LOOK`] of them in a row is every entry
+/// read, to choose among those that can play. `None` when none can.
+pub async fn random_entry(
+    session: &dyn Session,
+    id: &str,
+    mut random: impl FnMut(u32) -> u32,
+) -> Result<Option<EntryId>, BackendError> {
+    let head = session.playlist(id, 0, 1).await?;
+    if head.total == 0 {
+        return Ok(None);
+    }
+    let at = random(head.total).min(head.total - 1);
+    let near = session.playlist(id, at, RANDOM_LOOK).await?;
+    if let Some(entry) = near.entries.iter().find(|e| !e.unavailable) {
+        return Ok(Some(entry.entry));
+    }
+    let mut playable = Vec::new();
+    for_each_page(session, id, 0, PAGE, |page| {
+        playable.extend(
+            page.entries
+                .iter()
+                .filter(|e| !e.unavailable)
+                .map(|e| e.entry),
+        );
+        ControlFlow::<()>::Continue(())
+    })
+    .await?;
+    if playable.is_empty() {
+        return Ok(None);
+    }
+    let pick = (random(playable.len() as u32) as usize).min(playable.len() - 1);
+    Ok(Some(playable[pick]))
 }
 
 fn entry_ids(page: &PlaylistPage) -> Vec<EntryId> {
@@ -736,6 +819,39 @@ mod tests {
         futures::executor::block_on(future)
     }
 
+    #[test]
+    fn a_search_finds_a_name_holding_it_whatever_its_case() {
+        let name = search_text("Movie Night ");
+        assert_eq!(
+            [
+                matches_query(&name, &search_text("  NIGHT")),
+                matches_query(&name, &search_text("movie n")),
+                matches_query(&name, &search_text("")),
+                matches_query(&name, &search_text("nights")),
+            ],
+            [true, true, true, false]
+        );
+    }
+
+    #[test]
+    fn only_a_playlist_of_tracks_alone_is_music_only() {
+        let kinds = |movies, episodes, tracks| Kinds {
+            movies,
+            episodes,
+            tracks,
+        };
+        assert_eq!(
+            [
+                music_only(kinds(false, false, true)),
+                music_only(kinds(true, false, true)),
+                music_only(kinds(false, true, true)),
+                music_only(kinds(false, true, false)),
+                music_only(kinds(false, false, false)),
+            ],
+            [true, false, false, false, false]
+        );
+    }
+
     fn media(kind: MediaKind, key: &str) -> MediaId {
         MediaId::new(Namespace::Plex, kind, key).unwrap()
     }
@@ -941,6 +1057,80 @@ mod tests {
                 "3 episodes · 2 playable".to_owned()
             )
         );
+    }
+
+    /// The heists' entries, by their episode's key.
+    fn heists(client: &FakeClient) -> (Arc<dyn Session>, String, Vec<EntryId>) {
+        let andrey = session(client, "andrey");
+        let list = ready(andrey.playlists()).unwrap().playlists;
+        let id = named(&list, "Andor: the heists").id.clone();
+        let entries = page(andrey.as_ref(), &id)
+            .entries
+            .iter()
+            .map(|e| e.entry)
+            .collect();
+        (andrey, id, entries)
+    }
+
+    #[test]
+    fn a_random_pick_is_the_entry_at_a_random_place() {
+        let client = FakeClient::new(None);
+        let (andrey, id, entries) = heists(&client);
+        let picked = ready(random_entry(andrey.as_ref(), &id, |n| n - 2)).unwrap();
+        assert_eq!(picked, Some(entries[1]));
+    }
+
+    #[test]
+    fn a_random_pick_of_an_entry_that_cannot_play_is_the_next_that_can() {
+        let client = FakeClient::new(None);
+        let (andrey, id, entries) = heists(&client);
+        client.make_unavailable(&media(MediaKind::Episode, "64"));
+        let picked = ready(random_entry(andrey.as_ref(), &id, |_| 0)).unwrap();
+        assert_eq!(picked, Some(entries[1]));
+    }
+
+    #[test]
+    fn a_random_pick_past_the_last_that_can_play_chooses_among_them_all() {
+        let client = FakeClient::new(None);
+        let (andrey, id, entries) = heists(&client);
+        client.make_unavailable(&media(MediaKind::Episode, "72"));
+        // The last place first; then the second of the two that play.
+        let mut asked = Vec::new();
+        let picked = ready(random_entry(andrey.as_ref(), &id, |n| {
+            asked.push(n);
+            n - 1
+        }))
+        .unwrap();
+        assert_eq!((picked, asked), (Some(entries[1]), vec![3, 2]));
+    }
+
+    #[test]
+    fn a_random_pick_where_nothing_can_play_is_none() {
+        let client = FakeClient::new(None);
+        let (andrey, id, _) = heists(&client);
+        for key in ["64", "65", "72"] {
+            client.make_unavailable(&media(MediaKind::Episode, key));
+        }
+        let picked = ready(random_entry(andrey.as_ref(), &id, |_| 0)).unwrap();
+        assert_eq!(picked, None);
+    }
+
+    #[test]
+    fn every_page_is_read_from_where_asked_until_told_to_stop() {
+        let client = FakeClient::new(None);
+        let (andrey, id, entries) = heists(&client);
+        let mut seen = Vec::new();
+        let stopped = ready(for_each_page(andrey.as_ref(), &id, 1, 1, |page| {
+            seen.extend(page.entries.iter().map(|e| e.entry));
+            ControlFlow::<()>::Continue(())
+        }))
+        .unwrap();
+        assert_eq!((stopped, seen), (None, entries[1..].to_vec()));
+        let first = ready(for_each_page(andrey.as_ref(), &id, 0, 1, |page| {
+            ControlFlow::Break(page.entries[0].entry)
+        }))
+        .unwrap();
+        assert_eq!(first, Some(entries[0]));
     }
 
     #[test]
@@ -1163,31 +1353,369 @@ mod tests {
     }
 
     #[test]
-    fn shuffle_with_repeat_all_plays_every_entry_once_per_round() {
+    fn shuffle_with_repeat_all_replays_the_same_round() {
+        let client = FakeClient::new(None);
+        let andrey = session(&client, "andrey");
+        let (all, entries) = all_entries(andrey.as_ref());
+        let first = ready(andrey.play_playlist(&all, None, PlaySettings::default()))
+            .unwrap()
+            .unwrap();
+        ready(andrey.set_playlist_settings(
+            &all,
+            PlaySettings {
+                repeat: Repeat::All,
+                ..shuffled()
+            },
+        ))
+        .unwrap();
+        let mut played = vec![first.entry];
+        played.extend(next_n(
+            andrey.as_ref(),
+            &all,
+            first.entry,
+            2 * entries.len() - 1,
+        ));
+        let (one, two) = played.split_at(entries.len());
+        assert_eq!(
+            (each_once(one.to_vec(), &entries), one),
+            (true, two),
+            "played {played:?} of {entries:?}"
+        );
+    }
+
+    /// Shuffled, once through.
+    fn shuffled() -> PlaySettings {
+        PlaySettings {
+            shuffle: true,
+            ..PlaySettings::default()
+        }
+    }
+
+    /// The entries `first` and each next after it play, to the end.
+    fn played_from(andrey: &dyn Session, id: &str, first: Option<PlaylistNext>) -> Vec<EntryId> {
+        let (mut played, mut next) = (Vec::new(), first);
+        while let Some(now) = next {
+            played.push(now.entry);
+            assert!(played.len() <= 20, "no end: {played:?}");
+            next = ready(andrey.next_in_playlist(id, now.entry)).unwrap();
+        }
+        played
+    }
+
+    /// Each of `entries` once, in any order.
+    fn each_once(mut played: Vec<EntryId>, entries: &[EntryId]) -> bool {
+        let mut entries = entries.to_vec();
+        played.sort_unstable();
+        entries.sort_unstable();
+        played == entries
+    }
+
+    #[test]
+    fn shuffle_from_an_entry_plays_it_first_then_every_other_entry_once() {
         let client = FakeClient::new(None);
         let andrey = session(&client, "andrey");
         let list = ready(andrey.playlists()).unwrap().playlists;
         let heists = named(&list, "Andor: the heists").id.clone();
-        let settings = PlaySettings {
-            shuffle: true,
-            repeat: Repeat::All,
-            skip_watched: false,
-        };
-        let mut now = ready(andrey.play_playlist(&heists, None, settings))
+        let entries: Vec<EntryId> = page(andrey.as_ref(), &heists)
+            .entries
+            .iter()
+            .map(|e| e.entry)
+            .collect();
+        let last = *entries.last().unwrap();
+        let first = ready(andrey.play_playlist(&heists, Some(last), shuffled())).unwrap();
+        let played = played_from(andrey.as_ref(), &heists, first);
+        assert_eq!(
+            (played[0], each_once(played.clone(), &entries)),
+            (last, true),
+            "played {played:?} of {entries:?}"
+        );
+    }
+
+    #[test]
+    fn a_play_without_an_entry_keeps_the_shuffled_round_and_its_place() {
+        let client = FakeClient::new(None);
+        let andrey = session(&client, "andrey");
+        let list = ready(andrey.playlists()).unwrap().playlists;
+        let heists = named(&list, "Andor: the heists").id.clone();
+        let entries: Vec<EntryId> = page(andrey.as_ref(), &heists)
+            .entries
+            .iter()
+            .map(|e| e.entry)
+            .collect();
+        let start = ready(andrey.play_playlist(&heists, Some(entries[2]), shuffled()))
             .unwrap()
             .unwrap();
-        let mut played = vec![now.entry];
-        for _ in 0..5 {
-            now = ready(andrey.next_in_playlist(&heists, now.entry))
+        let second = ready(andrey.next_in_playlist(&heists, start.entry))
+            .unwrap()
+            .unwrap();
+        // Repeat changed, as a save of the modes sends it.
+        let resumed = ready(andrey.play_playlist(
+            &heists,
+            None,
+            PlaySettings {
+                repeat: Repeat::One,
+                ..shuffled()
+            },
+        ))
+        .unwrap()
+        .unwrap();
+        ready(andrey.play_playlist(&heists, None, shuffled())).unwrap();
+        let mut played = vec![start.entry];
+        played.extend(played_from(andrey.as_ref(), &heists, Some(resumed.clone())));
+        assert_eq!(
+            (resumed.entry, each_once(played.clone(), &entries)),
+            (second.entry, true),
+            "played {played:?} of {entries:?}"
+        );
+    }
+
+    /// What the server does, and so what a save of the modes must not
+    /// send while shuffling: an entry starts a new round at it, and the
+    /// entries already played come round again.
+    #[test]
+    fn a_play_from_an_entry_while_shuffling_starts_a_new_round() {
+        let client = FakeClient::new(None);
+        let andrey = session(&client, "andrey");
+        let list = ready(andrey.playlists()).unwrap().playlists;
+        let heists = named(&list, "Andor: the heists").id.clone();
+        let entries: Vec<EntryId> = page(andrey.as_ref(), &heists)
+            .entries
+            .iter()
+            .map(|e| e.entry)
+            .collect();
+        let start = ready(andrey.play_playlist(&heists, Some(entries[2]), shuffled()))
+            .unwrap()
+            .unwrap();
+        let second = ready(andrey.next_in_playlist(&heists, start.entry))
+            .unwrap()
+            .unwrap();
+        let again = ready(andrey.play_playlist(&heists, Some(second.entry), shuffled())).unwrap();
+        let played = played_from(andrey.as_ref(), &heists, again);
+        assert!(
+            played.contains(&start.entry),
+            "the first entry did not come round again: {played:?}"
+        );
+    }
+
+    /// Andrey's All (nine tracks) and its entries, in its order.
+    fn all_entries(andrey: &dyn Session) -> (String, Vec<EntryId>) {
+        let list = ready(andrey.playlists()).unwrap().playlists;
+        let all = list
+            .iter()
+            .find(|p| p.builtin == Some(Builtin::All))
+            .unwrap()
+            .id
+            .clone();
+        let entries = page(andrey, &all).entries.iter().map(|e| e.entry).collect();
+        (all, entries)
+    }
+
+    /// What the server says comes up in `id`, at most `limit`.
+    fn upcoming(andrey: &dyn Session, id: &str, limit: u32) -> Vec<EntryId> {
+        ready(andrey.upcoming_in_playlist(id, limit))
+            .unwrap()
+            .iter()
+            .map(|e| e.entry)
+            .collect()
+    }
+
+    /// The entries Next plays after `now`, at most `n`.
+    fn next_n(andrey: &dyn Session, id: &str, mut now: EntryId, n: usize) -> Vec<EntryId> {
+        let mut played = Vec::new();
+        while played.len() < n {
+            let Some(next) = ready(andrey.next_in_playlist(id, now)).unwrap() else {
+                break;
+            };
+            now = next.entry;
+            played.push(now);
+        }
+        played
+    }
+
+    /// The user's rule: turning shuffle on deals the whole playlist from
+    /// the song playing, and a repeat change after keeps that order.
+    #[test]
+    fn shuffle_turned_on_while_playing_plays_every_entry_once_then_ends() {
+        let client = FakeClient::new(None);
+        let andrey = session(&client, "andrey");
+        let (all, entries) = all_entries(andrey.as_ref());
+        let first = ready(andrey.play_playlist(&all, None, PlaySettings::default()))
+            .unwrap()
+            .unwrap();
+        for settings in [
+            shuffled(),
+            PlaySettings {
+                repeat: Repeat::One,
+                ..shuffled()
+            },
+            shuffled(),
+        ] {
+            ready(andrey.set_playlist_settings(&all, settings)).unwrap();
+        }
+        let mut played = vec![first.entry];
+        played.extend(next_n(
+            andrey.as_ref(),
+            &all,
+            first.entry,
+            2 * entries.len(),
+        ));
+        assert!(
+            each_once(played.clone(), &entries),
+            "played {played:?} of {entries:?}"
+        );
+    }
+
+    /// A play without an entry turning shuffle on (an older client's
+    /// save) deals from the place too: the whole playlist is ahead.
+    #[test]
+    fn shuffle_turned_on_by_a_play_without_an_entry_starts_its_round_at_the_place() {
+        let client = FakeClient::new(None);
+        let andrey = session(&client, "andrey");
+        let (all, entries) = all_entries(andrey.as_ref());
+        ready(andrey.play_playlist(&all, None, PlaySettings::default())).unwrap();
+        let resumed = ready(andrey.play_playlist(&all, None, shuffled())).unwrap();
+        let played = played_from(andrey.as_ref(), &all, resumed);
+        assert!(
+            each_once(played.clone(), &entries),
+            "played {played:?} of {entries:?}"
+        );
+    }
+
+    #[test]
+    fn a_pick_while_shuffling_starts_a_new_round_with_it_first() {
+        let client = FakeClient::new(None);
+        let andrey = session(&client, "andrey");
+        let (all, entries) = all_entries(andrey.as_ref());
+        let start = ready(andrey.play_playlist(&all, Some(entries[0]), shuffled()))
+            .unwrap()
+            .unwrap();
+        next_n(andrey.as_ref(), &all, start.entry, 3);
+        let picked = ready(andrey.play_playlist(&all, Some(entries[5]), shuffled())).unwrap();
+        let played = played_from(andrey.as_ref(), &all, picked);
+        assert_eq!(
+            (played[0], each_once(played.clone(), &entries)),
+            (entries[5], true),
+            "played {played:?} of {entries:?}"
+        );
+    }
+
+    #[test]
+    fn upcoming_is_what_next_plays() {
+        let repeat_all = PlaySettings {
+            repeat: Repeat::All,
+            ..PlaySettings::default()
+        };
+        for settings in [
+            PlaySettings::default(),
+            shuffled(),
+            repeat_all,
+            PlaySettings {
+                shuffle: true,
+                ..repeat_all
+            },
+        ] {
+            let client = FakeClient::new(None);
+            let andrey = session(&client, "andrey");
+            let (all, entries) = all_entries(andrey.as_ref());
+            let now = ready(andrey.play_playlist(&all, Some(entries[3]), settings))
                 .unwrap()
                 .unwrap();
-            played.push(now.entry);
+            let ahead = upcoming(andrey.as_ref(), &all, 12);
+            assert_eq!(
+                ahead,
+                next_n(andrey.as_ref(), &all, now.entry, 12),
+                "{settings:?}"
+            );
         }
-        let (mut one, mut two) = (played[..3].to_vec(), played[3..].to_vec());
-        one.sort_unstable();
-        two.sort_unstable();
-        assert_eq!((one.len(), one.windows(2).all(|w| w[0] != w[1])), (3, true));
-        assert_eq!(one, two);
+    }
+
+    #[test]
+    fn upcoming_with_repeat_one_is_the_entry_playing_alone() {
+        let client = FakeClient::new(None);
+        let andrey = session(&client, "andrey");
+        let (all, entries) = all_entries(andrey.as_ref());
+        let settings = PlaySettings {
+            repeat: Repeat::One,
+            ..PlaySettings::default()
+        };
+        ready(andrey.play_playlist(&all, Some(entries[3]), settings)).unwrap();
+        assert_eq!(upcoming(andrey.as_ref(), &all, 50), [entries[3]]);
+    }
+
+    #[test]
+    fn upcoming_with_no_place_is_the_top_of_the_playlist() {
+        let client = FakeClient::new(None);
+        let andrey = session(&client, "andrey");
+        let (all, entries) = all_entries(andrey.as_ref());
+        assert_eq!(upcoming(andrey.as_ref(), &all, 3), entries[..3]);
+    }
+
+    #[test]
+    fn a_repeat_change_while_shuffling_keeps_the_order() {
+        let client = FakeClient::new(None);
+        let andrey = session(&client, "andrey");
+        let (all, entries) = all_entries(andrey.as_ref());
+        let start = ready(andrey.play_playlist(&all, Some(entries[0]), shuffled()))
+            .unwrap()
+            .unwrap();
+        next_n(andrey.as_ref(), &all, start.entry, 2);
+        let before = upcoming(andrey.as_ref(), &all, 50);
+        let repeat_all = PlaySettings {
+            repeat: Repeat::All,
+            ..shuffled()
+        };
+        ready(andrey.set_playlist_settings(&all, repeat_all)).unwrap();
+        let after = upcoming(andrey.as_ref(), &all, 50);
+        assert_eq!(
+            (before.len(), &after[..before.len()]),
+            (entries.len() - 3, before.as_slice())
+        );
+    }
+
+    #[test]
+    fn shuffle_turned_off_plays_the_playlists_order_from_the_entry_playing() {
+        let client = FakeClient::new(None);
+        let andrey = session(&client, "andrey");
+        let (all, entries) = all_entries(andrey.as_ref());
+        ready(andrey.play_playlist(&all, Some(entries[4]), shuffled())).unwrap();
+        ready(andrey.set_playlist_settings(&all, PlaySettings::default())).unwrap();
+        assert_eq!(upcoming(andrey.as_ref(), &all, 50), entries[5..]);
+    }
+
+    #[test]
+    fn settings_saved_alone_keep_the_place() {
+        let client = FakeClient::new(None);
+        let andrey = session(&client, "andrey");
+        let (all, entries) = all_entries(andrey.as_ref());
+        ready(andrey.play_playlist(&all, Some(entries[4]), PlaySettings::default())).unwrap();
+        ready(andrey.set_playlist_settings(&all, shuffled())).unwrap();
+        let saved = page(andrey.as_ref(), &all);
+        assert_eq!(
+            (saved.place, saved.settings),
+            (Some(entries[4]), shuffled())
+        );
+    }
+
+    #[test]
+    fn without_the_feature_upcoming_and_settings_alone_are_refused() {
+        let client = FakeClient::new(None).without_playlist_upcoming();
+        let andrey = session(&client, "andrey");
+        let (all, _) = all_entries(andrey.as_ref());
+        let refused = || BackendError::Unsupported("spoolframe:playlist-upcoming".into());
+        assert_eq!(
+            (
+                andrey.has_playlist_upcoming(),
+                ready(andrey.upcoming_in_playlist(&all, 5)).err(),
+                ready(andrey.set_playlist_settings(&all, shuffled())).err(),
+                page(andrey.as_ref(), &all).settings,
+            ),
+            (
+                false,
+                Some(refused()),
+                Some(refused()),
+                PlaySettings::default()
+            )
+        );
     }
 
     #[test]

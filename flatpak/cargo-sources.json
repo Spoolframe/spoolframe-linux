@@ -7399,66 +7399,66 @@
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://cargo.coldsteel.casa/api/v1/crates/dl/spoolframe-client-sdk/0.12.1/download",
-        "sha256": "903f62ea10b38ba19518ac2aa1c7c71363c2cfc075a73029f4daebedd9dcfcdd",
-        "dest": "cargo/vendor/spoolframe-client-sdk-0.12.1"
+        "url": "https://cargo.coldsteel.casa/api/v1/crates/dl/spoolframe-client-sdk/0.13.0/download",
+        "sha256": "9821245019a5e32730b8bcdb8b6d45f0cd8a6f1325d48604fd3eb7c42bc766b2",
+        "dest": "cargo/vendor/spoolframe-client-sdk-0.13.0"
     },
     {
         "type": "inline",
-        "contents": "{\"package\": \"903f62ea10b38ba19518ac2aa1c7c71363c2cfc075a73029f4daebedd9dcfcdd\", \"files\": {}}",
-        "dest": "cargo/vendor/spoolframe-client-sdk-0.12.1",
+        "contents": "{\"package\": \"9821245019a5e32730b8bcdb8b6d45f0cd8a6f1325d48604fd3eb7c42bc766b2\", \"files\": {}}",
+        "dest": "cargo/vendor/spoolframe-client-sdk-0.13.0",
         "dest-filename": ".cargo-checksum.json"
     },
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://cargo.coldsteel.casa/api/v1/crates/dl/spoolframe-policy/0.12.1/download",
-        "sha256": "a9c65d0cf1671af21af21dde74d2875aeda29e1619c0a6b89ff09b9cab8e91dc",
-        "dest": "cargo/vendor/spoolframe-policy-0.12.1"
+        "url": "https://cargo.coldsteel.casa/api/v1/crates/dl/spoolframe-policy/0.13.0/download",
+        "sha256": "3943236e1e2152d5985040b1ab1172bf7b3670bda1f9dd384c642c9ceb79f441",
+        "dest": "cargo/vendor/spoolframe-policy-0.13.0"
     },
     {
         "type": "inline",
-        "contents": "{\"package\": \"a9c65d0cf1671af21af21dde74d2875aeda29e1619c0a6b89ff09b9cab8e91dc\", \"files\": {}}",
-        "dest": "cargo/vendor/spoolframe-policy-0.12.1",
+        "contents": "{\"package\": \"3943236e1e2152d5985040b1ab1172bf7b3670bda1f9dd384c642c9ceb79f441\", \"files\": {}}",
+        "dest": "cargo/vendor/spoolframe-policy-0.13.0",
         "dest-filename": ".cargo-checksum.json"
     },
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://cargo.coldsteel.casa/api/v1/crates/dl/spoolframe-protocol/0.12.1/download",
-        "sha256": "568fa187581914889ed19464297114656d08e952ce52b17fb528e1962f2fef29",
-        "dest": "cargo/vendor/spoolframe-protocol-0.12.1"
+        "url": "https://cargo.coldsteel.casa/api/v1/crates/dl/spoolframe-protocol/0.13.0/download",
+        "sha256": "bbe37e3cc1fc25ace261d900488fe330b7d3df1fd2700f7b0cbdcdec6fa3dbab",
+        "dest": "cargo/vendor/spoolframe-protocol-0.13.0"
     },
     {
         "type": "inline",
-        "contents": "{\"package\": \"568fa187581914889ed19464297114656d08e952ce52b17fb528e1962f2fef29\", \"files\": {}}",
-        "dest": "cargo/vendor/spoolframe-protocol-0.12.1",
+        "contents": "{\"package\": \"bbe37e3cc1fc25ace261d900488fe330b7d3df1fd2700f7b0cbdcdec6fa3dbab\", \"files\": {}}",
+        "dest": "cargo/vendor/spoolframe-protocol-0.13.0",
         "dest-filename": ".cargo-checksum.json"
     },
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://cargo.coldsteel.casa/api/v1/crates/dl/spoolframe-test-dir/0.12.1/download",
-        "sha256": "dc4f74dbfdc577e2073c96afa2dbfe83882e91e9688dc1b45e4d83dab6d54279",
-        "dest": "cargo/vendor/spoolframe-test-dir-0.12.1"
+        "url": "https://cargo.coldsteel.casa/api/v1/crates/dl/spoolframe-test-dir/0.13.0/download",
+        "sha256": "811b6e10ddf8a788abeafdac10921ddc67dfa2c57bfc8060ac695829e17dbdcf",
+        "dest": "cargo/vendor/spoolframe-test-dir-0.13.0"
     },
     {
         "type": "inline",
-        "contents": "{\"package\": \"dc4f74dbfdc577e2073c96afa2dbfe83882e91e9688dc1b45e4d83dab6d54279\", \"files\": {}}",
-        "dest": "cargo/vendor/spoolframe-test-dir-0.12.1",
+        "contents": "{\"package\": \"811b6e10ddf8a788abeafdac10921ddc67dfa2c57bfc8060ac695829e17dbdcf\", \"files\": {}}",
+        "dest": "cargo/vendor/spoolframe-test-dir-0.13.0",
         "dest-filename": ".cargo-checksum.json"
     },
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://cargo.coldsteel.casa/api/v1/crates/dl/spoolframe-types/0.12.1/download",
-        "sha256": "bb0cd232a69003ee3fd17377dde73ce87b595dcd04c7e3a14f9ee487b10a870d",
-        "dest": "cargo/vendor/spoolframe-types-0.12.1"
+        "url": "https://cargo.coldsteel.casa/api/v1/crates/dl/spoolframe-types/0.13.0/download",
+        "sha256": "6b13451f287c1c58c60b0ba72bfc5226448a7666f0b708f44f910bec8c1331bb",
+        "dest": "cargo/vendor/spoolframe-types-0.13.0"
     },
     {
         "type": "inline",
-        "contents": "{\"package\": \"bb0cd232a69003ee3fd17377dde73ce87b595dcd04c7e3a14f9ee487b10a870d\", \"files\": {}}",
-        "dest": "cargo/vendor/spoolframe-types-0.12.1",
+        "contents": "{\"package\": \"6b13451f287c1c58c60b0ba72bfc5226448a7666f0b708f44f910bec8c1331bb\", \"files\": {}}",
+        "dest": "cargo/vendor/spoolframe-types-0.13.0",
         "dest-filename": ".cargo-checksum.json"
     },
     {

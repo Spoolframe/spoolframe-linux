@@ -305,10 +305,9 @@ fn on_data(inner: &Weak<Mutex<Inner>>, info: &mut gst::PadProbeInfo) -> gst::Pad
 /// Whether `message` is GstPlay's "Error from element <path>: …" for the
 /// element at `path` or one inside it.
 fn from_element(message: &str, path: &str) -> bool {
-    message
-        .strip_prefix("Error from element ")
-        .and_then(|rest| rest.strip_prefix(path))
-        .is_some_and(|rest| rest.starts_with('/') || rest.starts_with(':'))
+    crate::pipeline::error_element_path(message)
+        .and_then(|element| element.strip_prefix(path))
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 /// Why `bytes` cannot be a subtitle: every external subtitle the server

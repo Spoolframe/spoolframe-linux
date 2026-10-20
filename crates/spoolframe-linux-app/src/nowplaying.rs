@@ -14,7 +14,7 @@ use spoolframe_linux_core::format;
 use spoolframe_types::{ArtworkKind, Item};
 
 use crate::artwork::Art;
-use crate::playback::{Change, Playback, Repeat};
+use crate::playback::{Change, Place, Playback, Repeat};
 use crate::player::{Actions, mono, round_button};
 use crate::views::{Cards, Enqueue};
 use crate::volume::Volume;
@@ -243,14 +243,23 @@ fn visualizer_view(
     header: &adw::HeaderBar,
     art: Option<Rc<Art>>,
 ) -> gtk::Stack {
-    use crate::visualizer::{Canvas, Mode};
+    use crate::visualizer::{Canvas, Choice, Mode};
     let stack = gtk::Stack::builder().hexpand(true).vexpand(true).build();
     // Hidden queue contents must not impose their minimum size on the visualizer.
     stack.set_hhomogeneous(false);
     stack.set_vhomogeneous(false);
     stack.add_named(normal, Some("cover"));
-    let measurements = playback.analysis(false);
+    let measurements = playback.measurements();
     let canvas = Canvas::new(measurements.clone().unwrap_or_default());
+    let canvas_art = CanvasArt::new(art, &canvas);
+    {
+        let canvas_art = Rc::downgrade(&canvas_art);
+        canvas.connect_map(move |_| {
+            if let Some(canvas_art) = canvas_art.upgrade() {
+                canvas_art.refresh();
+            }
+        });
+    }
     let picture = gtk::Picture::builder()
         .paintable(playback.paintable())
         .content_fit(gtk::ContentFit::Fill)
@@ -296,14 +305,14 @@ fn visualizer_view(
         let playback = Rc::downgrade(playback);
         trails.connect_toggled(move |button| {
             if let Some(playback) = playback.upgrade() {
-                playback.visualization_trails(button.is_active());
+                playback.set_visualizer_trails(button.is_active());
             }
         });
     }
 
     let plugins = crate::visualizer::plugins();
     let mut labels = vec!["Album & queue".to_owned()];
-    let mut choices: Vec<(Option<Mode>, Option<String>)> = vec![(None, None)];
+    let mut choices = vec![Choice::Cover];
     if measurements.is_some() {
         for (label, mode) in [
             ("Radial spectrum", Mode::Radial),
@@ -314,25 +323,24 @@ fn visualizer_view(
             ("Spectrogram", Mode::Spectrogram),
         ] {
             labels.push(label.to_owned());
-            choices.push((Some(mode), None));
+            choices.push(Choice::Canvas(mode));
         }
     }
     for (name, label) in plugins {
         labels.push(label);
-        choices.push((None, Some(name)));
+        choices.push(Choice::Effect(name));
     }
     let selector =
         gtk::DropDown::from_strings(&labels.iter().map(String::as_str).collect::<Vec<_>>());
     selector.set_tooltip_text(Some("Visualizer"));
     selector.set_sensitive(choices.len() > 1);
     header.pack_end(&selector);
-    let plugin_selected = Rc::new(Cell::new(false));
     let apply: Rc<dyn Fn(&gtk::DropDown)> = {
-        let plugin_selected = plugin_selected.clone();
         let weak = Rc::downgrade(playback);
         let stack = stack.downgrade();
         let canvas = canvas.downgrade();
         let visuals = visuals.downgrade();
+        let canvas_art = Rc::downgrade(&canvas_art);
         Rc::new(move |selector| {
             let (Some(playback), Some(stack), Some(canvas), Some(visuals)) = (
                 weak.upgrade(),
@@ -342,34 +350,34 @@ fn visualizer_view(
             ) else {
                 return;
             };
-            let Some((mode, plugin)) = choices.get(selector.selected() as usize) else {
+            let Some(choice) = choices.get(selector.selected() as usize) else {
                 return;
             };
-            plugin_selected.set(plugin.is_some());
-            let scope = matches!(plugin.as_deref(), Some("wavescope" | "spacescope"));
-            peaks.set_visible(*mode == Some(Mode::Spectrum));
+            // Every effect offered is a scope (see `plugins`).
+            let (spectrum, scope) = (
+                *choice == Choice::Canvas(Mode::Spectrum),
+                matches!(choice, Choice::Effect(_)),
+            );
+            peaks.set_visible(spectrum);
             trails.set_visible(scope);
-            options.set_visible(*mode == Some(Mode::Spectrum) || scope);
-            playback.analysis(mode.is_some());
-            if !playback.set_visualization(plugin.as_deref()) {
+            options.set_visible(spectrum || scope);
+            if !playback.set_visualizer(Some(choice)) {
                 selector.set_selected(0);
                 return;
             }
-            if scope {
-                playback.visualization_trails(trails.is_active());
-            }
-            if let Some(mode) = mode {
+            if let Choice::Canvas(mode) = choice {
                 canvas.set_mode(*mode);
+                if let Some(canvas_art) = canvas_art.upgrade() {
+                    canvas_art.refresh();
+                }
             }
-            visuals.set_visible_child_name(if mode.is_some() {
-                "custom"
-            } else {
-                "gstreamer"
+            visuals.set_visible_child_name(match choice {
+                Choice::Canvas(_) => "custom",
+                _ => "gstreamer",
             });
-            stack.set_visible_child_name(if selector.selected() == 0 {
-                "cover"
-            } else {
-                "visualizer"
+            stack.set_visible_child_name(match choice {
+                Choice::Cover => "cover",
+                _ => "visualizer",
             });
         })
     };
@@ -377,25 +385,27 @@ fn visualizer_view(
         let apply = apply.clone();
         selector.connect_selected_notify(move |selector| apply(selector));
     }
+    let controls = Rc::downgrade(&transport);
     {
-        let selector = selector.downgrade();
+        // The page owns the controls over the visualizer, for its life.
+        let (selector, weak) = (selector.downgrade(), Rc::downgrade(playback));
         stack.connect_map(move |_| {
             if let Some(selector) = selector.upgrade() {
                 apply(&selector);
+            }
+            if let Some(playback) = weak.upgrade() {
+                transport.show_item(&playback);
             }
         });
         let weak = Rc::downgrade(playback);
         stack.connect_unmap(move |_| {
             if let Some(playback) = weak.upgrade() {
-                playback.analysis(false);
-                playback.set_visualization(None);
+                playback.set_visualizer(None);
             }
         });
     }
     let weak = Rc::downgrade(playback);
     let canvas = canvas.downgrade();
-    let controls = Rc::downgrade(&transport);
-    let generation = Rc::new(Cell::new(0u64));
     let selector = selector.downgrade();
     playback.subscribe(move |change| {
         let (Some(playback), Some(canvas), Some(controls)) =
@@ -406,34 +416,11 @@ fn visualizer_view(
         match change {
             Change::Item(item) => {
                 controls.show_item(&playback);
-                canvas.set_texture(None);
-                generation.set(generation.get().wrapping_add(1));
-                if let Some(art) = art.clone() {
-                    let album = playback.album();
-                    let (_, artwork) = crate::views::cover_of(item, album.as_ref());
-                    let artwork = artwork.to_vec();
-                    let version = generation.get();
-                    let generation = generation.clone();
-                    let canvas = canvas.downgrade();
-                    gtk::glib::spawn_future_local(async move {
-                        let result = art
-                            .bytes(
-                                &artwork,
-                                &[ArtworkKind::Poster, ArtworkKind::Thumb],
-                                ArtworkSize::Large,
-                            )
-                            .await;
-                        if generation.get() == version
-                            && let Some(canvas) = canvas.upgrade()
-                        {
-                            canvas.set_texture(
-                                result.and_then(|(_, bytes)| crate::artwork::decode(&bytes).ok()),
-                            );
-                        }
-                    });
-                }
+                canvas.new_song();
+                let album = playback.album();
+                canvas_art.track(crate::views::cover_of(item, album.as_ref()).1.to_vec());
             }
-            Change::TrackFailed(_) if plugin_selected.get() && !playback.visualization_active() => {
+            Change::VisualizerStopped => {
                 if let Some(selector) = selector.upgrade() {
                     selector.set_selected(0);
                 }
@@ -448,11 +435,119 @@ fn visualizer_view(
         }
         true
     });
-    // Own the control state for exactly the life of this page.
-    stack.connect_destroy(move |_| {
-        let _ = &transport;
-    });
     stack
+}
+
+/// What the visualizer's canvas draws of the song's cover: the cover
+/// (large) and the tint of its colours (from the small one, about for the
+/// queue's rows already). Each is read only while the canvas shows a mode
+/// that draws it, and kept while the cover stays the same.
+struct CanvasArt {
+    art: Option<Rc<Art>>,
+    canvas: gtk::glib::WeakRef<crate::visualizer::Canvas>,
+    /// The song's artwork.
+    artwork: RefCell<Vec<spoolframe_types::Artwork>>,
+    /// The artwork the canvas's cover and tint are from, or are being
+    /// read from.
+    cover: RefCell<Option<spoolframe_types::ArtworkId>>,
+    tint: RefCell<Option<spoolframe_types::ArtworkId>>,
+}
+
+/// Which of a song's artwork the canvas draws.
+const CANVAS_ART: [ArtworkKind; 2] = [ArtworkKind::Poster, ArtworkKind::Thumb];
+
+impl CanvasArt {
+    fn new(art: Option<Rc<Art>>, canvas: &crate::visualizer::Canvas) -> Rc<Self> {
+        Rc::new(Self {
+            art,
+            canvas: canvas.downgrade(),
+            artwork: RefCell::default(),
+            cover: RefCell::default(),
+            tint: RefCell::default(),
+        })
+    }
+
+    /// A new song, with its `artwork`.
+    fn track(self: &Rc<Self>, artwork: Vec<spoolframe_types::Artwork>) {
+        self.artwork.replace(artwork);
+        self.refresh();
+    }
+
+    /// Reads what the canvas's mode draws of the song's cover, if it
+    /// shows and does not have it.
+    fn refresh(self: &Rc<Self>) {
+        let Some(canvas) = self.canvas.upgrade().filter(|c| c.is_mapped()) else {
+            return;
+        };
+        let id = crate::artwork::first_of(&self.artwork.borrow(), &CANVAS_ART);
+        if canvas.mode().draws_cover() {
+            self.load(&canvas, Part::Cover, id.clone());
+        }
+        if canvas.mode().tinted() {
+            self.load(&canvas, Part::Tint, id);
+        }
+    }
+
+    fn slot(&self, part: Part) -> &RefCell<Option<spoolframe_types::ArtworkId>> {
+        match part {
+            Part::Cover => &self.cover,
+            Part::Tint => &self.tint,
+        }
+    }
+
+    /// `part` from artwork `id`, unless the canvas has it or is getting
+    /// it; until then, none.
+    fn load(
+        self: &Rc<Self>,
+        canvas: &crate::visualizer::Canvas,
+        part: Part,
+        id: Option<spoolframe_types::ArtworkId>,
+    ) {
+        if *self.slot(part).borrow() == id {
+            return;
+        }
+        self.slot(part).replace(id.clone());
+        part.show(canvas, None);
+        let (Some(art), Some(id)) = (self.art.clone(), id) else {
+            return;
+        };
+        let size = match part {
+            Part::Cover => ArtworkSize::Large,
+            Part::Tint => ArtworkSize::Small,
+        };
+        let (this, artwork) = (Rc::downgrade(self), self.artwork.borrow().clone());
+        gtk::glib::spawn_future_local(async move {
+            let read = art.bytes(&artwork, &CANVAS_ART, size).await;
+            let Some(this) = this.upgrade() else { return };
+            if this.slot(part).borrow().as_ref() != Some(&id) {
+                return;
+            }
+            let texture = read.and_then(|(_, bytes)| crate::artwork::decode(&bytes).ok());
+            if texture.is_none() {
+                // Asked for again when next wanted.
+                this.slot(part).replace(None);
+            }
+            if let Some(canvas) = this.canvas.upgrade() {
+                part.show(&canvas, texture);
+            }
+        });
+    }
+}
+
+/// What [`CanvasArt`] reads of a cover.
+#[derive(Clone, Copy)]
+enum Part {
+    Cover,
+    Tint,
+}
+
+impl Part {
+    fn show(self, canvas: &crate::visualizer::Canvas, texture: Option<gtk::gdk::Texture>) {
+        match self {
+            Part::Cover => canvas.set_cover(texture),
+            Part::Tint => canvas.set_tint(texture.as_ref()),
+        }
+    }
 }
 
 struct View {
@@ -545,6 +640,7 @@ impl View {
             | Change::Stopped
             | Change::SignedOut
             | Change::PlaylistFinished(_)
+            | Change::VisualizerStopped
             | Change::Skipped(_)
             | Change::TrackFailed(_)
             | Change::Offer(_)
@@ -689,6 +785,15 @@ impl Transport {
         ] {
             row.append(widget);
         }
+        {
+            // Hidden, Next is not kept up to date; it is as it shows.
+            let (weak, next) = (Rc::downgrade(playback), next.downgrade());
+            row.connect_map(move |_| {
+                if let (Some(playback), Some(next)) = (weak.upgrade(), next.upgrade()) {
+                    next.set_sensitive(playback.has_next());
+                }
+            });
+        }
         Self {
             row,
             shuffle,
@@ -699,8 +804,11 @@ impl Transport {
         }
     }
 
+    /// Whether Next plays something, while the controls show.
     pub fn show_item(&self, playback: &Playback) {
-        self.next.set_sensitive(playback.has_next());
+        if self.row.is_mapped() {
+            self.next.set_sensitive(playback.has_next());
+        }
     }
 
     pub fn show_playing(&self, playing: bool) {
@@ -712,12 +820,12 @@ impl Transport {
         self.shuffle.set_active(shuffle);
         self.repeat.set_active(repeat != Repeat::Off);
         self.syncing.set(false);
-        let (icon, tip) = match repeat {
-            Repeat::Off => (crate::icons::REPEAT, "Repeat"),
-            Repeat::All => (crate::icons::REPEAT, "Repeating the queue"),
-            Repeat::One => (crate::icons::REPEAT_ONE, "Repeating this track"),
+        let tip = match repeat {
+            Repeat::Off => "Repeat",
+            Repeat::All => "Repeating the queue",
+            Repeat::One => "Repeating this track",
         };
-        self.repeat.set_icon_name(icon);
+        self.repeat.set_icon_name(repeat.icon());
         self.repeat.set_tooltip_text(Some(tip));
     }
 }
@@ -729,9 +837,8 @@ enum Row {
     Inert,
     /// A hand-added item, by its queue id.
     Queued(u64),
-    /// The context's item at this position in its play order.
-    Context(usize),
-    Playlist(spoolframe_linux_core::backend::EntryId),
+    /// What follows the queue: the context's or the playlist's.
+    Ahead(Place),
 }
 
 /// "Up next", in three sections: "Now playing", "Next in queue" (the
@@ -795,8 +902,7 @@ impl Queue {
                 let picked = rows.borrow().get(row.index() as usize).copied();
                 match picked {
                     Some(Row::Queued(id)) => playback.play_queued(id),
-                    Some(Row::Context(pos)) => playback.play_context_at(pos),
-                    Some(Row::Playlist(entry)) => playback.play_playlist_entry(entry),
+                    Some(Row::Ahead(place)) => playback.play_ahead(place),
                     Some(Row::Inert) | None => {}
                 }
             });
@@ -836,8 +942,7 @@ impl Queue {
         let album = playback.album();
         // The server's playlist (PX-40) over the album its track is from.
         let from = playback
-            .playing_from()
-            .map(|playing| playing.line())
+            .source_label()
             .or_else(|| album.as_ref().map(|a| format!("Playing from {}", a.title)));
         if let Some(from) = &from {
             self.from.set_label(from);
@@ -876,105 +981,80 @@ impl Queue {
                 let row = self.append(&content, Row::Queued(queued.id), &mut rows);
                 self.reorderable(&row, queued.id, index);
                 // Right-click: play it now, or take it out of the queue.
-                let id = queued.id;
-                let mut groups =
-                    vec![vec![self.entry("Play now", crate::icons::PLAY, move |p| {
-                        p.play_queued(id)
-                    })]];
-                if let Item::Track(track) = &queued.item {
-                    groups.push(crate::views::track_go_to_entries(track, &self.go_to, true));
-                }
-                groups.push(vec![crate::views::MenuEntry {
-                    destructive: true,
-                    ..self.entry("Remove from queue", crate::icons::REMOVE, move |p| {
-                        p.remove_queued(id)
-                    })
-                }]);
-                let menu = crate::views::menu_popover(groups);
-                crate::views::context_menu(row.upcast_ref(), &menu);
+                let (weak, go_to) = (self.playback.clone(), self.go_to.clone());
+                let (id, item) = (queued.id, queued.item.clone());
+                crate::views::lazy_context_menu(row.upcast_ref(), move || {
+                    let mut groups = vec![vec![entry(
+                        &weak,
+                        "Play now",
+                        crate::icons::PLAY,
+                        move |p| p.play_queued(id),
+                    )]];
+                    if let Item::Track(track) = &item {
+                        groups.push(crate::views::track_go_to_entries(track, &go_to, true));
+                    }
+                    groups.push(vec![crate::views::MenuEntry {
+                        destructive: true,
+                        ..entry(&weak, "Remove from queue", crate::icons::REMOVE, move |p| {
+                            p.remove_queued(id)
+                        })
+                    }]);
+                    crate::views::menu_popover(groups)
+                });
             }
         }
 
-        if !up_next.context.is_empty() {
-            let heading = match &up_next.from {
-                Some(album) => format!("Next from {}", album.title),
-                None => "Next".to_owned(),
-            };
-            self.heading(&heading, false, &mut rows);
-            for (pos, item) in up_next.context.iter() {
-                let artist = artist_of(item, up_next.from.as_ref());
-                let content = queue_row(
-                    &self.thumb(item, up_next.from.as_ref()),
-                    item,
-                    &artist,
-                    None,
-                );
-                let row = self.append(&content, Row::Context(*pos), &mut rows);
-                // Right-click: play it now, or queue it next.
-                let mut groups = Vec::new();
-                {
-                    let (pos, item, from) = (*pos, item.clone(), up_next.from.clone());
-                    groups.push(vec![
-                        self.entry("Play now", crate::icons::PLAY, move |p| {
-                            p.play_context_at(pos)
+        for ahead in &up_next.ahead {
+            self.heading(&ahead.heading, false, &mut rows);
+            for (place, item) in &ahead.entries {
+                let artist = artist_of(item, ahead.album.as_ref());
+                let content =
+                    queue_row(&self.thumb(item, ahead.album.as_ref()), item, &artist, None);
+                let row = self.append(&content, Row::Ahead(*place), &mut rows);
+                // Right-click: play it now, or queue it next; a
+                // playlist's entry can go to the end of the queue too.
+                let (weak, go_to) = (self.playback.clone(), self.go_to.clone());
+                let (place, item, from) = (*place, item.clone(), ahead.album.clone());
+                crate::views::lazy_context_menu(row.upcast_ref(), move || {
+                    let (next, from) = (item.clone(), from.clone());
+                    let mut play = vec![
+                        entry(&weak, "Play now", crate::icons::PLAY, move |p| {
+                            p.play_ahead(place)
                         }),
-                        self.entry("Play next", crate::icons::PLAY_NEXT, move |p| {
-                            p.play_next(vec![item.clone()], from.clone())
+                        entry(&weak, "Play next", crate::icons::PLAY_NEXT, move |p| {
+                            p.play_next(vec![next.clone()], from.clone())
                         }),
-                    ]);
-                }
-                if let Item::Track(track) = item {
-                    groups.push(crate::views::track_go_to_entries(track, &self.go_to, true));
-                }
-                let menu = crate::views::menu_popover(groups);
-                crate::views::context_menu(row.upcast_ref(), &menu);
+                    ];
+                    if matches!(place, Place::Playlist(_)) {
+                        let last = item.clone();
+                        play.push(entry(
+                            &weak,
+                            "Add to queue",
+                            crate::icons::ADD_TO_QUEUE,
+                            move |p| p.add_to_queue(vec![last.clone()], None),
+                        ));
+                    }
+                    let mut groups = vec![play];
+                    if let Item::Track(track) = &item {
+                        groups.push(crate::views::track_go_to_entries(track, &go_to, true));
+                    }
+                    crate::views::menu_popover(groups)
+                });
             }
-        }
-        if let Some((heading, entries)) = playback.playlist_up_next()
-            && !entries.is_empty()
-        {
-            self.heading(&heading, false, &mut rows);
-            for entry in entries {
-                let artist = artist_of(&entry.item, None);
-                let content = queue_row(&self.thumb(&entry.item, None), &entry.item, &artist, None);
-                let row = self.append(&content, Row::Playlist(entry.entry), &mut rows);
-                let id = entry.entry;
-                let next_item = entry.item.clone();
-                let queued_item = entry.item.clone();
-                let mut groups = vec![vec![
-                    self.entry("Play now", crate::icons::PLAY, move |p| {
-                        p.play_playlist_entry(id)
-                    }),
-                    self.entry("Play next", crate::icons::PLAY_NEXT, move |p| {
-                        p.play_next(vec![next_item.clone()], None)
-                    }),
-                    self.entry("Add to queue", crate::icons::ADD_TO_QUEUE, move |p| {
-                        p.add_to_queue(vec![queued_item.clone()], None)
-                    }),
-                ]];
-                if let Item::Track(track) = &entry.item {
-                    groups.push(crate::views::track_go_to_entries(track, &self.go_to, true));
-                }
-                let menu = crate::views::menu_popover(groups);
-                crate::views::context_menu(row.upcast_ref(), &menu);
+            if let Some(note) = ahead.note {
+                let label = gtk::Label::builder()
+                    .label(note)
+                    .xalign(0.0)
+                    .wrap(true)
+                    .margin_top(4)
+                    .margin_bottom(4)
+                    .css_classes(["dim-label"])
+                    .build();
+                let row = self.append(&label, Row::Inert, &mut rows);
+                row.set_activatable(false);
             }
         }
         self.rows.replace(rows);
-    }
-
-    /// A menu row that runs `run` on the playback, while there is one.
-    fn entry(
-        &self,
-        label: &'static str,
-        icon: &'static str,
-        run: impl Fn(&Rc<Playback>) + 'static,
-    ) -> crate::views::MenuEntry {
-        let weak = self.playback.clone();
-        crate::views::MenuEntry::new(label, icon, move || {
-            if let Some(playback) = weak.upgrade() {
-                run(&playback);
-            }
-        })
     }
 
     /// A section's heading; the queue's carries Clear, as designed.
@@ -1070,6 +1150,21 @@ impl Queue {
         });
         row.add_controller(target);
     }
+}
+
+/// A menu row that runs `run` on the playback, while there is one.
+fn entry(
+    playback: &std::rc::Weak<Playback>,
+    label: &'static str,
+    icon: &'static str,
+    run: impl Fn(&Rc<Playback>) + 'static,
+) -> crate::views::MenuEntry {
+    let weak = playback.clone();
+    crate::views::MenuEntry::new(label, icon, move || {
+        if let Some(playback) = weak.upgrade() {
+            run(&playback);
+        }
+    })
 }
 
 fn artist_of(item: &Item, album: Option<&spoolframe_types::Album>) -> String {

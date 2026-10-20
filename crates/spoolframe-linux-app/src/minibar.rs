@@ -441,7 +441,7 @@ impl MiniBar {
                     ),
                     _ => facts.detail.clone(),
                 };
-                let detail = crate::player::with_playlist(detail, playback.playing_from().as_ref());
+                let detail = crate::player::with_playlist(detail, playback.source_label());
                 self.detail.set_label(detail.as_deref().unwrap_or_default());
                 self.detail.set_tooltip_text(detail.as_deref());
                 if let Some(music) = self.music.borrow().as_ref() {
@@ -486,6 +486,7 @@ impl MiniBar {
             | Change::Stopped
             | Change::SignedOut
             | Change::PlaylistFinished(_)
+            | Change::VisualizerStopped
             | Change::Skipped(_)
             | Change::TrackFailed(_)
             | Change::Offer(_)

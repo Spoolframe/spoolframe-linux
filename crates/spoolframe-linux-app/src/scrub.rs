@@ -62,7 +62,7 @@ struct Sheet {
     width: usize,
     height: usize,
     stride: usize,
-    pixels: Vec<u8>,
+    pixels: glib::Bytes,
 }
 
 impl Frames {
@@ -210,9 +210,8 @@ impl Frames {
 fn decode(bytes: &[u8]) -> Result<Sheet, String> {
     let texture = crate::artwork::decode(bytes)?;
     let (width, height) = (texture.width() as usize, texture.height() as usize);
-    let stride = width * 4;
-    let mut pixels = vec![0u8; stride * height];
-    texture.download(&mut pixels, stride);
+    let (pixels, stride) =
+        crate::artwork::pixels(&texture, gdk::MemoryFormat::B8g8r8a8Premultiplied);
     Ok(Sheet {
         width,
         height,
@@ -503,6 +502,7 @@ mod tests {
     fn sheet() -> Sheet {
         let (width, height) = (4, 2);
         let pixels = (0..width * height).flat_map(|i| [i as u8; 4]).collect();
+        let pixels = glib::Bytes::from_owned::<Vec<u8>>(pixels);
         Sheet {
             width,
             height,

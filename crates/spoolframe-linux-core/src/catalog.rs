@@ -848,6 +848,10 @@ impl Session for CachedSession {
         self.inner.has_playlist_art()
     }
 
+    fn has_playlist_upcoming(&self) -> bool {
+        self.inner.has_playlist_upcoming()
+    }
+
     fn has_subtitle_sync(&self) -> bool {
         self.inner.has_subtitle_sync()
     }
@@ -1021,6 +1025,24 @@ impl Session for CachedSession {
         after: EntryId,
     ) -> BoxFuture<'a, Result<Option<PlaylistNext>, BackendError>> {
         self.changing(move || self.inner.next_in_playlist(id, after))
+    }
+
+    /// Not kept: it follows the place, which playing moves.
+    fn upcoming_in_playlist<'a>(
+        &'a self,
+        id: &'a str,
+        limit: u32,
+    ) -> BoxFuture<'a, Result<Vec<PlaylistEntry>, BackendError>> {
+        self.inner.upcoming_in_playlist(id, limit)
+    }
+
+    /// A change: the playlist's page holds its settings.
+    fn set_playlist_settings<'a>(
+        &'a self,
+        id: &'a str,
+        settings: PlaySettings,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        self.changing(move || self.inner.set_playlist_settings(id, settings))
     }
 }
 

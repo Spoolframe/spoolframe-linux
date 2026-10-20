@@ -43,6 +43,9 @@ pub struct Pipeline {
     external: ExternalSubtitle,
     analyzer: Option<crate::visualizer::Analyzer>,
     visualization_active: Cell<bool>,
+    /// Whether a scope's old waveforms fade out behind the new one: kept
+    /// for each effect set.
+    trails: Cell<bool>,
 }
 
 impl Pipeline {
@@ -90,6 +93,7 @@ impl Pipeline {
             external,
             analyzer,
             visualization_active: Cell::new(false),
+            trails: Cell::new(true),
         })
     }
 
@@ -123,9 +127,13 @@ impl Pipeline {
         }
         self.play().set_visualization_enabled(name.is_some());
         self.visualization_active.set(name.is_some());
+        if name.is_some() {
+            self.apply_trails();
+        }
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn visualization_active(&self) -> bool {
         self.visualization_active.get()
     }
@@ -137,6 +145,13 @@ impl Pipeline {
     }
 
     pub fn visualization_trails(&self, enabled: bool) {
+        self.trails.set(enabled);
+        self.apply_trails();
+    }
+
+    /// The effect's trails as [`Self::visualization_trails`] last set
+    /// them: only a scope has any.
+    fn apply_trails(&self) {
         if let Some(plugin) = self
             .play()
             .pipeline()
@@ -149,16 +164,24 @@ impl Pipeline {
             if let Some(effect) = effect
                 && effect.find_property("shader").is_some()
             {
-                effect.set_property_from_str("shader", if enabled { "fade" } else { "none" });
+                let shader = if self.trails.get() { "fade" } else { "none" };
+                effect.set_property_from_str("shader", shader);
             }
         }
     }
 
-    pub fn analysis(&self, enabled: bool) -> Option<crate::visualizer::Measurements> {
-        self.analyzer.as_ref().map(|analyzer| {
+    /// What the audio analysis measures, for the canvas; `None` where
+    /// it could not be put in.
+    pub fn measurements(&self) -> Option<crate::visualizer::Measurements> {
+        self.analyzer
+            .as_ref()
+            .map(|analyzer| analyzer.levels.clone())
+    }
+
+    pub fn set_analysis(&self, enabled: bool) {
+        if let Some(analyzer) = &self.analyzer {
             analyzer.enable(enabled);
-            analyzer.levels.clone()
-        })
+        }
     }
 
     /// For the diagnostics: read only.
@@ -379,6 +402,16 @@ impl Drop for Pipeline {
     }
 }
 
+/// The path of the element GstPlay's error `message` ("Error from element
+/// <path>: …") is from; `None` for an error that names none.
+pub fn error_element_path(message: &str) -> Option<&str> {
+    message
+        .strip_prefix("Error from element ")?
+        .split_once(": ")
+        .map(|(path, _)| path)
+        .filter(|path| !path.is_empty())
+}
+
 fn file_uri(path: &Path) -> String {
     gtk::prelude::FileExt::uri(&gtk::gio::File::for_path(path)).to_string()
 }
@@ -527,6 +560,19 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+
+    #[test]
+    fn an_errors_element_path_is_what_comes_before_its_text() {
+        let path = "/GstPlayBin3:playbin3/GstPlaySink:playsink/GstBin:visbin";
+        assert_eq!(
+            [
+                error_element_path(&format!("Error from element {path}: Not negotiated: -4")),
+                error_element_path("Error from element : nothing"),
+                error_element_path("the server went away"),
+            ],
+            [Some(path), None, None]
+        );
+    }
 
     /// A second of tiny raw video with one SRT cue muxed in as Matroska's
     /// S_TEXT/UTF8, as a ripped file carries it.

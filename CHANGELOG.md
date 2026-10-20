@@ -2,11 +2,23 @@
 
 ## Unreleased
 
-- The SDK crates are 0.12.1. The app also lists playlist covers,
-  subtitle sync and subtitle search to each server; a server without
-  them shows nothing new. On an item's page, a playlist shared with you
-  says whose it is ("Alice’s"), as its card does, where the server names
-  the owner.
+- The SDK crates are 0.13.0. The app also lists playlist covers,
+  subtitle sync, subtitle search and what comes up in a playlist to each
+  server; a server without them shows nothing new. On an item's page, a
+  playlist shared with you says whose it is ("Alice’s"), as its card
+  does, where the server names the owner.
+- Up next shows the songs a playlist plays next, in the order they play,
+  on a server that says what comes up (0.13): shuffled, the shuffled
+  order; with Repeat All, round to the top; with Repeat One, the song
+  playing. It changes as songs play, as modes change and as the playlist
+  is edited. An older server's playlist shows as before: its own order,
+  or "Songs play in a shuffled order".
+- Shuffle keeps its order until it is turned off: turning it on shuffles
+  the whole playlist from the song playing, Repeat All plays the same
+  order again, and changing Repeat or Skip watched keeps it. Turning
+  shuffle on again shuffles anew, and picking a song while shuffled
+  shuffles anew from that song. On a 0.13 server, changing a mode no
+  longer moves past a song heard to its end.
 - Playlist covers, on a server that has them: the server's picture (a
   cover someone chose, its mosaic, Liked's and All's tiles) shows on the
   Playlists cards, Pinned in the sidebar, a playlist's page, the

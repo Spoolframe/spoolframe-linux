@@ -35,6 +35,14 @@ pub fn decode(bytes: &[u8]) -> Result<gdk::Texture, String> {
     gdk::Texture::from_bytes(&glib::Bytes::from(bytes)).map_err(|e| e.to_string())
 }
 
+/// `texture`'s pixels in `format`, and the bytes from one row to the
+/// next.
+pub fn pixels(texture: &gdk::Texture, format: gdk::MemoryFormat) -> (glib::Bytes, usize) {
+    let mut downloader = gdk::TextureDownloader::new(texture);
+    downloader.set_format(format);
+    downloader.download_bytes()
+}
+
 /// Loads one session's artwork.
 pub struct Art {
     session: Arc<dyn Session>,
@@ -126,7 +134,7 @@ impl Art {
 }
 
 /// The first artwork of `kinds`, in the order of `kinds`.
-fn first_of(artwork: &[Artwork], kinds: &[ArtworkKind]) -> Option<ArtworkId> {
+pub fn first_of(artwork: &[Artwork], kinds: &[ArtworkKind]) -> Option<ArtworkId> {
     kinds
         .iter()
         .find_map(|kind| artwork.iter().find(|a| a.kind == *kind))

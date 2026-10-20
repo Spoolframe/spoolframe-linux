@@ -30,8 +30,8 @@ use crate::backend::{
     ProfileSignIn, SearchRequest, SearchResults, Selection, Server, ServerKey, Session,
 };
 use crate::backend::{
-    EntryId, ItemDetail, Kinds, PlaySettings, PlaylistEdit, PlaylistList, PlaylistNext,
-    PlaylistPage, PlaylistSummary, PlaylistUpdate, ShareCandidatePage, Visibility,
+    EntryId, ItemDetail, Kinds, PlaySettings, PlaylistEdit, PlaylistEntry, PlaylistList,
+    PlaylistNext, PlaylistPage, PlaylistSummary, PlaylistUpdate, ShareCandidatePage, Visibility,
 };
 use crate::backend::{
     FinishPasskeyRegistration, FinishPasskeySignIn, PasskeyCreation, PasskeyInfo, PasskeyRequest,
@@ -1448,6 +1448,10 @@ impl Session for SdkSession {
         self.session.features().playlist_art
     }
 
+    fn has_playlist_upcoming(&self) -> bool {
+        self.session.features().playlist_upcoming
+    }
+
     fn has_subtitle_sync(&self) -> bool {
         self.session.features().subtitle_sync
     }
@@ -1646,6 +1650,24 @@ impl Session for SdkSession {
     ) -> BoxFuture<'a, Result<Option<PlaylistNext>, BackendError>> {
         let id = id.to_owned();
         Box::pin(self.call(move |s| async move { s.next_in_playlist(&id, after).await }))
+    }
+
+    fn upcoming_in_playlist<'a>(
+        &'a self,
+        id: &'a str,
+        limit: u32,
+    ) -> BoxFuture<'a, Result<Vec<PlaylistEntry>, BackendError>> {
+        let id = id.to_owned();
+        Box::pin(self.call(move |s| async move { s.upcoming_in_playlist(&id, limit).await }))
+    }
+
+    fn set_playlist_settings<'a>(
+        &'a self,
+        id: &'a str,
+        settings: PlaySettings,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        let id = id.to_owned();
+        Box::pin(self.call(move |s| async move { s.set_playlist_settings(&id, settings).await }))
     }
 
     fn begin_passkey_registration(&self) -> BoxFuture<'_, Result<PasskeyCreation, BackendError>> {

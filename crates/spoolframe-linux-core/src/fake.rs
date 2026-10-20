@@ -2408,6 +2408,10 @@ impl Session for FakeSession {
         self.features.playlist_art
     }
 
+    fn has_playlist_upcoming(&self) -> bool {
+        self.features.playlist_upcoming
+    }
+
     fn has_subtitle_sync(&self) -> bool {
         self.features.subtitle_sync
     }
@@ -2734,6 +2738,48 @@ impl Session for FakeSession {
                     .next(id, after, self.viewer(), |item| watch.get(item).watched)?
             };
             Ok(next.and_then(|(entry, item)| self.playlist_next(entry, &item)))
+        })
+    }
+
+    fn upcoming_in_playlist<'a>(
+        &'a self,
+        id: &'a str,
+        limit: u32,
+    ) -> BoxFuture<'a, Result<Vec<crate::backend::PlaylistEntry>, BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            let (ahead, liked) = {
+                let watch = self.watch();
+                let mut store = self.lock_playlists();
+                let ahead =
+                    store.upcoming(id, limit, self.viewer(), |item| watch.get(item).watched)?;
+                (ahead, store.liked(&self.username))
+            };
+            let watch = self.watch();
+            Ok(ahead
+                .into_iter()
+                .filter_map(|(entry, item)| {
+                    let found = self.catalog.items.get(&item)?;
+                    Some(crate::backend::PlaylistEntry {
+                        entry,
+                        item: self.with_state(found, &watch),
+                        unavailable: false,
+                        liked: liked.contains(&item),
+                    })
+                })
+                .collect())
+        })
+    }
+
+    fn set_playlist_settings<'a>(
+        &'a self,
+        id: &'a str,
+        settings: PlaySettings,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            self.guard()?;
+            self.lock_playlists()
+                .set_settings(id, settings, self.viewer())
         })
     }
 
@@ -3360,6 +3406,17 @@ impl FakeClient {
         })
     }
 
+    /// The server lists no `spoolframe:playlist-upcoming`: an older one,
+    /// which says nothing of what comes up and saves the play settings
+    /// only by playing.
+    pub fn without_playlist_upcoming(self) -> Self {
+        let features = self.lock_playlists().features;
+        self.with_features(Features {
+            playlist_upcoming: false,
+            ..features
+        })
+    }
+
     /// The session has only these features, as when the server or the
     /// app lists fewer: Liked, sharing and covers go with playlists, as
     /// the SDK has it.
@@ -3368,6 +3425,7 @@ impl FakeClient {
             liked: features.liked && features.playlists,
             playlist_sharing: features.playlist_sharing && features.playlists,
             playlist_art: features.playlist_art && features.playlists,
+            playlist_upcoming: features.playlist_upcoming && features.playlists,
             ..features
         };
         self
@@ -7299,7 +7357,7 @@ mod cover_tests {
                 ready(andrey.set_playlist_art(&liked.id, PNG.to_vec()))
             ),
             (
-                Some("tile/liked/1".to_owned()),
+                Some("tile/liked/2".to_owned()),
                 Err(BackendError::NotAllowed)
             )
         );

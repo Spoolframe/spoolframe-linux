@@ -294,7 +294,8 @@ impl View {
             | Change::TrackFailed(_)
             | Change::Stopped
             | Change::SignedOut
-            | Change::PlaylistFinished(_) => {}
+            | Change::PlaylistFinished(_)
+            | Change::VisualizerStopped => {}
         }
     }
 
@@ -317,7 +318,7 @@ impl View {
         }
         self.top.title.set_label(&facts.title);
         // "Playing from the Heists" after what the item is (PX-40).
-        let detail = with_playlist(facts.detail.clone(), playback.playing_from().as_ref());
+        let detail = with_playlist(facts.detail.clone(), playback.source_label());
         self.top
             .detail
             .set_label(detail.as_deref().unwrap_or_default());
@@ -1354,12 +1355,9 @@ fn next_label(playing: Option<&spoolframe_linux_core::playlists::Playing>) -> St
     }
 }
 
-/// `detail`, with the playlist it plays from after it.
-pub fn with_playlist(
-    detail: Option<String>,
-    playing: Option<&spoolframe_linux_core::playlists::Playing>,
-) -> Option<String> {
-    let line = playing.map(|p| p.line());
+/// `detail`, with the playlist it plays from after it (`line`, from
+/// [`crate::playback::Playback::source_label`]).
+pub fn with_playlist(detail: Option<String>, line: Option<String>) -> Option<String> {
     match (detail, line) {
         (Some(detail), Some(line)) => Some(format!("{detail} · {line}")),
         (detail, line) => detail.or(line),
@@ -1410,8 +1408,8 @@ mod tests {
         };
         assert_eq!(
             (
-                with_playlist(Some("Andor · S1 · E3".into()), Some(&playing)),
-                with_playlist(None, Some(&playing)),
+                with_playlist(Some("Andor · S1 · E3".into()), Some(playing.line())),
+                with_playlist(None, Some(playing.line())),
                 with_playlist(Some("1979".into()), None),
                 next_label(Some(&playing)),
                 next_label(None),
