@@ -45,9 +45,6 @@ const DEVICE_PAGES: [(&str, &str, &str); 7] = [
     ("about", "About", crate::icons::ABOUT),
 ];
 
-/// Downloads waits on server work (PX-37, PX-38): listed, not open.
-const NOT_YET: &str = "downloads";
-
 /// The stack's name for a server's page.
 pub fn server_page_name(key: &ServerKey) -> String {
     format!("server:{}", key.0)
@@ -98,7 +95,7 @@ pub fn window(parent: &impl IsA<gtk::Window>, needs: Needs, open: Open) -> adw::
     let client = needs.servers.client.clone();
     // About opens Open source licenses and a license's text over itself.
     let about = crate::licenses_page::about_view();
-    let pages: [(&str, gtk::Widget); 6] = [
+    let pages: [(&str, gtk::Widget); 7] = [
         (
             "appearance",
             preferences::appearance(needs.theme, needs.set_theme).upcast(),
@@ -107,6 +104,10 @@ pub fn window(parent: &impl IsA<gtk::Window>, needs: Needs, open: Open) -> adw::
         (
             "connection",
             preferences::connection(&needs.device).upcast(),
+        ),
+        (
+            "downloads",
+            preferences::downloads(client.clone(), crate::downloads_dir()).upcast(),
         ),
         (
             "identity",
@@ -126,12 +127,6 @@ pub fn window(parent: &impl IsA<gtk::Window>, needs: Needs, open: Open) -> adw::
     for (name, title, icon) in DEVICE_PAGES {
         let row = sidebar_row(title, None, icon);
         row.set_widget_name(name);
-        if name == NOT_YET {
-            row.set_sensitive(false);
-            row.set_activatable(false);
-            row.set_selectable(false);
-            set_subtitle(&row, "Not available yet");
-        }
         device.append(&row);
     }
     let servers_list = gtk::ListBox::builder()

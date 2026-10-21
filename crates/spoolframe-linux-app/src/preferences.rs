@@ -1,14 +1,15 @@
 //! The pages of Settings ([`crate::settings_window`]), as on the
 //! LinuxSettingsDevice and LinuxSettingsServer boards: This computer's
-//! Appearance, Playback, Connection, Shared computer and About, and each
-//! saved server's page.
+//! Appearance, Playback, Connection, Downloads, Shared computer and About,
+//! and each saved server's page.
 
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use adw::prelude::*;
 use spoolframe_linux_core::backend::TrackPreferencesInfo;
-use spoolframe_linux_core::backend::{Client, Reachability, Server, ServerKey};
+use spoolframe_linux_core::backend::{Client, LocalDownload, Reachability, Server, ServerKey};
 use spoolframe_linux_core::format;
 use spoolframe_linux_core::theme::Theme;
 use spoolframe_types::{
@@ -591,6 +592,200 @@ pub(crate) fn connection(device: &Device) -> adw::PreferencesPage {
     group.add(&relays);
     page.add(&group);
     page
+}
+
+/// Downloads (PX-38), as the LinuxSettingsDevice board has them: the room
+/// they take, by server, where they are, and Delete all. Read again each
+/// time the page shows. The folder cannot be changed: the sandbox lets the
+/// app write only under its own data.
+pub(crate) fn downloads(
+    client: Arc<dyn Client>,
+    dir: Option<std::path::PathBuf>,
+) -> adw::PreferencesPage {
+    let page = adw::PreferencesPage::builder()
+        .title("Downloads")
+        .description("On this computer, from every server.")
+        .icon_name(crate::icons::DOWNLOADS)
+        .build();
+    let space = adw::PreferencesGroup::builder().title("Space").build();
+    let used = adw::ActionRow::builder().use_markup(false).build();
+    used.set_title("Downloads");
+    let by_server = adw::ActionRow::builder().use_markup(false).build();
+    by_server.set_title("By server");
+    by_server.set_visible(false);
+    space.add(&used);
+    space.add(&by_server);
+    page.add(&space);
+
+    let folder_group = adw::PreferencesGroup::builder().title("Downloads").build();
+    let folder = adw::ActionRow::builder()
+        .use_markup(false)
+        .title("Folder")
+        .build();
+    folder.set_subtitle(&dir.as_ref().map_or_else(
+        || "None: no data directory".to_owned(),
+        |d| d.display().to_string(),
+    ));
+    folder.add_css_class("property");
+    folder_group.add(&folder);
+    page.add(&folder_group);
+
+    let delete_group = adw::PreferencesGroup::new();
+    let delete_row = adw::ActionRow::builder()
+        .use_markup(false)
+        .title("Delete all downloads")
+        .subtitle("On this computer, from every server.")
+        .build();
+    let delete = gtk::Button::builder()
+        .label("Delete all…")
+        .valign(gtk::Align::Center)
+        .css_classes(["destructive-action"])
+        .build();
+    delete_row.add_suffix(&delete);
+    delete_group.add(&delete_row);
+    page.add(&delete_group);
+
+    let shown = DownloadRows {
+        client,
+        used,
+        by_server,
+        delete,
+    };
+    let shown = Rc::new(shown);
+    {
+        let shown = Rc::downgrade(&shown);
+        page.connect_map(move |_| {
+            if let Some(shown) = shown.upgrade() {
+                shown.load();
+            }
+        });
+    }
+    {
+        let weak = Rc::downgrade(&shown);
+        shown.delete.connect_clicked(move |button| {
+            if let Some(shown) = weak.upgrade() {
+                shown.ask_delete_all(button);
+            }
+        });
+    }
+    // The page holds the rows' state for as long as it lives.
+    let held = RefCell::new(Some(shown));
+    page.connect_destroy(move |_| {
+        held.borrow_mut().take();
+    });
+    page
+}
+
+/// What Settings › Downloads shows, read again as it changes.
+struct DownloadRows {
+    client: Arc<dyn Client>,
+    used: adw::ActionRow,
+    by_server: adw::ActionRow,
+    delete: gtk::Button,
+}
+
+impl DownloadRows {
+    fn load(self: &Rc<Self>) {
+        let client = self.client.clone();
+        let read = relm4::spawn(async move {
+            let space = client.download_space().await;
+            let downloads = client.downloads().await;
+            let servers = client.servers().await.unwrap_or_default();
+            (space, downloads, servers)
+        });
+        let weak = Rc::downgrade(self);
+        gtk::glib::spawn_future_local(async move {
+            let Ok((space, downloads, servers)) = read.await else {
+                return;
+            };
+            let Some(shown) = weak.upgrade() else { return };
+            match space {
+                Ok(space) => {
+                    shown.used.set_title(&format!(
+                        "{} of downloads",
+                        crate::downloads::size(space.used)
+                    ));
+                    shown
+                        .used
+                        .set_subtitle(&format!("{} free", crate::downloads::size(space.available)));
+                }
+                Err(e) => {
+                    shown.used.set_title("Downloads");
+                    shown.used.set_subtitle(&e.to_string());
+                }
+            }
+            let line = by_server_line(&downloads, &servers);
+            shown.by_server.set_visible(!line.is_empty());
+            shown.by_server.set_subtitle(&line);
+            shown.delete.set_sensitive(!downloads.is_empty());
+        });
+    }
+
+    fn ask_delete_all(self: &Rc<Self>, over: &gtk::Button) {
+        let alert = adw::AlertDialog::builder()
+            .heading("Delete all downloads?")
+            .body(
+                "Every film and episode downloaded on this computer is deleted, from every \
+                 server and profile. You can still stream them.",
+            )
+            .default_response("cancel")
+            .close_response("cancel")
+            .build();
+        alert.add_response("cancel", "Cancel");
+        alert.add_response("delete", "Delete all");
+        alert.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+        let weak = Rc::downgrade(self);
+        alert.connect_response(Some("delete"), move |_, _| {
+            if let Some(shown) = weak.upgrade() {
+                shown.delete_all();
+            }
+        });
+        alert.present(Some(over));
+    }
+
+    /// Each download deleted; one that will not go is said in the log, and
+    /// the page shows what is left.
+    fn delete_all(self: &Rc<Self>) {
+        self.delete.set_sensitive(false);
+        let client = self.client.clone();
+        let deleted = relm4::spawn(async move {
+            for download in client.downloads().await {
+                if let Err(e) = client.delete_download(&download.key).await {
+                    tracing::warn!(key = download.key, error = %e, "a download was not deleted");
+                }
+            }
+        });
+        let weak = Rc::downgrade(self);
+        gtk::glib::spawn_future_local(async move {
+            let _ = deleted.await;
+            if let Some(shown) = weak.upgrade() {
+                shown.load();
+            }
+        });
+    }
+}
+
+/// "Home Media 31.0 GB · Bob's Media 7.2 GB": what each server's downloads
+/// take, by the name this computer knows it by; empty with none.
+pub fn by_server_line(downloads: &[LocalDownload], servers: &[Server]) -> String {
+    let mut totals: Vec<(String, u64)> = Vec::new();
+    for download in downloads {
+        let name = servers
+            .iter()
+            .find(|s| s.key.0 == download.server)
+            .map_or_else(|| "Another server".to_owned(), |s| s.name.clone());
+        // What is on disk: all of a finished one, the part of the rest.
+        let bytes = download.received;
+        match totals.iter_mut().find(|(n, _)| *n == name) {
+            Some((_, total)) => *total += bytes,
+            None => totals.push((name, bytes)),
+        }
+    }
+    totals
+        .into_iter()
+        .map(|(name, bytes)| format!("{name} {}", crate::downloads::size(bytes)))
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 /// Shared computer: whether people with their own identity may sign in
@@ -1294,6 +1489,36 @@ mod tests {
     use super::*;
 
     use crate::reachability::tests::{NOW, cabin};
+
+    #[test]
+    fn downloads_are_totalled_by_the_name_of_their_server() {
+        use spoolframe_linux_core::backend::{DownloadSource, DownloadTracks};
+        use spoolframe_linux_core::fake::FakeClient;
+        use spoolframe_linux_core::testing::ready;
+        let client = FakeClient::new(None);
+        let session = client.session(&FakeClient::profile("andrey")).unwrap();
+        let alien = "plex:movie:1".parse().unwrap();
+        let key =
+            ready(session.start_download(&alien, DownloadSource::Original, DownloadTracks::All))
+                .unwrap()
+                .key;
+        client.advance_download(&key, 31_000_000_000);
+        let servers = ready(client.servers()).unwrap();
+        let home = servers
+            .iter()
+            .find(|s| s.key == FakeClient::profile("andrey").server)
+            .unwrap();
+        assert_eq!(
+            (
+                by_server_line(&ready(client.downloads()), &servers),
+                by_server_line(&ready(client.downloads()), &[])
+            ),
+            (
+                format!("{} 31.0 GB", home.name),
+                "Another server 31.0 GB".to_owned()
+            )
+        );
+    }
 
     fn cabin_server() -> Server {
         Server {

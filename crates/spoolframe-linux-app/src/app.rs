@@ -18,6 +18,10 @@ use spoolframe_linux_core::backend::{
     PlaylistPage, PlaylistRef, PlaylistSummary, PlaylistUpdate, Profile, ProfileSignIn,
     SearchScope, Selection, Server, ServerKey, Session, TrackPreferencesInfo, Visibility,
 };
+use spoolframe_linux_core::backend::{
+    DownloadEvent, DownloadOptionsInfo, DownloadSource, DownloadSpace, DownloadTracks,
+    LocalDownload,
+};
 use spoolframe_linux_core::next_episode::next_episode;
 use spoolframe_linux_core::playlists::{self as playlist_rules, PinNotesShown};
 use spoolframe_linux_core::theme::Theme;
@@ -206,6 +210,14 @@ pub struct App {
     /// A subtitle track just downloaded from the item's page (PX-02):
     /// its next drawing shows it picked.
     picked_subtitle: Option<(MediaId, u32)>,
+    /// Every download on this computer (PX-38), whoever made it: listed
+    /// at start and kept by their events, with or without a server.
+    downloads: Vec<LocalDownload>,
+    /// The Downloads page, while it is the sidebar's choice.
+    downloads_page: Option<Rc<crate::downloads::DownloadsPage>>,
+    /// The Download actions of the item pages on the stack, changed in
+    /// place by their downloads' events.
+    item_downloads: Vec<Rc<crate::downloads::ItemDownload>>,
 }
 
 /// An item page on the stack.
@@ -278,6 +290,7 @@ enum Root {
     Search,
     Library,
     Playlists,
+    Downloads,
 }
 
 pub struct AppWidgets {
@@ -443,6 +456,18 @@ pub enum Msg {
     SubtitleDownloaded(MediaId, u32),
     /// Removes item `id`'s downloaded track `download`.
     RemoveDownload(MediaId, String),
+    /// This computer's downloads (PX-38), listed afresh.
+    DownloadsListed(Vec<LocalDownload>),
+    /// Download events were missed: list them again.
+    ListDownloads,
+    LocalDownloadChanged(Box<LocalDownload>),
+    /// A download was cancelled or deleted, by its key.
+    LocalDownloadRemoved(String),
+    /// "Download" on an item's page: what may be downloaded of it.
+    OpenDownloadPicker(Box<Item>),
+    StartDownload(MediaId, DownloadSource, DownloadTracks),
+    /// A download's button, on its key.
+    DownloadAct(String, crate::downloads::Act),
     PlaylistChanged(Box<PlaylistEvent>),
     /// A kept catalog read came back different from what was shown.
     CatalogChanged(Box<catalog::Change>),
@@ -656,6 +681,13 @@ pub enum Loaded {
     CoverChanged(String, Result<(), BackendError>),
     /// A downloaded subtitle removed (PX-02).
     DownloadRemoved(Result<(), BackendError>),
+    /// What may be downloaded of an item (PX-38), and the room here.
+    DownloadOptions(
+        Box<Item>,
+        Result<DownloadOptionsInfo, BackendError>,
+        Option<DownloadSpace>,
+    ),
+    DownloadStarted(Result<Box<LocalDownload>, BackendError>),
     /// A playlist deleted, by name.
     PlaylistDeleted(String, Result<(), BackendError>),
     PinChanged(Result<(), BackendError>),
@@ -728,6 +760,8 @@ impl Loaded {
             | Loaded::PlaylistUpdated(_, Err(e))
             | Loaded::CoverChanged(_, Err(e))
             | Loaded::DownloadRemoved(Err(e))
+            | Loaded::DownloadOptions(_, Err(e), _)
+            | Loaded::DownloadStarted(Err(e))
             | Loaded::PlaylistDeleted(_, Err(e))
             | Loaded::PinChanged(Err(e))
             | Loaded::PlaylistStarted(_, _, Err(e)) => Some(e),
@@ -785,7 +819,7 @@ impl Component for App {
             },
         });
         sidebar.fill(
-            sidebar::rows(0, sidebar::Playlists::Off),
+            sidebar::rows(0, sidebar::Playlists::Off, true),
             &[],
             &[],
             &pinned_actions,
@@ -1145,8 +1179,15 @@ impl Component for App {
             shown_item: None,
             redrawing: None,
             picked_subtitle: None,
+            downloads: Vec::new(),
+            downloads_page: None,
+            item_downloads: Vec::new(),
         };
         model.watch_catalog(&sender);
+        // Downloads are this computer's, not a session's: heard from the
+        // start, whoever signs in, and listed once heard so none is missed.
+        model.watch_downloads(&sender);
+        model.list_downloads(&sender);
         model.load_servers(&sender);
         // Invite links the desktop opened before the window was up.
         for link in opened::listen(sender.clone()) {
@@ -1677,6 +1718,24 @@ impl Component for App {
                 self.show_playlists(widgets, &sender);
                 self.load_playlists(&sender);
             }
+            Msg::Select(Row::Downloads) => {
+                widgets.new_playlist.set_visible(false);
+                self.select_root(Root::Downloads);
+                plain_header(widgets);
+                self.library = None;
+                widgets.stack.pop_to_page(&widgets.root_page);
+                widgets.root_page.set_title("Downloads");
+                show_content(widgets);
+                clear(&widgets.content);
+                let page = crate::downloads::DownloadsPage::new(
+                    self.client.clone(),
+                    self.who(),
+                    download_acts(&sender),
+                );
+                page.fill(&self.downloads);
+                widgets.content.append(&page.widget);
+                self.downloads_page = Some(page);
+            }
             Msg::Select(Row::Pinned(id)) => self.open_playlist(id, PlaylistPlace::Library, &sender),
             Msg::Select(Row::NothingPinned) => {}
             Msg::Select(Row::Library(index)) => {
@@ -1987,6 +2046,64 @@ impl Component for App {
                 };
                 self.command(&sender, async move {
                     Loaded::DownloadRemoved(session.remove_subtitle_download(&id, &download).await)
+                });
+            }
+            Msg::DownloadsListed(listed) => {
+                self.downloads = listed;
+                if let Some(page) = &self.downloads_page {
+                    page.fill(&self.downloads);
+                }
+                self.show_item_downloads();
+            }
+            Msg::ListDownloads => self.list_downloads(&sender),
+            Msg::LocalDownloadChanged(download) => {
+                self.download_event(DownloadEvent::Changed(*download))
+            }
+            Msg::LocalDownloadRemoved(key) => self.download_event(DownloadEvent::Removed { key }),
+            Msg::OpenDownloadPicker(item) => {
+                let Some(session) = self.session.clone().filter(|s| s.has_downloads()) else {
+                    return;
+                };
+                let client = self.client.clone();
+                self.command(&sender, async move {
+                    let options = session.download_options(item.id()).await;
+                    // The footer goes without the room if it cannot be read.
+                    let space = client.download_space().await.ok();
+                    Loaded::DownloadOptions(item, options, space)
+                });
+            }
+            Msg::StartDownload(id, source, tracks) => {
+                let Some(session) = self.session.clone().filter(|s| s.has_downloads()) else {
+                    return;
+                };
+                self.command(&sender, async move {
+                    Loaded::DownloadStarted(
+                        session
+                            .start_download(&id, source, tracks)
+                            .await
+                            .map(Box::new),
+                    )
+                });
+            }
+            // On this computer, no session needed; what changes comes back
+            // as the download's event.
+            Msg::DownloadAct(key, act) => {
+                use crate::downloads::Act;
+                let client = self.client.clone();
+                let acted = relm4::spawn(async move {
+                    match act {
+                        Act::Pause => client.pause_download(&key).await.map(drop),
+                        Act::Resume => client.resume_download(&key).await.map(drop),
+                        Act::Retry => client.retry_download(&key).await.map(drop),
+                        Act::Cancel | Act::Dismiss => client.cancel_download(&key).await,
+                        Act::Delete => client.delete_download(&key).await,
+                    }
+                });
+                let sender = sender.clone();
+                glib::spawn_future_local(async move {
+                    if let Ok(Err(e)) = acted.await {
+                        sender.input(Msg::Toast(sentence(&e.to_string())));
+                    }
                 });
             }
             Msg::SetCover(id, bytes) => {
@@ -2851,6 +2968,22 @@ impl Component for App {
                     },
                     subtitles: self.subtitle_actions(&item, &sender),
                 };
+                let download = download_offered(self.session.as_deref()).then(|| {
+                    let open: Rc<dyn Fn()> = {
+                        let (sender, item) = (sender.clone(), item.clone());
+                        Rc::new(move || {
+                            sender.input(Msg::OpenDownloadPicker(Box::new(item.clone())))
+                        })
+                    };
+                    crate::downloads::ItemDownload::new(id.clone(), open, download_acts(&sender))
+                });
+                if let Some(download) = &download {
+                    download.show(crate::downloads::for_item(
+                        &self.downloads,
+                        &self.who(),
+                        &id,
+                    ));
+                }
                 let body = pages::playable(
                     &item,
                     context.as_deref(),
@@ -2860,10 +2993,14 @@ impl Component for App {
                     pages::Under {
                         next: next.as_deref(),
                         playlists: self.playlist_rows(&refs, &sender).as_ref(),
+                        download: download.as_deref(),
                     },
                     cards,
                 );
                 self.push_item(widgets, &title, &body, reads_of_playable(&item));
+                // Those of pages gone from the stack go with them.
+                self.item_downloads.retain(|d| d.in_window());
+                self.item_downloads.extend(download);
             }
             Loaded::Show(show, Ok(seasons), open, refs) => {
                 let actions = pages::ShowActions {
@@ -3194,6 +3331,30 @@ impl Component for App {
                     toast(widgets, &e);
                 }
                 self.redraw_item(&sender);
+            }
+            Loaded::DownloadOptions(item, Ok(options), space) => {
+                let start: Rc<dyn Fn(DownloadSource, DownloadTracks)> = {
+                    let (sender, id) = (sender.clone(), item.id().clone());
+                    Rc::new(move |source, tracks| {
+                        sender.input(Msg::StartDownload(id.clone(), source, tracks))
+                    })
+                };
+                crate::download_dialog::present(
+                    root,
+                    crate::download_dialog::Picker {
+                        title: views::Facts::of(&item).title,
+                        options,
+                        space,
+                        start,
+                    },
+                );
+            }
+            Loaded::DownloadOptions(_, Err(e), _) | Loaded::DownloadStarted(Err(e)) => {
+                toast(widgets, &e)
+            }
+            // Its event says the same; shown now in case it came first.
+            Loaded::DownloadStarted(Ok(download)) => {
+                self.download_event(DownloadEvent::Changed(*download))
             }
             Loaded::CoverChanged(id, done) => {
                 if let Err(e) = done {
@@ -3567,6 +3728,70 @@ impl App {
         }));
     }
 
+    /// Hears this computer's downloads change (PX-38), for as long as the
+    /// app runs; missed changes list them all again.
+    fn watch_downloads(&self, sender: &ComponentSender<Self>) {
+        let mut events = self.client.download_events();
+        let sender = sender.clone();
+        glib::spawn_future_local(async move {
+            use tokio::sync::broadcast::error::RecvError;
+            loop {
+                match events.recv().await {
+                    Ok(DownloadEvent::Changed(download)) => {
+                        sender.input(Msg::LocalDownloadChanged(Box::new(download)))
+                    }
+                    Ok(DownloadEvent::Removed { key }) => {
+                        sender.input(Msg::LocalDownloadRemoved(key))
+                    }
+                    Err(RecvError::Lagged(_)) => sender.input(Msg::ListDownloads),
+                    Err(RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+
+    /// Lists this computer's downloads, from disk: no server is needed.
+    fn list_downloads(&self, sender: &ComponentSender<Self>) {
+        let client = self.client.clone();
+        let listed = relm4::spawn(async move { client.downloads().await });
+        let sender = sender.clone();
+        glib::spawn_future_local(async move {
+            if let Ok(listed) = listed.await {
+                sender.input(Msg::DownloadsListed(listed));
+            }
+        });
+    }
+
+    /// One download changed or went: the list, the Downloads page and the
+    /// item pages showing it follow, each in place.
+    fn download_event(&mut self, event: DownloadEvent) {
+        crate::downloads::apply(&mut self.downloads, &event);
+        if let Some(page) = &self.downloads_page {
+            page.apply(&event);
+        }
+        self.show_item_downloads();
+    }
+
+    /// Each item page's Download action, as the downloads are now.
+    fn show_item_downloads(&mut self) {
+        self.item_downloads.retain(|d| d.in_window());
+        let who = self.who();
+        for shown in &self.item_downloads {
+            shown.show(crate::downloads::for_item(
+                &self.downloads,
+                &who,
+                &shown.item,
+            ));
+        }
+    }
+
+    /// The profile in use, as a download names its user.
+    fn who(&self) -> crate::downloads::Who {
+        self.profile
+            .as_ref()
+            .map(|p| (p.server.0.clone(), p.username.clone()))
+    }
+
     /// Hears subtitle timing changes (PX-03), where the session has
     /// subtitle sync: the playing item's subtitle is read again when its
     /// timing changes. A missed one is only a subtitle shown as before.
@@ -3619,7 +3844,8 @@ impl App {
             (Some(_), Some(list)) => sidebar::Playlists::Listed(list),
         };
         widgets.sidebar.fill(
-            sidebar::rows(self.libraries.len(), state),
+            // Downloads are this computer's: their row is always there.
+            sidebar::rows(self.libraries.len(), state, true),
             &self.libraries,
             listed.unwrap_or_default(),
             &self.pinned_actions,
@@ -4387,6 +4613,8 @@ impl App {
         if let Some(load) = self.root_load.take() {
             load.abort();
         }
+        // Made again each time it is chosen.
+        self.downloads_page = None;
     }
 
     /// Loads the root page's content on the runtime and hands the answer
@@ -4734,6 +4962,19 @@ async fn fresh(session: &dyn Session, item: Item) -> (Item, Vec<PlaylistRef>) {
 fn open_with(sender: &ComponentSender<App>) -> views::Open {
     let sender = sender.clone();
     Rc::new(move |item| sender.input(Msg::Open(Box::new(item))))
+}
+
+/// Whether an item page offers Download (PX-38): only where the server
+/// and the app both do downloads, as the board's "No downloads here" has
+/// it. Downloads already made show on the Downloads page either way.
+fn download_offered(session: Option<&dyn Session>) -> bool {
+    session.is_some_and(|s| s.has_downloads())
+}
+
+/// What a download's buttons do, wherever it shows (PX-38).
+fn download_acts(sender: &ComponentSender<App>) -> crate::downloads::Acts {
+    let sender = sender.clone();
+    Rc::new(move |download, act| sender.input(Msg::DownloadAct(download.key, act)))
 }
 
 fn show_connection(widgets: &AppWidgets, server: Option<&Server>, state: &ConnectionState) {
@@ -5528,6 +5769,21 @@ mod tests {
         assert_eq!(home_recent_albums(client), Vec::<String>::new());
     }
 
+    #[test]
+    fn a_server_without_downloads_offers_no_download_action() {
+        let profile = spoolframe_linux_core::fake::FakeClient::profile("andrey");
+        let without = spoolframe_linux_core::fake::FakeClient::new(None).without_downloads();
+        let with = spoolframe_linux_core::fake::FakeClient::new(None);
+        assert_eq!(
+            (
+                download_offered(Some(without.session(&profile).unwrap().as_ref())),
+                download_offered(Some(with.session(&profile).unwrap().as_ref())),
+                download_offered(None)
+            ),
+            (false, true, false)
+        );
+    }
+
     const FEATURES_ALL: spoolframe_linux_core::backend::Features =
         spoolframe_linux_core::backend::Features {
             playlists: true,
@@ -5539,7 +5795,7 @@ mod tests {
             playlist_upcoming: true,
             subtitle_sync: true,
             subtitle_search: true,
-            downloads: false,
+            downloads: true,
             music_downloads: false,
         };
 

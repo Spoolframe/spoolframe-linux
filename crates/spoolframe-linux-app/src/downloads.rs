@@ -1,0 +1,1317 @@
+//! Downloads for offline viewing (PX-38), as the LinuxDownloadStates and
+//! LinuxDownloads boards have them: the Download action on a film's or an
+//! episode's page, and the Downloads page with every download on this
+//! computer. Both show a download the same way, from [`status`], and are
+//! changed in place as its events come (one per 8 MiB read): a row is made
+//! once and its labels, bar and buttons are set again.
+
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Duration;
+
+use adw::prelude::*;
+use gtk::glib;
+use spoolframe_linux_core::backend::{
+    Client, DownloadEvent, DownloadPhase, DownloadSource, DownloadSpace, DownloadState,
+    DownloadTracks, LocalDownload,
+};
+use spoolframe_linux_core::format;
+use spoolframe_types::{ArtworkKind, Item, MediaId};
+
+/// What a download's buttons do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Act {
+    Pause,
+    Resume,
+    /// A failed download, again.
+    Retry,
+    /// Stops one not finished and takes it off this computer.
+    Cancel,
+    /// A failed one off this computer: a cancel, under the board's word.
+    Dismiss,
+    /// A finished one off this computer, once the user confirms.
+    Delete,
+}
+
+impl Act {
+    fn label(self) -> &'static str {
+        match self {
+            Act::Pause => "Pause",
+            Act::Resume => "Resume",
+            Act::Retry => "Try again",
+            Act::Cancel => "Cancel",
+            Act::Dismiss => "Dismiss",
+            Act::Delete => "Delete download",
+        }
+    }
+
+    fn icon(self) -> Option<&'static str> {
+        match self {
+            Act::Pause => Some(crate::icons::PAUSE),
+            Act::Resume => Some(crate::icons::DOWNLOADS),
+            Act::Delete => Some(crate::icons::FORGET),
+            _ => None,
+        }
+    }
+}
+
+/// What a download's buttons ask of the app: `Act` on this download.
+pub type Acts = Rc<dyn Fn(LocalDownload, Act)>;
+
+/// Whether a failed download is worth trying again. The SDK keeps no
+/// record of where it failed, but `size` tells: the server sets it once
+/// its file is ready. A failure with no size happened while the server
+/// prepared the file (it could not convert it, or the item is gone), and
+/// trying again prepares the same thing the same way. With a size, it
+/// failed on the way here or on this computer (the file arrived damaged,
+/// the disk was full, a read went wrong), which another try may not.
+/// Network trouble is never a failure: the SDK waits and tries by itself,
+/// saying so in `note`.
+pub fn retryable(download: &LocalDownload) -> bool {
+    matches!(download.phase, DownloadPhase::Failed { .. }) && download.size.is_some()
+}
+
+/// How a download shows: a heading ("Downloading · 63%"), a line under it,
+/// a bar while it moves, and its buttons.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Status {
+    pub heading: String,
+    pub detail: Option<String>,
+    /// 0 to 1, while there is something to show.
+    pub progress: Option<f64>,
+    pub acts: Vec<Act>,
+}
+
+/// How `download` shows, in its phase. While the SDK waits to try again,
+/// its note says why, in place of the line under the heading.
+pub fn status(download: &LocalDownload) -> Status {
+    let version = version(&download.source);
+    let note = download.note.clone();
+    match &download.phase {
+        DownloadPhase::Preparing { server } => {
+            let (heading, progress, detail) = match server {
+                DownloadState::Waiting => (
+                    "Waiting on the server".to_owned(),
+                    None,
+                    format!("{version} · the server prepares it, then it downloads"),
+                ),
+                DownloadState::Converting {
+                    done_percent,
+                    eta_secs,
+                } => (
+                    with_percent("Converting on the server", *done_percent),
+                    done_percent.map(fraction),
+                    match eta_secs {
+                        Some(secs) => format!("{version} · about {}", eta(*secs)),
+                        None => version,
+                    },
+                ),
+                DownloadState::Writing { done_percent } => (
+                    with_percent("Writing on the server", *done_percent),
+                    done_percent.map(fraction),
+                    version,
+                ),
+                _ => ("Preparing on the server".to_owned(), None, version),
+            };
+            Status {
+                heading,
+                detail: note.or(Some(detail)),
+                progress,
+                acts: vec![Act::Cancel],
+            }
+        }
+        DownloadPhase::Transferring => Status {
+            heading: with_percent("Downloading", percent(download)),
+            detail: note.or_else(|| amount(download)),
+            progress: Some(percent(download).map_or(0.0, fraction)),
+            acts: vec![Act::Pause, Act::Cancel],
+        },
+        DownloadPhase::Paused => Status {
+            heading: match percent(download) {
+                Some(p) => format!("Paused at {p}%"),
+                None => "Paused".to_owned(),
+            },
+            detail: amount(download),
+            progress: percent(download).map(fraction),
+            acts: vec![Act::Resume, Act::Cancel],
+        },
+        DownloadPhase::Done => Status {
+            heading: format!(
+                "Downloaded · {}",
+                size(download.size.unwrap_or(download.received))
+            ),
+            detail: Some(format!("{version} · {}", tracks_line(download))),
+            progress: None,
+            acts: vec![Act::Delete],
+        },
+        DownloadPhase::Failed { reason } => Status {
+            heading: "Couldn’t download".to_owned(),
+            detail: Some(reason.clone()),
+            progress: None,
+            acts: match retryable(download) {
+                true => vec![Act::Retry, Act::Dismiss],
+                false => vec![Act::Dismiss],
+            },
+        },
+    }
+}
+
+fn with_percent(what: &str, percent: Option<impl std::fmt::Display>) -> String {
+    match percent {
+        Some(p) => format!("{what} · {p}%"),
+        None => what.to_owned(),
+    }
+}
+
+fn fraction(percent: impl Into<u64>) -> f64 {
+    (percent.into().min(100) as f64) / 100.0
+}
+
+/// How much of the file is here, once its size is known.
+fn percent(download: &LocalDownload) -> Option<u64> {
+    let size = download.size.filter(|s| *s > 0)?;
+    Some((download.received.saturating_mul(100) / size).min(100))
+}
+
+/// "2.3 of 3.6 GB", once the size is known.
+fn amount(download: &LocalDownload) -> Option<String> {
+    let whole = download.size?;
+    Some(match (download.received, whole) {
+        (r, s) if r >= GB && s >= GB => {
+            format!("{:.1} of {:.1} GB", r as f64 / 1e9, s as f64 / 1e9)
+        }
+        (r, s) => format!("{} of {}", size(r), size(s)),
+    })
+}
+
+/// "14 min left", from the server's guess in seconds.
+fn eta(secs: u64) -> String {
+    format::remaining(Duration::from_secs(secs), Duration::ZERO)
+}
+
+const GB: u64 = 1_000_000_000;
+
+/// A size as the boards write it: "3.4 GB", "740 MB", in powers of ten as
+/// file managers show them.
+pub fn size(bytes: u64) -> String {
+    let b = bytes as f64;
+    match bytes {
+        n if n >= GB => format!("{:.1} GB", b / 1e9),
+        n if n >= 1_000_000 => format!("{:.0} MB", b / 1e6),
+        n if n >= 1_000 => format!("{:.0} kB", b / 1e3),
+        n => format!("{n} bytes"),
+    }
+}
+
+/// The version a download was made from: Original, or its profile.
+pub fn version(source: &DownloadSource) -> String {
+    match source {
+        DownloadSource::Original => "Original".to_owned(),
+        DownloadSource::Profile { name } => name.clone(),
+        DownloadSource::Aac256 => "AAC 256 kbit/s".to_owned(),
+        DownloadSource::Unknown => "Another version".to_owned(),
+    }
+}
+
+/// "all tracks", or how many the file carries besides the video.
+fn tracks_line(download: &LocalDownload) -> String {
+    if download.chosen == DownloadTracks::All {
+        return "all tracks".to_owned();
+    }
+    let file = spoolframe_linux_core::downloads::file_tracks(download);
+    match file.audio.len() + file.subtitles.len() {
+        1 => "1 track".to_owned(),
+        n => format!("{n} tracks"),
+    }
+}
+
+/// A download's name: the film's, or "Severance · S2 E5 · Trojan's Horse".
+pub fn title(download: &LocalDownload) -> String {
+    match &download.item {
+        Item::Episode(e) => {
+            let show = e
+                .show_title
+                .clone()
+                .or_else(|| download.show.as_ref().map(item_title));
+            let episode = format!("S{} E{} · {}", e.season, e.episode, e.title);
+            match show {
+                Some(show) => format!("{show} · {episode}"),
+                None => episode,
+            }
+        }
+        other => item_title(other),
+    }
+}
+
+fn item_title(item: &Item) -> String {
+    crate::views::Facts::of(item).title
+}
+
+/// The line under a row's title: "Movie · Mobile · 2 tracks", with the
+/// size once finished, and whose it is when it is another profile's.
+pub fn info_line(download: &LocalDownload, theirs: bool) -> String {
+    let kind = match download.item {
+        Item::Episode(_) => "Episode",
+        _ => "Movie",
+    };
+    let mut line = format!(
+        "{kind} · {} · {}",
+        version(&download.source),
+        tracks_line(download)
+    );
+    if download.phase == DownloadPhase::Done {
+        line.push_str(&format!(
+            " · {}",
+            size(download.size.unwrap_or(download.received))
+        ));
+    }
+    if theirs {
+        line.push_str(&format!(" · {}", download.username));
+    }
+    line
+}
+
+/// The profile in use, as a download names its user: the server's key and
+/// the username.
+pub type Who = Option<(String, String)>;
+
+fn mine(download: &LocalDownload, who: &Who) -> bool {
+    who.as_ref()
+        .is_some_and(|(server, user)| download.server == *server && download.username == *user)
+}
+
+/// The download an item's page shows: the profile's latest of the item.
+/// Another profile's download of it is theirs, not shown here.
+pub fn for_item<'a>(
+    downloads: &'a [LocalDownload],
+    who: &Who,
+    item: &MediaId,
+) -> Option<&'a LocalDownload> {
+    downloads
+        .iter()
+        .filter(|d| mine(d, who) && d.item.id() == item)
+        .max_by_key(|d| d.created_at)
+}
+
+/// The order the Downloads page lists in: the profile in use's first, then
+/// the other profiles', each oldest first as the SDK lists them.
+pub fn order<'a>(downloads: &'a [LocalDownload], who: &Who) -> Vec<&'a LocalDownload> {
+    let (mut first, rest): (Vec<_>, Vec<_>) = downloads.iter().partition(|d| mine(d, who));
+    first.extend(rest);
+    first
+}
+
+/// Whether a download is listed under Downloaded, not In progress.
+fn finished(download: &LocalDownload) -> bool {
+    download.phase == DownloadPhase::Done
+}
+
+/// Where download `key` goes in its section, in [`order`].
+pub fn place(downloads: &[LocalDownload], who: &Who, key: &str) -> usize {
+    let Some(done) = downloads.iter().find(|d| d.key == key).map(finished) else {
+        return 0;
+    };
+    order(downloads, who)
+        .into_iter()
+        .filter(|d| finished(d) == done)
+        .position(|d| d.key == key)
+        .unwrap_or(0)
+}
+
+/// What an event did to a list of downloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Applied {
+    /// One listed changed, in place.
+    Updated,
+    Added,
+    Removed,
+    /// The removal of one not listed: nothing to do.
+    Nothing,
+}
+
+/// `event` applied to `downloads`, as the SDK's own list would have it.
+pub fn apply(downloads: &mut Vec<LocalDownload>, event: &DownloadEvent) -> Applied {
+    match event {
+        DownloadEvent::Changed(changed) => {
+            match downloads.iter_mut().find(|d| d.key == changed.key) {
+                Some(listed) => {
+                    *listed = changed.clone();
+                    Applied::Updated
+                }
+                None => {
+                    downloads.push(changed.clone());
+                    Applied::Added
+                }
+            }
+        }
+        DownloadEvent::Removed { key } => match downloads.iter().position(|d| d.key == *key) {
+            Some(at) => {
+                downloads.remove(at);
+                Applied::Removed
+            }
+            None => Applied::Nothing,
+        },
+    }
+}
+
+/// "Delete the download of Alien?", over `parent`; `delete` on Delete.
+fn confirm_delete(parent: &impl IsA<gtk::Widget>, download: &LocalDownload, delete: Rc<dyn Fn()>) {
+    let alert = adw::AlertDialog::builder()
+        .heading(format!("Delete the download of {}?", title(download)))
+        .body(format!(
+            "{} is freed on this computer. You can still stream it from the server.",
+            size(download.size.unwrap_or(download.received))
+        ))
+        .default_response("cancel")
+        .close_response("cancel")
+        .build();
+    alert.add_response("cancel", "Cancel");
+    alert.add_response("delete", "Delete");
+    alert.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+    alert.connect_response(Some("delete"), move |_, _| delete());
+    alert.present(Some(parent));
+}
+
+/// A download's heading, line and bar, and its buttons, set again in place
+/// for each change.
+struct StatusView {
+    text: gtk::Box,
+    heading: gtk::Label,
+    detail: gtk::Label,
+    progress: gtk::ProgressBar,
+    actions: gtk::Box,
+    /// The buttons shown: made again only when they change.
+    acts: RefCell<Vec<Act>>,
+    /// What the buttons act on.
+    shown: Rc<RefCell<Option<LocalDownload>>>,
+    act: Acts,
+}
+
+impl StatusView {
+    fn new(act: Acts) -> Self {
+        let text = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(4)
+            .hexpand(true)
+            .build();
+        let heading = gtk::Label::builder()
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["heading"])
+            .build();
+        let progress = gtk::ProgressBar::builder()
+            .visible(false)
+            .valign(gtk::Align::Center)
+            .css_classes(["download-progress"])
+            .build();
+        let detail = gtk::Label::builder()
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["dim-label", "caption"])
+            .build();
+        text.append(&heading);
+        text.append(&progress);
+        text.append(&detail);
+        let actions = gtk::Box::builder()
+            .spacing(8)
+            .valign(gtk::Align::Center)
+            .build();
+        StatusView {
+            text,
+            heading,
+            detail,
+            progress,
+            actions,
+            acts: RefCell::default(),
+            shown: Rc::default(),
+            act,
+        }
+    }
+
+    fn show(&self, download: &LocalDownload) {
+        let status = status(download);
+        self.heading.set_label(&status.heading);
+        self.detail
+            .set_label(status.detail.as_deref().unwrap_or(""));
+        self.detail.set_visible(status.detail.is_some());
+        self.progress.set_visible(status.progress.is_some());
+        self.progress.set_fraction(status.progress.unwrap_or(0.0));
+        *self.shown.borrow_mut() = Some(download.clone());
+        if *self.acts.borrow() != status.acts {
+            while let Some(child) = self.actions.first_child() {
+                self.actions.remove(&child);
+            }
+            for act in &status.acts {
+                self.actions.append(&self.button(*act));
+            }
+            *self.acts.borrow_mut() = status.acts;
+        }
+    }
+
+    fn button(&self, act: Act) -> gtk::Button {
+        let button = gtk::Button::builder()
+            .valign(gtk::Align::Center)
+            .css_classes(["action", "outlined"])
+            .build();
+        match act.icon() {
+            Some(icon) => button.set_child(Some(
+                &adw::ButtonContent::builder()
+                    .icon_name(icon)
+                    .label(act.label())
+                    .build(),
+            )),
+            None => button.set_label(act.label()),
+        }
+        let (shown, run) = (self.shown.clone(), self.act.clone());
+        button.connect_clicked(move |button| {
+            let Some(download) = shown.borrow().clone() else {
+                return;
+            };
+            if act == Act::Delete {
+                let (run, kept) = (run.clone(), download.clone());
+                confirm_delete(
+                    button,
+                    &download,
+                    Rc::new(move || run(kept.clone(), Act::Delete)),
+                );
+            } else {
+                run(download, act);
+            }
+        });
+        button
+    }
+}
+
+/// The Download action on a film's or an episode's page: a Download button
+/// beside Resume while there is no download, and the download's state
+/// under the row once there is one.
+pub struct ItemDownload {
+    pub item: MediaId,
+    pub button: gtk::Button,
+    pub status: gtk::Box,
+    view: StatusView,
+}
+
+impl ItemDownload {
+    /// `open` asks what to download.
+    pub fn new(item: MediaId, open: Rc<dyn Fn()>, act: Acts) -> Rc<Self> {
+        let button = gtk::Button::builder()
+            .child(
+                &adw::ButtonContent::builder()
+                    .icon_name(crate::icons::DOWNLOADS)
+                    .label("Download")
+                    .build(),
+            )
+            .valign(gtk::Align::Center)
+            .css_classes(["action", "outlined"])
+            .build();
+        button.connect_clicked(move |_| open());
+        let view = StatusView::new(act);
+        let status = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(10)
+            .visible(false)
+            .css_classes(["card", "download-status"])
+            .build();
+        let inner = gtk::Box::builder()
+            .spacing(16)
+            .margin_top(12)
+            .margin_bottom(12)
+            .margin_start(16)
+            .margin_end(16)
+            .build();
+        inner.append(&gtk::Image::from_icon_name(crate::icons::DOWNLOADS));
+        inner.append(&view.text);
+        inner.append(&view.actions);
+        status.append(&inner);
+        Rc::new(ItemDownload {
+            item,
+            button,
+            status,
+            view,
+        })
+    }
+
+    /// Shows `download`, or the Download button without one.
+    pub fn show(&self, download: Option<&LocalDownload>) {
+        self.button.set_visible(download.is_none());
+        self.status.set_visible(download.is_some());
+        if let Some(download) = download {
+            self.view.show(download);
+        }
+    }
+
+    /// Whether its page is still in the window: one left is dropped.
+    pub fn in_window(&self) -> bool {
+        self.button.root().is_some() || self.status.root().is_some()
+    }
+}
+
+/// One section of the Downloads page: In progress or Downloaded.
+struct Section {
+    widget: gtk::Box,
+    count: gtk::Label,
+    list: gtk::ListBox,
+}
+
+impl Section {
+    fn new(title: &str) -> Self {
+        let widget = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(10)
+            .build();
+        let head = gtk::Box::builder().spacing(10).build();
+        head.append(
+            &gtk::Label::builder()
+                .label(title)
+                .xalign(0.0)
+                .css_classes(["title-3"])
+                .build(),
+        );
+        let count = gtk::Label::builder()
+            .xalign(0.0)
+            .valign(gtk::Align::Baseline)
+            .css_classes(["dim-label"])
+            .build();
+        head.append(&count);
+        let list = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .css_classes(["boxed-list"])
+            .build();
+        widget.append(&head);
+        widget.append(&list);
+        Section {
+            widget,
+            count,
+            list,
+        }
+    }
+}
+
+/// A download's row on the Downloads page.
+struct PageRow {
+    key: String,
+    finished: bool,
+    row: gtk::ListBoxRow,
+    title: gtk::Label,
+    info: gtk::Label,
+    view: StatusView,
+}
+
+/// The Downloads page: how much room the downloads take, then In
+/// progress and Downloaded, each a list of rows changed in place.
+pub struct DownloadsPage {
+    pub widget: gtk::Box,
+    client: Arc<dyn Client>,
+    who: Who,
+    act: Acts,
+    used: gtk::Label,
+    free: gtk::Label,
+    bar: gtk::LevelBar,
+    running: Section,
+    done: Section,
+    empty: adw::StatusPage,
+    downloads: RefCell<Vec<LocalDownload>>,
+    rows: RefCell<Vec<PageRow>>,
+}
+
+impl DownloadsPage {
+    pub fn new(client: Arc<dyn Client>, who: Who, act: Acts) -> Rc<Self> {
+        let widget = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(20)
+            .build();
+        // How much room they take, and where, as the board's top card.
+        let card = gtk::Box::builder()
+            .spacing(16)
+            .css_classes(["card", "download-space"])
+            .build();
+        let inner = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(6)
+            .hexpand(true)
+            .margin_top(14)
+            .margin_bottom(14)
+            .margin_end(16)
+            .build();
+        let line = gtk::Box::builder().spacing(12).build();
+        let used = gtk::Label::builder()
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::Middle)
+            .build();
+        let free = gtk::Label::builder()
+            .xalign(1.0)
+            .css_classes(["dim-label"])
+            .build();
+        line.append(&used);
+        line.append(&free);
+        let bar = gtk::LevelBar::builder()
+            .min_value(0.0)
+            .max_value(1.0)
+            .build();
+        inner.append(&line);
+        inner.append(&bar);
+        let icon = gtk::Image::builder()
+            .icon_name(crate::icons::DOWNLOADS)
+            .pixel_size(22)
+            .margin_start(16)
+            .css_classes(["accent"])
+            .build();
+        card.append(&icon);
+        card.append(&inner);
+        widget.append(&card);
+        let running = Section::new("In progress");
+        let done = Section::new("Downloaded");
+        let empty = adw::StatusPage::builder()
+            .icon_name(crate::icons::DOWNLOADS)
+            .title("No downloads")
+            .description("Download a film or an episode from its page to watch it with no server.")
+            .visible(false)
+            .build();
+        widget.append(&running.widget);
+        widget.append(&done.widget);
+        widget.append(&empty);
+        widget.append(
+            &gtk::Label::builder()
+                .label(
+                    "Downloads go on while Spoolframe runs. Anyone who can play it can download \
+                     it, and a download never expires.",
+                )
+                .xalign(0.0)
+                .wrap(true)
+                .css_classes(["dim-label", "caption"])
+                .build(),
+        );
+        Rc::new(DownloadsPage {
+            widget,
+            client,
+            who,
+            act,
+            used,
+            free,
+            bar,
+            running,
+            done,
+            empty,
+            downloads: RefCell::default(),
+            rows: RefCell::default(),
+        })
+    }
+
+    /// Lists `downloads` afresh: at first, and after events were missed.
+    pub fn fill(self: &Rc<Self>, downloads: &[LocalDownload]) {
+        for row in self.rows.borrow_mut().drain(..) {
+            self.section(row.finished).list.remove(&row.row);
+        }
+        *self.downloads.borrow_mut() = downloads.to_vec();
+        let ordered: Vec<LocalDownload> =
+            order(downloads, &self.who).into_iter().cloned().collect();
+        for download in &ordered {
+            self.add(download);
+        }
+        self.counted();
+        self.load_space();
+    }
+
+    /// One download changed or went: its row alone is changed, moved or
+    /// taken away. The room is read again when the phase changes, not for
+    /// each piece read.
+    pub fn apply(self: &Rc<Self>, event: &DownloadEvent) {
+        let before = match event {
+            DownloadEvent::Changed(d) => self
+                .downloads
+                .borrow()
+                .iter()
+                .find(|listed| listed.key == d.key)
+                .map(|listed| std::mem::discriminant(&listed.phase)),
+            DownloadEvent::Removed { .. } => None,
+        };
+        let applied = apply(&mut self.downloads.borrow_mut(), event);
+        match (applied, event) {
+            (Applied::Updated, DownloadEvent::Changed(download)) => {
+                let moved = {
+                    let rows = self.rows.borrow();
+                    let row = rows.iter().find(|r| r.key == download.key);
+                    match row {
+                        Some(row) if row.finished == finished(download) => {
+                            row.view.show(download);
+                            row.title.set_label(&title(download));
+                            row.info
+                                .set_label(&info_line(download, self.theirs(download)));
+                            false
+                        }
+                        _ => true,
+                    }
+                };
+                if moved {
+                    self.remove(&download.key);
+                    self.add(download);
+                }
+                if before != Some(std::mem::discriminant(&download.phase)) {
+                    self.load_space();
+                }
+            }
+            (Applied::Added, DownloadEvent::Changed(download)) => {
+                self.add(download);
+                self.load_space();
+            }
+            (Applied::Removed, DownloadEvent::Removed { key }) => {
+                self.remove(key);
+                self.load_space();
+            }
+            _ => {}
+        }
+        self.counted();
+    }
+
+    fn theirs(&self, download: &LocalDownload) -> bool {
+        self.who.is_some() && !mine(download, &self.who)
+    }
+
+    fn section(&self, finished: bool) -> &Section {
+        if finished { &self.done } else { &self.running }
+    }
+
+    /// A row for `download`, at its place in its section.
+    fn add(&self, download: &LocalDownload) {
+        let view = StatusView::new(self.act.clone());
+        view.show(download);
+        let title = gtk::Label::builder()
+            .label(title(download))
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .css_classes(["heading"])
+            .build();
+        let info = gtk::Label::builder()
+            .label(info_line(download, self.theirs(download)))
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .css_classes(["dim-label", "caption"])
+            .build();
+        // The title over the phase, as the board's rows.
+        let texts = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(4)
+            .hexpand(true)
+            .build();
+        texts.append(&title);
+        texts.append(&info);
+        texts.append(&view.text);
+        let body = gtk::Box::builder()
+            .spacing(16)
+            .margin_top(12)
+            .margin_bottom(12)
+            .margin_start(16)
+            .margin_end(16)
+            .build();
+        body.append(&poster(download));
+        body.append(&texts);
+        body.append(&view.actions);
+        let row = gtk::ListBoxRow::builder()
+            .child(&body)
+            .activatable(false)
+            .build();
+        let done = finished(download);
+        let at = place(&self.downloads.borrow(), &self.who, &download.key);
+        self.section(done).list.insert(&row, at as i32);
+        self.rows.borrow_mut().push(PageRow {
+            key: download.key.clone(),
+            finished: done,
+            row,
+            title,
+            info,
+            view,
+        });
+    }
+
+    fn remove(&self, key: &str) {
+        let mut rows = self.rows.borrow_mut();
+        if let Some(at) = rows.iter().position(|r| r.key == key) {
+            let row = rows.remove(at);
+            self.section(row.finished).list.remove(&row.row);
+        }
+    }
+
+    /// The sections' counts, and the empty page when there is nothing.
+    fn counted(&self) {
+        let downloads = self.downloads.borrow();
+        let (done, running): (Vec<_>, Vec<_>) = downloads.iter().partition(|d| finished(d));
+        self.running.count.set_label(&running.len().to_string());
+        self.running.widget.set_visible(!running.is_empty());
+        let bytes: u64 = done.iter().map(|d| d.size.unwrap_or(d.received)).sum();
+        self.done
+            .count
+            .set_label(&format!("{} · {}", done.len(), size(bytes)));
+        self.done.widget.set_visible(!done.is_empty());
+        self.empty.set_visible(downloads.is_empty());
+    }
+
+    fn load_space(self: &Rc<Self>) {
+        let client = self.client.clone();
+        let asked = relm4::spawn(async move { client.download_space().await });
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let Ok(space) = asked.await else { return };
+            let Some(page) = weak.upgrade() else { return };
+            match space {
+                Ok(space) => page.show_space(space),
+                Err(e) => tracing::warn!(error = %e, "cannot read the downloads' room"),
+            }
+        });
+    }
+
+    fn show_space(&self, space: DownloadSpace) {
+        self.used
+            .set_label(&space_line(space, crate::downloads_dir().as_deref()));
+        self.free
+            .set_label(&format!("{} free", size(space.available)));
+        self.bar.set_value(used_fraction(space));
+    }
+
+    /// The title of each row, in the order shown, for tests.
+    #[cfg(test)]
+    fn titles(&self) -> Vec<(bool, String)> {
+        let rows = self.rows.borrow();
+        let mut shown = Vec::new();
+        for section in [&self.running, &self.done] {
+            let mut child = section.list.first_child();
+            while let Some(widget) = child {
+                if let Some(row) = rows
+                    .iter()
+                    .find(|r| r.row.upcast_ref::<gtk::Widget>() == &widget)
+                {
+                    shown.push((row.finished, row.title.label().to_string()));
+                }
+                child = widget.next_sibling();
+            }
+        }
+        shown
+    }
+}
+
+/// "41.2 GB in ~/.local/share/spoolframe/downloads".
+pub fn space_line(space: DownloadSpace, dir: Option<&std::path::Path>) -> String {
+    match dir {
+        Some(dir) => format!("{} in {}", size(space.used), home_relative(dir)),
+        None => size(space.used),
+    }
+}
+
+/// The share of the room the downloads take, for the bar.
+pub fn used_fraction(space: DownloadSpace) -> f64 {
+    let whole = space.used.saturating_add(space.available);
+    if whole == 0 {
+        0.0
+    } else {
+        space.used as f64 / whole as f64
+    }
+}
+
+/// `path` with the home directory as "~".
+fn home_relative(path: &std::path::Path) -> String {
+    let home = glib::home_dir();
+    match path.strip_prefix(&home) {
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
+/// The download's poster, read from this computer: it shows offline.
+fn poster(download: &LocalDownload) -> gtk::Widget {
+    const SIZE: (i32, i32) = (36, 54);
+    let pick = |kind: ArtworkKind| download.artwork.iter().find(|a| a.kind == kind);
+    let art = pick(ArtworkKind::Poster)
+        .or_else(|| pick(ArtworkKind::Thumb))
+        .or_else(|| download.artwork.first());
+    match art {
+        Some(art) => {
+            let picture = gtk::Picture::for_filename(&art.path);
+            picture.set_content_fit(gtk::ContentFit::Cover);
+            picture.set_size_request(SIZE.0, SIZE.1);
+            picture.set_valign(gtk::Align::Center);
+            picture.set_overflow(gtk::Overflow::Hidden);
+            picture.add_css_class("download-poster");
+            picture.upcast()
+        }
+        None => {
+            let tile = crate::views::tile(download.item.id(), "", "poster", SIZE);
+            tile.set_valign(gtk::Align::Center);
+            tile.upcast()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use spoolframe_linux_core::backend::{DownloadTracks, Session};
+    use spoolframe_linux_core::fake::FakeClient;
+    use spoolframe_linux_core::testing::ready;
+    use spoolframe_types::{MediaKind, Namespace};
+
+    use super::*;
+
+    fn id(kind: MediaKind, key: &str) -> MediaId {
+        MediaId::new(Namespace::Plex, kind, key).unwrap()
+    }
+
+    fn alien() -> MediaId {
+        id(MediaKind::Movie, "1")
+    }
+
+    fn andrey(client: &FakeClient) -> Arc<dyn Session> {
+        client.session(&FakeClient::profile("andrey")).unwrap()
+    }
+
+    fn andrey_is_watching() -> Who {
+        let profile = FakeClient::profile("andrey");
+        Some((profile.server.0, profile.username))
+    }
+
+    fn started(client: &FakeClient, item: &MediaId) -> LocalDownload {
+        ready(andrey(client).start_download(item, DownloadSource::Original, DownloadTracks::All))
+            .unwrap()
+    }
+
+    fn in_phase(phase: DownloadPhase) -> LocalDownload {
+        let client = FakeClient::new(None);
+        LocalDownload {
+            phase,
+            ..started(&client, &alien())
+        }
+    }
+
+    fn preparing(server: DownloadState) -> LocalDownload {
+        in_phase(DownloadPhase::Preparing { server })
+    }
+
+    #[test]
+    fn a_conversion_failure_on_the_server_offers_no_retry() {
+        let failed = in_phase(DownloadPhase::Failed {
+            reason: "the conversion failed".into(),
+        });
+        assert_eq!(
+            (retryable(&failed), status(&failed).acts),
+            (false, vec![Act::Dismiss])
+        );
+    }
+
+    #[test]
+    fn a_failure_on_the_way_here_offers_retry() {
+        let failed = LocalDownload {
+            size: Some(3_600_000_000),
+            received: 1_200_000_000,
+            ..in_phase(DownloadPhase::Failed {
+                reason: "The file arrived damaged; try again".into(),
+            })
+        };
+        assert_eq!(
+            (retryable(&failed), status(&failed).acts),
+            (true, vec![Act::Retry, Act::Dismiss])
+        );
+    }
+
+    #[test]
+    fn a_download_under_way_is_never_retryable() {
+        let moving = LocalDownload {
+            size: Some(10),
+            ..in_phase(DownloadPhase::Transferring)
+        };
+        assert!(!retryable(&moving));
+    }
+
+    #[test]
+    fn a_failed_download_says_why() {
+        let failed = in_phase(DownloadPhase::Failed {
+            reason: "the file is gone".into(),
+        });
+        let shown = status(&failed);
+        assert_eq!(
+            (shown.heading.as_str(), shown.detail.as_deref()),
+            ("Couldn’t download", Some("the file is gone"))
+        );
+    }
+
+    #[test]
+    fn waiting_says_so_and_only_cancels() {
+        let shown = status(&preparing(DownloadState::Waiting));
+        assert_eq!(
+            (shown.heading.as_str(), shown.progress, shown.acts),
+            ("Waiting on the server", None, vec![Act::Cancel])
+        );
+    }
+
+    #[test]
+    fn converting_shows_its_share_and_the_time_left() {
+        let shown = status(&LocalDownload {
+            source: DownloadSource::Profile {
+                name: "Mobile".into(),
+            },
+            ..preparing(DownloadState::Converting {
+                done_percent: Some(42),
+                eta_secs: Some(14 * 60),
+            })
+        });
+        assert_eq!(
+            (
+                shown.heading.as_str(),
+                shown.detail.as_deref(),
+                shown.progress
+            ),
+            (
+                "Converting on the server · 42%",
+                Some("Mobile · about 14 min left"),
+                Some(0.42)
+            )
+        );
+    }
+
+    #[test]
+    fn writing_on_the_server_shows_its_share() {
+        let shown = status(&preparing(DownloadState::Writing {
+            done_percent: Some(10),
+        }));
+        assert_eq!(
+            (shown.heading.as_str(), shown.progress),
+            ("Writing on the server · 10%", Some(0.1))
+        );
+    }
+
+    #[test]
+    fn downloading_shows_what_arrived_and_pauses() {
+        let shown = status(&LocalDownload {
+            size: Some(3_600_000_000),
+            received: 2_300_000_000,
+            ..in_phase(DownloadPhase::Transferring)
+        });
+        assert_eq!(
+            (shown.heading.as_str(), shown.detail.as_deref(), shown.acts),
+            (
+                "Downloading · 63%",
+                Some("2.3 of 3.6 GB"),
+                vec![Act::Pause, Act::Cancel]
+            )
+        );
+    }
+
+    #[test]
+    fn the_sdk_waiting_to_try_again_says_why_in_place_of_the_amount() {
+        let shown = status(&LocalDownload {
+            size: Some(100),
+            received: 10,
+            note: Some("Waiting for the server: it cannot be reached".into()),
+            ..in_phase(DownloadPhase::Transferring)
+        });
+        assert_eq!(
+            shown.detail.as_deref(),
+            Some("Waiting for the server: it cannot be reached")
+        );
+    }
+
+    #[test]
+    fn paused_resumes_from_where_it_got_to() {
+        let shown = status(&LocalDownload {
+            size: Some(1_000),
+            received: 200,
+            ..in_phase(DownloadPhase::Paused)
+        });
+        assert_eq!(
+            (shown.heading.as_str(), shown.acts),
+            ("Paused at 20%", vec![Act::Resume, Act::Cancel])
+        );
+    }
+
+    #[test]
+    fn downloaded_says_its_size_and_deletes() {
+        let shown = status(&LocalDownload {
+            size: Some(3_400_000_000),
+            received: 3_400_000_000,
+            ..in_phase(DownloadPhase::Done)
+        });
+        assert_eq!(
+            (shown.heading.as_str(), shown.detail.as_deref(), shown.acts),
+            (
+                "Downloaded · 3.4 GB",
+                Some("Original · all tracks"),
+                vec![Act::Delete]
+            )
+        );
+    }
+
+    #[test]
+    fn sizes_read_as_file_managers_write_them() {
+        assert_eq!(
+            [999, 74_000, 740_000_000, 38_400_000_000].map(size),
+            ["999 bytes", "74 kB", "740 MB", "38.4 GB"]
+        );
+    }
+
+    #[test]
+    fn an_episode_is_named_with_its_show_and_place() {
+        let client = FakeClient::new(None);
+        let episode = started(&client, &id(MediaKind::Episode, "65"));
+        let Item::Episode(e) = &episode.item else {
+            panic!("65 is an episode")
+        };
+        assert_eq!(
+            title(&episode),
+            format!(
+                "{} · S{} E{} · {}",
+                e.show_title.clone().unwrap(),
+                e.season,
+                e.episode,
+                e.title
+            )
+        );
+    }
+
+    #[test]
+    fn an_items_page_shows_the_profiles_own_download_of_it() {
+        let client = FakeClient::new(None);
+        let mine = started(&client, &alien());
+        ready(
+            client
+                .session(&FakeClient::profile("bob"))
+                .unwrap()
+                .start_download(&alien(), DownloadSource::Original, DownloadTracks::All),
+        )
+        .unwrap();
+        let listed = ready(client.downloads());
+        let who = andrey_is_watching();
+        assert_eq!(
+            (
+                for_item(&listed, &who, &alien()).map(|d| d.key.clone()),
+                for_item(&listed, &None, &alien()).map(|d| d.key.clone())
+            ),
+            (Some(mine.key), None)
+        );
+    }
+
+    #[test]
+    fn the_profiles_own_downloads_are_listed_first() {
+        let client = FakeClient::new(None);
+        let bobs = ready(
+            client
+                .session(&FakeClient::profile("bob"))
+                .unwrap()
+                .start_download(&alien(), DownloadSource::Original, DownloadTracks::All),
+        )
+        .unwrap();
+        let mine = started(&client, &alien());
+        let listed = ready(client.downloads());
+        let who = andrey_is_watching();
+        assert_eq!(
+            order(&listed, &who)
+                .into_iter()
+                .map(|d| d.key.clone())
+                .collect::<Vec<_>>(),
+            [mine.key, bobs.key]
+        );
+    }
+
+    #[test]
+    fn a_changed_download_is_changed_in_place() {
+        let client = FakeClient::new(None);
+        let first = started(&client, &alien());
+        let mut listed = ready(client.downloads());
+        client.advance_download(&first.key, 500);
+        let changed = ready(client.download(&first.key)).unwrap();
+        assert_eq!(
+            (
+                apply(&mut listed, &DownloadEvent::Changed(changed.clone())),
+                listed
+            ),
+            (Applied::Updated, vec![changed])
+        );
+    }
+
+    #[test]
+    fn a_removed_download_leaves_the_list() {
+        let client = FakeClient::new(None);
+        let first = started(&client, &alien());
+        let mut listed = ready(client.downloads());
+        let removed = DownloadEvent::Removed {
+            key: first.key.clone(),
+        };
+        assert_eq!(
+            (
+                apply(&mut listed, &removed),
+                listed.len(),
+                apply(&mut listed, &removed)
+            ),
+            (Applied::Removed, 0, Applied::Nothing)
+        );
+    }
+
+    #[test]
+    fn a_new_download_is_added() {
+        let client = FakeClient::new(None);
+        let mut listed = Vec::new();
+        let first = started(&client, &alien());
+        assert_eq!(
+            apply(&mut listed, &DownloadEvent::Changed(first)),
+            Applied::Added
+        );
+    }
+
+    #[test]
+    fn the_bar_shows_the_share_the_downloads_take() {
+        let space = DownloadSpace {
+            available: 75,
+            used: 25,
+        };
+        assert_eq!(used_fraction(space), 0.25);
+    }
+
+    /// The page with the fake: a Changed event changes the row it has, a
+    /// finished one moves to Downloaded, and Removed takes it away.
+    #[test]
+    #[ignore = "needs a display; run on its own"]
+    fn the_page_changes_rows_in_place() {
+        gtk::init().unwrap();
+        adw::init().unwrap();
+        let client = Arc::new(FakeClient::new(None));
+        let first = started(&client, &alien());
+        let second = started(&client, &id(MediaKind::Episode, "65"));
+        let page = DownloadsPage::new(client.clone(), andrey_is_watching(), Rc::new(|_, _| {}));
+        page.fill(&ready(client.downloads()));
+        let row_of = |key: &str| {
+            page.rows
+                .borrow()
+                .iter()
+                .find(|r| r.key == key)
+                .map(|r| r.row.clone())
+        };
+        let before = row_of(&first.key).unwrap();
+
+        client.advance_download(&first.key, 500_000);
+        let moving = ready(client.download(&first.key)).unwrap();
+        page.apply(&DownloadEvent::Changed(moving));
+        let after = row_of(&first.key).unwrap();
+        let heading = page.rows.borrow()[0].view.heading.label();
+        assert_eq!(
+            (before == after, heading.as_str()),
+            (true, "Downloading · 50%")
+        );
+
+        client.finish_download(&second.key);
+        page.apply(&DownloadEvent::Changed(
+            ready(client.download(&second.key)).unwrap(),
+        ));
+        assert_eq!(
+            page.titles()
+                .into_iter()
+                .map(|(done, _)| done)
+                .collect::<Vec<_>>(),
+            [false, true]
+        );
+
+        page.apply(&DownloadEvent::Removed {
+            key: first.key.clone(),
+        });
+        assert_eq!((row_of(&first.key), page.titles().len()), (None, 1));
+    }
+}

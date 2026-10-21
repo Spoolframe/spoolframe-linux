@@ -7,6 +7,8 @@ mod confirm;
 mod create_identity;
 mod denylist;
 mod dialog;
+mod download_dialog;
+mod downloads;
 mod external_subtitle;
 mod file_helper;
 mod fonts;
@@ -200,9 +202,15 @@ fn client_options(settings: &settings::Settings) -> sdk::ClientOptions {
     sdk::ClientOptions {
         relays: settings.use_relays(),
         features: FEATURES,
-        downloads_dir: spoolframe_linux_core::paths::data_dir().map(|dir| dir.join("downloads")),
+        downloads_dir: downloads_dir(),
         ..sdk::ClientOptions::default()
     }
+}
+
+/// Where the downloads are kept (PX-38): under the app's data, where the
+/// sandbox lets it write. Settings shows it.
+pub fn downloads_dir() -> Option<std::path::PathBuf> {
+    spoolframe_linux_core::paths::data_dir().map(|dir| dir.join("downloads"))
 }
 
 /// The regular features this app handles, listed to every server: the
@@ -219,7 +227,7 @@ const FEATURES: sdk::Features = sdk::Features {
     playlist_upcoming: true,
     subtitle_sync: true,
     subtitle_search: true,
-    downloads: false,
+    downloads: true,
     music_downloads: false,
 };
 
@@ -315,7 +323,7 @@ mod tests {
                 playlist_upcoming: true,
                 subtitle_sync: true,
                 subtitle_search: true,
-                downloads: false,
+                downloads: true,
                 music_downloads: false,
             }
         );

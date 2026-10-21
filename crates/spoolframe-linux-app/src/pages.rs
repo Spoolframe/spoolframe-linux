@@ -80,6 +80,10 @@ pub struct Under<'a> {
     pub next: Option<&'a Item>,
     /// The playlists holding it (PX-40).
     pub playlists: Option<&'a gtk::Widget>,
+    /// Its Download action (PX-38): a button beside Resume, and the
+    /// download's state under them. None where the server has no
+    /// downloads.
+    pub download: Option<&'a crate::downloads::ItemDownload>,
 }
 
 /// What an album's page does with its tracks.
@@ -123,7 +127,11 @@ pub fn playable(
     under: Under<'_>,
     cards: &Cards,
 ) -> gtk::Widget {
-    let Under { next, playlists } = under;
+    let Under {
+        next,
+        playlists,
+        download,
+    } = under;
     let facts = Facts::of(item);
     let (title, summary, cast) = match item {
         Item::Movie(m) => (m.title.clone(), m.summary.clone(), m.cast.as_slice()),
@@ -210,6 +218,9 @@ pub fn playable(
         )
     });
     let buttons = playback_buttons(&facts, &actions, pickers.clone());
+    if let Some(download) = download {
+        buttons.append(&download.button);
+    }
     let mut more = Vec::new();
     if let Item::Episode(e) = item {
         more.push(views::go_to_entries(e, &cards.open));
@@ -219,6 +230,9 @@ pub fn playable(
         buttons.append(&views::menu_button(&views::menu_popover(more), "More"));
     }
     info.append(&buttons);
+    if let Some(download) = download {
+        info.append(&download.status);
+    }
     if let Some(pickers) = &pickers {
         info.append(&pickers.column);
     }

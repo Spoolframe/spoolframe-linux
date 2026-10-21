@@ -1,6 +1,7 @@
-//! The library's sidebar: Home, Search, the libraries, and with playlists
-//! (PX-40) a Playlists row and the user's Pinned under it, as on the
-//! LinuxPlaylists and LinuxPinnedPlaylists boards. Each row is known by
+//! The library's sidebar: Home, Search, the libraries, with playlists
+//! (PX-40) a Playlists row, with downloads (PX-38) a Downloads row, and the
+//! user's Pinned under them, as on the LinuxPlaylists,
+//! LinuxPinnedPlaylists and LinuxDownloads boards. Each row is known by
 //! what it is, not where it sits, so a row more above it moves nothing.
 
 use std::cell::RefCell;
@@ -20,6 +21,8 @@ pub enum Row {
     /// The library at this index in the session's list.
     Library(usize),
     Playlists,
+    /// This computer's downloads (PX-38).
+    Downloads,
     /// A pinned playlist, by id.
     Pinned(String),
     /// Pinned's hint while nothing is pinned; not a choice.
@@ -42,16 +45,21 @@ pub enum Playlists<'a> {
     Listed(&'a [PlaylistSummary]),
 }
 
-/// The rows, in order: Home, Search, the libraries, then Playlists and
-/// the pinned ones in the user's order.
-pub fn rows(libraries: usize, playlists: Playlists<'_>) -> Vec<Row> {
+/// The rows, in order: Home, Search, the libraries, then Playlists,
+/// Downloads, and the pinned ones in the user's order. Downloads are this
+/// computer's, so their row does not wait on the server.
+pub fn rows(libraries: usize, playlists: Playlists<'_>, downloads: bool) -> Vec<Row> {
     let mut rows = vec![Row::Home, Row::Search];
     rows.extend((0..libraries).map(Row::Library));
+    if !matches!(playlists, Playlists::Off) {
+        rows.push(Row::Playlists);
+    }
+    if downloads {
+        rows.push(Row::Downloads);
+    }
     match playlists {
-        Playlists::Off => {}
-        Playlists::Loading => rows.push(Row::Playlists),
+        Playlists::Off | Playlists::Loading => {}
         Playlists::Listed(list) => {
-            rows.push(Row::Playlists);
             let pinned = playlists::pinned(list);
             if pinned.is_empty() {
                 rows.push(Row::NothingPinned);
@@ -65,7 +73,8 @@ pub fn rows(libraries: usize, playlists: Playlists<'_>) -> Vec<Row> {
 /// What goes over a row.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Header {
-    /// A rule: after Search, and before Playlists.
+    /// A rule: after Search, and before Playlists (or Downloads without
+    /// them).
     Rule,
     /// "Pinned", over the group.
     Pinned,
@@ -75,9 +84,8 @@ pub fn header(rows: &[Row], index: usize) -> Option<Header> {
     let row = rows.get(index)?;
     let before = index.checked_sub(1).and_then(|i| rows.get(i))?;
     match (before, row) {
-        (Row::Search, Row::Library(_)) | (Row::Search | Row::Library(_), Row::Playlists) => {
-            Some(Header::Rule)
-        }
+        (Row::Search, Row::Library(_))
+        | (Row::Search | Row::Library(_), Row::Playlists | Row::Downloads) => Some(Header::Rule),
         (Row::Pinned(_), _) => None,
         (_, Row::Pinned(_) | Row::NothingPinned) => Some(Header::Pinned),
         _ => None,
@@ -153,6 +161,7 @@ impl Sidebar {
                     None => plain_row("", crate::icons::MOVIES),
                 },
                 Row::Playlists => plain_row("Playlists", crate::icons::PLAYLISTS),
+                Row::Downloads => plain_row("Downloads", crate::icons::DOWNLOADS),
                 Row::Pinned(id) => {
                     let playlist = playlists.iter().find(|p| p.id == *id);
                     let name = playlist.map_or("", |p| p.name.as_str());
@@ -330,7 +339,7 @@ mod tests {
     #[test]
     fn without_the_feature_there_is_no_playlists_row_or_pinned() {
         assert_eq!(
-            rows(2, Playlists::Off),
+            rows(2, Playlists::Off, false),
             [Row::Home, Row::Search, Row::Library(0), Row::Library(1)]
         );
     }
@@ -341,7 +350,7 @@ mod tests {
         let list = listed(&client);
         let heists = list.iter().find(|p| p.pinned.is_some()).unwrap().id.clone();
         assert_eq!(
-            rows(1, Playlists::Listed(&list)),
+            rows(1, Playlists::Listed(&list), false),
             [
                 Row::Home,
                 Row::Search,
@@ -360,7 +369,7 @@ mod tests {
         let night = list.iter().find(|p| p.name == "Movie night").unwrap();
         ready(session.pin_playlist(&night.id, 0)).unwrap();
         let list = listed(&client);
-        let pinned: Vec<_> = rows(0, Playlists::Listed(&list))
+        let pinned: Vec<_> = rows(0, Playlists::Listed(&list), false)
             .into_iter()
             .filter_map(|row| match row {
                 Row::Pinned(id) => list.iter().find(|p| p.id == id).map(|p| p.name.clone()),
@@ -377,7 +386,7 @@ mod tests {
             playlist.pinned = None;
         }
         assert_eq!(
-            rows(0, Playlists::Listed(&list)),
+            rows(0, Playlists::Listed(&list), false),
             [Row::Home, Row::Search, Row::Playlists, Row::NothingPinned]
         );
     }
@@ -385,7 +394,7 @@ mod tests {
     #[test]
     fn pinned_waits_for_the_list_but_the_playlists_row_does_not() {
         assert_eq!(
-            rows(0, Playlists::Loading),
+            rows(0, Playlists::Loading, false),
             [Row::Home, Row::Search, Row::Playlists]
         );
     }
@@ -422,6 +431,29 @@ mod tests {
         assert_eq!(
             (pinned_index(&rows, 4), pinned_index(&rows, 2)),
             (Some(1), None)
+        );
+    }
+
+    #[test]
+    fn downloads_follow_playlists_and_come_before_pinned() {
+        let list = listed(&FakeClient::new(None));
+        let rows = rows(0, Playlists::Listed(&list), true);
+        assert_eq!(
+            (rows[2..4].to_vec(), header(&rows, 3), header(&rows, 4)),
+            (
+                vec![Row::Playlists, Row::Downloads],
+                None,
+                Some(Header::Pinned)
+            )
+        );
+    }
+
+    #[test]
+    fn without_playlists_downloads_are_ruled_off_from_the_libraries() {
+        let rows = rows(1, Playlists::Off, true);
+        assert_eq!(
+            (rows.last(), header(&rows, 3)),
+            (Some(&Row::Downloads), Some(Header::Rule))
         );
     }
 
