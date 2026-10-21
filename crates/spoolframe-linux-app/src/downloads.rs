@@ -780,8 +780,8 @@ impl DownloadsPage {
         widget.append(
             &gtk::Label::builder()
                 .label(
-                    "Downloads go on while Spoolframe runs. Anyone who can play it can download \
-                     it, and a download never expires.",
+                    "Downloads go on while the window is closed, as long as Spoolframe runs. \
+                     Anyone who can play it can download it, and a download never expires.",
                 )
                 .xalign(0.0)
                 .wrap(true)

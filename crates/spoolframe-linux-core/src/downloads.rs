@@ -82,12 +82,21 @@ fn pick<T: Clone>(all: &[T], places: &[u32]) -> Vec<T> {
 /// coming to this device): the app keeps listening for its events, and
 /// holds back from closing the client, while this is so.
 pub fn keeps_running(downloads: &[LocalDownload]) -> bool {
-    downloads.iter().any(|d| {
-        matches!(
-            d.phase,
-            DownloadPhase::Preparing { .. } | DownloadPhase::Transferring
-        )
-    })
+    running(downloads) > 0
+}
+
+/// How many downloads the SDK is still moving: what closing the window
+/// names when it asks.
+pub fn running(downloads: &[LocalDownload]) -> usize {
+    downloads
+        .iter()
+        .filter(|d| {
+            matches!(
+                d.phase,
+                DownloadPhase::Preparing { .. } | DownloadPhase::Transferring
+            )
+        })
+        .count()
 }
 
 #[cfg(test)]
@@ -269,5 +278,18 @@ mod tests {
             in_phase(DownloadPhase::Transferring),
         ];
         assert_eq!((keeps_running(&list), keeps_running(&[])), (true, false));
+    }
+
+    #[test]
+    fn only_the_downloads_under_way_are_counted() {
+        let list = [
+            in_phase(DownloadPhase::Done),
+            in_phase(DownloadPhase::Transferring),
+            in_phase(DownloadPhase::Paused),
+            in_phase(DownloadPhase::Preparing {
+                server: DownloadState::Waiting,
+            }),
+        ];
+        assert_eq!(running(&list), 2);
     }
 }

@@ -3,6 +3,7 @@ mod app;
 mod artwork;
 mod browser;
 mod capabilities;
+mod closing;
 mod confirm;
 mod create_identity;
 mod denylist;
@@ -163,6 +164,15 @@ fn main() -> Result<()> {
     use gtk::gio::prelude::*;
     let application = relm4::main_application();
     application.set_flags(application.flags() | gtk::gio::ApplicationFlags::HANDLES_OPEN);
+    // A second launch activates the one running: a window hidden while
+    // downloads finish (PX-38) comes back, in front. Relm4 makes the
+    // window once, at startup, and on activating only makes it visible.
+    application.connect_activate(|application| {
+        use gtk::prelude::{GtkApplicationExt, GtkWindowExt};
+        if let Some(window) = application.active_window() {
+            window.present();
+        }
+    });
     application.connect_open(|application, links, _| {
         // Opening is not activating: the window is made by activate.
         application.activate();
@@ -179,7 +189,8 @@ fn main() -> Result<()> {
     // The SDK's runtime: its tasks (discovery, reconnecting) run here for
     // as long as the app does. Kept in scope until the app returns.
     let runtime = tokio::runtime::Runtime::new().context("cannot start the async runtime")?;
-    let client: Arc<dyn Client> = Arc::new(open_sdk(&runtime)?);
+    let sdk = Arc::new(open_sdk(&runtime)?);
+    let client: Arc<dyn Client> = sdk.clone();
 
     let artwork_cache = open_artwork_cache(&runtime);
     app.run::<app::App>(app::Init {
@@ -187,12 +198,23 @@ fn main() -> Result<()> {
         artwork_cache: artwork_cache.clone(),
     });
     playback::shutdown();
+    // The downloads stop where they got to, for the next start (PX-38),
+    // and the connections close.
+    if runtime
+        .block_on(tokio::time::timeout(CLOSE_WAIT, sdk.close()))
+        .is_err()
+    {
+        tracing::warn!("the client did not close in time");
+    }
     if let Some(cache) = artwork_cache {
         runtime.block_on(cache.close());
     }
     drop(runtime);
     Ok(())
 }
+
+/// How long quitting waits for the client to close.
+const CLOSE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How the SDK opens, from the user's settings: with or without relays
 /// (P6-03), which it cannot change while it runs, and with its downloads

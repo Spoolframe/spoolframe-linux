@@ -399,6 +399,12 @@ pub struct SdkClient {
 }
 
 impl SdkClient {
+    /// Closes the SDK at quitting: its downloads stop, keeping where each
+    /// got to (PX-38), then every connection.
+    pub async fn close(&self) {
+        self.client.close().await;
+    }
+
     /// `handle` is the runtime `client` was opened in; it must outlive this.
     pub fn new(client: sdk::Client, handle: Handle) -> Self {
         let servers_changed = watch::Sender::new(());

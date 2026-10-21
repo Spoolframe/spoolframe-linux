@@ -221,6 +221,12 @@ pub struct App {
     /// The Downloads page is over the window with no server (PX-38):
     /// Choose a server's listings leave it be.
     offline: bool,
+    /// What closing the window does while downloads run (PX-38), read by
+    /// the window's close handler.
+    closing: Rc<std::cell::RefCell<crate::closing::Closing>>,
+    /// Holds the app while the window is hidden for downloads to finish.
+    hold: Option<gtk::gio::ApplicationHoldGuard>,
+    window: glib::WeakRef<adw::ApplicationWindow>,
 }
 
 /// An item page on the stack.
@@ -474,6 +480,9 @@ pub enum Msg {
     /// This computer's downloads with no server (PX-38): from Choose a
     /// server, or its banner when the server can't be reached.
     OpenOfflineDownloads,
+    /// The window was closed while downloads run: what now?
+    AskClose,
+    Closing(crate::closing::Answer),
     PlaylistChanged(Box<PlaylistEvent>),
     /// A kept catalog read came back different from what was shown.
     CatalogChanged(Box<catalog::Change>),
@@ -1125,6 +1134,18 @@ impl Component for App {
         let toasts = adw::ToastOverlay::new();
         toasts.set_child(Some(&screens));
         root.set_content(Some(&toasts));
+        // Closed while downloads run, the window asks first (PX-38).
+        let closing = Rc::new(std::cell::RefCell::new(crate::closing::Closing::default()));
+        {
+            let (closing, sender) = (closing.clone(), sender.clone());
+            root.connect_close_request(move |_| match closing.borrow().on_close() {
+                crate::closing::OnClose::Close => glib::Propagation::Proceed,
+                crate::closing::OnClose::Ask => {
+                    sender.input(Msg::AskClose);
+                    glib::Propagation::Stop
+                }
+            });
+        }
 
         let model = App {
             client,
@@ -1189,6 +1210,9 @@ impl Component for App {
             downloads_page: None,
             item_downloads: Vec::new(),
             offline: false,
+            closing,
+            hold: None,
+            window: root.downgrade(),
         };
         model.watch_catalog(&sender);
         // Downloads are this computer's, not a session's: heard from the
@@ -2065,6 +2089,7 @@ impl Component for App {
                 }
                 self.show_item_downloads();
                 self.offer_downloads(had, &sender);
+                self.downloads_running();
             }
             Msg::ListDownloads => self.list_downloads(&sender),
             Msg::LocalDownloadChanged(download) => {
@@ -2074,6 +2099,27 @@ impl Component for App {
                 self.download_event(DownloadEvent::Removed { key }, &sender)
             }
             Msg::OpenOfflineDownloads => self.open_offline(widgets, &sender),
+            Msg::AskClose => {
+                let sender = sender.clone();
+                crate::closing::ask(
+                    root,
+                    self.closing.borrow().running(),
+                    Rc::new(move |answer| sender.input(Msg::Closing(answer))),
+                );
+            }
+            // Hidden, the app runs on for the downloads alone: what plays
+            // stops, as it would have with the window closed.
+            Msg::Closing(crate::closing::Answer::Keep) => {
+                if self.closing.borrow_mut().keep() {
+                    self.hold = Some(relm4::main_application().hold());
+                }
+                self.stop_playback(widgets);
+                root.set_visible(false);
+            }
+            Msg::Closing(crate::closing::Answer::Quit) => {
+                self.closing.borrow_mut().quit();
+                root.close();
+            }
             Msg::DownloadAct(key, crate::downloads::Act::Play) => {
                 if let Some(download) = self.downloads.iter().find(|d| d.key == key).cloned() {
                     let from = crate::downloads::resume_point(&download.watch);
@@ -3811,6 +3857,24 @@ impl App {
         }
         self.show_item_downloads();
         self.offer_downloads(had, sender);
+        self.downloads_running();
+    }
+
+    /// Closing follows how many downloads run. Once none does, the app
+    /// kept in the background for them lets go, and a hidden window
+    /// closes, which quits as closing it would have.
+    fn downloads_running(&mut self) {
+        let running = spoolframe_linux_core::downloads::running(&self.downloads);
+        if !self.closing.borrow_mut().downloads(running) {
+            return;
+        }
+        tracing::info!("the downloads finished; the app is no longer kept running");
+        self.hold = None;
+        if let Some(window) = self.window.upgrade()
+            && !window.is_visible()
+        {
+            window.close();
+        }
     }
 
     /// Choose a server offers the downloads while there are any: listed

@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- Downloads, on a server that has them: a film's or an episode's page
+  gets Download, which asks for the version (Original or one of the
+  server's profiles) and the tracks (all, or a choice), and shows the
+  free room. Its state then shows on the page: waiting or converting on
+  the server, downloading with Pause, paused with Resume, failed with
+  Try again where another try can help, or downloaded with Play and
+  Delete download. Downloads, in the sidebar, lists every download on
+  this computer, the profile's first, with the room they take; Settings
+  › This computer › Downloads shows the room by server and deletes them
+  all. A downloaded film or episode plays from its file, and its page's
+  Play and Resume play it too, with no server needed: when none can be
+  reached, Choose a server opens Downloads, every profile's downloads
+  play, and what was watched is sent when the server is back. Closing
+  the window while downloads run asks first: Keep in background finishes
+  them with the window hidden, and opening Spoolframe again shows it;
+  Quit stops them, and they go on from where they got to at the next
+  start.
 - The SDK crates are 0.14.0. The app also lists playlist covers,
   subtitle sync, subtitle search and what comes up in a playlist to each
   server; a server without them shows nothing new. On an item's page, a
