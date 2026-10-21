@@ -1,10 +1,10 @@
 //! What the UI works out about downloads (PX-38) without a server or a
-//! display: which tracks a downloaded file holds, and whether the SDK is
-//! still moving anything.
+//! display: which tracks a downloaded file holds, which of them a choice
+//! of the item's tracks is, and whether the SDK is still moving anything.
 
 use spoolframe_types::MediaTracks;
 
-use crate::backend::{DownloadPhase, LocalDownload};
+use crate::backend::{DownloadPhase, LocalDownload, Selection};
 
 /// The tracks in `download`'s file, as the player and the track menus
 /// should list them: the download's `tracks` cut down to what the file
@@ -15,20 +15,57 @@ use crate::backend::{DownloadPhase, LocalDownload};
 /// Until the server says what the file is (`file` is `None`), the file is
 /// what was asked for: every track for `All`, else the `Chosen` ones.
 pub fn file_tracks(download: &LocalDownload) -> MediaTracks {
+    let (audio, subtitles) = places(download);
+    MediaTracks {
+        audio: pick(&download.tracks.audio, &audio),
+        subtitles: pick(&download.tracks.subtitles, &subtitles),
+        ..download.tracks.clone()
+    }
+}
+
+/// `selection`, of the item's tracks, as the same tracks in `download`'s
+/// file ([`file_tracks`]): what the player picks among the file's
+/// streams. A track the file does not carry is left to the file's
+/// default (audio) or off (subtitles).
+pub fn file_selection(download: &LocalDownload, selection: Selection) -> Selection {
+    let (audio, subtitles) = places(download);
+    let within = |places: &[u32], track: Option<u32>| {
+        places
+            .iter()
+            .position(|&p| Some(p) == track)
+            .map(|at| at as u32)
+    };
+    Selection {
+        audio: within(&kept(&download.tracks.audio, &audio), selection.audio),
+        subtitle: within(
+            &kept(&download.tracks.subtitles, &subtitles),
+            selection.subtitle,
+        ),
+    }
+}
+
+/// The places of `places` that are in `all`, in order: those
+/// [`file_tracks`] lists.
+fn kept<T>(all: &[T], places: &[u32]) -> Vec<u32> {
+    places
+        .iter()
+        .copied()
+        .filter(|&place| (place as usize) < all.len())
+        .collect()
+}
+
+/// The places, in the item's tracks, of the audio and subtitles in the
+/// file. Until the server says what the file is, what was asked for.
+fn places(download: &LocalDownload) -> (Vec<u32>, Vec<u32>) {
     use crate::backend::DownloadTracks;
 
-    let (audio, subtitles) = match (&download.file, download.chosen.normalized()) {
+    match (&download.file, download.chosen.normalized()) {
         (Some(file), _) => (file.tracks.audio.clone(), file.tracks.subtitles.clone()),
         (None, DownloadTracks::Chosen { audio, subtitles }) => (audio, subtitles),
         (None, _) => (
             (0..download.tracks.audio.len() as u32).collect(),
             (0..download.tracks.subtitles.len() as u32).collect(),
         ),
-    };
-    MediaTracks {
-        audio: pick(&download.tracks.audio, &audio),
-        subtitles: pick(&download.tracks.subtitles, &subtitles),
-        ..download.tracks.clone()
     }
 }
 
@@ -148,6 +185,39 @@ mod tests {
             ),
             (1, 0)
         );
+    }
+
+    #[test]
+    fn tracks_picked_from_the_item_are_found_in_the_file() {
+        let download = started(DownloadTracks::Chosen {
+            audio: vec![2, 0],
+            subtitles: vec![1],
+        });
+        // The file holds audio 0 and 2, in that order, and subtitle 1.
+        let picked = Selection {
+            audio: Some(2),
+            subtitle: Some(1),
+        };
+        assert_eq!(
+            file_selection(&download, picked),
+            Selection {
+                audio: Some(1),
+                subtitle: Some(0),
+            }
+        );
+    }
+
+    #[test]
+    fn a_track_the_file_does_not_carry_is_not_picked() {
+        let download = started(DownloadTracks::Chosen {
+            audio: vec![2],
+            subtitles: Vec::new(),
+        });
+        let picked = Selection {
+            audio: Some(1),
+            subtitle: Some(0),
+        };
+        assert_eq!(file_selection(&download, picked), Selection::default());
     }
 
     #[test]

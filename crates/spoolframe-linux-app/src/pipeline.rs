@@ -35,6 +35,9 @@ pub struct Pipeline {
     paintable: gtk::gdk::Paintable,
     /// The reader GstPlay reads, reachable by its URI while published.
     published: RefCell<Option<Published>>,
+    /// The file GstPlay reads instead, by its `file://` URI: a download
+    /// (PX-38), until stopped.
+    file: RefCell<Option<String>>,
     /// The external subtitle GstPlay was given last.
     subtitle: RefCell<Option<PathBuf>>,
     loading_subtitle: std::sync::Arc<std::sync::Mutex<Option<Option<String>>>>,
@@ -88,6 +91,7 @@ impl Pipeline {
             video,
             paintable,
             published: RefCell::new(None),
+            file: RefCell::new(None),
             subtitle: RefCell::new(None),
             loading_subtitle,
             external,
@@ -202,22 +206,38 @@ impl Pipeline {
     /// URI may not keep it.
     pub fn load(&self, reader: Box<dyn ByteSource>, subtitle: Option<&Path>) {
         self.quiesce();
-        let play = self.play();
         let published = Published::boxed(reader);
-        let uri = subtitle.map(file_uri);
-        self.external.attach(uri.clone());
+        self.open(&published.uri(), subtitle);
+        self.published.replace(Some(published));
+    }
+
+    /// Stops what plays and opens the file at `uri`, a `file://` URL, in
+    /// its place: a download (PX-38), which needs no reader. Its subtitles
+    /// are its own streams.
+    pub fn load_uri(&self, uri: &str) {
+        self.quiesce();
+        // The last reader goes: nothing reads it now.
+        self.published.replace(None);
+        self.open(uri, None);
+        self.file.replace(Some(uri.to_owned()));
+    }
+
+    /// GstPlay opens `uri`, with `subtitle` beside it.
+    fn open(&self, uri: &str, subtitle: Option<&Path>) {
+        let play = self.play();
+        let subtitle_uri = subtitle.map(file_uri);
+        self.external.attach(subtitle_uri.clone());
         // Setting even an empty suburi during source-setup can leave the
         // next item's pipeline at EOS without delivering its EOS message.
         // Touch it only to install a subtitle or clear a previous one.
         *self.loading_subtitle.lock().unwrap() =
-            (subtitle.is_some() || self.subtitle.borrow().is_some()).then_some(uri);
+            (subtitle.is_some() || self.subtitle.borrow().is_some()).then_some(subtitle_uri);
         self.subtitle.replace(subtitle.map(Path::to_path_buf));
         // Shown once GstPlay lists it; see [`give_subtitle_uri`].
         if subtitle.is_some() {
             play.set_subtitle_track_enabled(false);
         }
-        play.set_uri(Some(&published.uri()));
-        self.published.replace(Some(published));
+        play.set_uri(Some(uri));
     }
 
     /// Hands GstPlay an external subtitle mid-play, on, or takes it away.
@@ -255,6 +275,8 @@ impl Pipeline {
         if let Some(published) = self.published.borrow().as_ref() {
             published.retire();
         }
+        // A file's errors from here on are the last item's.
+        self.file.replace(None);
         self.play().stop();
     }
 
@@ -280,10 +302,12 @@ impl Pipeline {
     }
 
     pub fn accepts_error(&self, uri: &str) -> bool {
-        self.published
-            .borrow()
-            .as_ref()
-            .is_some_and(|p| !p.retired() && p.uri() == uri)
+        self.file.borrow().as_deref() == Some(uri)
+            || self
+                .published
+                .borrow()
+                .as_ref()
+                .is_some_and(|p| !p.retired() && p.uri() == uri)
     }
 
     pub fn play_now(&self) {

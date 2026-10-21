@@ -36,7 +36,8 @@ const FRAME_WIDTH: i32 = 224;
 
 /// An item's frames, as far as known.
 pub struct Frames {
-    session: Arc<dyn Session>,
+    /// None for a download (PX-38): it has no frames to show.
+    session: Option<Arc<dyn Session>>,
     item: RefCell<Option<MediaId>>,
     state: RefCell<State>,
     /// Bumped per item, so an answer for the last item is dropped.
@@ -66,7 +67,7 @@ struct Sheet {
 }
 
 impl Frames {
-    pub fn new(session: Arc<dyn Session>) -> Rc<Self> {
+    pub fn new(session: Option<Arc<dyn Session>>) -> Rc<Self> {
         Rc::new(Self {
             session,
             item: RefCell::new(None),
@@ -95,7 +96,10 @@ impl Frames {
         let Some(item) = self.item.borrow().clone() else {
             return;
         };
-        let session = self.session.clone();
+        let Some(session) = self.session.clone() else {
+            self.state.replace(State::None);
+            return;
+        };
         let asked = relm4::spawn(async move { session.previews(&item).await });
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
@@ -176,7 +180,9 @@ impl Frames {
 
     fn fetch(self: &Rc<Self>, index: usize, id: spoolframe_types::ArtworkId) {
         let generation = self.generation.get();
-        let session = self.session.clone();
+        let Some(session) = self.session.clone() else {
+            return;
+        };
         let fetched =
             relm4::spawn(async move { session.artwork(&id, ArtworkSize::Original).await });
         let weak: Weak<Self> = Rc::downgrade(self);
@@ -431,7 +437,9 @@ mod tests {
 
     fn frames(answer: PreviewsAnswer) -> Rc<Frames> {
         let client = FakeClient::new(None).with_previews(answer);
-        Frames::new(client.session(&FakeClient::profile("andrey")).unwrap())
+        Frames::new(Some(
+            client.session(&FakeClient::profile("andrey")).unwrap(),
+        ))
     }
 
     fn arrival() -> MediaId {

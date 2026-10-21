@@ -171,11 +171,13 @@ pub fn page(playback: &Rc<Playback>, actions: Actions) -> adw::NavigationPage {
             let (Some(view), Some(playback)) = (view.upgrade(), weak_playback.upgrade()) else {
                 return glib::ControlFlow::Break;
             };
+            // A download plays with no link to show.
             let session = playback.session();
-            view.controls.show_link(format::link_line(
-                session.connection_path(),
-                session.link_rate(),
-            ));
+            view.controls.show_link(
+                session
+                    .as_ref()
+                    .and_then(|s| format::link_line(s.connection_path(), s.link_rate())),
+            );
             if let Some(status) = playback.reader_status() {
                 view.controls.show_buffered(status.ready);
                 if view.diagnostics.panel.is_visible() {
@@ -189,7 +191,10 @@ pub fn page(playback: &Rc<Playback>, actions: Actions) -> adw::NavigationPage {
                     .show_range(playback.video_sink(), playback.plan().as_ref());
                 view.diagnostics.set(
                     "connection",
-                    &format::connection_path(playback.session().connection_path()),
+                    &session.as_ref().map_or_else(
+                        || "This computer".to_owned(),
+                        |s| format::connection_path(s.connection_path()),
+                    ),
                 );
             }
             glib::ControlFlow::Continue

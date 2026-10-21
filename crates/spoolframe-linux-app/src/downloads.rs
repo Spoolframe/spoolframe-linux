@@ -1,9 +1,10 @@
-//! Downloads for offline viewing (PX-38), as the LinuxDownloadStates and
-//! LinuxDownloads boards have them: the Download action on a film's or an
-//! episode's page, and the Downloads page with every download on this
-//! computer. Both show a download the same way, from [`status`], and are
-//! changed in place as its events come (one per 8 MiB read): a row is made
-//! once and its labels, bar and buttons are set again.
+//! Downloads for offline viewing (PX-38), as the LinuxDownloadStates,
+//! LinuxDownloads and LinuxDownloadsOffline boards have them: the Download
+//! action on a film's or an episode's page, and the Downloads page with
+//! every download on this computer, which also opens with no server. Both
+//! show a download the same way, from [`status`], and are changed in place
+//! as its events come (one per 8 MiB read): a row is made once and its
+//! labels, bar and buttons are set again.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -14,7 +15,7 @@ use adw::prelude::*;
 use gtk::glib;
 use spoolframe_linux_core::backend::{
     Client, DownloadEvent, DownloadPhase, DownloadSource, DownloadSpace, DownloadState,
-    DownloadTracks, LocalDownload,
+    DownloadTracks, LocalDownload, LocalWatch,
 };
 use spoolframe_linux_core::format;
 use spoolframe_types::{ArtworkKind, Item, MediaId};
@@ -22,6 +23,8 @@ use spoolframe_types::{ArtworkKind, Item, MediaId};
 /// What a download's buttons do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Act {
+    /// A finished one, from its file, with or without a server.
+    Play,
     Pause,
     Resume,
     /// A failed download, again.
@@ -37,6 +40,7 @@ pub enum Act {
 impl Act {
     fn label(self) -> &'static str {
         match self {
+            Act::Play => "Play",
             Act::Pause => "Pause",
             Act::Resume => "Resume",
             Act::Retry => "Try again",
@@ -48,6 +52,7 @@ impl Act {
 
     fn icon(self) -> Option<&'static str> {
         match self {
+            Act::Play => Some(crate::icons::PLAY),
             Act::Pause => Some(crate::icons::PAUSE),
             Act::Resume => Some(crate::icons::DOWNLOADS),
             Act::Delete => Some(crate::icons::FORGET),
@@ -141,9 +146,12 @@ pub fn status(download: &LocalDownload) -> Status {
                 "Downloaded · {}",
                 size(download.size.unwrap_or(download.received))
             ),
-            detail: Some(format!("{version} · {}", tracks_line(download))),
+            detail: Some(match watch_line(download) {
+                Some(watch) => format!("{version} · {} · {watch}", tracks_line(download)),
+                None => format!("{version} · {}", tracks_line(download)),
+            }),
             progress: None,
-            acts: vec![Act::Delete],
+            acts: vec![Act::Play, Act::Delete],
         },
         DownloadPhase::Failed { reason } => Status {
             heading: "Couldn’t download".to_owned(),
@@ -154,6 +162,91 @@ pub fn status(download: &LocalDownload) -> Status {
                 false => vec![Act::Dismiss],
             },
         },
+    }
+}
+
+/// How far the user got in a finished download: "1 h 20 min left" or
+/// "Watched", as this computer has it; none before it is started. A watch
+/// the server has not heard yet says so: it goes at the next sync.
+pub fn watch_line(download: &LocalDownload) -> Option<String> {
+    let watch = &download.watch;
+    let line = match (watch.watched, watch.position_ms) {
+        (Some(true), _) => "Watched".to_owned(),
+        (_, Some(ms)) if ms > 0 => {
+            let length = crate::views::Facts::of(&download.item).length?;
+            format::remaining(length, Duration::from_millis(ms))
+        }
+        _ => return None,
+    };
+    Some(match watch.pending {
+        true => format!("{line}, not sent yet"),
+        false => line,
+    })
+}
+
+/// Where a download plays from on its own Play: where the user stopped in
+/// it, as this computer has it; the start once watched.
+pub fn resume_point(watch: &LocalWatch) -> Option<Duration> {
+    match watch.watched {
+        Some(true) => None,
+        _ => watch.position_ms.map(Duration::from_millis),
+    }
+}
+
+/// Where a download plays from when its item page asked for `asked`
+/// (Resume, or Play from the start with `None`): the place watched here
+/// while the server has not heard it, else the server's, which the page
+/// showed.
+pub fn start_from(watch: &LocalWatch, asked: Option<Duration>) -> Option<Duration> {
+    match (asked, watch.pending) {
+        (None, _) => None,
+        (Some(_), true) => resume_point(watch),
+        (Some(at), false) => Some(at),
+    }
+}
+
+/// The profile's finished download of `item`, to play from its file in
+/// place of the server's: the newest, if there is more than one.
+pub fn playable_here<'a>(
+    downloads: &'a [LocalDownload],
+    who: &Who,
+    item: &MediaId,
+) -> Option<&'a LocalDownload> {
+    downloads
+        .iter()
+        .filter(|d| mine(d, who) && d.item.id() == item)
+        .filter(|d| d.phase == DownloadPhase::Done && d.file_url.is_some())
+        .max_by_key(|d| d.created_at)
+}
+
+/// What was watched offline and waits for the server, as the offline
+/// board says it: "2 changes to send: Alien watched, Heat at 1:12:40.
+/// They go when the server is back."; none with nothing waiting.
+pub fn pending_line(downloads: &[LocalDownload]) -> Option<String> {
+    let changes: Vec<String> = downloads
+        .iter()
+        .filter(|d| d.watch.pending)
+        .map(|d| {
+            let name = title(d);
+            match (d.watch.watched, d.watch.position_ms) {
+                (Some(true), _) => format!("{name} watched"),
+                (_, Some(ms)) => {
+                    format!("{name} at {}", format::timestamp(Duration::from_millis(ms)))
+                }
+                _ => format!("{name} not watched"),
+            }
+        })
+        .collect();
+    match changes.len() {
+        0 => None,
+        1 => Some(format!(
+            "1 change to send: {}. It goes when the server is back.",
+            changes[0]
+        )),
+        n => Some(format!(
+            "{n} changes to send: {}. They go when the server is back.",
+            changes.join(", ")
+        )),
     }
 }
 
@@ -612,8 +705,19 @@ pub struct DownloadsPage {
     running: Section,
     done: Section,
     empty: adw::StatusPage,
+    /// What waits for the server, on the banner over the page while no
+    /// server can be reached.
+    offline: RefCell<Option<gtk::Label>>,
     downloads: RefCell<Vec<LocalDownload>>,
     rows: RefCell<Vec<PageRow>>,
+}
+
+/// The banner over the Downloads page with no server (the offline board):
+/// which can't be reached, and its Try now.
+pub struct Offline {
+    /// "Home Media can't be reached".
+    pub heading: String,
+    pub try_now: Rc<dyn Fn()>,
 }
 
 impl DownloadsPage {
@@ -695,9 +799,44 @@ impl DownloadsPage {
             running,
             done,
             empty,
+            offline: RefCell::default(),
             downloads: RefCell::default(),
             rows: RefCell::default(),
         })
+    }
+
+    /// Opens with no server (the offline board): the banner over the
+    /// page says the downloads still play, and what waits to be sent.
+    pub fn set_offline(&self, offline: Offline) {
+        let card = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(6)
+            .css_classes(["card", "unreachable-banner"])
+            .build();
+        let heading = gtk::Label::builder()
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["heading"])
+            .build();
+        heading.set_text(&offline.heading);
+        let body = gtk::Label::builder()
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["dim-label"])
+            .build();
+        let try_now = gtk::Button::builder()
+            .label("Try now")
+            .halign(gtk::Align::End)
+            .css_classes(["suggested-action"])
+            .build();
+        let again = offline.try_now;
+        try_now.connect_clicked(move |_| again());
+        card.append(&heading);
+        card.append(&body);
+        card.append(&try_now);
+        self.widget.prepend(&card);
+        self.offline.replace(Some(body));
+        self.counted();
     }
 
     /// Lists `downloads` afresh: at first, and after events were missed.
@@ -846,6 +985,12 @@ impl DownloadsPage {
             .set_label(&format!("{} · {}", done.len(), size(bytes)));
         self.done.widget.set_visible(!done.is_empty());
         self.empty.set_visible(downloads.is_empty());
+        if let Some(body) = self.offline.borrow().as_ref() {
+            body.set_text(&match pending_line(&downloads) {
+                Some(pending) => format!("Your downloads still play. {pending}"),
+                None => "Your downloads still play.".to_owned(),
+            });
+        }
     }
 
     fn load_space(self: &Rc<Self>) {
@@ -890,6 +1035,49 @@ impl DownloadsPage {
         shown
     }
 }
+
+/// The Downloads page as a page of its own, over the window, while no
+/// server can be reached (PX-38): `back` goes to Choose a server.
+pub fn offline_page(page: &DownloadsPage, back: Rc<dyn Fn()>) -> adw::NavigationPage {
+    let header = adw::HeaderBar::new();
+    let servers = gtk::Button::builder()
+        .child(
+            &adw::ButtonContent::builder()
+                .icon_name(crate::icons::BACK)
+                .label("Servers")
+                .build(),
+        )
+        .tooltip_text("Choose a server")
+        .css_classes(["flat"])
+        .build();
+    servers.connect_clicked(move |_| back());
+    header.pack_start(&servers);
+    let clamp = adw::Clamp::builder()
+        .maximum_size(960)
+        .child(&page.widget)
+        .margin_top(28)
+        .margin_bottom(28)
+        .margin_start(28)
+        .margin_end(28)
+        .build();
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&header);
+    toolbar.set_content(Some(
+        &gtk::ScrolledWindow::builder()
+            .child(&clamp)
+            .vexpand(true)
+            .build(),
+    ));
+    adw::NavigationPage::builder()
+        .title("Downloads")
+        .tag(OFFLINE_TAG)
+        .can_pop(false)
+        .child(&toolbar)
+        .build()
+}
+
+/// The offline Downloads page's tag on the window's stack.
+pub const OFFLINE_TAG: &str = "offline-downloads";
 
 /// "41.2 GB in ~/.local/share/spoolframe/downloads".
 pub fn space_line(space: DownloadSpace, dir: Option<&std::path::Path>) -> String {
@@ -1129,15 +1317,129 @@ mod tests {
         let shown = status(&LocalDownload {
             size: Some(3_400_000_000),
             received: 3_400_000_000,
-            ..in_phase(DownloadPhase::Done)
+            ..done_with(watched(None, None, false))
         });
         assert_eq!(
             (shown.heading.as_str(), shown.detail.as_deref(), shown.acts),
             (
                 "Downloaded · 3.4 GB",
                 Some("Original · all tracks"),
-                vec![Act::Delete]
+                vec![Act::Play, Act::Delete]
             )
+        );
+    }
+
+    fn watched(position_ms: Option<u64>, watched: Option<bool>, pending: bool) -> LocalWatch {
+        LocalWatch {
+            position_ms,
+            watched,
+            at: 0,
+            pending,
+        }
+    }
+
+    fn done_with(watch: LocalWatch) -> LocalDownload {
+        LocalDownload {
+            watch,
+            ..in_phase(DownloadPhase::Done)
+        }
+    }
+
+    #[test]
+    fn a_download_started_says_how_much_is_left() {
+        let download = done_with(watched(Some(10 * 60 * 1000), None, false));
+        let length = crate::views::Facts::of(&download.item).length.unwrap();
+        assert_eq!(
+            watch_line(&download),
+            Some(format::remaining(length, Duration::from_secs(600)))
+        );
+    }
+
+    #[test]
+    fn a_download_watched_here_says_so_and_that_it_waits() {
+        let download = done_with(watched(None, Some(true), true));
+        assert_eq!(
+            watch_line(&download).as_deref(),
+            Some("Watched, not sent yet")
+        );
+    }
+
+    #[test]
+    fn a_download_never_started_has_no_watch_line() {
+        assert_eq!(watch_line(&done_with(watched(None, None, false))), None);
+    }
+
+    #[test]
+    fn a_finished_downloads_line_carries_how_far_it_was_watched() {
+        let shown = status(&done_with(watched(None, Some(true), false)));
+        assert_eq!(
+            shown.detail.as_deref(),
+            Some("Original · all tracks · Watched")
+        );
+    }
+
+    #[test]
+    fn its_own_play_resumes_where_it_stopped_and_starts_over_once_watched() {
+        assert_eq!(
+            (
+                resume_point(&watched(Some(5_000), None, true)),
+                resume_point(&watched(None, Some(true), false))
+            ),
+            (Some(Duration::from_secs(5)), None)
+        );
+    }
+
+    #[test]
+    fn resume_from_the_page_takes_the_place_the_server_has_not_heard() {
+        let asked = Some(Duration::from_secs(60));
+        assert_eq!(
+            (
+                start_from(&watched(Some(90_000), None, true), asked),
+                start_from(&watched(Some(90_000), None, false), asked),
+                start_from(&watched(Some(90_000), None, true), None)
+            ),
+            (Some(Duration::from_secs(90)), asked, None)
+        );
+    }
+
+    #[test]
+    fn only_a_finished_download_of_the_profiles_plays_in_place_of_the_server() {
+        let client = FakeClient::new(None);
+        let first = started(&client, &alien());
+        let listed = ready(client.downloads());
+        let who = andrey_is_watching();
+        let before = playable_here(&listed, &who, &alien()).is_some();
+        client.finish_download(&first.key);
+        let listed = ready(client.downloads());
+        let mut finished = listed.clone();
+        // A file the fake serves for it: none here, so one is named.
+        finished[0].file_url = Some("file:///tmp/alien.mkv".into());
+        assert_eq!(
+            (
+                before,
+                playable_here(&finished, &who, &alien()).map(|d| d.key.clone()),
+                playable_here(&finished, &None, &alien()).is_some()
+            ),
+            (false, Some(first.key), false)
+        );
+    }
+
+    #[test]
+    fn nothing_waiting_for_the_server_says_nothing() {
+        assert_eq!(pending_line(&[done_with(watched(None, None, false))]), None);
+    }
+
+    #[test]
+    fn what_waits_for_the_server_is_named() {
+        let alien = done_with(watched(None, Some(true), true));
+        let heat = done_with(watched(Some(4_360_000), None, true));
+        let name = title(&alien);
+        assert_eq!(
+            pending_line(&[alien, heat]),
+            Some(format!(
+                "2 changes to send: {name} watched, {name} at 1:12:40. They go when \
+                 the server is back."
+            ))
         );
     }
 
@@ -1264,6 +1566,64 @@ mod tests {
             used: 25,
         };
         assert_eq!(used_fraction(space), 0.25);
+    }
+
+    /// With no server and no profile, the page lists every download, a
+    /// finished one with Play, and the banner says what waits to be sent.
+    #[test]
+    #[ignore = "needs a display; run on its own"]
+    fn the_page_lists_and_plays_with_no_session() {
+        gtk::init().unwrap();
+        adw::init().unwrap();
+        let client = Arc::new(FakeClient::new(None));
+        let first = started(&client, &alien());
+        client.finish_download(&first.key);
+        ready(client.record_download_position(&first.key, Duration::from_secs(60))).unwrap();
+        let bobs = ready(
+            client
+                .session(&FakeClient::profile("bob"))
+                .unwrap()
+                .start_download(
+                    &id(MediaKind::Episode, "65"),
+                    DownloadSource::Original,
+                    DownloadTracks::All,
+                ),
+        )
+        .unwrap();
+        let played = Rc::new(RefCell::new(Vec::new()));
+        let acts: Acts = {
+            let played = played.clone();
+            Rc::new(move |download, act| played.borrow_mut().push((download.key, act)))
+        };
+        let page = DownloadsPage::new(client.clone(), None, acts);
+        page.set_offline(Offline {
+            heading: "Home Media can’t be reached".into(),
+            try_now: Rc::new(|| {}),
+        });
+        page.fill(&ready(client.downloads()));
+        let row = page
+            .rows
+            .borrow()
+            .iter()
+            .position(|r| r.key == first.key)
+            .unwrap();
+        let play = page.rows.borrow()[row]
+            .view
+            .actions
+            .first_child()
+            .and_downcast::<gtk::Button>()
+            .unwrap();
+        play.emit_clicked();
+        let banner = page.offline.borrow().as_ref().unwrap().text();
+        assert_eq!(
+            (
+                page.titles().len(),
+                played.borrow().clone(),
+                banner.contains("1 change to send"),
+                page.rows.borrow().iter().any(|r| r.key == bobs.key)
+            ),
+            (2, vec![(first.key.clone(), Act::Play)], true, true)
+        );
     }
 
     /// The page with the fake: a Changed event changes the row it has, a

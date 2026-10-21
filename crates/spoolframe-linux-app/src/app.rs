@@ -34,7 +34,7 @@ use crate::artwork::Art;
 use crate::minibar::MiniBar;
 use crate::mpris::Mpris;
 use crate::passkey_dialog::{self, PasskeySignIn};
-use crate::playback::{Change, Playback, Playlist};
+use crate::playback::{Change, LocalItem, Playback, Playlist};
 use crate::playlists::{Mode, PlaylistView};
 use crate::queue::Queued;
 use crate::remote_sign_in::{self, RemoteSignIn, Via};
@@ -218,6 +218,9 @@ pub struct App {
     /// The Download actions of the item pages on the stack, changed in
     /// place by their downloads' events.
     item_downloads: Vec<Rc<crate::downloads::ItemDownload>>,
+    /// The Downloads page is over the window with no server (PX-38):
+    /// Choose a server's listings leave it be.
+    offline: bool,
 }
 
 /// An item page on the stack.
@@ -468,6 +471,9 @@ pub enum Msg {
     StartDownload(MediaId, DownloadSource, DownloadTracks),
     /// A download's button, on its key.
     DownloadAct(String, crate::downloads::Act),
+    /// This computer's downloads with no server (PX-38): from Choose a
+    /// server, or its banner when the server can't be reached.
+    OpenOfflineDownloads,
     PlaylistChanged(Box<PlaylistEvent>),
     /// A kept catalog read came back different from what was shown.
     CatalogChanged(Box<catalog::Change>),
@@ -1182,6 +1188,7 @@ impl Component for App {
             downloads: Vec::new(),
             downloads_page: None,
             item_downloads: Vec::new(),
+            offline: false,
         };
         model.watch_catalog(&sender);
         // Downloads are this computer's, not a session's: heard from the
@@ -1254,6 +1261,7 @@ impl Component for App {
             }
             Msg::ShowServers => {
                 self.invalidate_session();
+                self.leave_offline(widgets);
                 widgets.screens.set_visible_child_name("servers");
                 self.load_servers(&sender);
             }
@@ -1289,6 +1297,7 @@ impl Component for App {
             Msg::ChooseServer(server) => {
                 // Tried again: the banner goes, and comes back if it fails.
                 self.unreachable = None;
+                self.leave_offline(widgets);
                 sender.input(Msg::CheckServer(server, false));
             }
             Msg::ReachabilityDetails(server) => {
@@ -2049,17 +2058,28 @@ impl Component for App {
                 });
             }
             Msg::DownloadsListed(listed) => {
+                let had = !self.downloads.is_empty();
                 self.downloads = listed;
                 if let Some(page) = &self.downloads_page {
                     page.fill(&self.downloads);
                 }
                 self.show_item_downloads();
+                self.offer_downloads(had, &sender);
             }
             Msg::ListDownloads => self.list_downloads(&sender),
             Msg::LocalDownloadChanged(download) => {
-                self.download_event(DownloadEvent::Changed(*download))
+                self.download_event(DownloadEvent::Changed(*download), &sender)
             }
-            Msg::LocalDownloadRemoved(key) => self.download_event(DownloadEvent::Removed { key }),
+            Msg::LocalDownloadRemoved(key) => {
+                self.download_event(DownloadEvent::Removed { key }, &sender)
+            }
+            Msg::OpenOfflineDownloads => self.open_offline(widgets, &sender),
+            Msg::DownloadAct(key, crate::downloads::Act::Play) => {
+                if let Some(download) = self.downloads.iter().find(|d| d.key == key).cloned() {
+                    let from = crate::downloads::resume_point(&download.watch);
+                    self.play_local(&download, from, None, widgets, &sender);
+                }
+            }
             Msg::OpenDownloadPicker(item) => {
                 let Some(session) = self.session.clone().filter(|s| s.has_downloads()) else {
                     return;
@@ -2092,6 +2112,8 @@ impl Component for App {
                 let client = self.client.clone();
                 let acted = relm4::spawn(async move {
                     match act {
+                        // Played by the app, above.
+                        Act::Play => Ok(()),
                         Act::Pause => client.pause_download(&key).await.map(drop),
                         Act::Resume => client.resume_download(&key).await.map(drop),
                         Act::Retry => client.retry_download(&key).await.map(drop),
@@ -2220,6 +2242,15 @@ impl Component for App {
             }
             Msg::Open(item) => self.open_item(*item, &sender),
             Msg::Play(request) => {
+                // A film or an episode downloaded here plays from its file,
+                // with or without the server (PX-38).
+                if let Some(download) = self.downloaded(&request).cloned() {
+                    let from = crate::downloads::start_from(&download.watch, request.from);
+                    let selection = request
+                        .selection
+                        .map(|s| spoolframe_linux_core::downloads::file_selection(&download, s));
+                    return self.play_local(&download, from, selection, widgets, &sender);
+                }
                 let Some(session) = self.session.clone() else {
                     return;
                 };
@@ -2525,6 +2556,11 @@ impl Component for App {
                     let sender = sender.clone();
                     Rc::new(move |on| sender.input(Msg::SetUseRelays(on)))
                 };
+                // They play with no server: offered here while there are any.
+                let downloads = (!self.downloads.is_empty()).then(|| -> Rc<dyn Fn()> {
+                    let sender = sender.clone();
+                    Rc::new(move || sender.input(Msg::OpenOfflineDownloads))
+                });
                 let unreachable = self.unreachable.as_ref().map(|(server, reach)| {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -2541,6 +2577,7 @@ impl Component for App {
                             let (sender, server) = (sender.clone(), server.clone());
                             Rc::new(move || sender.input(Msg::ChooseServer(server.clone())))
                         },
+                        downloads: downloads.clone(),
                     }
                 });
                 widgets.servers.set_child(Some(&start::servers(
@@ -2550,8 +2587,9 @@ impl Component for App {
                     &add,
                     (self.settings.use_relays(), &set_relays),
                     unreachable.as_ref(),
+                    downloads.as_ref(),
                 )));
-                if self.server.is_none() {
+                if self.server.is_none() && !self.offline {
                     widgets.screens.set_visible_child_name("servers");
                 }
             }
@@ -3354,7 +3392,7 @@ impl Component for App {
             }
             // Its event says the same; shown now in case it came first.
             Loaded::DownloadStarted(Ok(download)) => {
-                self.download_event(DownloadEvent::Changed(*download))
+                self.download_event(DownloadEvent::Changed(*download), &sender)
             }
             Loaded::CoverChanged(id, done) => {
                 if let Err(e) = done {
@@ -3691,6 +3729,7 @@ impl App {
         widgets.search = None;
         self.library = None;
         self.stop_playback(widgets);
+        self.offline = false;
         // The queue was the last profile's; this one's comes back paused.
         self.queued.clear();
         self.saved_queue = SavedQueue::for_profile(&profile).map(Rc::new);
@@ -3764,12 +3803,112 @@ impl App {
 
     /// One download changed or went: the list, the Downloads page and the
     /// item pages showing it follow, each in place.
-    fn download_event(&mut self, event: DownloadEvent) {
+    fn download_event(&mut self, event: DownloadEvent, sender: &ComponentSender<Self>) {
+        let had = !self.downloads.is_empty();
         crate::downloads::apply(&mut self.downloads, &event);
         if let Some(page) = &self.downloads_page {
             page.apply(&event);
         }
         self.show_item_downloads();
+        self.offer_downloads(had, sender);
+    }
+
+    /// Choose a server offers the downloads while there are any: listed
+    /// again when the first comes or the last goes.
+    fn offer_downloads(&self, had: bool, sender: &ComponentSender<Self>) {
+        if had == self.downloads.is_empty() && self.server.is_none() {
+            self.load_servers(sender);
+        }
+    }
+
+    /// The film or episode `request` plays, when it is the profile's and
+    /// downloaded here: it plays from the file (PX-38). A playlist's entry
+    /// plays from the server, which moves the playlist on.
+    fn downloaded(&self, request: &PlayRequest) -> Option<&LocalDownload> {
+        match (request.items.as_slice(), &request.playlist) {
+            ([item @ (Item::Movie(_) | Item::Episode(_))], None) => {
+                crate::downloads::playable_here(&self.downloads, &self.who(), item.id())
+            }
+            _ => None,
+        }
+    }
+
+    /// Plays `download` from its file (PX-38), from `from`, with the
+    /// file's tracks `selection`: with or without a server.
+    fn play_local(
+        &mut self,
+        download: &LocalDownload,
+        from: Option<Duration>,
+        selection: Option<Selection>,
+        widgets: &mut AppWidgets,
+        sender: &ComponentSender<Self>,
+    ) {
+        let Some(item) = LocalItem::of(download, self.client.clone()) else {
+            return toast_text(widgets, "This download isn’t finished yet");
+        };
+        self.stop_playback(widgets);
+        let display = Some(crate::capabilities::display(self.settings.show_hdr()));
+        match Playback::play_local(item, from, selection, display) {
+            Ok(playback) => {
+                self.attach_playback(&playback, widgets, sender);
+                widgets
+                    .window_stack
+                    .push(&player_page(&playback, sender, &self.cards));
+                self.playback = Some(playback);
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "cannot build the player");
+                toast_text(widgets, &format!("Cannot play: {e}"));
+            }
+        }
+    }
+
+    /// The Downloads page over the window, with no server (PX-38): what
+    /// was downloaded plays, whoever downloaded it, and what was watched
+    /// waits to be sent.
+    fn open_offline(&mut self, widgets: &mut AppWidgets, sender: &ComponentSender<Self>) {
+        self.stop_playback(widgets);
+        let page =
+            crate::downloads::DownloadsPage::new(self.client.clone(), None, download_acts(sender));
+        let (heading, try_now): (String, Rc<dyn Fn()>) = match &self.unreachable {
+            Some((server, _)) => {
+                let (sender, server) = (sender.clone(), server.clone());
+                (
+                    format!("{} can’t be reached", server.name),
+                    Rc::new(move || sender.input(Msg::ChooseServer(server.clone()))),
+                )
+            }
+            None => {
+                let sender = sender.clone();
+                (
+                    "Not connected to a server".to_owned(),
+                    Rc::new(move || sender.input(Msg::ShowServers)),
+                )
+            }
+        };
+        page.set_offline(crate::downloads::Offline { heading, try_now });
+        page.fill(&self.downloads);
+        let back: Rc<dyn Fn()> = {
+            let sender = sender.clone();
+            Rc::new(move || sender.input(Msg::ShowServers))
+        };
+        widgets.window_stack.pop_to_page(&widgets.library_page);
+        widgets
+            .window_stack
+            .push(&crate::downloads::offline_page(&page, back));
+        widgets.screens.set_visible_child_name("library");
+        self.downloads_page = Some(page);
+        self.offline = true;
+    }
+
+    /// Leaves the Downloads page shown with no server, and what it plays.
+    fn leave_offline(&mut self, widgets: &mut AppWidgets) {
+        if !std::mem::take(&mut self.offline) {
+            return;
+        }
+        self.stop_playback(widgets);
+        self.downloads_page = None;
+        widgets.window_stack.pop_to_page(&widgets.library_page);
     }
 
     /// Each item page's Download action, as the downloads are now.
@@ -4138,7 +4277,10 @@ impl App {
             }
             true
         });
-        if let Some(saved) = self.saved_queue.clone() {
+        // A download plays alone, from this computer: not a queue to keep.
+        if let Some(saved) = self.saved_queue.clone()
+            && !playback.is_local()
+        {
             save_queue_on_changes(playback, saved);
         }
         widgets.mini_bar.attach(playback, &self.cards);
@@ -4219,9 +4361,21 @@ impl App {
     /// Stops what plays, closing the full player and the bar.
     fn stop_playback(&mut self, widgets: &mut AppWidgets) {
         if let Some(playback) = self.playback.take() {
-            self.queued = playback.carry();
+            // A download plays alone: the queue from before waits for the
+            // next playback.
+            if !playback.is_local() {
+                self.queued = playback.carry();
+            }
             self.shutdown_calls.retain(|call| !call.is_finished());
-            self.shutdown_calls.extend(playback.stop_waitable());
+            let calls = playback.stop_waitable();
+            match self
+                .session
+                .clone()
+                .filter(|s| playback.is_local() && s.has_downloads())
+            {
+                Some(session) => self.shutdown_calls.push(sync_watch_after(calls, session)),
+                None => self.shutdown_calls.extend(calls),
+            }
         }
         widgets.mini_bar.detach();
         widgets.mpris.detach();
@@ -4969,6 +5123,31 @@ fn open_with(sender: &ComponentSender<App>) -> views::Open {
 /// it. Downloads already made show on the Downloads page either way.
 fn download_offered(session: Option<&dyn Session>) -> bool {
     session.is_some_and(|s| s.has_downloads())
+}
+
+/// Waits for `calls`, a download's last places written here, then sends
+/// what was watched offline to the server (PX-38): it hears it now, not at
+/// the next reconnect, when the SDK sends it by itself. What it hands back
+/// is the calls' end alone, which quitting waits for; the sync may take
+/// as long as the server does.
+fn sync_watch_after(
+    calls: Vec<tokio::task::JoinHandle<()>>,
+    session: Arc<dyn Session>,
+) -> tokio::task::JoinHandle<()> {
+    let (written, done) = tokio::sync::oneshot::channel();
+    relm4::spawn(async move {
+        if done.await.is_ok()
+            && let Err(e) = session.sync_download_watch().await
+        {
+            tracing::debug!(error = %e, "the offline watch waits for the next sync");
+        }
+    });
+    relm4::spawn(async move {
+        for call in calls {
+            let _ = call.await;
+        }
+        let _ = written.send(());
+    })
 }
 
 /// What a download's buttons do, wherever it shows (PX-38).

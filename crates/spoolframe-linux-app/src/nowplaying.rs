@@ -683,7 +683,10 @@ fn short_codec(codec: &str) -> String {
 /// hidden while not connected.
 fn show_path(chip: &gtk::Label, playback: &Playback) {
     use spoolframe_linux_core::backend::ConnectionPath;
-    let path = playback.session().connection_path();
+    let Some(path) = playback.session().map(|s| s.connection_path()) else {
+        chip.set_visible(false);
+        return;
+    };
     let Some(label) = spoolframe_linux_core::format::path_chip(path) else {
         chip.set_visible(false);
         return;

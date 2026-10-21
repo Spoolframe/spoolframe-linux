@@ -23,6 +23,9 @@ pub struct Unreachable {
     pub line: String,
     pub details: Rc<dyn Fn()>,
     pub try_again: Rc<dyn Fn()>,
+    /// The Downloads page with no server (PX-38), while this computer has
+    /// any: they still play.
+    pub downloads: Option<Rc<dyn Fn()>>,
 }
 
 /// The banner over the saved servers: which one can't be reached, what
@@ -58,6 +61,11 @@ fn unreachable_banner(unreachable: &Unreachable) -> gtk::Box {
         .spacing(8)
         .halign(gtk::Align::End)
         .build();
+    if let Some(open) = unreachable.downloads.clone() {
+        let downloads = gtk::Button::builder().label("Downloads").build();
+        downloads.connect_clicked(move |_| open());
+        buttons.append(&downloads);
+    }
     buttons.append(&details);
     buttons.append(&try_again);
     card.append(&heading);
@@ -73,6 +81,7 @@ pub fn servers(
     add: &Rc<dyn Fn()>,
     (relays, set_relays): (bool, &Rc<dyn Fn(bool)>),
     unreachable: Option<&Unreachable>,
+    downloads: Option<&Rc<dyn Fn()>>,
 ) -> gtk::Widget {
     let (clamp, column) = column();
     column.append(&crate::logo::mark(72));
@@ -105,6 +114,11 @@ pub fn servers(
         .collect();
     if !saved.is_empty() {
         column.append(&section("Saved", &saved));
+    }
+    if let Some(open) = downloads {
+        let list = boxed_list();
+        list.append(&downloads_row(open));
+        column.append(&section("On this computer", &[list]));
     }
     let add_button = gtk::Button::builder()
         .label("Add a server…")
@@ -237,6 +251,29 @@ fn nearby_row(server: &Server, choose: &Choose<Server>) -> adw::ActionRow {
     connect.connect_clicked(move |_| choose(server.clone()));
     row.add_suffix(&connect);
     row.set_activatable_widget(Some(&connect));
+    row
+}
+
+/// This computer's downloads (PX-38), which play with no server: the way
+/// to them before any server is chosen, or when none can be reached.
+fn downloads_row(open: &Rc<dyn Fn()>) -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .use_markup(false)
+        .title("Downloads")
+        .subtitle("Films and episodes downloaded here play with no server.")
+        .activatable(true)
+        .css_classes(["server-row"])
+        .build();
+    row.add_prefix(&tile(crate::icons::DOWNLOADS, "tint-accent"));
+    let button = gtk::Button::builder()
+        .label("Open")
+        .valign(gtk::Align::Center)
+        .css_classes(["server-connect", "outlined"])
+        .build();
+    let (on_button, on_row) = (open.clone(), open.clone());
+    button.connect_clicked(move |_| on_button());
+    row.connect_activated(move |_| on_row());
+    row.add_suffix(&button);
     row
 }
 

@@ -1,7 +1,8 @@
 //! What is playing, apart from any window onto it (P1-16). GstPlay
-//! (playbin3) reads the server's file through the spoolframe:// source and
-//! draws into gtk4paintablesink. The playlist, the track choices and the
-//! progress reports live here.
+//! (playbin3) reads the server's file through the spoolframe:// source, or
+//! a download's file on this computer (PX-38), and draws into
+//! gtk4paintablesink. The playlist, the track choices and the progress
+//! reports live here.
 //!
 //! The app owns one [`Playback`] at a time, and views attach to it: the
 //! full player page, and the bar along the bottom of the window when the
@@ -21,8 +22,8 @@ use gtk::glib;
 use gtk::glib::thread_guard::ThreadGuard;
 use spoolframe_client_sdk::PlaybackOptions;
 use spoolframe_linux_core::backend::{
-    BackendError, EntryId, Marker, PlaySettings, PlaybackHandle, PlaybackPlan, PlaylistEntry,
-    Selection, Session, SubtitleTiming,
+    BackendError, Client, DownloadPhase, EntryId, LocalDownload, Marker, PlaySettings,
+    PlaybackHandle, PlaybackPlan, PlaylistEntry, Selection, Session, SubtitleTiming,
 };
 use spoolframe_linux_core::markers;
 pub use spoolframe_linux_core::markers::Offer;
@@ -88,6 +89,39 @@ pub struct Playlist {
     /// the server's next entry. Its settings are those it was started
     /// with: shuffle and repeat are the playlist's from the first song.
     pub from_playlist: Option<crate::saved_queue::PlaylistResume>,
+}
+
+/// A film or an episode downloaded to this computer (PX-38), played from
+/// its file with no server: what it is, where the file is, and the client
+/// that keeps where the user got to in it until the server hears it.
+pub struct LocalItem {
+    /// The download's key, for the client's calls.
+    pub key: String,
+    pub item: Item,
+    /// The file, as a `file://` URL.
+    pub file_url: String,
+    pub markers: Vec<Marker>,
+    /// The tracks the file holds, in its order (see
+    /// [`spoolframe_linux_core::downloads::file_tracks`]).
+    pub tracks: MediaTracks,
+    pub client: Arc<dyn Client>,
+}
+
+impl LocalItem {
+    /// `download`'s file to play, once it is all here.
+    pub fn of(download: &LocalDownload, client: Arc<dyn Client>) -> Option<Self> {
+        if download.phase != DownloadPhase::Done {
+            return None;
+        }
+        Some(Self {
+            key: download.key.clone(),
+            item: download.item.clone(),
+            file_url: download.file_url.clone()?,
+            markers: download.markers.clone(),
+            tracks: spoolframe_linux_core::downloads::file_tracks(download),
+            client,
+        })
+    }
 }
 
 /// How the first item starts: see [`Playlist`].
@@ -306,7 +340,13 @@ struct Skip {
 pub struct Playback {
     /// GstPlay and what it plays through; nothing else touches them.
     pipeline: Pipeline,
-    session: Arc<dyn Session>,
+    /// The server's session it plays from; `None` for a download, which
+    /// plays with no server, and has none of what needs one (subtitle
+    /// search and timing, quality, the show's next episode, playlists).
+    session: Option<Arc<dyn Session>>,
+    /// The download playing (PX-38), in place of the server's file: its
+    /// place goes to the client, which sends it to the server later.
+    local: Option<LocalItem>,
     /// What plays, and what plays next.
     queue: RefCell<Queue>,
     /// The item playing, and everything that is its alone; `None` once
@@ -394,6 +434,9 @@ struct Current {
     /// The automatic intro skip, to undo; set once skipped, so the item
     /// skips its intro once (a restart of it keeps this).
     intro_skipped: Cell<Option<Skip>>,
+    /// A download played to its end and marked watched: where it stops
+    /// now is not a place to resume from, until a seek back into it.
+    ended: Cell<bool>,
     /// An external subtitle, written where GstPlay can open it.
     subtitle_file: RefCell<Option<PathBuf>>,
     failure: RefCell<Option<String>>,
@@ -453,6 +496,7 @@ impl Current {
             markers: RefCell::new(Vec::new()),
             offered: Cell::new(None),
             intro_skipped: Cell::new(None),
+            ended: Cell::new(false),
             subtitle_file: RefCell::new(None),
             failure: RefCell::new(None),
         }
@@ -903,12 +947,40 @@ impl Playback {
             quality: playlist.quality,
             display: playlist.display,
         };
-        let playback = Self::build(playlist.session, queue, start, true)?;
+        let playback = Self::build(Some(playlist.session), None, queue, start, true)?;
         tracing::info!(playlist = ?playlist.from_playlist, "starting playback context");
         if let Some(from) = playlist.from_playlist {
             playback.play_from(from);
         }
         Ok(playback)
+    }
+
+    /// Plays download `item` from its file (PX-38), from `from`, with the
+    /// file's tracks `selection` (see
+    /// [`spoolframe_linux_core::downloads::file_selection`]); `None` plays
+    /// the file's default audio, without subtitles. No server is asked for
+    /// anything: it plays offline.
+    pub fn play_local(
+        item: LocalItem,
+        from: Option<Duration>,
+        selection: Option<Selection>,
+        display: Option<spoolframe_types::DisplayCapabilities>,
+    ) -> anyhow::Result<Rc<Self>> {
+        let queue = Queue::new(vec![item.item.clone()], 0, None, Vec::new());
+        let start = Start {
+            from,
+            selection,
+            tracks: Some(item.tracks.clone()),
+            quality: Default::default(),
+            display,
+        };
+        tracing::info!(download = %item.key, "playing a download");
+        Self::build(None, Some(item), queue, start, true)
+    }
+
+    /// Whether a download plays, from this computer.
+    pub fn is_local(&self) -> bool {
+        self.local.is_some()
     }
 
     /// Plays on from the server's playlist `from`, with the settings it
@@ -965,9 +1037,11 @@ impl Playback {
         if !reads_preview(self.playlist_settings()) {
             return;
         }
+        let Some(session) = self.session.clone() else {
+            return;
+        };
         let read = self.preview_reads.get().wrapping_add(1);
         self.preview_reads.set(read);
-        let session = self.session.clone();
         let requested = playing.clone();
         let task = relm4::spawn(async move {
             read_preview::<PREVIEW_PAGE, PREVIEW_WINDOW>(
@@ -1035,7 +1109,7 @@ impl Playback {
     /// modes have changed: what the server says comes up, where it says
     /// so; else the preview, when the entry has moved past it.
     fn follow_ahead(self: &Rc<Self>) {
-        match self.session.has_playlist_upcoming() {
+        match self.has_upcoming() {
             true => self.load_upcoming(),
             false => self.follow_preview(),
         }
@@ -1065,7 +1139,9 @@ impl Playback {
             else {
                 return;
             };
-            let session = playback.session.clone();
+            let Some(session) = playback.session.clone() else {
+                return;
+            };
             drop(playback);
             let asked = id.clone();
             let answer =
@@ -1110,7 +1186,7 @@ impl Playback {
     /// Playlist `id` changed on the server (an edit, here or elsewhere):
     /// if it is the one playing, what comes up in it is read again.
     pub fn playlist_changed(&self, id: &str) {
-        if self.plays_playlist(id) && self.session.has_playlist_upcoming() {
+        if self.plays_playlist(id) && self.has_upcoming() {
             self.load_upcoming();
         }
     }
@@ -1120,7 +1196,7 @@ impl Playback {
     fn playlist_up_next(&self) -> Option<PlaylistAhead> {
         let context = self.playlist.borrow();
         let context = context.as_ref()?;
-        if self.session.has_playlist_upcoming() {
+        if self.has_upcoming() {
             return Some(upcoming_ahead(
                 &context.playing.name,
                 context.modes?,
@@ -1134,6 +1210,13 @@ impl Playback {
             context.preview.as_ref(),
             context.playing.entry,
         )
+    }
+
+    /// Whether the server says what comes up in its playlists.
+    fn has_upcoming(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|s| s.has_playlist_upcoming())
     }
 
     pub fn play_playlist_entry(self: &Rc<Self>, entry: EntryId) {
@@ -1186,7 +1269,12 @@ impl Playback {
             if call == Call::Next {
                 tracing::info!(playlist = %playing.id, entry = ?playing.entry, "requesting next playlist entry");
             }
-            let session = playback.session.clone();
+            let Some(session) = playback.session.clone() else {
+                if call != Call::Save {
+                    playback.asking_playlist.set(false);
+                }
+                return;
+            };
             let id = playing.id.clone();
             drop(playback);
             let answer = relm4::spawn(async move {
@@ -1257,7 +1345,7 @@ impl Playback {
             quality: Default::default(),
             display,
         };
-        let playback = Self::build(session, queue, start, false)?;
+        let playback = Self::build(Some(session), None, queue, start, false)?;
         if let Some(playlist) = playlist {
             playback.play_from(playlist);
         }
@@ -1270,7 +1358,8 @@ impl Playback {
     }
 
     fn build(
-        session: Arc<dyn Session>,
+        session: Option<Arc<dyn Session>>,
+        local: Option<LocalItem>,
         queue: Queue,
         start: Start,
         autoplay: bool,
@@ -1280,6 +1369,7 @@ impl Playback {
             me: me.clone(),
             pipeline,
             session,
+            local,
             queue: RefCell::new(queue),
             current: RefCell::new(None),
             held: Cell::new(false),
@@ -1613,8 +1703,8 @@ impl Playback {
     }
 
     /// The session the playback plays from, for what views fetch beside
-    /// it (preview frames).
-    pub fn session(&self) -> Arc<dyn Session> {
+    /// it (preview frames); none for a download.
+    pub fn session(&self) -> Option<Arc<dyn Session>> {
         self.session.clone()
     }
 
@@ -1669,8 +1759,9 @@ impl Playback {
                 this.emit(&Change::TrackFailed(message));
             }
         });
-        // Quality is a film's or an episode's; music plays as it is.
-        let quality = self.is_video().then(|| {
+        // Quality is a film's or an episode's; music plays as it is, and
+        // a download as it was downloaded.
+        let quality = (self.is_video() && !self.is_local()).then(|| {
             let (current, choose) = (self.me.clone(), self.me.clone());
             crate::tracks::QualityMenu {
                 current: Rc::new(move || {
@@ -1709,7 +1800,8 @@ impl Playback {
     /// server has it and a film or an episode plays: the panel over
     /// `anchor`, and a track it downloads plays from here.
     fn subtitle_search(&self) -> Option<crate::tracks::FindSubtitles> {
-        if !self.is_video() || !self.session.has_subtitle_search() {
+        let session = self.session.clone().filter(|s| s.has_subtitle_search())?;
+        if !self.is_video() {
             return None;
         }
         let me = self.me.clone();
@@ -1727,7 +1819,7 @@ impl Playback {
             crate::subtitle_search::present(
                 anchor,
                 crate::subtitle_search::Search {
-                    session: this.session.clone(),
+                    session: session.clone(),
                     item: item.id().clone(),
                     title: crate::views::Facts::of(&item).title,
                     server: this.server_name.borrow().clone(),
@@ -1740,7 +1832,7 @@ impl Playback {
     /// The subtitle menu's Timing (PX-03), where the server syncs
     /// subtitles: for the chosen track while it is an external text one.
     fn timing_menu(&self) -> Option<crate::subtitle_timing::TimingMenu> {
-        if !self.session.has_subtitle_sync() {
+        if !self.session.as_ref().is_some_and(|s| s.has_subtitle_sync()) {
             return None;
         }
         let me = self.me.clone();
@@ -1787,8 +1879,10 @@ impl Playback {
     /// subtitle `track`; its answer is the track's timing now, as an
     /// event would tell it.
     fn retime(self: &Rc<Self>, track: u32, ask: TimingCall, offset_ms: i64) {
-        let Some(item) = self.current() else { return };
-        let (session, id) = (self.session.clone(), item.id().clone());
+        let (Some(item), Some(session)) = (self.current(), self.session.clone()) else {
+            return;
+        };
+        let id = item.id().clone();
         let answer = relm4::spawn(async move {
             match ask {
                 TimingCall::Sync => session.sync_subtitle(&id, track).await,
@@ -1958,6 +2052,8 @@ impl Playback {
     /// A seek in the file. Views show the target at once; the pipeline's
     /// positions wait until it lands.
     fn seek_direct(self: &Rc<Self>, current: &Current, to: Duration) {
+        // Back into a download played to its end: its place counts again.
+        current.ended.set(false);
         current.stage.replace(Stage::Seeking {
             since: Instant::now(),
         });
@@ -2150,6 +2246,10 @@ impl Playback {
     /// A converted playback, which reads nothing while its buffer is
     /// full, reads a byte.
     fn keep_alive(&self) {
+        // A download has no server playback to keep.
+        if self.is_local() {
+            return;
+        }
         let Some(current) = self.now() else { return };
         let paused = !self.playing.get() && !self.stopped.get();
         if paused && self.report_progress().is_some() {
@@ -2455,12 +2555,14 @@ impl Playback {
     /// playback's encode begins there; direct play seeks itself.
     fn ask(self: &Rc<Self>, current: &Rc<Current>, from: Option<Duration>) {
         current.stage.replace(Stage::Asking);
+        if self.is_local() {
+            return self.open_local(current, from);
+        }
+        let Some(session) = self.session.clone() else {
+            return self.failed("there is no server to play it from");
+        };
         let need_tracks = current.track_list.borrow().is_none();
-        let (session, id, requested) = (
-            self.session.clone(),
-            current.item.id().clone(),
-            current.requested,
-        );
+        let (id, requested) = (current.item.id().clone(), current.requested);
         let quality = self.quality.get();
         let display = self.display.borrow().clone();
         let pending = self.progress_calls.leave();
@@ -2499,6 +2601,28 @@ impl Playback {
                 });
             }
         });
+    }
+
+    /// GstPlay opens the download's file (PX-38), with nothing to ask
+    /// first: its markers came with it, and its tracks are the file's.
+    /// From `from` as a direct play resumes, once the length is known.
+    fn open_local(self: &Rc<Self>, current: &Rc<Current>, from: Option<Duration>) {
+        let Some(local) = &self.local else { return };
+        tracing::debug!(download = %local.key, resume = ?from, "opening the download's file");
+        current.markers.replace(local.markers.clone());
+        let selection = current.requested.unwrap_or_default();
+        current.pending.set(Some(selection));
+        current.selected.set(Some(selection));
+        self.pipeline.load_uri(&local.file_url);
+        current.stage.replace(Stage::Open {
+            mode: Mode::Direct,
+            resume: from,
+        });
+        if from.is_some() || !self.autoplay.get() {
+            self.pipeline.pause();
+        } else {
+            self.pipeline.play_now();
+        }
     }
 
     /// The server's answer to starting an item: GstPlay gets its file.
@@ -2582,7 +2706,11 @@ impl Playback {
         if !self.queue.borrow().context_ahead().is_empty() {
             return;
         }
-        let (session, episode) = (self.session.clone(), episode.clone());
+        // A download plays alone: the show is the server's.
+        let Some(session) = self.session.clone() else {
+            return;
+        };
+        let episode = episode.clone();
         let found = relm4::spawn(async move { next_episode(session.as_ref(), &episode).await });
         let (weak, current) = (Rc::downgrade(self), Rc::downgrade(current));
         glib::spawn_future_local(async move {
@@ -2634,7 +2762,9 @@ impl Playback {
     /// Fetches the playback's external subtitle; GstPlay takes subtitles
     /// only by URI, so it is handed over as a file.
     fn load_external_subtitle(self: &Rc<Self>, current: &Rc<Current>, handle: PlaybackHandle) {
-        let session = self.session.clone();
+        let Some(session) = self.session.clone() else {
+            return;
+        };
         let fetched = {
             let handle = handle.clone();
             relm4::spawn(async move { session.read_subtitle(&handle).await })
@@ -2751,9 +2881,22 @@ impl Playback {
         self.send_progress(self.pipeline.position()?)
     }
 
-    /// Tells the server the current item is at `position`.
+    /// Tells the server the current item is at `position`; a download's
+    /// place goes to the client, for the server later (PX-38).
     fn send_progress(&self, position: Duration) -> Option<tokio::task::JoinHandle<()>> {
         let current = self.now()?;
+        if let Some(local) = &self.local {
+            // Watched at its end: stopping there must not undo that.
+            if current.ended.get() {
+                return None;
+            }
+            let (client, key) = (local.client.clone(), local.key.clone());
+            return Some(self.progress_calls.send(async move {
+                if let Err(e) = client.record_download_position(&key, position).await {
+                    tracing::warn!(error = %e, "the download's place was not kept");
+                }
+            }));
+        }
         let managed = current.managed.borrow().clone()?;
         Some(self.progress_calls.send(async move {
             if let Err(e) = managed.report_position(position) {
@@ -2978,7 +3121,18 @@ impl Playback {
     /// The item played to its end: report it, then play the next one.
     fn ended(self: &Rc<Self>) {
         tracing::info!(item = ?self.current().map(|item| item.id().clone()), playlist = ?self.playing_from(), "playback reached end of stream");
-        if let Some(length) = self.pipeline.duration() {
+        if let Some(local) = &self.local {
+            // Watched, here: the server hears it at the next sync.
+            if let Some(current) = self.now() {
+                current.ended.set(true);
+            }
+            let (client, key) = (local.client.clone(), local.key.clone());
+            self.progress_calls.send(async move {
+                if let Err(e) = client.set_download_watched(&key, true).await {
+                    tracing::warn!(error = %e, "the download was not marked watched");
+                }
+            });
+        } else if let Some(length) = self.pipeline.duration() {
             self.send_progress(length);
         }
         if self.repeat() == Repeat::One {
@@ -4294,6 +4448,7 @@ mod tests {
         an_automatic_intro_skip_happens_once_and_undoes();
         quitting_waits_for_the_last_progress();
         a_playlist_goes_on_to_the_servers_next_entry_then_ends();
+        a_finished_download_plays_offline_to_its_end();
     }
 
     /// Movie night (two films, then an episode) from the top: each entry
@@ -4577,7 +4732,13 @@ mod tests {
         assert_eq!(preview.len(), total as usize - 1);
         assert_eq!(playback.playing_from().unwrap().entry, first.entry);
         let page = context
-            .block_on(playback.session.playlist(&night.id, 0, 200))
+            .block_on(
+                playback
+                    .session
+                    .as_ref()
+                    .unwrap()
+                    .playlist(&night.id, 0, 200),
+            )
             .unwrap();
         assert_eq!(
             page.place,
@@ -4592,7 +4753,7 @@ mod tests {
             assert_eq!(playback.repeat(), Repeat::All);
             context.block_on(playback.playlist_calls.idle()).unwrap();
             let saved = context
-                .block_on(playback.session.playlist(&night.id, 0, 1))
+                .block_on(playback.session.as_ref().unwrap().playlist(&night.id, 0, 1))
                 .unwrap();
             assert!(saved.settings.shuffle);
             assert_eq!(
@@ -4639,7 +4800,7 @@ mod tests {
             let bytes =
                 serde_json::to_vec(&(playback.snapshot(), playback.playlist_resume())).unwrap();
             let (queue, playlist) = serde_json::from_slice(&bytes).unwrap();
-            let session = playback.session.clone();
+            let session = playback.session.clone().unwrap();
             playback.stop();
             let restored =
                 Playback::restore(session, queue, Duration::ZERO, playlist, None).unwrap();
@@ -5448,6 +5609,54 @@ mod tests {
         );
         shutdown();
         assert!(!playback.is_playing());
+    }
+
+    /// A finished download (PX-38) plays from its file through playbin3
+    /// with no session, alone: no queue to carry or save. Pausing keeps its
+    /// place on the client, and playing to its end marks it watched there,
+    /// which stopping at the end does not undo; both wait for the server.
+    fn a_finished_download_plays_offline_to_its_end() {
+        use spoolframe_linux_core::backend::{DownloadSource, DownloadTracks};
+        let dir = TestDir::new_blocking("spoolframe-download");
+        let path = dir.join("clip.mkv");
+        clip(&path);
+        let client = Arc::new(FakeClient::new(Some(path)));
+        let session = client.session(&FakeClient::profile("andrey")).unwrap();
+        let id = first_movie(&session).id().clone();
+        let context = glib::MainContext::default();
+        let key = context
+            .block_on(session.start_download(&id, DownloadSource::Original, DownloadTracks::All))
+            .unwrap()
+            .key;
+        client.finish_download(&key);
+        let download = context.block_on(client.download(&key)).unwrap();
+        let item = LocalItem::of(&download, client.clone()).unwrap();
+        let playback = Playback::play_local(item, None, None, None).unwrap();
+        assert!(playback.session().is_none() && playback.carry().is_empty());
+        let kept = || context.block_on(client.download(&key)).unwrap().watch;
+        assert!(
+            run_until(Duration::from_secs(20), || playback.position()
+                > Duration::from_secs(1)),
+            "the download never got past a second"
+        );
+        playback.toggle();
+        assert!(
+            run_until(Duration::from_secs(3), || kept()
+                .position_ms
+                .is_some_and(|ms| ms >= 1_000)),
+            "pausing kept no place ({:?})",
+            kept()
+        );
+        playback.toggle();
+        assert!(
+            run_until(Duration::from_secs(20), || kept().watched == Some(true)),
+            "the end did not mark it watched ({:?})",
+            kept()
+        );
+        playback.stop();
+        run_until(Duration::from_secs(1), || false);
+        let watch = kept();
+        assert_eq!((watch.watched, watch.pending), (Some(true), true));
     }
 
     /// `client`'s first movie playing for `profile`, from `from`.
