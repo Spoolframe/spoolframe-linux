@@ -7,9 +7,13 @@
 //! try on its own: every wrong try counts towards the ten that end the
 //! session. Enter, or the Unlock button once there are four digits,
 //! sends it.
+//!
+//! The same pad, without the header and the password, stands in for a
+//! locked profile's downloads (PX-60, [`inline`]).
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::Duration;
 
 use adw::prelude::*;
 use gtk::glib;
@@ -70,6 +74,14 @@ pub struct Pad {
     message: gtk::Label,
     unlock: gtk::Button,
     keys: gtk::Grid,
+    /// Types a digit, and sends what was typed, as the keys do: for tests.
+    #[cfg(test)]
+    press: Rc<dyn Fn(char)>,
+    #[cfg(test)]
+    send: Rc<dyn Fn()>,
+    /// Counts a wait down. It holds the pad weakly: a pad dropped stops
+    /// it at the next second.
+    countdown: RefCell<Option<glib::SourceId>>,
 }
 
 impl Pad {
@@ -81,12 +93,50 @@ impl Pad {
     /// The server refused for another reason (too many tries, a
     /// connection lost), in its words.
     pub fn reject(&self, why: &str) {
+        self.stop_countdown();
         self.digits.borrow_mut().clear();
-        self.message.set_label(why);
-        self.message.add_css_class("error");
-        self.message.set_visible(true);
+        self.say(why);
         self.busy(false);
         self.redraw();
+    }
+
+    /// Too many tries: the keys rest for `wait`, saying how long is left
+    /// each second, and wake when it is over (PX-60).
+    pub fn wait(self: &Rc<Self>, wait: Duration) {
+        self.stop_countdown();
+        self.digits.borrow_mut().clear();
+        self.redraw();
+        let left = Rc::new(std::cell::Cell::new(wait.as_secs().max(1)));
+        self.say(&wait_line(left.get()));
+        self.busy(true);
+        let weak = Rc::downgrade(self);
+        let id = glib::timeout_add_seconds_local(1, move || {
+            let Some(pad) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            left.set(left.get().saturating_sub(1));
+            if left.get() == 0 {
+                pad.countdown.take();
+                pad.message.set_visible(false);
+                pad.busy(false);
+                return glib::ControlFlow::Break;
+            }
+            pad.say(&wait_line(left.get()));
+            glib::ControlFlow::Continue
+        });
+        self.countdown.replace(Some(id));
+    }
+
+    fn stop_countdown(&self) {
+        if let Some(id) = self.countdown.take() {
+            id.remove();
+        }
+    }
+
+    fn say(&self, what: &str) {
+        self.message.set_label(what);
+        self.message.add_css_class("error");
+        self.message.set_visible(true);
     }
 
     /// Waiting for the server: the keys rest.
@@ -99,6 +149,31 @@ impl Pad {
     fn redraw(&self) {
         redraw(&self.digits.borrow(), &self.dots, &self.unlock);
     }
+
+    /// Types `pin` and sends it, as the keys would.
+    #[cfg(test)]
+    pub fn enter(&self, pin: &str) {
+        for c in pin.chars() {
+            (self.press)(c);
+        }
+        (self.send)();
+    }
+
+    /// Whether the keys take digits now, and what the pad says.
+    #[cfg(test)]
+    pub fn shown(&self) -> (bool, Option<String>) {
+        (
+            self.keys.is_sensitive(),
+            self.message
+                .is_visible()
+                .then(|| self.message.label().to_string()),
+        )
+    }
+}
+
+/// "Try again in 4 s".
+pub fn wait_line(secs: u64) -> String {
+    format!("Try again in {secs} s")
 }
 
 fn redraw(digits: &Digits, dots: &gtk::Box, unlock: &gtk::Button) {
@@ -153,12 +228,39 @@ pub fn pad(
         back_button.connect_clicked(move |_| back());
     }
     header.pack_start(&back_button);
+    let pad = keypad(&profile.display_name, unlock, Some(forgot), Some(back));
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&header);
+    toolbar.set_content(Some(&pad.widget));
+    let pad = Rc::new(Pad {
+        widget: toolbar.upcast(),
+        ..pad
+    });
+    pad.redraw();
+    pad
+}
 
-    let avatar = adw::Avatar::new(88, Some(&profile.display_name), true);
+/// The pad alone, to sit in a page (PX-60's locked downloads): the
+/// avatar and `name`, the dots and the keys. `unlock` gets the PIN.
+pub fn inline(name: &str, unlock: Rc<dyn Fn(String)>) -> Rc<Pad> {
+    let pad = Rc::new(keypad(name, unlock, None, None));
+    pad.redraw();
+    pad
+}
+
+/// The avatar, the dots, the keys and the keyboard, with "Forgot your
+/// PIN?" when there is a `forgot`, and Esc for `back`.
+fn keypad(
+    name: &str,
+    unlock: Rc<dyn Fn(String)>,
+    forgot: Option<Rc<dyn Fn()>>,
+    back: Option<Rc<dyn Fn()>>,
+) -> Pad {
+    let avatar = adw::Avatar::new(88, Some(name), true);
     avatar.add_css_class("profile-avatar");
     avatar.add_css_class("tint-purple");
     let name = gtk::Label::builder()
-        .label(&profile.display_name)
+        .label(name)
         .css_classes(["pin-name"])
         .margin_top(4)
         .build();
@@ -195,14 +297,17 @@ pub fn pad(
 
     // Every way of typing goes through these.
     let press: Rc<dyn Fn(char)> = {
-        let (digits, dots, message, unlock_button) = (
+        let (digits, dots, message, unlock_button, keys) = (
             digits.clone(),
             dots.clone(),
             message.clone(),
             unlock_button.clone(),
+            keys.clone(),
         );
         Rc::new(move |c| {
-            if digits.borrow_mut().push(c) {
+            // Resting keys take nothing: a try is with the server, or a
+            // wait runs.
+            if keys.is_sensitive() && digits.borrow_mut().push(c) {
                 message.set_label("");
                 message.remove_css_class("error");
                 message.set_visible(false);
@@ -253,13 +358,6 @@ pub fn pad(
         let send = send.clone();
         unlock_button.connect_clicked(move |_| send());
     }
-    let forgot_link = gtk::Button::builder()
-        .label("Forgot your PIN? Sign in with your password")
-        .halign(gtk::Align::Center)
-        .margin_top(10)
-        .css_classes(["flat", "text-link"])
-        .build();
-    forgot_link.connect_clicked(move |_| forgot());
 
     let column = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -276,44 +374,59 @@ pub fn pad(
         message.upcast_ref(),
         keys.upcast_ref(),
         unlock_button.upcast_ref(),
-        forgot_link.upcast_ref(),
     ] {
         column.append(widget);
     }
+    if let Some(forgot) = forgot {
+        let forgot_link = gtk::Button::builder()
+            .label("Forgot your PIN? Sign in with your password")
+            .halign(gtk::Align::Center)
+            .margin_top(10)
+            .css_classes(["flat", "text-link"])
+            .build();
+        forgot_link.connect_clicked(move |_| forgot());
+        column.append(&forgot_link);
+    }
 
-    let toolbar = adw::ToolbarView::new();
-    toolbar.add_top_bar(&header);
-    toolbar.set_content(Some(&column));
     // The keyboard: digits, Backspace, Enter, Esc.
     let typing = gtk::EventControllerKey::new();
-    typing.connect_key_pressed(move |_, key, _, _| {
-        match key {
-            gtk::gdk::Key::BackSpace => delete(),
-            gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter => send(),
-            gtk::gdk::Key::Escape => back(),
-            _ => match key.to_unicode() {
-                Some(c) if c.is_ascii_digit() => press(c),
-                _ => return glib::Propagation::Proceed,
-            },
-        }
-        glib::Propagation::Stop
-    });
-    toolbar.add_controller(typing);
-    toolbar.set_focusable(true);
-    toolbar.connect_map(|toolbar| {
-        toolbar.grab_focus();
+    {
+        let (press, send) = (press.clone(), send.clone());
+        typing.connect_key_pressed(move |_, key, _, _| {
+            match key {
+                gtk::gdk::Key::BackSpace => delete(),
+                gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter => send(),
+                gtk::gdk::Key::Escape => match &back {
+                    Some(back) => back(),
+                    None => return glib::Propagation::Proceed,
+                },
+                _ => match key.to_unicode() {
+                    Some(c) if c.is_ascii_digit() => press(c),
+                    _ => return glib::Propagation::Proceed,
+                },
+            }
+            glib::Propagation::Stop
+        });
+    }
+    column.add_controller(typing);
+    column.set_focusable(true);
+    column.connect_map(|column| {
+        column.grab_focus();
     });
 
-    let pad = Rc::new(Pad {
-        widget: toolbar.upcast(),
+    Pad {
+        widget: column.upcast(),
         digits,
         dots,
         message,
         unlock: unlock_button,
         keys,
-    });
-    pad.redraw();
-    pad
+        #[cfg(test)]
+        press,
+        #[cfg(test)]
+        send,
+        countdown: RefCell::default(),
+    }
 }
 
 fn digit_key(c: char, press: &Rc<dyn Fn(char)>) -> gtk::Button {

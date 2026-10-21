@@ -16,11 +16,14 @@
   Play and Resume play it too, with no server needed: when none can be
   reached, Choose a server opens Downloads for the profile used last,
   with a choice of the others that have downloads here, they play, and
-  what was watched is sent when the server is back. Closing
-  the window while downloads run asks first: Keep in background finishes
-  them with the window hidden, and opening Spoolframe again shows it;
-  Quit stops them, and they go on from where they got to at the next
-  start.
+  what was watched is sent when the server is back. A profile whose PIN
+  is asked for on this computer shows the PIN pad in place of its
+  downloads; with no server the PIN is checked here, and the same PIN
+  unlocks the profile once the server is back, without asking again.
+  Closing the window while downloads run asks first: Keep in background
+  finishes them with the window hidden, and opening Spoolframe again
+  shows it; Quit stops them, and they go on from where they got to at
+  the next start.
 - The SDK crates are 0.14.1. The app also lists playlist covers,
   subtitle sync, subtitle search and what comes up in a playlist to each
   server; a server without them shows nothing new. On an item's page, a

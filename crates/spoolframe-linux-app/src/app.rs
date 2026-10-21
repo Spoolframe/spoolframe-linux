@@ -220,6 +220,9 @@ pub struct App {
     /// Bumped each time another profile is shown: a listing asked for
     /// before is the last profile's, and dropped.
     listing: u64,
+    /// The PIN that unlocked the profile's downloads with no server, for
+    /// its session's unlock once it is reached (PX-60). Memory only.
+    offline_pin: crate::downloads::OfflinePin,
     /// The Downloads page, while it is the sidebar's choice.
     downloads_page: Option<Rc<crate::downloads::DownloadsPage>>,
     /// The Download actions of the item pages on the stack, changed in
@@ -489,6 +492,10 @@ pub enum Msg {
     OpenOfflineDownloads,
     /// The offline Downloads page shows this profile's (PX-60).
     ShowDownloadsOf(crate::downloads::Holder),
+    /// The PIN typed on the Downloads page of a locked profile (PX-60).
+    UnlockDownloads(Secret),
+    /// What the PIN did: sent to the server (`true`) or checked here.
+    DownloadsUnlocked(Secret, bool, Result<(), BackendError>),
     /// The window was closed while downloads run: what now?
     AskClose,
     Closing(crate::closing::Answer),
@@ -1218,6 +1225,7 @@ impl Component for App {
             downloads: Vec::new(),
             holders: Vec::new(),
             listing: 0,
+            offline_pin: Default::default(),
             downloads_page: None,
             item_downloads: Vec::new(),
             offline: false,
@@ -1722,6 +1730,7 @@ impl Component for App {
                 });
             }
             Msg::SwitchProfile => {
+                self.offline_pin.forget();
                 self.invalidate_session();
                 if let Some(server) = self.server.clone() {
                     self.load_profiles(server, &sender);
@@ -1782,7 +1791,11 @@ impl Component for App {
                 let page = crate::downloads::DownloadsPage::new(
                     self.client.clone(),
                     download_acts(&sender),
+                    download_unlock(&sender),
                 );
+                if let Some(profile) = &self.profile {
+                    page.set_name(&profile.display_name);
+                }
                 page.fill(&self.downloads);
                 widgets.content.append(&page.widget);
                 self.downloads_page = Some(page);
@@ -2125,7 +2138,45 @@ impl Component for App {
                 self.download_event(DownloadEvent::Removed { key }, &sender)
             }
             Msg::OpenOfflineDownloads => self.open_offline(widgets, &sender),
-            Msg::ShowDownloadsOf(holder) => self.show_downloads_of(holder, &sender),
+            Msg::ShowDownloadsOf(holder) => {
+                if let Some(page) = &self.downloads_page {
+                    page.set_name(&holder.username);
+                }
+                self.show_downloads_of(holder, &sender)
+            }
+            // With the profile's session, the server checks the PIN, which
+            // opens the downloads too; with none, the SDK checks it here.
+            Msg::UnlockDownloads(Secret(pin)) => {
+                let session = self.session.clone().filter(|_| !self.offline);
+                let online = session.is_some();
+                let client = self.client.clone();
+                let unlocked = relm4::spawn(async move {
+                    let unlocked = match session {
+                        Some(session) => session.unlock(&pin).await,
+                        None => client.unlock_downloads_offline(&pin).await,
+                    };
+                    (pin, unlocked)
+                });
+                let sender = sender.clone();
+                glib::spawn_future_local(async move {
+                    if let Ok((pin, unlocked)) = unlocked.await {
+                        sender.input(Msg::DownloadsUnlocked(Secret(pin), online, unlocked));
+                    }
+                });
+            }
+            Msg::DownloadsUnlocked(Secret(pin), online, Ok(())) => {
+                // The server's side is still locked: its session's unlock
+                // takes the same PIN once reached.
+                if !online && let Some(shown) = self.settings.download_profile() {
+                    self.offline_pin.keep(shown, pin);
+                }
+                self.list_downloads(&sender);
+            }
+            Msg::DownloadsUnlocked(_, online, Err(e)) => {
+                if let Some(page) = &self.downloads_page {
+                    page.refused(&e, online);
+                }
+            }
             Msg::AskClose => {
                 let sender = sender.clone();
                 crate::closing::ask(
@@ -3890,6 +3941,7 @@ impl App {
         self.client
             .set_download_profile(&holder.server, &holder.user_id);
         self.settings.set_download_profile(&holder);
+        self.offline_pin.shown(&holder);
         // Known until its listing says it has none.
         if !self.holders.contains(&holder) {
             self.holders.push(holder);
@@ -4012,7 +4064,14 @@ impl App {
         if let Some(holder) = shown.clone() {
             self.show_downloads_of(holder, sender);
         }
-        let page = crate::downloads::DownloadsPage::new(self.client.clone(), download_acts(sender));
+        let page = crate::downloads::DownloadsPage::new(
+            self.client.clone(),
+            download_acts(sender),
+            download_unlock(sender),
+        );
+        if let Some(shown) = &shown {
+            page.set_name(&shown.username);
+        }
         let (heading, try_now): (String, Rc<dyn Fn()>) = match &self.unreachable {
             Some((server, _)) => {
                 let (sender, server) = (sender.clone(), server.clone());
@@ -4778,7 +4837,15 @@ impl App {
         widgets.profiles.set_child(Some(&pad.widget));
         widgets.screens.set_visible_child_name("profiles");
         widgets.pin_pad = Some(pad);
+        // Its downloads were unlocked with no server (PX-60): that PIN
+        // unlocks the session too, once, and a refusal shows on the pad.
+        let given = self
+            .offline_pin
+            .take_for(&profile.server.0, &profile.username);
         self.unlocking = Some(profile);
+        if let Some(pin) = given {
+            sender.input(Msg::Unlock(Secret(pin)));
+        }
     }
 
     /// What the server said no to a PIN with, on the pad.
@@ -5296,6 +5363,12 @@ fn sync_watch_after(
 fn download_acts(sender: &ComponentSender<App>) -> crate::downloads::Acts {
     let sender = sender.clone();
     Rc::new(move |download, act| sender.input(Msg::DownloadAct(download.key, act)))
+}
+
+/// The Downloads page's PIN pad sends what was typed (PX-60).
+fn download_unlock(sender: &ComponentSender<App>) -> Rc<dyn Fn(String)> {
+    let sender = sender.clone();
+    Rc::new(move |pin| sender.input(Msg::UnlockDownloads(Secret(pin))))
 }
 
 fn show_connection(widgets: &AppWidgets, server: Option<&Server>, state: &ConnectionState) {

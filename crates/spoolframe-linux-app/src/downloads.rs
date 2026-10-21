@@ -14,8 +14,8 @@ use std::time::Duration;
 use adw::prelude::*;
 use gtk::glib;
 use spoolframe_linux_core::backend::{
-    Client, DownloadEvent, DownloadPhase, DownloadSource, DownloadSpace, DownloadState,
-    DownloadTracks, LocalDownload, LocalWatch,
+    BackendError, Client, DownloadEvent, DownloadPhase, DownloadSource, DownloadSpace,
+    DownloadState, DownloadTracks, LocalDownload, LocalWatch,
 };
 use spoolframe_linux_core::format;
 use spoolframe_types::{ArtworkKind, Item, MediaId};
@@ -730,6 +730,91 @@ pub struct DownloadsPage {
     offline: RefCell<Option<gtk::Label>>,
     downloads: RefCell<Vec<LocalDownload>>,
     rows: RefCell<Vec<PageRow>>,
+    /// The downloads, or the PIN pad.
+    body: gtk::Stack,
+    lock: Lock,
+}
+
+/// The PIN pad of a locked profile's downloads (PX-60).
+struct Lock {
+    /// Gets the PIN typed.
+    unlock: Rc<dyn Fn(String)>,
+    name: RefCell<String>,
+    /// While the profile is locked.
+    pad: RefCell<Option<Rc<crate::pin::Pad>>>,
+}
+
+const LIST: &str = "list";
+const LOCKED: &str = "locked";
+
+/// What the pad over locked downloads does with a refused PIN (PX-60).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refusal {
+    /// "Wrong PIN. Try again."
+    Wrong,
+    /// Too many tries: the keys rest this long, counting down.
+    Wait(Duration),
+    /// Anything else, said under the dots.
+    Say(String),
+}
+
+/// How the pad answers `error` for a PIN sent `online` (to the server, a
+/// session's unlock) or not (checked here).
+pub fn refusal(error: &BackendError, online: bool) -> Refusal {
+    match error {
+        BackendError::WrongCredentials => Refusal::Wrong,
+        BackendError::RateLimited(wait) => Refusal::Wait(*wait),
+        // The tenth wrong PIN in a row: online the session ended, offline
+        // it stays locked until an unlock online.
+        BackendError::SignInRequired if online => {
+            Refusal::Say("Too many wrong PINs. Sign in again with your password.".into())
+        }
+        BackendError::SignInRequired => {
+            Refusal::Say("Too many wrong PINs. Connect to the server to unlock.".into())
+        }
+        BackendError::NoOfflinePin => Refusal::Say("Connect to the server to unlock.".into()),
+        other => Refusal::Say(crate::app::sentence(&other.to_string())),
+    }
+}
+
+/// The PIN that unlocked a profile's downloads with no server (PX-60),
+/// kept in memory only, to unlock the server's side with once its
+/// session is reached, so the PIN is not asked twice. Never written
+/// anywhere, never logged.
+#[derive(Default)]
+pub struct OfflinePin(Option<(Holder, String)>);
+
+impl std::fmt::Debug for OfflinePin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OfflinePin(..)")
+    }
+}
+
+impl OfflinePin {
+    pub fn keep(&mut self, holder: Holder, pin: String) {
+        self.0 = Some((holder, pin));
+    }
+
+    /// `holder`'s downloads are shown now: another profile's PIN goes.
+    pub fn shown(&mut self, holder: &Holder) {
+        if self.0.as_ref().is_some_and(|(kept, _)| !kept.same(holder)) {
+            self.0 = None;
+        }
+    }
+
+    /// The PIN for `username`'s locked session on `server`, once: it is
+    /// forgotten as it is given.
+    pub fn take_for(&mut self, server: &str, username: &str) -> Option<String> {
+        let (kept, _) = self.0.as_ref()?;
+        if kept.server != server || kept.username != username {
+            return None;
+        }
+        self.0.take().map(|(_, pin)| pin)
+    }
+
+    pub fn forget(&mut self) {
+        self.0 = None;
+    }
 }
 
 /// The banner over the Downloads page with no server (the offline board):
@@ -746,8 +831,9 @@ pub struct Offline {
 }
 
 impl DownloadsPage {
-    pub fn new(client: Arc<dyn Client>, act: Acts) -> Rc<Self> {
-        let widget = gtk::Box::builder()
+    /// `unlock` gets the PIN typed while the profile is locked.
+    pub fn new(client: Arc<dyn Client>, act: Acts, unlock: Rc<dyn Fn(String)>) -> Rc<Self> {
+        let list = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(20)
             .build();
@@ -790,7 +876,7 @@ impl DownloadsPage {
             .build();
         card.append(&icon);
         card.append(&inner);
-        widget.append(&card);
+        list.append(&card);
         let running = Section::new("In progress");
         let done = Section::new("Downloaded");
         let empty = adw::StatusPage::builder()
@@ -799,10 +885,10 @@ impl DownloadsPage {
             .description("Download a film or an episode from its page to watch it with no server.")
             .visible(false)
             .build();
-        widget.append(&running.widget);
-        widget.append(&done.widget);
-        widget.append(&empty);
-        widget.append(
+        list.append(&running.widget);
+        list.append(&done.widget);
+        list.append(&empty);
+        list.append(
             &gtk::Label::builder()
                 .label(
                     "Downloads go on while the window is closed, as long as Spoolframe runs. \
@@ -813,6 +899,14 @@ impl DownloadsPage {
                 .css_classes(["dim-label", "caption"])
                 .build(),
         );
+        // A locked profile's PIN pad stands in for all of it (PX-60).
+        let body = gtk::Stack::builder().vhomogeneous(false).build();
+        body.add_named(&list, Some(LIST));
+        let widget = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(20)
+            .build();
+        widget.append(&body);
         Rc::new(DownloadsPage {
             widget,
             client,
@@ -826,7 +920,49 @@ impl DownloadsPage {
             offline: RefCell::default(),
             downloads: RefCell::default(),
             rows: RefCell::default(),
+            body,
+            lock: Lock {
+                unlock,
+                name: RefCell::default(),
+                pad: RefCell::default(),
+            },
         })
+    }
+
+    /// The name the PIN pad shows for a locked profile.
+    pub fn set_name(&self, name: &str) {
+        self.lock.name.replace(name.to_owned());
+    }
+
+    /// Shows the PIN pad while the profile shown is locked here, else the
+    /// downloads.
+    fn show_lock(&self) {
+        if !self.client.download_profile_locked() {
+            self.lock.pad.take();
+            self.body.set_visible_child_name(LIST);
+            return;
+        }
+        if self.lock.pad.borrow().is_none() {
+            let pad = crate::pin::inline(&self.lock.name.borrow(), self.lock.unlock.clone());
+            if let Some(old) = self.body.child_by_name(LOCKED) {
+                self.body.remove(&old);
+            }
+            self.body.add_named(&pad.widget, Some(LOCKED));
+            self.lock.pad.replace(Some(pad));
+        }
+        self.body.set_visible_child_name(LOCKED);
+    }
+
+    /// The PIN sent from the pad was refused: `online`, by the server.
+    pub fn refused(&self, error: &BackendError, online: bool) {
+        let Some(pad) = self.lock.pad.borrow().clone() else {
+            return;
+        };
+        match refusal(error, online) {
+            Refusal::Wrong => pad.wrong(),
+            Refusal::Wait(wait) => pad.wait(wait),
+            Refusal::Say(why) => pad.reject(&why),
+        }
     }
 
     /// Opens with no server (the offline board): the banner over the
@@ -875,6 +1011,7 @@ impl DownloadsPage {
         for download in downloads {
             self.add(download);
         }
+        self.show_lock();
         self.counted();
         self.load_space();
     }
@@ -1033,6 +1170,16 @@ impl DownloadsPage {
         self.free
             .set_label(&format!("{} free", size(space.available)));
         self.bar.set_value(used_fraction(space));
+    }
+
+    /// The PIN pad, while it stands in for the downloads, for tests.
+    #[cfg(test)]
+    fn pad(&self) -> Option<Rc<crate::pin::Pad>> {
+        self.lock
+            .pad
+            .borrow()
+            .clone()
+            .filter(|_| self.body.visible_child_name().as_deref() == Some(LOCKED))
     }
 
     /// The title of each row, in the order shown, for tests.
@@ -1677,7 +1824,7 @@ mod tests {
             Rc::new(move |download, act| played.borrow_mut().push((download.key, act)))
         };
         let chosen = Rc::new(RefCell::new(Vec::new()));
-        let page = DownloadsPage::new(client.clone(), acts);
+        let page = DownloadsPage::new(client.clone(), acts, Rc::new(|_| {}));
         page.set_offline(Offline {
             heading: "Home Media can’t be reached".into(),
             try_now: Rc::new(|| {}),
@@ -1748,7 +1895,7 @@ mod tests {
         let mine = started(&client, &alien());
         let bobs = bobs_episode(&client);
         andrey_shown(&client);
-        let page = DownloadsPage::new(client.clone(), Rc::new(|_, _| {}));
+        let page = DownloadsPage::new(client.clone(), Rc::new(|_, _| {}), Rc::new(|_| {}));
         page.fill(&ready(client.downloads()));
         let mut events = client.download_events();
         client.advance_download(&bobs.key, 500);
@@ -1770,7 +1917,7 @@ mod tests {
         let first = started(&client, &alien());
         let second = started(&client, &id(MediaKind::Episode, "65"));
         andrey_shown(&client);
-        let page = DownloadsPage::new(client.clone(), Rc::new(|_, _| {}));
+        let page = DownloadsPage::new(client.clone(), Rc::new(|_, _| {}), Rc::new(|_| {}));
         page.fill(&ready(client.downloads()));
         let row_of = |key: &str| {
             page.rows
@@ -1807,5 +1954,150 @@ mod tests {
             key: first.key.clone(),
         });
         assert_eq!((row_of(&first.key), page.titles().len()), (None, 1));
+    }
+
+    #[test]
+    fn a_wrong_pin_is_said_as_wrong() {
+        assert_eq!(
+            refusal(&BackendError::WrongCredentials, false),
+            Refusal::Wrong
+        );
+    }
+
+    #[test]
+    fn too_many_tries_wait_as_long_as_the_sdk_says() {
+        assert_eq!(
+            refusal(&BackendError::RateLimited(Duration::from_secs(8)), false),
+            Refusal::Wait(Duration::from_secs(8))
+        );
+    }
+
+    #[test]
+    fn ten_wrong_pins_offline_need_the_server() {
+        assert_eq!(
+            refusal(&BackendError::SignInRequired, false),
+            Refusal::Say("Too many wrong PINs. Connect to the server to unlock.".into())
+        );
+    }
+
+    #[test]
+    fn ten_wrong_pins_online_need_the_password() {
+        assert_eq!(
+            refusal(&BackendError::SignInRequired, true),
+            Refusal::Say("Too many wrong PINs. Sign in again with your password.".into())
+        );
+    }
+
+    #[test]
+    fn nothing_to_check_offline_needs_the_server() {
+        assert_eq!(
+            refusal(&BackendError::NoOfflinePin, false),
+            Refusal::Say("Connect to the server to unlock.".into())
+        );
+    }
+
+    #[test]
+    fn the_offline_pin_unlocks_its_profiles_session_once() {
+        let mut kept = OfflinePin::default();
+        kept.keep(holder("alice"), "1234".into());
+        let other = kept.take_for("home", "bob");
+        let first = kept.take_for("home", "alice");
+        assert_eq!(
+            (other, first, kept.take_for("home", "alice")),
+            (None, Some("1234".to_owned()), None)
+        );
+    }
+
+    #[test]
+    fn showing_another_profile_forgets_the_offline_pin() {
+        let mut kept = OfflinePin::default();
+        kept.keep(holder("alice"), "1234".into());
+        kept.shown(&holder("alice"));
+        let still = kept.take_for("home", "alice").is_some();
+        kept.keep(holder("alice"), "1234".into());
+        kept.shown(&holder("bob"));
+        assert_eq!((still, kept.take_for("home", "alice")), (true, None));
+    }
+
+    #[test]
+    fn the_offline_pin_is_never_shown_in_a_log() {
+        let mut kept = OfflinePin::default();
+        kept.keep(holder("alice"), "1234".into());
+        assert!(!format!("{kept:?}").contains("1234"));
+    }
+
+    /// Andrey's downloads, his PIN asked for here and checked offline
+    /// against 1234, on a page whose pad hands what is typed to `sent`.
+    fn locked_page(client: &Arc<FakeClient>, sent: &Rc<RefCell<Vec<String>>>) -> Rc<DownloadsPage> {
+        client.require_offline_pin(
+            &FakeClient::profile("andrey").server,
+            "andrey",
+            Some("1234"),
+        );
+        andrey_shown(client);
+        let unlock: Rc<dyn Fn(String)> = {
+            let sent = sent.clone();
+            Rc::new(move |pin| sent.borrow_mut().push(pin))
+        };
+        let page = DownloadsPage::new(client.clone(), Rc::new(|_, _| {}), unlock);
+        page.set_name("Andrey");
+        page.fill(&ready(client.downloads()));
+        page
+    }
+
+    /// A locked profile's page is the PIN pad, with none of its rows.
+    #[test]
+    #[ignore = "needs a display; run on its own"]
+    fn a_locked_profiles_page_shows_the_pin_pad_not_its_downloads() {
+        gtk::init().unwrap();
+        adw::init().unwrap();
+        let client = Arc::new(FakeClient::new(None));
+        started(&client, &alien());
+        let page = locked_page(&client, &Rc::default());
+        assert_eq!((page.pad().is_some(), page.titles().len()), (true, 0));
+    }
+
+    /// The right PIN, checked here, opens the list: the pad goes.
+    #[test]
+    #[ignore = "needs a display; run on its own"]
+    fn the_right_pin_unlocks_and_lists() {
+        gtk::init().unwrap();
+        adw::init().unwrap();
+        let client = Arc::new(FakeClient::new(None));
+        let mine = started(&client, &alien());
+        let sent = Rc::default();
+        let page = locked_page(&client, &sent);
+        page.pad().unwrap().enter("1234");
+        let pin = sent.borrow_mut().pop().unwrap();
+        ready(client.unlock_downloads_offline(&pin)).unwrap();
+        page.fill(&ready(client.downloads()));
+        assert_eq!(
+            (page.pad().is_some(), page.titles()),
+            (false, vec![(false, title(&mine))])
+        );
+    }
+
+    /// After three wrong PINs the fourth try waits: the keys rest, and
+    /// the pad says for how long.
+    #[test]
+    #[ignore = "needs a display; run on its own"]
+    fn too_many_wrong_pins_rest_the_keys_with_a_countdown() {
+        gtk::init().unwrap();
+        adw::init().unwrap();
+        let client = Arc::new(FakeClient::new(None));
+        started(&client, &alien());
+        let sent = Rc::default();
+        let page = locked_page(&client, &sent);
+        for _ in 0..4 {
+            page.pad().unwrap().enter("0000");
+            let pin = sent.borrow_mut().pop().unwrap();
+            if let Err(e) = ready(client.unlock_downloads_offline(&pin)) {
+                page.refused(&e, false);
+            }
+        }
+        assert_eq!(
+            page.pad().unwrap().shown(),
+            (false, Some("Try again in 2 s".to_owned()))
+        );
     }
 }
