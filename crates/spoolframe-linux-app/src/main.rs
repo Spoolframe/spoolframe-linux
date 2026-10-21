@@ -216,6 +216,8 @@ const FEATURES: sdk::Features = sdk::Features {
     playlist_upcoming: true,
     subtitle_sync: true,
     subtitle_search: true,
+    downloads: false,
+    music_downloads: false,
 };
 
 /// The artwork cache, or none if it cannot be opened: images are then
@@ -297,6 +299,8 @@ mod tests {
                 playlist_upcoming: true,
                 subtitle_sync: true,
                 subtitle_search: true,
+                downloads: false,
+                music_downloads: false,
             }
         );
     }

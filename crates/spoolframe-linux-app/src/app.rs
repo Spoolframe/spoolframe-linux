@@ -5539,6 +5539,8 @@ mod tests {
             playlist_upcoming: true,
             subtitle_sync: true,
             subtitle_search: true,
+            downloads: false,
+            music_downloads: false,
         };
 
     fn nothing_shown() -> Shown<'static> {

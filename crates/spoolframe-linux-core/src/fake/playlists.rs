@@ -137,6 +137,8 @@ impl Store {
                 playlist_upcoming: true,
                 subtitle_sync: true,
                 subtitle_search: true,
+                downloads: false,
+                music_downloads: false,
             },
             server: server.to_owned(),
             next_id: 1,

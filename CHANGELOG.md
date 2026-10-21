@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- The SDK crates are 0.13.0. The app also lists playlist covers,
+- The SDK crates are 0.14.0. The app also lists playlist covers,
   subtitle sync, subtitle search and what comes up in a playlist to each
   server; a server without them shows nothing new. On an item's page, a
   playlist shared with you says whose it is ("Alice’s"), as its card
