@@ -2,8 +2,9 @@
 //! version (Original, then each optimized profile the admin set), the
 //! tracks (every one, or a choice ticked from the user's languages first),
 //! and the room left here. What the server says of the item
-//! (`DownloadOptionsInfo`) is all it shows: the board's per-profile sizes,
-//! codecs and "ready on the server" are not sent, so they are left out.
+//! (`DownloadOptionsInfo`) is all it shows: each version's size and
+//! whether the server must convert it first (`estimates`), but not the
+//! board's codecs, which are not sent, so they are left out.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -11,7 +12,8 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use spoolframe_linux_core::backend::{
-    DownloadOptionsInfo, DownloadSource, DownloadSpace, DownloadTracks, OriginalDownload,
+    DownloadEstimate, DownloadOptionsInfo, DownloadReadiness, DownloadSource, DownloadSpace,
+    DownloadTracks, OriginalDownload,
 };
 use spoolframe_linux_core::format;
 
@@ -100,6 +102,57 @@ pub fn original_line(original: &OriginalDownload) -> String {
     }
 }
 
+/// What the server says of `source`, found by the source it names, not
+/// by place: none when it sent no estimate (a server before 0.14.2, or
+/// an item that is not a film or an episode).
+pub fn estimate_for<'a>(
+    options: &'a DownloadOptionsInfo,
+    source: &DownloadSource,
+) -> Option<&'a DownloadEstimate> {
+    options.estimates.iter().find(|e| &e.source == source)
+}
+
+/// A version's size, as the board has it: Original's is the file's own
+/// ("38.4 GB"), a profile's a guess ("about 3.6 GB"). None when the
+/// server could not tell.
+pub fn size_text(source: &DownloadSource, estimate: Option<&DownloadEstimate>) -> Option<String> {
+    let bytes = estimate?.size_bytes?;
+    let size = crate::downloads::size(bytes);
+    Some(match source {
+        DownloadSource::Original => size,
+        _ => format!("about {size}"),
+    })
+}
+
+/// Whether the server must convert a version first. A kind this build
+/// does not know says nothing.
+pub fn readiness_line(readiness: DownloadReadiness) -> Option<&'static str> {
+    match readiness {
+        DownloadReadiness::Ready => Some("Ready on the server"),
+        DownloadReadiness::ConvertsFirst => Some("The server converts it first"),
+        DownloadReadiness::Unknown => None,
+    }
+}
+
+/// The line under a version's name. Original keeps what it would be on
+/// this computer, which says more than "ready" (as is, repackaged, or
+/// what is converted); only when that is not known does the server's
+/// readiness stand in.
+pub fn version_line(
+    source: &DownloadSource,
+    original: &OriginalDownload,
+    estimate: Option<&DownloadEstimate>,
+) -> Option<String> {
+    let readiness = estimate.and_then(|e| readiness_line(e.readiness));
+    match source {
+        DownloadSource::Original => match original {
+            OriginalDownload::Unknown => readiness.map(str::to_owned),
+            _ => Some(original_line(original)),
+        },
+        _ => readiness.map(str::to_owned),
+    }
+}
+
 /// A track's row: its place in the item's tracks, its name, and why it
 /// is left out, if it is.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,14 +194,33 @@ pub fn subtitle_rows(options: &DownloadOptionsInfo) -> Vec<TrackRow> {
     kept.into_iter().chain(left_out).collect()
 }
 
-/// The footer: how many tracks go with the video, and the room here.
-pub fn footer(choice: &Choice, space: Option<DownloadSpace>) -> String {
+/// The footer: the chosen version's size, when it is known for what is
+/// asked, how many tracks go with the video, and the room here. The
+/// server sizes a version with every track (the request does not carry
+/// the choice), so the size shows only while All tracks is on; a
+/// smaller choice has no number the server gave, and none is made up.
+pub fn footer(
+    choice: &Choice,
+    options: &DownloadOptionsInfo,
+    space: Option<DownloadSpace>,
+) -> String {
+    let source = choice.source(options);
+    let about = match choice.all {
+        true => estimate_for(options, &source)
+            .and_then(|e| e.size_bytes)
+            .map(|bytes| format!("About {}", crate::downloads::size(bytes))),
+        false => None,
+    };
     let tracks = match choice.all {
         true => "Every track".to_owned(),
         false => match choice.audio.len() + choice.subtitles.len() {
             1 => "With 1 track".to_owned(),
             n => format!("With {n} tracks"),
         },
+    };
+    let tracks = match about {
+        Some(about) => format!("{about} · {}", tracks.to_lowercase()),
+        None => tracks,
     };
     match space {
         Some(space) => format!(
@@ -192,12 +264,16 @@ impl View {
             .build();
         let mut first: Option<gtk::CheckButton> = None;
         let mut radios = Vec::new();
-        let names = std::iter::once((
-            "Original".to_owned(),
-            Some(original_line(&options.original)),
-        ))
-        .chain(options.profiles.iter().map(|p| (p.clone(), None)));
-        for (index, (name, line)) in names.enumerate() {
+        let names = std::iter::once(("Original".to_owned(), DownloadSource::Original)).chain(
+            options
+                .profiles
+                .iter()
+                .map(|p| (p.clone(), DownloadSource::Profile { name: p.clone() })),
+        );
+        for (index, (name, source)) in names.enumerate() {
+            let estimate = estimate_for(options, &source);
+            let line = version_line(&source, &options.original, estimate);
+            let size = size_text(&source, estimate);
             let radio = gtk::CheckButton::builder()
                 .active(index == choice.version)
                 .valign(gtk::Align::Center)
@@ -211,6 +287,14 @@ impl View {
             row.set_title(&name);
             if let Some(line) = line {
                 row.set_subtitle(&line);
+            }
+            if let Some(size) = size {
+                row.add_suffix(
+                    &gtk::Label::builder()
+                        .label(size)
+                        .css_classes(["dim-label"])
+                        .build(),
+                );
             }
             row.add_prefix(&radio);
             row.set_activatable_widget(Some(&radio));
@@ -253,7 +337,7 @@ impl View {
         page.add(&columns);
 
         let foot = gtk::Label::builder()
-            .label(footer(&choice, picker.space))
+            .label(footer(&choice, options, picker.space))
             .xalign(0.0)
             .hexpand(true)
             .wrap(true)
@@ -296,6 +380,7 @@ impl View {
             radio.connect_toggled(move |radio| {
                 if let (true, Some(view)) = (radio.is_active(), weak.upgrade()) {
                     view.choice.borrow_mut().version = index;
+                    view.refresh();
                 }
             });
         }
@@ -359,8 +444,11 @@ impl View {
     }
 
     fn refresh(&self) {
-        self.footer
-            .set_label(&footer(&self.choice.borrow(), self.picker.space));
+        self.footer.set_label(&footer(
+            &self.choice.borrow(),
+            &self.picker.options,
+            self.picker.space,
+        ));
     }
 
     /// What Download would ask for now.
@@ -522,9 +610,123 @@ mod tests {
             used: 0,
         };
         assert_eq!(
-            footer(&choice, Some(space)),
+            footer(&choice, &options(), Some(space)),
             "With 3 tracks · 182.0 GB free here"
         );
+    }
+
+    fn profile(name: &str) -> DownloadSource {
+        DownloadSource::Profile { name: name.into() }
+    }
+
+    #[test]
+    fn an_estimate_is_found_by_its_source_not_its_place() {
+        let mut options = options();
+        options.estimates.reverse();
+        assert_eq!(
+            estimate_for(&options, &profile("Mobile")).map(|e| e.size_bytes),
+            Some(Some(3_600_000_000))
+        );
+    }
+
+    #[test]
+    fn a_version_without_an_estimate_has_no_size_and_no_line() {
+        let mut options = options();
+        options.estimates.clear();
+        let source = profile("Mobile");
+        let estimate = estimate_for(&options, &source);
+        assert_eq!(
+            (
+                size_text(&source, estimate),
+                version_line(&source, &options.original, estimate)
+            ),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn original_has_its_size_and_a_profile_about_its_size() {
+        let options = options();
+        let sizes = [
+            DownloadSource::Original,
+            profile("Mobile"),
+            profile("Mobile (H.264)"),
+        ]
+        .map(|s| size_text(&s, estimate_for(&options, &s)));
+        assert_eq!(
+            sizes,
+            [
+                Some("38.4 GB".to_owned()),
+                Some("about 3.6 GB".to_owned()),
+                None
+            ]
+        );
+    }
+
+    #[test]
+    fn readiness_says_whether_the_server_converts_first() {
+        assert_eq!(
+            [
+                DownloadReadiness::Ready,
+                DownloadReadiness::ConvertsFirst,
+                DownloadReadiness::Unknown
+            ]
+            .map(readiness_line),
+            [
+                Some("Ready on the server"),
+                Some("The server converts it first"),
+                None
+            ]
+        );
+    }
+
+    #[test]
+    fn original_keeps_its_own_line_unless_that_is_unknown() {
+        let options = options();
+        let estimate = estimate_for(&options, &DownloadSource::Original);
+        let lines = [OriginalDownload::AsIs, OriginalDownload::Unknown]
+            .map(|o| version_line(&DownloadSource::Original, &o, estimate));
+        assert_eq!(
+            lines,
+            [
+                Some("This computer plays the source as it is: nothing converted".to_owned()),
+                Some("Ready on the server".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn the_footer_shows_the_size_only_for_every_track() {
+        let options = options();
+        let every = Choice {
+            all: true,
+            version: 1,
+            ..Choice::first(&options)
+        };
+        let some = Choice {
+            all: false,
+            audio: [0].into(),
+            subtitles: [1].into(),
+            ..every.clone()
+        };
+        assert_eq!(
+            [
+                footer(&every, &options, None),
+                footer(&some, &options, None)
+            ],
+            ["About 3.6 GB · every track", "With 2 tracks"].map(str::to_owned)
+        );
+    }
+
+    #[test]
+    fn the_footer_has_no_size_when_the_server_gave_none() {
+        let options = options();
+        let choice = Choice {
+            all: true,
+            version: 2,
+            ..Choice::first(&options)
+        };
+        assert_eq!(footer(&choice, &options, None), "Every track");
     }
 
     /// The dialog itself: a left-out subtitle's tick cannot be used, and

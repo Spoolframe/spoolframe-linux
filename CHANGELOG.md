@@ -24,8 +24,12 @@
   finishes them with the window hidden, and opening Spoolframe again
   shows it; Quit stops them, and they go on from where they got to at
   the next start.
-- The SDK crates are 0.14.1. The app also lists playlist covers,
-  subtitle sync, subtitle search and what comes up in a playlist to each
+- The SDK crates are 0.14.2. The download picker shows each version's
+  size ("38.4 GB" for Original, "about 3.6 GB" for a profile) and
+  whether it is ready on the server or the server converts it first,
+  and with All tracks on, the footer shows the chosen version's size. The
+  server now offers only the profiles this computer plays. The app also
+  lists playlist covers, subtitle sync, subtitle search and what comes up in a playlist to each
   server; a server without them shows nothing new. On an item's page, a
   playlist shared with you says whose it is ("Alice’s"), as its card
   does, where the server names the owner.

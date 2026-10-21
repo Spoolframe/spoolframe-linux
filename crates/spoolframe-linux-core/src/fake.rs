@@ -38,8 +38,8 @@ use crate::backend::{
     ServerKey, Session, TopResult, TrustedProfile,
 };
 use crate::backend::{
-    DownloadEvent, DownloadOptionsInfo, DownloadSource, DownloadSpace, DownloadTracks,
-    LocalDownload, OriginalDownload, SyncedWatch,
+    DownloadEstimate, DownloadEvent, DownloadOptionsInfo, DownloadReadiness, DownloadSource,
+    DownloadSpace, DownloadTracks, LocalDownload, OriginalDownload, SyncedWatch,
 };
 use crate::backend::{
     EntryId, Features, ItemDetail, Kinds, PlaySettings, PlaylistEdit, PlaylistEvent, PlaylistList,
@@ -2832,9 +2832,32 @@ impl Session for FakeSession {
             Ok(DownloadOptionsInfo {
                 tracks,
                 preferred: DownloadTracks::Chosen { audio, subtitles },
-                profiles: vec!["Mobile".into()],
+                profiles: vec!["Mobile".into(), "Mobile (H.264)".into()],
                 original: OriginalDownload::AsIs,
                 left_out: Vec::new(),
+                // As the server tells them: Original first, then each
+                // profile in order, sized for every track.
+                estimates: vec![
+                    DownloadEstimate {
+                        source: DownloadSource::Original,
+                        size_bytes: Some(38_400_000_000),
+                        readiness: DownloadReadiness::Ready,
+                    },
+                    DownloadEstimate {
+                        source: DownloadSource::Profile {
+                            name: "Mobile".into(),
+                        },
+                        size_bytes: Some(3_600_000_000),
+                        readiness: DownloadReadiness::ConvertsFirst,
+                    },
+                    DownloadEstimate {
+                        source: DownloadSource::Profile {
+                            name: "Mobile (H.264)".into(),
+                        },
+                        size_bytes: None,
+                        readiness: DownloadReadiness::Ready,
+                    },
+                ],
             })
         })
     }

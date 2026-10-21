@@ -860,7 +860,7 @@ mod tests {
                     audio: vec![0],
                     subtitles: (0..options.tracks.subtitles.len() as u32).collect()
                 },
-                vec!["Mobile".to_owned()],
+                vec!["Mobile".to_owned(), "Mobile (H.264)".to_owned()],
                 OriginalDownload::AsIs,
                 Vec::new()
             )
