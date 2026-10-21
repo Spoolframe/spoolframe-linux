@@ -6,7 +6,14 @@
 //! a finished download is deleted, never cancelled. Nothing moves by
 //! itself: a test moves it with `FakeClient::advance_download`,
 //! `FakeClient::finish_download` and `FakeClient::fail_download`.
+//!
+//! As in SDK 0.14.1 (PX-60), a file is the device's: the profiles that
+//! downloaded it hold it, each with its own watch, and the app's shown
+//! profile (`Client::set_download_profile`) sees only what it holds. A
+//! profile whose PIN is asked for here starts locked
+//! (`FakeClient::require_offline_pin`).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -43,11 +50,48 @@ pub(in crate::fake) struct Start {
 }
 
 pub(in crate::fake) struct Store {
-    /// Oldest first.
-    downloads: Vec<LocalDownload>,
+    /// Oldest first, each with the profiles that hold it.
+    downloads: Vec<Held>,
     next: u64,
     events: broadcast::Sender<DownloadEvent>,
+    /// The profile the app shows (PX-60); every profile's downloads are
+    /// listed before there is one.
+    shown: Option<Shown>,
+    /// The profiles whose PIN is asked for on this device, by server and
+    /// user.
+    locks: HashMap<(String, String), Lock>,
 }
+
+/// One file on the device and who holds it: a film two profiles
+/// downloaded is one file, and each has its own watch state.
+struct Held {
+    download: LocalDownload,
+    /// User ids, oldest hold first, each with its watch.
+    holders: Vec<(String, LocalWatch)>,
+}
+
+struct Shown {
+    server: String,
+    user_id: String,
+    unlocked: bool,
+}
+
+/// A profile's lock offline, as the SDK keeps it.
+#[derive(Default)]
+struct Lock {
+    /// The PIN that last unlocked it online here; none, nothing to check.
+    pin: Option<String>,
+    /// Wrong PINs in a row.
+    wrong: u32,
+    /// The next try waits: the fake has no clock, so a test says when
+    /// the wait is over ([`Store::wait_out`]).
+    waiting: bool,
+}
+
+/// Wrong PINs in a row before each next try waits, and before the
+/// profile stays locked until an online unlock: the SDK's.
+const FREE_TRIES: u32 = 3;
+const MOST_WRONG: u32 = 10;
 
 impl Store {
     pub fn new() -> Self {
@@ -55,6 +99,8 @@ impl Store {
             downloads: Vec::new(),
             next: 1,
             events: broadcast::channel(64).0,
+            shown: None,
+            locks: HashMap::new(),
         }
     }
 
@@ -62,38 +108,144 @@ impl Store {
         self.events.subscribe()
     }
 
+    /// The app shows `server`'s `user_id`: another profile than before
+    /// starts locked, if its PIN is asked for here.
+    pub fn set_profile(&mut self, server: &str, user_id: &str) {
+        if self
+            .shown
+            .as_ref()
+            .is_some_and(|s| s.server == server && s.user_id == user_id)
+        {
+            return;
+        }
+        self.shown = Some(Shown {
+            server: server.into(),
+            user_id: user_id.into(),
+            unlocked: false,
+        });
+    }
+
+    pub fn locked(&self) -> bool {
+        self.shown.as_ref().is_some_and(|s| {
+            !s.unlocked
+                && self
+                    .locks
+                    .contains_key(&(s.server.clone(), s.user_id.clone()))
+        })
+    }
+
+    /// `server`'s `user_id` asks for their PIN on this device; `pin` last
+    /// unlocked them online here, if any did.
+    pub fn require_pin(&mut self, server: &str, user_id: &str, pin: Option<&str>) {
+        self.locks.insert(
+            (server.into(), user_id.into()),
+            Lock {
+                pin: pin.map(str::to_owned),
+                ..Lock::default()
+            },
+        );
+    }
+
+    /// `pin` unlocked `server`'s `user_id` online: kept to check offline,
+    /// the wrong ones forgotten, and the profile open if it is shown.
+    pub fn unlocked_online(&mut self, server: &str, user_id: &str, pin: &str) {
+        self.locks.insert(
+            (server.into(), user_id.into()),
+            Lock {
+                pin: Some(pin.into()),
+                ..Lock::default()
+            },
+        );
+        if let Some(shown) = self.shown.as_mut()
+            && shown.server == server
+            && shown.user_id == user_id
+        {
+            shown.unlocked = true;
+        }
+    }
+
+    /// Unlocks the profile shown with `pin`, with the SDK's answers.
+    pub fn unlock_offline(&mut self, pin: &str) -> Result<(), BackendError> {
+        let Some(shown) = self.shown.as_mut() else {
+            return Err(BackendError::InvalidInput("no profile is shown".into()));
+        };
+        let Some(lock) = self
+            .locks
+            .get_mut(&(shown.server.clone(), shown.user_id.clone()))
+        else {
+            shown.unlocked = true;
+            return Ok(());
+        };
+        if lock.wrong >= MOST_WRONG {
+            return Err(BackendError::SignInRequired);
+        }
+        if lock.waiting {
+            return Err(BackendError::RateLimited(wait_after(lock.wrong)));
+        }
+        let Some(right) = lock.pin.as_deref() else {
+            return Err(BackendError::NoOfflinePin);
+        };
+        if right == pin {
+            lock.wrong = 0;
+            shown.unlocked = true;
+            return Ok(());
+        }
+        lock.wrong += 1;
+        lock.waiting = lock.wrong >= FREE_TRIES;
+        if lock.wrong >= MOST_WRONG {
+            Err(BackendError::SignInRequired)
+        } else {
+            Err(BackendError::WrongCredentials)
+        }
+    }
+
+    /// The wait after the last wrong PIN is over.
+    pub fn wait_out(&mut self) {
+        for lock in self.locks.values_mut() {
+            lock.waiting = false;
+        }
+    }
+
     pub fn list(&self) -> Vec<LocalDownload> {
-        self.downloads.clone()
+        self.downloads
+            .iter()
+            .filter(|h| self.sees(h))
+            .map(|h| self.view(h))
+            .collect()
     }
 
     pub fn get(&self, key: &str) -> Result<LocalDownload, BackendError> {
-        self.downloads
-            .iter()
-            .find(|d| d.key == key)
-            .cloned()
-            .ok_or_else(|| missing(key))
+        let at = self.find(key)?;
+        Ok(self.view(&self.downloads[at]))
     }
 
+    /// The device's room: every profile's files count.
     pub fn space(&self) -> DownloadSpace {
         DownloadSpace {
             available: SPACE_AVAILABLE,
-            used: self.downloads.iter().map(|d| d.received).sum(),
+            used: self.downloads.iter().map(|h| h.download.received).sum(),
         }
     }
 
     /// Download `start`: waiting its turn on the server. The same item,
-    /// source and tracks for the same user are the one download.
+    /// source and tracks on the same server are the one file: another
+    /// user starting it holds it too.
     pub fn start(&mut self, start: Start) -> LocalDownload {
         let chosen = start.chosen.normalized();
-        let same = |d: &&LocalDownload| {
-            d.user_id == start.username
-                && d.server == start.server
-                && d.item.id() == start.item.id()
-                && d.source == start.source
-                && d.chosen == chosen
+        let same = |h: &Held| {
+            h.download.server == start.server
+                && h.download.item.id() == start.item.id()
+                && h.download.source == start.source
+                && h.download.chosen == chosen
         };
-        if let Some(found) = self.downloads.iter().find(same) {
-            return found.clone();
+        if let Some(at) = self.downloads.iter().position(same) {
+            let held = &mut self.downloads[at];
+            if !held.holders.iter().any(|(u, _)| *u == start.username) {
+                held.holders
+                    .push((start.username.clone(), watch_of(&start.item)));
+                self.tell(at);
+            }
+            return view_for(&self.downloads[at], &start.username);
         }
         let (audio, subtitles) = match &chosen {
             DownloadTracks::Chosen { audio, subtitles } => (audio.clone(), subtitles.clone()),
@@ -102,12 +254,13 @@ impl Store {
                 (0..start.tracks.subtitles.len() as u32).collect(),
             ),
         };
+        let watch = watch_of(&start.item);
         let download = LocalDownload {
             key: format!("download-{}", self.next),
             server: start.server,
             user_id: start.username.clone(),
-            username: start.username,
-            watch: watch_of(&start.item),
+            username: start.username.clone(),
+            watch: watch.clone(),
             item: start.item,
             show: start.show,
             season: start.season,
@@ -129,8 +282,11 @@ impl Store {
             created_at: STARTED_AT,
         };
         self.next += 1;
-        self.downloads.push(download.clone());
-        self.tell(&download);
+        self.downloads.push(Held {
+            download: download.clone(),
+            holders: vec![(start.username, watch)],
+        });
+        self.tell(self.downloads.len() - 1);
         download
     }
 
@@ -178,13 +334,18 @@ impl Store {
         self.delete(key)
     }
 
+    /// Lets go of the shown profile's hold on `key`: the file goes with
+    /// the last hold, and with no profile shown it goes at once.
     pub fn delete(&mut self, key: &str) -> Result<(), BackendError> {
-        let at = self
-            .downloads
-            .iter()
-            .position(|d| d.key == key)
-            .ok_or_else(|| missing(key))?;
-        self.downloads.remove(at);
+        let at = self.find(key)?;
+        let held = &mut self.downloads[at];
+        match &self.shown {
+            Some(shown) => held.holders.retain(|(u, _)| *u != shown.user_id),
+            None => held.holders.clear(),
+        }
+        if held.holders.is_empty() {
+            self.downloads.remove(at);
+        }
         // Nobody listening is fine: nothing is shown.
         let _ = self.events.send(DownloadEvent::Removed { key: key.into() });
         Ok(())
@@ -198,30 +359,39 @@ impl Store {
         self.watched(key, None, Some(watched))
     }
 
+    /// The shown profile's watch of `key` changes; with none shown, the
+    /// first holder's.
     fn watched(
         &mut self,
         key: &str,
         position_ms: Option<u64>,
         watched: Option<bool>,
     ) -> Result<LocalDownload, BackendError> {
-        self.change(key, |d| {
-            d.watch = LocalWatch {
+        let at = self.find(key)?;
+        let user = self.shown.as_ref().map(|s| s.user_id.clone());
+        let holders = &mut self.downloads[at].holders;
+        let watch = match user {
+            Some(user) => holders.iter_mut().find(|(u, _)| *u == user),
+            None => holders.first_mut(),
+        };
+        if let Some((_, watch)) = watch {
+            *watch = LocalWatch {
                 position_ms,
                 watched,
                 at: STARTED_AT,
                 pending: true,
             };
-            Ok(())
-        })
+        }
+        self.tell(at);
+        Ok(self.view(&self.downloads[at]))
     }
 
     /// The transfer got to `received` bytes.
     pub fn advance(&mut self, key: &str, received: u64) -> Result<LocalDownload, BackendError> {
-        self.change(key, |d| {
+        self.move_on(key, |d| {
             d.phase = DownloadPhase::Transferring;
             d.size.get_or_insert(FILE_SIZE);
             d.received = received;
-            Ok(())
         })
     }
 
@@ -231,7 +401,7 @@ impl Store {
         key: &str,
         path: Option<PathBuf>,
     ) -> Result<LocalDownload, BackendError> {
-        self.change(key, |d| {
+        self.move_on(key, |d| {
             let size = path
                 .as_ref()
                 .and_then(|p| std::fs::metadata(p).ok())
@@ -244,63 +414,128 @@ impl Store {
                 .and_then(|p| url::Url::from_file_path(p).ok())
                 .map(String::from);
             d.file_path = path;
-            Ok(())
         })
     }
 
-    /// Sends `username`'s offline watching: all of it is written, as the
-    /// server does for state newer than its own.
-    pub fn sync(&mut self, username: &str) -> Vec<SyncedWatch> {
-        let keys: Vec<String> = self
-            .downloads
-            .iter()
-            .filter(|d| d.user_id == username && d.watch.pending)
-            .map(|d| d.key.clone())
-            .collect();
-        keys.iter()
-            .filter_map(|key| {
-                self.change(key, |d| {
-                    d.watch.pending = false;
-                    Ok(())
-                })
-                .ok()
-            })
-            .map(|d| SyncedWatch {
-                item: d.item.id().clone(),
+    /// Sends `username`'s offline watching on `server`: all of it is
+    /// written, as the server does for state newer than its own.
+    pub fn sync(&mut self, server: &str, username: &str) -> Vec<SyncedWatch> {
+        let mut synced = Vec::new();
+        for at in 0..self.downloads.len() {
+            let held = &mut self.downloads[at];
+            if held.download.server != server {
+                continue;
+            }
+            let Some((_, watch)) = held
+                .holders
+                .iter_mut()
+                .find(|(u, w)| u == username && w.pending)
+            else {
+                continue;
+            };
+            watch.pending = false;
+            synced.push(SyncedWatch {
+                item: held.download.item.id().clone(),
                 outcome: OfflineWatchOutcome::Applied,
-            })
-            .collect()
+            });
+            self.tell(at);
+        }
+        synced
     }
 
     pub fn fail(&mut self, key: &str, reason: &str) -> Result<LocalDownload, BackendError> {
-        self.change(key, |d| {
+        self.move_on(key, |d| {
             d.phase = DownloadPhase::Failed {
                 reason: reason.into(),
             };
-            Ok(())
         })
     }
 
+    /// Where `key` is, if the shown profile may see it.
+    fn find(&self, key: &str) -> Result<usize, BackendError> {
+        if self.locked() {
+            return Err(BackendError::ProfileLocked);
+        }
+        self.downloads
+            .iter()
+            .position(|h| h.download.key == key && self.sees(h))
+            .ok_or_else(|| missing(key))
+    }
+
+    /// The shown profile holds it on its server, unlocked; any, with no
+    /// profile shown.
+    fn sees(&self, held: &Held) -> bool {
+        match &self.shown {
+            None => true,
+            Some(shown) => {
+                !self.locked()
+                    && held.download.server == shown.server
+                    && held.holders.iter().any(|(u, _)| *u == shown.user_id)
+            }
+        }
+    }
+
+    /// `held` as the shown profile has it: their watch.
+    fn view(&self, held: &Held) -> LocalDownload {
+        match &self.shown {
+            Some(shown) => view_for(held, &shown.user_id),
+            None => view_for(held, &held.download.user_id),
+        }
+    }
+
+    /// The shown profile's change of `key`.
     fn change(
         &mut self,
         key: &str,
         change: impl FnOnce(&mut LocalDownload) -> Result<(), BackendError>,
     ) -> Result<LocalDownload, BackendError> {
-        let download = self
-            .downloads
-            .iter_mut()
-            .find(|d| d.key == key)
-            .ok_or_else(|| missing(key))?;
-        change(download)?;
-        let download = download.clone();
-        self.tell(&download);
-        Ok(download)
+        let at = self.find(key)?;
+        change(&mut self.downloads[at].download)?;
+        self.tell(at);
+        Ok(self.view(&self.downloads[at]))
     }
 
-    fn tell(&self, download: &LocalDownload) {
-        // Nobody listening is fine: nothing is shown.
-        let _ = self.events.send(DownloadEvent::Changed(download.clone()));
+    /// The SDK moved `key` on, whoever is shown.
+    fn move_on(
+        &mut self,
+        key: &str,
+        change: impl FnOnce(&mut LocalDownload),
+    ) -> Result<LocalDownload, BackendError> {
+        let at = self
+            .downloads
+            .iter()
+            .position(|h| h.download.key == key)
+            .ok_or_else(|| missing(key))?;
+        change(&mut self.downloads[at].download);
+        self.tell(at);
+        Ok(self.view(&self.downloads[at]))
     }
+
+    /// The download at `at` changed: told only to a profile that sees
+    /// it, as the SDK's events are.
+    fn tell(&self, at: usize) {
+        let held = &self.downloads[at];
+        if self.sees(held) {
+            // Nobody listening is fine: nothing is shown.
+            let _ = self.events.send(DownloadEvent::Changed(self.view(held)));
+        }
+    }
+}
+
+/// `held` with `user`'s watch.
+fn view_for(held: &Held, user: &str) -> LocalDownload {
+    let mut download = held.download.clone();
+    if let Some((_, watch)) = held.holders.iter().find(|(u, _)| u == user) {
+        download.watch = watch.clone();
+    }
+    download
+}
+
+/// How long the next PIN waits after `wrong` in a row: 2 s, doubling,
+/// at most 5 min, as the SDK's.
+fn wait_after(wrong: u32) -> Duration {
+    let over = wrong.saturating_sub(FREE_TRIES);
+    Duration::from_secs(2u64 << over.min(16)).min(Duration::from_secs(300))
 }
 
 fn waiting() -> DownloadPhase {
@@ -671,5 +906,221 @@ mod tests {
             (download.show.is_some(), download.season.is_some()),
             (true, true)
         );
+    }
+
+    fn bob(client: &FakeClient) -> Arc<dyn Session> {
+        client.session(&FakeClient::profile("bob")).unwrap()
+    }
+
+    fn server() -> String {
+        FakeClient::profile("andrey").server.0
+    }
+
+    fn keys(client: &FakeClient) -> Vec<String> {
+        ready(client.downloads())
+            .into_iter()
+            .map(|d| d.key)
+            .collect()
+    }
+
+    #[test]
+    fn the_list_follows_the_profile_shown() {
+        let client = FakeClient::new(None);
+        let andreys = start(andrey(&client).as_ref()).key;
+        let bobs = ready(bob(&client).start_download(
+            &media(MediaKind::Episode, "65"),
+            DownloadSource::Original,
+            DownloadTracks::All,
+        ))
+        .unwrap()
+        .key;
+        let everyone = keys(&client);
+        client.set_download_profile(&server(), "andrey");
+        let andrey_sees = keys(&client);
+        client.set_download_profile(&server(), "bob");
+        assert_eq!(
+            (everyone, andrey_sees, keys(&client)),
+            (
+                vec![andreys.clone(), bobs.clone()],
+                vec![andreys],
+                vec![bobs]
+            )
+        );
+    }
+
+    #[test]
+    fn another_profiles_download_is_not_found() {
+        let client = FakeClient::new(None);
+        let key = start(andrey(&client).as_ref()).key;
+        client.set_download_profile(&server(), "bob");
+        assert_eq!(
+            ready(client.download(&key)).err(),
+            Some(BackendError::NotFound(format!("download {key}")))
+        );
+    }
+
+    #[test]
+    fn another_profiles_changes_are_not_told() {
+        let client = FakeClient::new(None);
+        let key = start(andrey(&client).as_ref()).key;
+        client.set_download_profile(&server(), "bob");
+        let mut events = client.download_events();
+        client.advance_download(&key, 10);
+        assert!(phases(&mut events).is_empty());
+    }
+
+    #[test]
+    fn a_file_two_profiles_downloaded_stays_for_the_other() {
+        let client = FakeClient::new(None);
+        let key = start(andrey(&client).as_ref()).key;
+        let again = start(bob(&client).as_ref()).key;
+        client.set_download_profile(&server(), "andrey");
+        ready(client.delete_download(&key)).unwrap();
+        let andrey_sees = keys(&client);
+        client.set_download_profile(&server(), "bob");
+        assert_eq!(
+            (again == key, andrey_sees, keys(&client)),
+            (true, Vec::<String>::new(), vec![key])
+        );
+    }
+
+    #[test]
+    fn each_profile_has_its_own_watch_of_a_shared_file() {
+        let client = FakeClient::new(None);
+        let key = start(andrey(&client).as_ref()).key;
+        start(bob(&client).as_ref());
+        client.set_download_profile(&server(), "andrey");
+        ready(client.record_download_position(&key, Duration::from_secs(90))).unwrap();
+        client.set_download_profile(&server(), "bob");
+        let bobs = ready(client.download(&key)).unwrap().watch;
+        assert!(!bobs.pending);
+    }
+
+    fn locked_andrey(pin: Option<&str>) -> (FakeClient, String) {
+        let client = FakeClient::new(None);
+        let key = start(andrey(&client).as_ref()).key;
+        client.require_offline_pin(&FakeClient::profile("andrey").server, "andrey", pin);
+        client.set_download_profile(&server(), "andrey");
+        (client, key)
+    }
+
+    #[test]
+    fn a_locked_profile_lists_nothing_and_refuses_each_key() {
+        let (client, key) = locked_andrey(Some("1234"));
+        assert_eq!(
+            (
+                client.download_profile_locked(),
+                keys(&client),
+                ready(client.download(&key)).err()
+            ),
+            (
+                true,
+                Vec::<String>::new(),
+                Some(BackendError::ProfileLocked)
+            )
+        );
+    }
+
+    #[test]
+    fn the_right_pin_unlocks_offline_and_lists() {
+        let (client, key) = locked_andrey(Some("1234"));
+        ready(client.unlock_downloads_offline("1234")).unwrap();
+        assert_eq!(
+            (client.download_profile_locked(), keys(&client)),
+            (false, vec![key])
+        );
+    }
+
+    #[test]
+    fn showing_another_profile_and_back_locks_again() {
+        let (client, _) = locked_andrey(Some("1234"));
+        ready(client.unlock_downloads_offline("1234")).unwrap();
+        client.set_download_profile(&server(), "andrey");
+        let same_again = client.download_profile_locked();
+        client.set_download_profile(&server(), "bob");
+        client.set_download_profile(&server(), "andrey");
+        assert_eq!(
+            (same_again, client.download_profile_locked()),
+            (false, true)
+        );
+    }
+
+    #[test]
+    fn with_no_pin_kept_here_nothing_can_be_checked() {
+        let (client, _) = locked_andrey(None);
+        assert_eq!(
+            ready(client.unlock_downloads_offline("1234")).err(),
+            Some(BackendError::NoOfflinePin)
+        );
+    }
+
+    #[test]
+    fn after_three_wrong_pins_the_next_try_waits() {
+        let (client, _) = locked_andrey(Some("1234"));
+        let tries: Vec<_> = (0..4)
+            .map(|_| ready(client.unlock_downloads_offline("0000")).err())
+            .collect();
+        client.wait_out_offline_pin();
+        let after_waiting = ready(client.unlock_downloads_offline("1234"));
+        assert_eq!(
+            (tries, after_waiting),
+            (
+                vec![
+                    Some(BackendError::WrongCredentials),
+                    Some(BackendError::WrongCredentials),
+                    Some(BackendError::WrongCredentials),
+                    Some(BackendError::RateLimited(Duration::from_secs(2))),
+                ],
+                Ok(())
+            )
+        );
+    }
+
+    #[test]
+    fn ten_wrong_pins_lock_it_until_an_online_unlock() {
+        let (client, _) = locked_andrey(Some("1234"));
+        let mut last = None;
+        for _ in 0..10 {
+            client.wait_out_offline_pin();
+            last = ready(client.unlock_downloads_offline("0000")).err();
+        }
+        client.wait_out_offline_pin();
+        assert_eq!(
+            (last, ready(client.unlock_downloads_offline("1234")).err()),
+            (
+                Some(BackendError::SignInRequired),
+                Some(BackendError::SignInRequired)
+            )
+        );
+    }
+
+    #[test]
+    fn an_online_unlock_opens_the_downloads_and_keeps_the_pin() {
+        let client = FakeClient::new(None);
+        let alice = client.session(&FakeClient::profile("alice")).unwrap();
+        client.require_offline_pin(&FakeClient::profile("alice").server, "alice", None);
+        client.set_download_profile(&server(), "alice");
+        let before = client.download_profile_locked();
+        ready(alice.unlock(crate::fake::FAKE_PIN)).unwrap();
+        let after = client.download_profile_locked();
+        client.set_download_profile(&server(), "bob");
+        client.set_download_profile(&server(), "alice");
+        assert_eq!(
+            (
+                before,
+                after,
+                ready(client.unlock_downloads_offline(crate::fake::FAKE_PIN))
+            ),
+            (true, false, Ok(()))
+        );
+    }
+
+    #[test]
+    fn the_room_counts_every_profiles_files() {
+        let client = FakeClient::new(None);
+        let key = start(andrey(&client).as_ref()).key;
+        client.advance_download(&key, 400);
+        client.set_download_profile(&server(), "bob");
+        assert_eq!(ready(client.download_space()).unwrap().used, 400);
     }
 }

@@ -264,6 +264,20 @@ mod tests {
         ));
     }
 
+    /// The SDK keeps each profile's offline lock (PX-60) as a secret
+    /// under a key of its own, not one of the sessions': it is a key
+    /// here, and a value under it reads back.
+    #[test]
+    fn the_offline_locks_key_round_trips() {
+        let key = spoolframe_client_sdk::storage::keys::OFFLINE_LOCKS;
+        let (_dir, store) = temp_store("offline-locks");
+        store.set(key, Some(b"{}")).unwrap();
+        assert_eq!(
+            (check_key(key).is_ok(), store.get(key).unwrap()),
+            (true, Some(b"{}".to_vec()))
+        );
+    }
+
     /// Against the desktop's real keyring; run with `--ignored` in a
     /// session that has one. Leaves nothing behind.
     #[tokio::test]

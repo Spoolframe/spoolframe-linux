@@ -206,15 +206,15 @@ pub fn start_from(watch: &LocalWatch, asked: Option<Duration>) -> Option<Duratio
 }
 
 /// The profile's finished download of `item`, to play from its file in
-/// place of the server's: the newest, if there is more than one.
+/// place of the server's: the newest, if there is more than one. The
+/// list is the profile's own (`Client::set_download_profile`).
 pub fn playable_here<'a>(
     downloads: &'a [LocalDownload],
-    who: &Who,
     item: &MediaId,
 ) -> Option<&'a LocalDownload> {
     downloads
         .iter()
-        .filter(|d| mine(d, who) && d.item.id() == item)
+        .filter(|d| d.item.id() == item)
         .filter(|d| d.phase == DownloadPhase::Done && d.file_url.is_some())
         .max_by_key(|d| d.created_at)
 }
@@ -342,8 +342,8 @@ fn item_title(item: &Item) -> String {
 }
 
 /// The line under a row's title: "Movie · Mobile · 2 tracks", with the
-/// size once finished, and whose it is when it is another profile's.
-pub fn info_line(download: &LocalDownload, theirs: bool) -> String {
+/// size once finished.
+pub fn info_line(download: &LocalDownload) -> String {
     let kind = match download.item {
         Item::Episode(_) => "Episode",
         _ => "Movie",
@@ -359,40 +359,60 @@ pub fn info_line(download: &LocalDownload, theirs: bool) -> String {
             size(download.size.unwrap_or(download.received))
         ));
     }
-    if theirs {
-        line.push_str(&format!(" · {}", download.username));
-    }
     line
 }
 
-/// The profile in use, as a download names its user: the server's key and
-/// the username.
-pub type Who = Option<(String, String)>;
+/// A profile with downloads on this computer (PX-60), as a download names
+/// the user fetching it: what `Client::set_download_profile` takes, and
+/// the username to show.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Holder {
+    pub server: String,
+    pub user_id: String,
+    pub username: String,
+}
 
-fn mine(download: &LocalDownload, who: &Who) -> bool {
-    who.as_ref()
-        .is_some_and(|(server, user)| download.server == *server && download.username == *user)
+impl Holder {
+    pub fn of(download: &LocalDownload) -> Self {
+        Holder {
+            server: download.server.clone(),
+            user_id: download.user_id.clone(),
+            username: download.username.clone(),
+        }
+    }
+
+    fn same(&self, other: &Holder) -> bool {
+        self.server == other.server && self.user_id == other.user_id
+    }
+}
+
+/// `known` with the profiles `downloads` name added, each once, in the
+/// order first seen.
+pub fn holders(mut known: Vec<Holder>, downloads: &[LocalDownload]) -> Vec<Holder> {
+    for holder in downloads.iter().map(Holder::of) {
+        if !known.iter().any(|k| k.same(&holder)) {
+            known.push(holder);
+        }
+    }
+    known
+}
+
+/// The profile the Downloads page shows with no server: the one used
+/// last, if it has downloads here, else the first that has; the one
+/// used last when none is known to.
+pub fn offline_holder(holders: &[Holder], last: Option<Holder>) -> Option<Holder> {
+    match last {
+        Some(last) if holders.iter().any(|h| h.same(&last)) || holders.is_empty() => Some(last),
+        _ => holders.first().cloned(),
+    }
 }
 
 /// The download an item's page shows: the profile's latest of the item.
-/// Another profile's download of it is theirs, not shown here.
-pub fn for_item<'a>(
-    downloads: &'a [LocalDownload],
-    who: &Who,
-    item: &MediaId,
-) -> Option<&'a LocalDownload> {
+pub fn for_item<'a>(downloads: &'a [LocalDownload], item: &MediaId) -> Option<&'a LocalDownload> {
     downloads
         .iter()
-        .filter(|d| mine(d, who) && d.item.id() == item)
+        .filter(|d| d.item.id() == item)
         .max_by_key(|d| d.created_at)
-}
-
-/// The order the Downloads page lists in: the profile in use's first, then
-/// the other profiles', each oldest first as the SDK lists them.
-pub fn order<'a>(downloads: &'a [LocalDownload], who: &Who) -> Vec<&'a LocalDownload> {
-    let (mut first, rest): (Vec<_>, Vec<_>) = downloads.iter().partition(|d| mine(d, who));
-    first.extend(rest);
-    first
 }
 
 /// Whether a download is listed under Downloaded, not In progress.
@@ -400,13 +420,14 @@ fn finished(download: &LocalDownload) -> bool {
     download.phase == DownloadPhase::Done
 }
 
-/// Where download `key` goes in its section, in [`order`].
-pub fn place(downloads: &[LocalDownload], who: &Who, key: &str) -> usize {
+/// Where download `key` goes in its section: oldest first, as the SDK
+/// lists them.
+pub fn place(downloads: &[LocalDownload], key: &str) -> usize {
     let Some(done) = downloads.iter().find(|d| d.key == key).map(finished) else {
         return 0;
     };
-    order(downloads, who)
-        .into_iter()
+    downloads
+        .iter()
         .filter(|d| finished(d) == done)
         .position(|d| d.key == key)
         .unwrap_or(0)
@@ -697,7 +718,6 @@ struct PageRow {
 pub struct DownloadsPage {
     pub widget: gtk::Box,
     client: Arc<dyn Client>,
-    who: Who,
     act: Acts,
     used: gtk::Label,
     free: gtk::Label,
@@ -718,10 +738,15 @@ pub struct Offline {
     /// "Home Media can't be reached".
     pub heading: String,
     pub try_now: Rc<dyn Fn()>,
+    /// The profiles with downloads here, and the one shown: offered to
+    /// choose from when there is more than one (PX-60).
+    pub profiles: Vec<Holder>,
+    pub shown: Option<Holder>,
+    pub choose: Rc<dyn Fn(Holder)>,
 }
 
 impl DownloadsPage {
-    pub fn new(client: Arc<dyn Client>, who: Who, act: Acts) -> Rc<Self> {
+    pub fn new(client: Arc<dyn Client>, act: Acts) -> Rc<Self> {
         let widget = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(20)
@@ -791,7 +816,6 @@ impl DownloadsPage {
         Rc::new(DownloadsPage {
             widget,
             client,
-            who,
             act,
             used,
             free,
@@ -829,10 +853,13 @@ impl DownloadsPage {
             .halign(gtk::Align::End)
             .css_classes(["suggested-action"])
             .build();
-        let again = offline.try_now;
+        let again = offline.try_now.clone();
         try_now.connect_clicked(move |_| again());
         card.append(&heading);
         card.append(&body);
+        if let Some(whose) = profile_choice(&offline) {
+            card.append(&whose);
+        }
         card.append(&try_now);
         self.widget.prepend(&card);
         self.offline.replace(Some(body));
@@ -845,9 +872,7 @@ impl DownloadsPage {
             self.section(row.finished).list.remove(&row.row);
         }
         *self.downloads.borrow_mut() = downloads.to_vec();
-        let ordered: Vec<LocalDownload> =
-            order(downloads, &self.who).into_iter().cloned().collect();
-        for download in &ordered {
+        for download in downloads {
             self.add(download);
         }
         self.counted();
@@ -877,8 +902,7 @@ impl DownloadsPage {
                         Some(row) if row.finished == finished(download) => {
                             row.view.show(download);
                             row.title.set_label(&title(download));
-                            row.info
-                                .set_label(&info_line(download, self.theirs(download)));
+                            row.info.set_label(&info_line(download));
                             false
                         }
                         _ => true,
@@ -905,10 +929,6 @@ impl DownloadsPage {
         self.counted();
     }
 
-    fn theirs(&self, download: &LocalDownload) -> bool {
-        self.who.is_some() && !mine(download, &self.who)
-    }
-
     fn section(&self, finished: bool) -> &Section {
         if finished { &self.done } else { &self.running }
     }
@@ -924,7 +944,7 @@ impl DownloadsPage {
             .css_classes(["heading"])
             .build();
         let info = gtk::Label::builder()
-            .label(info_line(download, self.theirs(download)))
+            .label(info_line(download))
             .xalign(0.0)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .css_classes(["dim-label", "caption"])
@@ -953,7 +973,7 @@ impl DownloadsPage {
             .activatable(false)
             .build();
         let done = finished(download);
-        let at = place(&self.downloads.borrow(), &self.who, &download.key);
+        let at = place(&self.downloads.borrow(), &download.key);
         self.section(done).list.insert(&row, at as i32);
         self.rows.borrow_mut().push(PageRow {
             key: download.key.clone(),
@@ -1034,6 +1054,41 @@ impl DownloadsPage {
         }
         shown
     }
+}
+
+/// "Downloads of [Andrey ▾]" on the offline banner: the profile shown, of
+/// those with downloads here. None with one profile or none.
+fn profile_choice(offline: &Offline) -> Option<gtk::Box> {
+    if offline.profiles.len() < 2 {
+        return None;
+    }
+    let names: Vec<&str> = offline
+        .profiles
+        .iter()
+        .map(|p| p.username.as_str())
+        .collect();
+    let choice = gtk::DropDown::from_strings(&names);
+    let at = offline
+        .shown
+        .as_ref()
+        .and_then(|shown| offline.profiles.iter().position(|p| p.same(shown)))
+        .unwrap_or(0);
+    choice.set_selected(at as u32);
+    let (profiles, choose) = (offline.profiles.clone(), offline.choose.clone());
+    choice.connect_selected_notify(move |choice| {
+        if let Some(profile) = profiles.get(choice.selected() as usize) {
+            choose(profile.clone());
+        }
+    });
+    let line = gtk::Box::builder().spacing(8).build();
+    line.append(
+        &gtk::Label::builder()
+            .label("Downloads of")
+            .css_classes(["dim-label"])
+            .build(),
+    );
+    line.append(&choice);
+    Some(line)
 }
 
 /// The Downloads page as a page of its own, over the window, while no
@@ -1152,11 +1207,6 @@ mod tests {
 
     fn andrey(client: &FakeClient) -> Arc<dyn Session> {
         client.session(&FakeClient::profile("andrey")).unwrap()
-    }
-
-    fn andrey_is_watching() -> Who {
-        let profile = FakeClient::profile("andrey");
-        Some((profile.server.0, profile.username))
     }
 
     fn started(client: &FakeClient, item: &MediaId) -> LocalDownload {
@@ -1403,12 +1453,11 @@ mod tests {
     }
 
     #[test]
-    fn only_a_finished_download_of_the_profiles_plays_in_place_of_the_server() {
+    fn only_a_finished_download_plays_in_place_of_the_server() {
         let client = FakeClient::new(None);
         let first = started(&client, &alien());
         let listed = ready(client.downloads());
-        let who = andrey_is_watching();
-        let before = playable_here(&listed, &who, &alien()).is_some();
+        let before = playable_here(&listed, &alien()).is_some();
         client.finish_download(&first.key);
         let listed = ready(client.downloads());
         let mut finished = listed.clone();
@@ -1417,10 +1466,9 @@ mod tests {
         assert_eq!(
             (
                 before,
-                playable_here(&finished, &who, &alien()).map(|d| d.key.clone()),
-                playable_here(&finished, &None, &alien()).is_some()
+                playable_here(&finished, &alien()).map(|d| d.key.clone())
             ),
-            (false, Some(first.key), false)
+            (false, Some(first.key))
         );
     }
 
@@ -1470,47 +1518,87 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_items_page_shows_the_profiles_own_download_of_it() {
-        let client = FakeClient::new(None);
-        let mine = started(&client, &alien());
+    fn bobs_episode(client: &FakeClient) -> LocalDownload {
         ready(
             client
                 .session(&FakeClient::profile("bob"))
                 .unwrap()
-                .start_download(&alien(), DownloadSource::Original, DownloadTracks::All),
+                .start_download(
+                    &id(MediaKind::Episode, "65"),
+                    DownloadSource::Original,
+                    DownloadTracks::All,
+                ),
         )
+        .unwrap()
+    }
+
+    fn andrey_shown(client: &FakeClient) {
+        client.set_download_profile(&FakeClient::profile("andrey").server.0, "andrey");
+    }
+
+    #[test]
+    fn an_items_page_shows_the_latest_download_of_it() {
+        let client = FakeClient::new(None);
+        let mobile = ready(andrey(&client).start_download(
+            &alien(),
+            DownloadSource::Profile {
+                name: "Mobile".into(),
+            },
+            DownloadTracks::All,
+        ))
         .unwrap();
-        let listed = ready(client.downloads());
-        let who = andrey_is_watching();
+        started(&client, &alien());
+        // The Mobile one newer, though listed first.
+        let listed: Vec<LocalDownload> = ready(client.downloads())
+            .into_iter()
+            .map(|d| LocalDownload {
+                created_at: d.created_at + i64::from(d.key == mobile.key),
+                ..d
+            })
+            .collect();
         assert_eq!(
-            (
-                for_item(&listed, &who, &alien()).map(|d| d.key.clone()),
-                for_item(&listed, &None, &alien()).map(|d| d.key.clone())
-            ),
-            (Some(mine.key), None)
+            for_item(&listed, &alien()).map(|d| d.key.clone()),
+            Some(mobile.key)
         );
     }
 
     #[test]
-    fn the_profiles_own_downloads_are_listed_first() {
+    fn the_profiles_with_downloads_are_each_named_once() {
         let client = FakeClient::new(None);
-        let bobs = ready(
-            client
-                .session(&FakeClient::profile("bob"))
-                .unwrap()
-                .start_download(&alien(), DownloadSource::Original, DownloadTracks::All),
-        )
-        .unwrap();
-        let mine = started(&client, &alien());
-        let listed = ready(client.downloads());
-        let who = andrey_is_watching();
+        started(&client, &alien());
+        started(&client, &id(MediaKind::Movie, "2"));
+        bobs_episode(&client);
+        let named: Vec<String> = holders(Vec::new(), &ready(client.downloads()))
+            .into_iter()
+            .map(|h| h.username)
+            .collect();
+        assert_eq!(named, ["andrey", "bob"]);
+    }
+
+    fn holder(user: &str) -> Holder {
+        Holder {
+            server: "home".into(),
+            user_id: user.into(),
+            username: user.into(),
+        }
+    }
+
+    #[test]
+    fn offline_the_profile_used_last_is_shown_if_it_has_downloads() {
+        let known = [holder("andrey"), holder("bob")];
         assert_eq!(
-            order(&listed, &who)
-                .into_iter()
-                .map(|d| d.key.clone())
-                .collect::<Vec<_>>(),
-            [mine.key, bobs.key]
+            (
+                offline_holder(&known, Some(holder("bob"))),
+                offline_holder(&known, Some(holder("carol"))),
+                offline_holder(&[], Some(holder("carol"))),
+                offline_holder(&known, None),
+            ),
+            (
+                Some(holder("bob")),
+                Some(holder("andrey")),
+                Some(holder("carol")),
+                Some(holder("andrey"))
+            )
         );
     }
 
@@ -1568,8 +1656,9 @@ mod tests {
         assert_eq!(used_fraction(space), 0.25);
     }
 
-    /// With no server and no profile, the page lists every download, a
-    /// finished one with Play, and the banner says what waits to be sent.
+    /// With no server, the page lists the profile shown's downloads alone
+    /// (PX-60), a finished one with Play, the banner says what waits to be
+    /// sent, and offers the other profile with downloads here.
     #[test]
     #[ignore = "needs a display; run on its own"]
     fn the_page_lists_and_plays_with_no_session() {
@@ -1579,26 +1668,25 @@ mod tests {
         let first = started(&client, &alien());
         client.finish_download(&first.key);
         ready(client.record_download_position(&first.key, Duration::from_secs(60))).unwrap();
-        let bobs = ready(
-            client
-                .session(&FakeClient::profile("bob"))
-                .unwrap()
-                .start_download(
-                    &id(MediaKind::Episode, "65"),
-                    DownloadSource::Original,
-                    DownloadTracks::All,
-                ),
-        )
-        .unwrap();
+        let bobs = bobs_episode(&client);
+        let known = holders(Vec::new(), &ready(client.downloads()));
+        andrey_shown(&client);
         let played = Rc::new(RefCell::new(Vec::new()));
         let acts: Acts = {
             let played = played.clone();
             Rc::new(move |download, act| played.borrow_mut().push((download.key, act)))
         };
-        let page = DownloadsPage::new(client.clone(), None, acts);
+        let chosen = Rc::new(RefCell::new(Vec::new()));
+        let page = DownloadsPage::new(client.clone(), acts);
         page.set_offline(Offline {
             heading: "Home Media can’t be reached".into(),
             try_now: Rc::new(|| {}),
+            shown: known.first().cloned(),
+            profiles: known,
+            choose: {
+                let chosen = chosen.clone();
+                Rc::new(move |h: Holder| chosen.borrow_mut().push(h.username))
+            },
         });
         page.fill(&ready(client.downloads()));
         let row = page
@@ -1615,15 +1703,60 @@ mod tests {
             .unwrap();
         play.emit_clicked();
         let banner = page.offline.borrow().as_ref().unwrap().text();
+        let choice = find_drop_down(page.widget.upcast_ref()).unwrap();
+        choice.set_selected(1);
         assert_eq!(
             (
                 page.titles().len(),
                 played.borrow().clone(),
                 banner.contains("1 change to send"),
-                page.rows.borrow().iter().any(|r| r.key == bobs.key)
+                page.rows.borrow().iter().any(|r| r.key == bobs.key),
+                chosen.borrow().clone()
             ),
-            (2, vec![(first.key.clone(), Act::Play)], true, true)
+            (
+                1,
+                vec![(first.key.clone(), Act::Play)],
+                true,
+                false,
+                vec!["bob".to_owned()]
+            )
         );
+    }
+
+    fn find_drop_down(widget: &gtk::Widget) -> Option<gtk::DropDown> {
+        if let Some(found) = widget.downcast_ref::<gtk::DropDown>() {
+            return Some(found.clone());
+        }
+        let mut child = widget.first_child();
+        while let Some(widget) = child {
+            if let Some(found) = find_drop_down(&widget) {
+                return Some(found);
+            }
+            child = widget.next_sibling();
+        }
+        None
+    }
+
+    /// Another profile's download moving on never reaches the page of the
+    /// profile shown: its events are not sent (PX-60).
+    #[test]
+    #[ignore = "needs a display; run on its own"]
+    fn another_profiles_events_do_not_reach_the_page() {
+        gtk::init().unwrap();
+        adw::init().unwrap();
+        let client = Arc::new(FakeClient::new(None));
+        let mine = started(&client, &alien());
+        let bobs = bobs_episode(&client);
+        andrey_shown(&client);
+        let page = DownloadsPage::new(client.clone(), Rc::new(|_, _| {}));
+        page.fill(&ready(client.downloads()));
+        let mut events = client.download_events();
+        client.advance_download(&bobs.key, 500);
+        client.finish_download(&bobs.key);
+        while let Ok(event) = events.try_recv() {
+            page.apply(&event);
+        }
+        assert_eq!(page.titles(), [(false, title(&mine))]);
     }
 
     /// The page with the fake: a Changed event changes the row it has, a
@@ -1636,7 +1769,8 @@ mod tests {
         let client = Arc::new(FakeClient::new(None));
         let first = started(&client, &alien());
         let second = started(&client, &id(MediaKind::Episode, "65"));
-        let page = DownloadsPage::new(client.clone(), andrey_is_watching(), Rc::new(|_, _| {}));
+        andrey_shown(&client);
+        let page = DownloadsPage::new(client.clone(), Rc::new(|_, _| {}));
         page.fill(&ready(client.downloads()));
         let row_of = |key: &str| {
             page.rows

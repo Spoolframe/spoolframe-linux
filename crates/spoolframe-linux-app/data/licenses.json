@@ -161,7 +161,7 @@
 "copyright": [
 "Copyright (c) 2021-2024 The RustCrypto Project Developers"
 ],
-"group": "app",
+"group": "sdk",
 "license": "MIT OR Apache-2.0",
 "name": "argon2",
 "texts": {
@@ -555,7 +555,7 @@
 "Copyright (c) 2015-2016 The blake2-rfc Developers, Cesar Barros",
 "Copyright (c) 2017 Artyom Pavlov"
 ],
-"group": "app",
+"group": "sdk",
 "license": "MIT OR Apache-2.0",
 "name": "blake2",
 "texts": {
@@ -4004,7 +4004,7 @@
 "copyright": [
 "Copyright (c) 2020-2023 RustCrypto Developers"
 ],
-"group": "app",
+"group": "sdk",
 "license": "MIT OR Apache-2.0",
 "name": "password-hash",
 "texts": {
@@ -5153,7 +5153,7 @@
 "Apache-2.0": 0,
 "MIT": 1
 },
-"version": "0.14.0"
+"version": "0.14.1"
 },
 {
 "copyright": [
@@ -5190,7 +5190,7 @@
 "Apache-2.0": 0,
 "MIT": 1
 },
-"version": "0.14.0"
+"version": "0.14.1"
 },
 {
 "copyright": [
@@ -5203,7 +5203,7 @@
 "Apache-2.0": 0,
 "MIT": 1
 },
-"version": "0.14.0"
+"version": "0.14.1"
 },
 {
 "copyright": [

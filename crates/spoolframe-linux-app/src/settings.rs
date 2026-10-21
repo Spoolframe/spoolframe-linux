@@ -9,10 +9,15 @@ use gtk::glib;
 use spoolframe_linux_core::paths;
 use spoolframe_linux_core::theme::Theme;
 
+use crate::downloads::Holder;
+
 const APPEARANCE: &str = "appearance";
 const THEME: &str = "theme";
 const CONNECTION: &str = "connection";
 const SERVER: &str = "server";
+const PROFILE_SERVER: &str = "profile-server";
+const PROFILE_USER: &str = "profile-user";
+const PROFILE_NAME: &str = "profile-name";
 const RELAYS: &str = "relays";
 const STREAMING: &str = "streaming";
 const MAX_BITRATE: &str = "max-bitrate";
@@ -82,6 +87,35 @@ impl Settings {
 
     pub fn set_server(&mut self, key: &str) {
         self.file.set_string(CONNECTION, SERVER, key);
+        self.save();
+    }
+
+    /// The profile shown last (PX-60): whose downloads the Downloads page
+    /// shows with no server.
+    pub fn download_profile(&self) -> Option<Holder> {
+        let read = |key| {
+            self.file
+                .string(CONNECTION, key)
+                .ok()
+                .map(|s| s.to_string())
+        };
+        Some(Holder {
+            server: read(PROFILE_SERVER)?,
+            user_id: read(PROFILE_USER)?,
+            username: read(PROFILE_NAME)?,
+        })
+    }
+
+    pub fn set_download_profile(&mut self, holder: &Holder) {
+        if self.download_profile().as_ref() == Some(holder) {
+            return;
+        }
+        self.file
+            .set_string(CONNECTION, PROFILE_SERVER, &holder.server);
+        self.file
+            .set_string(CONNECTION, PROFILE_USER, &holder.user_id);
+        self.file
+            .set_string(CONNECTION, PROFILE_NAME, &holder.username);
         self.save();
     }
 
@@ -185,6 +219,21 @@ mod tests {
         assert!(settings.use_relays());
         settings.set_use_relays(false);
         assert!(!Settings::at(&path).use_relays());
+    }
+
+    /// The profile shown last is kept for the next start, which may have
+    /// no server to ask (PX-60).
+    #[test]
+    fn the_profile_shown_last_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.ini");
+        let alice = Holder {
+            server: "k5d2".into(),
+            user_id: "u-alice".into(),
+            username: "alice".into(),
+        };
+        Settings::at(&path).set_download_profile(&alice);
+        assert_eq!(Settings::at(&path).download_profile(), Some(alice));
     }
 
     /// Spoolframe's own look until the user picks another: the system's

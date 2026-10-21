@@ -210,9 +210,16 @@ pub struct App {
     /// A subtitle track just downloaded from the item's page (PX-02):
     /// its next drawing shows it picked.
     picked_subtitle: Option<(MediaId, u32)>,
-    /// Every download on this computer (PX-38), whoever made it: listed
-    /// at start and kept by their events, with or without a server.
+    /// The downloads of the profile shown (PX-60), every profile's before
+    /// one is: listed at start and again for each profile, and kept by
+    /// their events, with or without a server.
     downloads: Vec<LocalDownload>,
+    /// The profiles known to have downloads here, from what was listed:
+    /// the offline page's choice.
+    holders: Vec<crate::downloads::Holder>,
+    /// Bumped each time another profile is shown: a listing asked for
+    /// before is the last profile's, and dropped.
+    listing: u64,
     /// The Downloads page, while it is the sidebar's choice.
     downloads_page: Option<Rc<crate::downloads::DownloadsPage>>,
     /// The Download actions of the item pages on the stack, changed in
@@ -466,7 +473,7 @@ pub enum Msg {
     /// Removes item `id`'s downloaded track `download`.
     RemoveDownload(MediaId, String),
     /// This computer's downloads (PX-38), listed afresh.
-    DownloadsListed(Vec<LocalDownload>),
+    DownloadsListed(u64, Vec<LocalDownload>),
     /// Download events were missed: list them again.
     ListDownloads,
     LocalDownloadChanged(Box<LocalDownload>),
@@ -480,6 +487,8 @@ pub enum Msg {
     /// This computer's downloads with no server (PX-38): from Choose a
     /// server, or its banner when the server can't be reached.
     OpenOfflineDownloads,
+    /// The offline Downloads page shows this profile's (PX-60).
+    ShowDownloadsOf(crate::downloads::Holder),
     /// The window was closed while downloads run: what now?
     AskClose,
     Closing(crate::closing::Answer),
@@ -1207,6 +1216,8 @@ impl Component for App {
             redrawing: None,
             picked_subtitle: None,
             downloads: Vec::new(),
+            holders: Vec::new(),
+            listing: 0,
             downloads_page: None,
             item_downloads: Vec::new(),
             offline: false,
@@ -1478,6 +1489,14 @@ impl Component for App {
                     Err(e) => return toast(widgets, &e),
                 };
                 self.stop_playback(widgets);
+                // Shown before it is unlocked, so the unlock opens its
+                // downloads too (PX-60); shown after, they would lock again.
+                let holder = crate::downloads::Holder {
+                    server: profile.server.0.clone(),
+                    user_id: session.user_id(),
+                    username: profile.username.clone(),
+                };
+                self.show_downloads_of(holder, &sender);
                 let pending = std::mem::take(&mut self.shutdown_calls);
                 self.unlock_in_flight = true;
                 self.command(&sender, async move {
@@ -1762,7 +1781,6 @@ impl Component for App {
                 clear(&widgets.content);
                 let page = crate::downloads::DownloadsPage::new(
                     self.client.clone(),
-                    self.who(),
                     download_acts(&sender),
                 );
                 page.fill(&self.downloads);
@@ -2081,9 +2099,17 @@ impl Component for App {
                     Loaded::DownloadRemoved(session.remove_subtitle_download(&id, &download).await)
                 });
             }
-            Msg::DownloadsListed(listed) => {
-                let had = !self.downloads.is_empty();
+            Msg::DownloadsListed(listing, listed) => {
+                // Whose downloads there are, from any listing: the first,
+                // of every profile's, may come after a profile is shown.
+                let had = self.has_downloads();
+                self.holders =
+                    crate::downloads::holders(std::mem::take(&mut self.holders), &listed);
+                if listing != self.listing {
+                    return;
+                }
                 self.downloads = listed;
+                self.forget_holder_if_empty();
                 if let Some(page) = &self.downloads_page {
                     page.fill(&self.downloads);
                 }
@@ -2099,6 +2125,7 @@ impl Component for App {
                 self.download_event(DownloadEvent::Removed { key }, &sender)
             }
             Msg::OpenOfflineDownloads => self.open_offline(widgets, &sender),
+            Msg::ShowDownloadsOf(holder) => self.show_downloads_of(holder, &sender),
             Msg::AskClose => {
                 let sender = sender.clone();
                 crate::closing::ask(
@@ -2603,7 +2630,7 @@ impl Component for App {
                     Rc::new(move |on| sender.input(Msg::SetUseRelays(on)))
                 };
                 // They play with no server: offered here while there are any.
-                let downloads = (!self.downloads.is_empty()).then(|| -> Rc<dyn Fn()> {
+                let downloads = self.has_downloads().then(|| -> Rc<dyn Fn()> {
                     let sender = sender.clone();
                     Rc::new(move || sender.input(Msg::OpenOfflineDownloads))
                 });
@@ -3062,11 +3089,7 @@ impl Component for App {
                     crate::downloads::ItemDownload::new(id.clone(), open, download_acts(&sender))
                 });
                 if let Some(download) = &download {
-                    download.show(crate::downloads::for_item(
-                        &self.downloads,
-                        &self.who(),
-                        &id,
-                    ));
+                    download.show(crate::downloads::for_item(&self.downloads, &id));
                 }
                 let body = pages::playable(
                     &item,
@@ -3750,6 +3773,14 @@ impl App {
                 )
             }),
         });
+        // Its downloads are the ones shown now (PX-60): picked, switched
+        // to, or opened at start.
+        let holder = crate::downloads::Holder {
+            server: profile.server.0.clone(),
+            user_id: session.user_id(),
+            username: profile.username.clone(),
+        };
+        self.show_downloads_of(holder, sender);
         self.library_cache = Some(library::Cache::new(session.clone()));
         self.session = Some(session);
         self.profile = Some(profile.clone());
@@ -3835,23 +3866,66 @@ impl App {
         });
     }
 
-    /// Lists this computer's downloads, from disk: no server is needed.
+    /// Lists the downloads of the profile shown, from disk: no server is
+    /// needed.
     fn list_downloads(&self, sender: &ComponentSender<Self>) {
-        let client = self.client.clone();
+        let (client, listing) = (self.client.clone(), self.listing);
         let listed = relm4::spawn(async move { client.downloads().await });
         let sender = sender.clone();
         glib::spawn_future_local(async move {
             if let Ok(listed) = listed.await {
-                sender.input(Msg::DownloadsListed(listed));
+                sender.input(Msg::DownloadsListed(listing, listed));
             }
         });
+    }
+
+    /// The downloads are `holder`'s from now on (PX-60): the SDK lists
+    /// theirs, sends their events and keeps their watch, and they are what
+    /// the Downloads page shows with no server at the next start.
+    fn show_downloads_of(
+        &mut self,
+        holder: crate::downloads::Holder,
+        sender: &ComponentSender<Self>,
+    ) {
+        self.client
+            .set_download_profile(&holder.server, &holder.user_id);
+        self.settings.set_download_profile(&holder);
+        // Known until its listing says it has none.
+        if !self.holders.contains(&holder) {
+            self.holders.push(holder);
+        }
+        self.listing += 1;
+        self.list_downloads(sender);
+    }
+
+    /// Downloads to offer with no server: the profile shown's, or another
+    /// profile's seen listed.
+    fn has_downloads(&self) -> bool {
+        !self.downloads.is_empty() || !self.holders.is_empty()
+    }
+
+    /// The profile shown has no downloads left (and is not merely locked):
+    /// it is no longer offered offline.
+    fn forget_holder_if_empty(&mut self) {
+        if !self.downloads.is_empty() || self.client.download_profile_locked() {
+            return;
+        }
+        if let Some(shown) = self.settings.download_profile() {
+            self.holders.retain(|h| *h != shown);
+        }
     }
 
     /// One download changed or went: the list, the Downloads page and the
     /// item pages showing it follow, each in place.
     fn download_event(&mut self, event: DownloadEvent, sender: &ComponentSender<Self>) {
-        let had = !self.downloads.is_empty();
+        let had = self.has_downloads();
         crate::downloads::apply(&mut self.downloads, &event);
+        if let DownloadEvent::Changed(download) = &event {
+            self.holders = crate::downloads::holders(
+                std::mem::take(&mut self.holders),
+                std::slice::from_ref(download),
+            );
+        }
         if let Some(page) = &self.downloads_page {
             page.apply(&event);
         }
@@ -3880,18 +3954,18 @@ impl App {
     /// Choose a server offers the downloads while there are any: listed
     /// again when the first comes or the last goes.
     fn offer_downloads(&self, had: bool, sender: &ComponentSender<Self>) {
-        if had == self.downloads.is_empty() && self.server.is_none() {
+        if had != self.has_downloads() && self.server.is_none() {
             self.load_servers(sender);
         }
     }
 
-    /// The film or episode `request` plays, when it is the profile's and
-    /// downloaded here: it plays from the file (PX-38). A playlist's entry
-    /// plays from the server, which moves the playlist on.
+    /// The film or episode `request` plays, when the profile downloaded it
+    /// here: it plays from the file (PX-38). A playlist's entry plays from
+    /// the server, which moves the playlist on.
     fn downloaded(&self, request: &PlayRequest) -> Option<&LocalDownload> {
         match (request.items.as_slice(), &request.playlist) {
             ([item @ (Item::Movie(_) | Item::Episode(_))], None) => {
-                crate::downloads::playable_here(&self.downloads, &self.who(), item.id())
+                crate::downloads::playable_here(&self.downloads, item.id())
             }
             _ => None,
         }
@@ -3928,12 +4002,17 @@ impl App {
     }
 
     /// The Downloads page over the window, with no server (PX-38): what
-    /// was downloaded plays, whoever downloaded it, and what was watched
-    /// waits to be sent.
+    /// one profile downloaded plays, and what was watched waits to be
+    /// sent. The profile is the one shown last, if it has downloads here
+    /// (PX-60); the others with downloads are offered on the banner.
     fn open_offline(&mut self, widgets: &mut AppWidgets, sender: &ComponentSender<Self>) {
         self.stop_playback(widgets);
-        let page =
-            crate::downloads::DownloadsPage::new(self.client.clone(), None, download_acts(sender));
+        let shown =
+            crate::downloads::offline_holder(&self.holders, self.settings.download_profile());
+        if let Some(holder) = shown.clone() {
+            self.show_downloads_of(holder, sender);
+        }
+        let page = crate::downloads::DownloadsPage::new(self.client.clone(), download_acts(sender));
         let (heading, try_now): (String, Rc<dyn Fn()>) = match &self.unreachable {
             Some((server, _)) => {
                 let (sender, server) = (sender.clone(), server.clone());
@@ -3950,7 +4029,18 @@ impl App {
                 )
             }
         };
-        page.set_offline(crate::downloads::Offline { heading, try_now });
+        let choose: Rc<dyn Fn(crate::downloads::Holder)> = {
+            let sender = sender.clone();
+            Rc::new(move |holder| sender.input(Msg::ShowDownloadsOf(holder)))
+        };
+        page.set_offline(crate::downloads::Offline {
+            heading,
+            try_now,
+            profiles: self.holders.clone(),
+            shown,
+            choose,
+        });
+        // What was listed for the profile before; its own listing follows.
         page.fill(&self.downloads);
         let back: Rc<dyn Fn()> = {
             let sender = sender.clone();
@@ -3978,21 +4068,9 @@ impl App {
     /// Each item page's Download action, as the downloads are now.
     fn show_item_downloads(&mut self) {
         self.item_downloads.retain(|d| d.in_window());
-        let who = self.who();
         for shown in &self.item_downloads {
-            shown.show(crate::downloads::for_item(
-                &self.downloads,
-                &who,
-                &shown.item,
-            ));
+            shown.show(crate::downloads::for_item(&self.downloads, &shown.item));
         }
-    }
-
-    /// The profile in use, as a download names its user.
-    fn who(&self) -> crate::downloads::Who {
-        self.profile
-            .as_ref()
-            .map(|p| (p.server.0.clone(), p.username.clone()))
     }
 
     /// Hears subtitle timing changes (PX-03), where the session has

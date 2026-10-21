@@ -154,6 +154,7 @@ pub fn backend_error(error: sdk::SdkError) -> BackendError {
         E::Busy => BackendError::Busy,
         E::WanStreamsFull { max } => BackendError::WanStreamsFull { max },
         E::ProfileLocked => BackendError::ProfileLocked,
+        E::NoOfflinePin => BackendError::NoOfflinePin,
         E::InvalidInput(why) => BackendError::InvalidInput(why),
         E::PlaybackRestarted { epoch } => BackendError::PlaybackRestarted { epoch },
         E::SubtitleNotReady { done_percent } => BackendError::SubtitleNotReady(done_percent),
@@ -995,6 +996,24 @@ impl Client for SdkClient {
         self.client.subtitle_timing_events()
     }
 
+    fn set_download_profile(&self, server: &str, user_id: &str) {
+        self.client.downloads().set_profile(server, user_id);
+    }
+
+    fn download_profile_locked(&self) -> bool {
+        self.client.downloads().profile_locked()
+    }
+
+    fn unlock_downloads_offline<'a>(
+        &'a self,
+        pin: &'a str,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        let (downloads, pin) = (self.client.downloads(), pin.to_owned());
+        Box::pin(on_runtime(&self.handle, async move {
+            downloads.unlock_offline(&pin).await
+        }))
+    }
+
     fn downloads(&self) -> BoxFuture<'_, Vec<LocalDownload>> {
         // Reads the manifests on disk.
         Box::pin(async move {
@@ -1437,6 +1456,10 @@ impl Session for SdkSession {
 
     fn is_admin(&self) -> bool {
         self.session.user().role.is_admin()
+    }
+
+    fn user_id(&self) -> String {
+        self.session.user().user_id.clone()
     }
 
     fn password_change_required(&self) -> bool {
@@ -2198,6 +2221,16 @@ mod tests {
         assert_eq!(
             backend_error(sdk::SdkError::DownloadNotReady),
             BackendError::DownloadNotReady
+        );
+    }
+
+    /// Offline with nothing to check a PIN against (PX-60): its own
+    /// error, for "Connect to the server to unlock", not a wrong PIN.
+    #[test]
+    fn no_offline_pin_is_its_own_error() {
+        assert_eq!(
+            backend_error(sdk::SdkError::NoOfflinePin),
+            BackendError::NoOfflinePin
         );
     }
 

@@ -83,6 +83,11 @@ pub enum BackendError {
     /// (P2-08).
     #[error("this profile is locked; enter its PIN")]
     ProfileLocked,
+    /// Offline, the profile's PIN cannot be checked here (PX-60): no PIN
+    /// has unlocked it online on this device since SDK 0.14.1. Unlocking
+    /// it online is the way on.
+    #[error("this profile’s PIN can’t be checked offline yet; connect to the server to unlock")]
+    NoOfflinePin,
     /// The server refused what was sent, saying why (a PIN that is not 4
     /// to 8 digits).
     #[error("{0}")]
@@ -858,13 +863,40 @@ pub trait Client: Send + Sync {
     /// or offset, by anyone. A player showing the track reads it again.
     fn subtitle_timing_events(&self) -> tokio::sync::broadcast::Receiver<SubtitleTimingEvent>;
 
-    /// Every film and episode downloaded on this device (PX-38), oldest
-    /// first. Read from disk: it needs no server, so it works offline and
-    /// before anyone signs in. Empty without a downloads directory.
+    /// The app shows `server`'s `user_id` (PX-60): from now on the
+    /// downloads, their events and their watch state are that profile's,
+    /// and deleting one lets go of that profile's hold on it. Choosing
+    /// another profile locks it on this device if its PIN is asked for
+    /// here; choosing the same one again does not.
+    fn set_download_profile(&self, server: &str, user_id: &str);
+
+    /// The profile shown is locked on this device: its downloads are
+    /// empty, and each key is [`BackendError::ProfileLocked`], until it is
+    /// unlocked online or with [`Client::unlock_downloads_offline`].
+    fn download_profile_locked(&self) -> bool;
+
+    /// Unlocks the profile shown with `pin`, with no server: checked
+    /// against the PIN that last unlocked it online here. A wrong one is
+    /// [`BackendError::WrongCredentials`]; after 3 in a row each next try
+    /// waits ([`BackendError::RateLimited`]); after 10 it stays locked
+    /// until it is unlocked online ([`BackendError::SignInRequired`]).
+    /// [`BackendError::NoOfflinePin`] when there is nothing to check
+    /// against. The server's side stays locked: `Session::unlock` with
+    /// the same PIN, once reached.
+    fn unlock_downloads_offline<'a>(
+        &'a self,
+        pin: &'a str,
+    ) -> BoxFuture<'a, Result<(), BackendError>>;
+
+    /// Every film and episode downloaded on this device (PX-38) for the
+    /// profile shown ([`Client::set_download_profile`]; every profile's
+    /// before one is), oldest first. Read from disk: it needs no server,
+    /// so it works offline and before anyone signs in. Empty for a locked
+    /// profile, and without a downloads directory.
     fn downloads(&self) -> BoxFuture<'_, Vec<LocalDownload>>;
 
     /// Download `key`, from disk. [`BackendError::NotFound`] for a key
-    /// this device does not have.
+    /// this device does not have, or not the profile shown's.
     fn download<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<LocalDownload, BackendError>>;
 
     /// Stops moving download `key` until [`Client::resume_download`]; what
@@ -915,9 +947,9 @@ pub trait Client: Send + Sync {
         watched: bool,
     ) -> BoxFuture<'a, Result<LocalDownload, BackendError>>;
 
-    /// Each change of a download (PX-38): its phase, its progress, its
-    /// watch, or its removal. Made before subscribing, they are not seen:
-    /// list the downloads first.
+    /// Each change of a download (PX-38) of the profile shown: its phase,
+    /// its progress, its watch, or its removal. Made before subscribing,
+    /// they are not seen: list the downloads first.
     fn download_events(&self) -> tokio::sync::broadcast::Receiver<DownloadEvent>;
 }
 
@@ -1260,6 +1292,10 @@ pub trait Session: Send + Sync {
     /// The user is the server's admin (P2-09): the app offers its admin
     /// pages.
     fn is_admin(&self) -> bool;
+
+    /// The server's id for the user, which [`Client::set_download_profile`]
+    /// takes.
+    fn user_id(&self) -> String;
 
     /// This session signed in with a one-time password an admin set
     /// (c86e6d3a): it must choose a new one before anything else. A

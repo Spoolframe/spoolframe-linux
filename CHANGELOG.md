@@ -8,18 +8,20 @@
   free room. Its state then shows on the page: waiting or converting on
   the server, downloading with Pause, paused with Resume, failed with
   Try again where another try can help, or downloaded with Play and
-  Delete download. Downloads, in the sidebar, lists every download on
-  this computer, the profile's first, with the room they take; Settings
-  › This computer › Downloads shows the room by server and deletes them
-  all. A downloaded film or episode plays from its file, and its page's
+  Delete download. Downloads, in the sidebar, lists the profile's
+  downloads on this computer, with the room all of them take; Settings
+  › This computer › Downloads shows the profile's by server and deletes
+  them. A film two profiles download is one file, kept until both delete
+  it. A downloaded film or episode plays from its file, and its page's
   Play and Resume play it too, with no server needed: when none can be
-  reached, Choose a server opens Downloads, every profile's downloads
-  play, and what was watched is sent when the server is back. Closing
+  reached, Choose a server opens Downloads for the profile used last,
+  with a choice of the others that have downloads here, they play, and
+  what was watched is sent when the server is back. Closing
   the window while downloads run asks first: Keep in background finishes
   them with the window hidden, and opening Spoolframe again shows it;
   Quit stops them, and they go on from where they got to at the next
   start.
-- The SDK crates are 0.14.0. The app also lists playlist covers,
+- The SDK crates are 0.14.1. The app also lists playlist covers,
   subtitle sync, subtitle search and what comes up in a playlist to each
   server; a server without them shows nothing new. On an item's page, a
   playlist shared with you says whose it is ("Alice’s"), as its card

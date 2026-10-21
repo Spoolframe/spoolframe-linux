@@ -1930,6 +1930,9 @@ impl Session for FakeSession {
                 .lock()
                 .expect("fake state is never poisoned")
                 .insert(self.username.clone());
+            // Kept to check offline, and the downloads open (PX-60).
+            self.lock_downloads()
+                .unlocked_online(&self.server.0, &self.username, given);
             Ok(())
         })
     }
@@ -2111,6 +2114,11 @@ impl Session for FakeSession {
 
     fn is_admin(&self) -> bool {
         self.username == FAKE_ADMIN
+    }
+
+    // The fake's users are known by their usernames.
+    fn user_id(&self) -> String {
+        self.username.clone()
     }
 
     fn password_change_required(&self) -> bool {
@@ -2876,7 +2884,7 @@ impl Session for FakeSession {
         Box::pin(async move {
             self.catalog()?;
             self.downloads_listed()?;
-            Ok(self.lock_downloads().sync(&self.username))
+            Ok(self.lock_downloads().sync(&self.server.0, &self.username))
         })
     }
 
@@ -3609,6 +3617,18 @@ impl FakeClient {
         self.lock_downloads()
             .fail(key, reason)
             .expect("a download that exists");
+    }
+
+    /// `user_id` on `server` asks for their PIN on this device (PX-60), so
+    /// their downloads start locked when shown; `pin` unlocked them
+    /// online here last, and none leaves nothing to check offline.
+    pub fn require_offline_pin(&self, server: &ServerKey, user_id: &str, pin: Option<&str>) {
+        self.lock_downloads().require_pin(&server.0, user_id, pin);
+    }
+
+    /// The wait after a third or later wrong PIN offline is over.
+    pub fn wait_out_offline_pin(&self) {
+        self.lock_downloads().wait_out();
     }
 
     fn lock_downloads(&self) -> std::sync::MutexGuard<'_, downloads::Store> {
@@ -4769,6 +4789,21 @@ impl Client for FakeClient {
 
     // The downloads are the device's own: no server is asked, so they
     // answer after `go_away` too.
+    fn set_download_profile(&self, server: &str, user_id: &str) {
+        self.lock_downloads().set_profile(server, user_id);
+    }
+
+    fn download_profile_locked(&self) -> bool {
+        self.lock_downloads().locked()
+    }
+
+    fn unlock_downloads_offline<'a>(
+        &'a self,
+        pin: &'a str,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move { self.lock_downloads().unlock_offline(pin) })
+    }
+
     fn downloads(&self) -> BoxFuture<'_, Vec<LocalDownload>> {
         Box::pin(async move { self.lock_downloads().list() })
     }

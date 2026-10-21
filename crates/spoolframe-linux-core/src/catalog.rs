@@ -742,6 +742,10 @@ impl Session for CachedSession {
         self.inner.is_admin()
     }
 
+    fn user_id(&self) -> String {
+        self.inner.user_id()
+    }
+
     fn password_change_required(&self) -> bool {
         self.inner.password_change_required()
     }

@@ -611,7 +611,8 @@ pub(crate) fn downloads(
     let used = adw::ActionRow::builder().use_markup(false).build();
     used.set_title("Downloads");
     let by_server = adw::ActionRow::builder().use_markup(false).build();
-    by_server.set_title("By server");
+    // The profile shown's (PX-60); the room above is every profile's.
+    by_server.set_title("Yours, by server");
     by_server.set_visible(false);
     space.add(&used);
     space.add(&by_server);
@@ -633,8 +634,8 @@ pub(crate) fn downloads(
     let delete_group = adw::PreferencesGroup::new();
     let delete_row = adw::ActionRow::builder()
         .use_markup(false)
-        .title("Delete all downloads")
-        .subtitle("On this computer, from every server.")
+        .title("Delete your downloads")
+        .subtitle("On this computer, from every server. Other profiles keep theirs.")
         .build();
     let delete = gtk::Button::builder()
         .label("Delete all…")
@@ -701,6 +702,8 @@ impl DownloadRows {
             let Some(shown) = weak.upgrade() else { return };
             match space {
                 Ok(space) => {
+                    // Every profile's files: the SDK counts them since
+                    // 0.14.1.
                     shown.used.set_title(&format!(
                         "{} of downloads",
                         crate::downloads::size(space.used)
@@ -723,10 +726,11 @@ impl DownloadRows {
 
     fn ask_delete_all(self: &Rc<Self>, over: &gtk::Button) {
         let alert = adw::AlertDialog::builder()
-            .heading("Delete all downloads?")
+            .heading("Delete your downloads?")
             .body(
-                "Every film and episode downloaded on this computer is deleted, from every \
-                 server and profile. You can still stream them.",
+                "Every film and episode you downloaded on this computer is deleted, from \
+                 every server. One another profile downloaded too stays for them. You can \
+                 still stream them.",
             )
             .default_response("cancel")
             .close_response("cancel")
