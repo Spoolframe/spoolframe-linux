@@ -243,6 +243,14 @@ pub enum BackendError {
         site: Option<String>,
         resets_at: Option<i64>,
     },
+    /// The download's file is not whole on the server yet (PX-38); the
+    /// SDK's manager waits and asks again, so the app rarely sees it.
+    #[error("the download is not ready")]
+    DownloadNotReady,
+    /// The downloads on this device could not be read or written (PX-38),
+    /// in the SDK's words: the directory is full, not writable, or not set.
+    #[error("downloads: {0}")]
+    Downloads(String),
     #[error("{0}")]
     Other(String),
 }
@@ -453,6 +461,17 @@ pub use spoolframe_client_sdk::{
 pub use spoolframe_client_sdk::{
     DialReport, DialStage, KnownPath, LivePath, LookupOutcome, LookupResult, PathKind,
     Reachability, SavedAddr,
+};
+
+/// Downloads for offline viewing (PX-38), in the SDK's and the protocol's
+/// own types.
+pub use spoolframe_client_sdk::{
+    DownloadEvent, DownloadPhase, DownloadSpace, LocalArtwork, LocalDownload, LocalWatch,
+    SyncedWatch,
+};
+pub use spoolframe_protocol::downloads::{
+    DownloadFile, DownloadOptionsInfo, DownloadSource, DownloadState, DownloadTracks, FileTracks,
+    LeftOutSubtitle, OriginalDownload,
 };
 
 /// The most a subtitle may be moved either way (PX-03): ten minutes, ms.
@@ -838,6 +857,68 @@ pub trait Client: Send + Sync {
     /// tells of (PX-03): a track synced, set back to its original timing,
     /// or offset, by anyone. A player showing the track reads it again.
     fn subtitle_timing_events(&self) -> tokio::sync::broadcast::Receiver<SubtitleTimingEvent>;
+
+    /// Every film and episode downloaded on this device (PX-38), oldest
+    /// first. Read from disk: it needs no server, so it works offline and
+    /// before anyone signs in. Empty without a downloads directory.
+    fn downloads(&self) -> BoxFuture<'_, Vec<LocalDownload>>;
+
+    /// Download `key`, from disk. [`BackendError::NotFound`] for a key
+    /// this device does not have.
+    fn download<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<LocalDownload, BackendError>>;
+
+    /// Stops moving download `key` until [`Client::resume_download`]; what
+    /// arrived is kept. [`BackendError::InvalidInput`] unless it is
+    /// preparing or transferring.
+    fn pause_download<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> BoxFuture<'a, Result<LocalDownload, BackendError>>;
+
+    /// Goes on with paused download `key`.
+    fn resume_download<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> BoxFuture<'a, Result<LocalDownload, BackendError>>;
+
+    /// Tries failed download `key` again; one under way and waiting to try
+    /// again tries now.
+    fn retry_download<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> BoxFuture<'a, Result<LocalDownload, BackendError>>;
+
+    /// Stops download `key`, not finished, and takes it off this device.
+    /// A finished one is refused with [`BackendError::InvalidInput`]:
+    /// [`Client::delete_download`] it.
+    fn cancel_download<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), BackendError>>;
+
+    /// Takes download `key` off this device, in any phase.
+    fn delete_download<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), BackendError>>;
+
+    /// The room downloads have, and how much they take.
+    fn download_space(&self) -> BoxFuture<'_, Result<DownloadSpace, BackendError>>;
+
+    /// The user got to `position` in download `key`, playing it here; sent
+    /// to the server at the next sync.
+    fn record_download_position<'a>(
+        &'a self,
+        key: &'a str,
+        position: Duration,
+    ) -> BoxFuture<'a, Result<LocalDownload, BackendError>>;
+
+    /// The user marked download `key` watched or not, here. Unwatched
+    /// starts it over.
+    fn set_download_watched<'a>(
+        &'a self,
+        key: &'a str,
+        watched: bool,
+    ) -> BoxFuture<'a, Result<LocalDownload, BackendError>>;
+
+    /// Each change of a download (PX-38): its phase, its progress, its
+    /// watch, or its removal. Made before subscribing, they are not seen:
+    /// list the downloads first.
+    fn download_events(&self) -> tokio::sync::broadcast::Receiver<DownloadEvent>;
 }
 
 /// One signed-in user's view of a server: the catalog, their watch state
@@ -1533,6 +1614,41 @@ pub trait Session: Send + Sync {
         id: &'a str,
         settings: PlaySettings,
     ) -> BoxFuture<'a, Result<(), BackendError>>;
+
+    /// Whether the server and this app both do downloads for offline
+    /// viewing (PX-38, `spoolframe:downloads`): [`Session::download_options`],
+    /// [`Session::start_download`] and [`Session::sync_download_watch`].
+    /// What was downloaded already plays and lists without it.
+    fn has_downloads(&self) -> bool;
+
+    /// What may be downloaded of film or episode `id`: its tracks, the
+    /// choice to tick first, the optimized profiles, what original
+    /// quality would be, and the subtitles a download would leave out.
+    /// Without [`Session::has_downloads`], [`BackendError::Unsupported`],
+    /// unsent.
+    fn download_options<'a>(
+        &'a self,
+        id: &'a MediaId,
+    ) -> BoxFuture<'a, Result<DownloadOptionsInfo, BackendError>>;
+
+    /// Downloads `id` with `tracks` from `source` as this session's user:
+    /// the server prepares it now (a refusal is this call's error), and
+    /// the SDK moves it on in the background; follow it with
+    /// [`Client::download_events`]. Started again, the same download as
+    /// before. Without [`Session::has_downloads`],
+    /// [`BackendError::Unsupported`], unsent.
+    fn start_download<'a>(
+        &'a self,
+        id: &'a MediaId,
+        source: DownloadSource,
+        tracks: DownloadTracks,
+    ) -> BoxFuture<'a, Result<LocalDownload, BackendError>>;
+
+    /// Sends what this user watched offline to the server, for every
+    /// download of theirs there: what became of each item. One the server
+    /// has newer takes the server's state on the download. Without
+    /// [`Session::has_downloads`], [`BackendError::Unsupported`], unsent.
+    fn sync_download_watch(&self) -> BoxFuture<'_, Result<Vec<SyncedWatch>, BackendError>>;
 }
 
 #[cfg(test)]

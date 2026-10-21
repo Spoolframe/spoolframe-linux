@@ -38,6 +38,10 @@ use crate::backend::{
     ServerKey, Session, TopResult, TrustedProfile,
 };
 use crate::backend::{
+    DownloadEvent, DownloadOptionsInfo, DownloadSource, DownloadSpace, DownloadTracks,
+    LocalDownload, OriginalDownload, SyncedWatch,
+};
+use crate::backend::{
     EntryId, Features, ItemDetail, Kinds, PlaySettings, PlaylistEdit, PlaylistEvent, PlaylistList,
     PlaylistNext, PlaylistPage, PlaylistSummary, PlaylistUpdate, Visibility,
 };
@@ -47,11 +51,13 @@ use crate::backend::{
 };
 use crate::backend::{InviteKind, InviteOrigin, InviteSpec, InviteSummary, MintedInvite};
 
+mod downloads;
 mod playlists;
 mod subtitles;
 
 use crate::backend::{SubtitleDownloaded, SubtitleSearch, SubtitleSync, SubtitleTiming};
 
+pub use downloads::{FILE_SIZE as DOWNLOAD_FILE_SIZE, SPACE_AVAILABLE as DOWNLOAD_SPACE};
 pub use playlists::PAGE_LIMIT as PLAYLIST_PAGE_LIMIT;
 pub use subtitles::{QUOTA_RESETS_AT, Sites};
 
@@ -570,6 +576,8 @@ pub struct FakeSession {
     /// The server's subtitle sites and what was downloaded (PX-02), for
     /// everyone.
     subtitles: Arc<Mutex<subtitles::Store>>,
+    /// This device's downloads (PX-38), which outlive the server.
+    downloads: Arc<Mutex<downloads::Store>>,
 }
 
 /// What this device keeps saved, shared by the client and its sessions.
@@ -743,6 +751,16 @@ const OWN_SUBTITLES: usize = 3;
 /// blue and yellow, a second apart.
 pub const FAKE_PREVIEW_SHEET: &[u8] = include_bytes!("fake-preview-sheet.png");
 
+/// What the fake server and the device keep for every session.
+struct Stores {
+    /// Every user's playlists (PX-40).
+    playlists: Arc<Mutex<playlists::Store>>,
+    /// The server's subtitle sites and downloads (PX-02).
+    subtitles: Arc<Mutex<subtitles::Store>>,
+    /// This device's downloads (PX-38).
+    downloads: Arc<Mutex<downloads::Store>>,
+}
+
 impl FakeSession {
     fn new(
         catalog: Arc<Catalog>,
@@ -752,14 +770,14 @@ impl FakeSession {
         active: Arc<Mutex<std::collections::HashSet<String>>>,
         passkeys: Arc<Mutex<FakeAuth>>,
         // Its server and the device's saved list, together: leaving needs
-        // both; and the server's playlists and subtitles.
-        (server, saved, playlists, subtitles): (
-            ServerKey,
-            Saved,
-            Arc<Mutex<playlists::Store>>,
-            Arc<Mutex<subtitles::Store>>,
-        ),
+        // both; and what the server and the device keep for everyone.
+        (server, saved, stores): (ServerKey, Saved, Stores),
     ) -> Self {
+        let Stores {
+            playlists,
+            subtitles,
+            downloads,
+        } = stores;
         // Alice has a PIN, asked for here, so the fake opens her locked.
         let pin = match username {
             "alice" => FakePin {
@@ -798,6 +816,7 @@ impl FakeSession {
             saved,
             playlists,
             subtitles,
+            downloads,
         };
         {
             let mut watch = session.watch();
@@ -2783,6 +2802,84 @@ impl Session for FakeSession {
         })
     }
 
+    fn has_downloads(&self) -> bool {
+        self.features.downloads
+    }
+
+    fn download_options<'a>(
+        &'a self,
+        id: &'a MediaId,
+    ) -> BoxFuture<'a, Result<DownloadOptionsInfo, BackendError>> {
+        Box::pin(async move {
+            self.catalog()?;
+            self.downloads_listed()?;
+            let tracks = self.tracks_of(self.downloadable(id)?);
+            // The first audio track and every subtitle, as the server
+            // ticks for a viewer who prefers English.
+            let audio = (!tracks.audio.is_empty())
+                .then_some(0)
+                .into_iter()
+                .collect();
+            let subtitles = (0..tracks.subtitles.len() as u32).collect();
+            Ok(DownloadOptionsInfo {
+                tracks,
+                preferred: DownloadTracks::Chosen { audio, subtitles },
+                profiles: vec!["Mobile".into()],
+                original: OriginalDownload::AsIs,
+                left_out: Vec::new(),
+            })
+        })
+    }
+
+    fn start_download<'a>(
+        &'a self,
+        id: &'a MediaId,
+        source: DownloadSource,
+        tracks: DownloadTracks,
+    ) -> BoxFuture<'a, Result<LocalDownload, BackendError>> {
+        Box::pin(async move {
+            self.catalog()?;
+            self.downloads_listed()?;
+            let item = self.downloadable(id)?;
+            let media_tracks = self.tracks_of(item);
+            if let DownloadTracks::Chosen { audio, subtitles } = &tracks {
+                let outside =
+                    |places: &[u32], len: usize| places.iter().any(|&p| p as usize >= len);
+                if outside(audio, media_tracks.audio.len())
+                    || outside(subtitles, media_tracks.subtitles.len())
+                {
+                    return Err(BackendError::InvalidInput(format!(
+                        "{id} has no such track"
+                    )));
+                }
+            }
+            let parent = |id: &MediaId| self.catalog.get(id).ok().cloned();
+            let (show, season) = match item {
+                Item::Episode(e) => (parent(&e.show_id), parent(&e.season_id)),
+                _ => (None, None),
+            };
+            Ok(self.lock_downloads().start(downloads::Start {
+                server: self.server.0.clone(),
+                username: self.username.clone(),
+                item: self.with_state(item, &self.watch()),
+                show,
+                season,
+                markers: self.serving.markers.clone(),
+                tracks: media_tracks,
+                source,
+                chosen: tracks,
+            }))
+        })
+    }
+
+    fn sync_download_watch(&self) -> BoxFuture<'_, Result<Vec<SyncedWatch>, BackendError>> {
+        Box::pin(async move {
+            self.catalog()?;
+            self.downloads_listed()?;
+            Ok(self.lock_downloads().sync(&self.username))
+        })
+    }
+
     fn begin_passkey_registration(&self) -> BoxFuture<'_, Result<PasskeyCreation, BackendError>> {
         Box::pin(async move {
             self.guard()?;
@@ -3096,6 +3193,31 @@ impl FakeSession {
         }
     }
 
+    fn lock_downloads(&self) -> std::sync::MutexGuard<'_, downloads::Store> {
+        self.downloads.lock().expect("fake state is never poisoned")
+    }
+
+    /// Refuses a download call without the feature, unsent.
+    fn downloads_listed(&self) -> Result<(), BackendError> {
+        match self.features.downloads {
+            true => Ok(()),
+            false => Err(BackendError::Unsupported(
+                spoolframe_protocol::features::DOWNLOADS.into(),
+            )),
+        }
+    }
+
+    /// `id`'s item, which must be a film or an episode: the only kinds
+    /// that download here.
+    fn downloadable(&self, id: &MediaId) -> Result<&Item, BackendError> {
+        match self.catalog.get(id)? {
+            item @ (Item::Movie(_) | Item::Episode(_)) => Ok(item),
+            _ => Err(BackendError::InvalidInput(format!(
+                "{id}: only films and episodes download"
+            ))),
+        }
+    }
+
     /// Refuses a subtitle sync call without the feature, unsent.
     fn subtitle_sync_listed(&self) -> Result<(), BackendError> {
         match self.features.subtitle_sync {
@@ -3200,6 +3322,9 @@ pub struct FakeClient {
     playlists: Arc<Mutex<playlists::Store>>,
     /// The server's subtitle sites and downloads (PX-02).
     subtitles: Arc<Mutex<subtitles::Store>>,
+    /// This device's downloads (PX-38): not the server's, so they stay
+    /// when it goes away.
+    downloads: Arc<Mutex<downloads::Store>>,
 }
 
 /// How the fake answers a sign-in a phone approves.
@@ -3393,6 +3518,7 @@ impl FakeClient {
             joined: Mutex::default(),
             playlists: Arc::new(Mutex::new(seeded_playlists())),
             subtitles: Arc::new(Mutex::new(subtitles::Store::new(&home_media().0))),
+            downloads: Arc::new(Mutex::new(downloads::Store::new())),
         }
     }
 
@@ -3402,6 +3528,17 @@ impl FakeClient {
         let features = self.lock_playlists().features;
         self.with_features(Features {
             playlists: false,
+            ..features
+        })
+    }
+
+    /// The server has no downloads (PX-38): an older one, without the
+    /// feature. What was downloaded before still lists and plays.
+    pub fn without_downloads(self) -> Self {
+        let features = self.lock_playlists().features;
+        self.with_features(Features {
+            downloads: false,
+            music_downloads: false,
             ..features
         })
     }
@@ -3448,6 +3585,34 @@ impl FakeClient {
             .expect("fake state is never poisoned")
             .sites = sites;
         self
+    }
+
+    /// The SDK moved download `key` on: `received` bytes of its file are
+    /// here, and it is `Transferring`.
+    pub fn advance_download(&self, key: &str, received: u64) {
+        self.lock_downloads()
+            .advance(key, received)
+            .expect("a download that exists");
+    }
+
+    /// The file of download `key` is whole and checked: it is `Done`, and
+    /// its `file_path` and `file_url` are the file the fake serves (none
+    /// if the fake has no media), so it plays.
+    pub fn finish_download(&self, key: &str) {
+        self.lock_downloads()
+            .finish(key, self.serving.file.clone())
+            .expect("a download that exists");
+    }
+
+    /// Download `key` could not be made or kept, for `reason`.
+    pub fn fail_download(&self, key: &str, reason: &str) {
+        self.lock_downloads()
+            .fail(key, reason)
+            .expect("a download that exists");
+    }
+
+    fn lock_downloads(&self) -> std::sync::MutexGuard<'_, downloads::Store> {
+        self.downloads.lock().expect("fake state is never poisoned")
     }
 
     /// `item`'s file can no longer be read (a drive offline): it stays in
@@ -3655,8 +3820,11 @@ impl FakeClient {
                     (
                         profile.server.clone(),
                         self.saved(),
-                        self.playlists.clone(),
-                        self.subtitles.clone(),
+                        Stores {
+                            playlists: self.playlists.clone(),
+                            subtitles: self.subtitles.clone(),
+                            downloads: self.downloads.clone(),
+                        },
                     ),
                 ))
             })
@@ -4597,6 +4765,69 @@ impl Client for FakeClient {
             .lock()
             .expect("fake state is never poisoned")
             .subscribe()
+    }
+
+    // The downloads are the device's own: no server is asked, so they
+    // answer after `go_away` too.
+    fn downloads(&self) -> BoxFuture<'_, Vec<LocalDownload>> {
+        Box::pin(async move { self.lock_downloads().list() })
+    }
+
+    fn download<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<LocalDownload, BackendError>> {
+        Box::pin(async move { self.lock_downloads().get(key) })
+    }
+
+    fn pause_download<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> BoxFuture<'a, Result<LocalDownload, BackendError>> {
+        Box::pin(async move { self.lock_downloads().pause(key) })
+    }
+
+    fn resume_download<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> BoxFuture<'a, Result<LocalDownload, BackendError>> {
+        Box::pin(async move { self.lock_downloads().resume(key) })
+    }
+
+    fn retry_download<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> BoxFuture<'a, Result<LocalDownload, BackendError>> {
+        Box::pin(async move { self.lock_downloads().retry(key) })
+    }
+
+    fn cancel_download<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move { self.lock_downloads().cancel(key) })
+    }
+
+    fn delete_download<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move { self.lock_downloads().delete(key) })
+    }
+
+    fn download_space(&self) -> BoxFuture<'_, Result<DownloadSpace, BackendError>> {
+        Box::pin(async move { Ok(self.lock_downloads().space()) })
+    }
+
+    fn record_download_position<'a>(
+        &'a self,
+        key: &'a str,
+        position: Duration,
+    ) -> BoxFuture<'a, Result<LocalDownload, BackendError>> {
+        Box::pin(async move { self.lock_downloads().position(key, position) })
+    }
+
+    fn set_download_watched<'a>(
+        &'a self,
+        key: &'a str,
+        watched: bool,
+    ) -> BoxFuture<'a, Result<LocalDownload, BackendError>> {
+        Box::pin(async move { self.lock_downloads().mark(key, watched) })
+    }
+
+    fn download_events(&self) -> tokio::sync::broadcast::Receiver<DownloadEvent> {
+        self.lock_downloads().subscribe()
     }
 }
 

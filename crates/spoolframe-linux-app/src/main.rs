@@ -193,11 +193,14 @@ fn main() -> Result<()> {
 }
 
 /// How the SDK opens, from the user's settings: with or without relays
-/// (P6-03), which it cannot change while it runs.
+/// (P6-03), which it cannot change while it runs, and with its downloads
+/// (PX-38) in a directory under the app's data, the one place the sandbox
+/// lets it write to.
 fn client_options(settings: &settings::Settings) -> sdk::ClientOptions {
     sdk::ClientOptions {
         relays: settings.use_relays(),
         features: FEATURES,
+        downloads_dir: spoolframe_linux_core::paths::data_dir().map(|dir| dir.join("downloads")),
         ..sdk::ClientOptions::default()
     }
 }
@@ -279,6 +282,19 @@ mod tests {
         assert!(client_options(&settings).relays);
         settings.set_use_relays(false);
         assert!(!client_options(&settings::Settings::at(&path)).relays);
+    }
+
+    /// Downloads (PX-38) are kept in the data directory, where the sandbox
+    /// allows writing.
+    #[test]
+    fn the_sdk_keeps_downloads_under_the_data_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = settings::Settings::at(&dir.path().join("settings.ini"));
+        let data = spoolframe_linux_core::paths::data_dir().expect("a home directory");
+        assert_eq!(
+            client_options(&settings).downloads_dir,
+            Some(data.join("downloads"))
+        );
     }
 
     /// The SDK lists no feature an app does not ask for (0.11): playlists

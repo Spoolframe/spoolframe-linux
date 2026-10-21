@@ -5,6 +5,7 @@
 pub mod artcache;
 pub mod backend;
 pub mod catalog;
+pub mod downloads;
 // A server answering from fixed data, for tests only: the app talks to
 // real servers, through the SDK.
 #[cfg(any(test, feature = "testing"))]

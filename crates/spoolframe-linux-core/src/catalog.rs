@@ -1044,6 +1044,36 @@ impl Session for CachedSession {
     ) -> BoxFuture<'a, Result<(), BackendError>> {
         self.changing(move || self.inner.set_playlist_settings(id, settings))
     }
+
+    fn has_downloads(&self) -> bool {
+        self.inner.has_downloads()
+    }
+
+    /// Not kept: the options follow the user's tracks and the server's
+    /// profiles, and a dialog asks them once.
+    fn download_options<'a>(
+        &'a self,
+        id: &'a MediaId,
+    ) -> BoxFuture<'a, Result<DownloadOptionsInfo, BackendError>> {
+        self.inner.download_options(id)
+    }
+
+    /// Not a change to the catalog: a download is the device's own copy,
+    /// and the item reads the same.
+    fn start_download<'a>(
+        &'a self,
+        id: &'a MediaId,
+        source: DownloadSource,
+        tracks: DownloadTracks,
+    ) -> BoxFuture<'a, Result<LocalDownload, BackendError>> {
+        self.inner.start_download(id, source, tracks)
+    }
+
+    /// A change: the server's watch state is written from what was
+    /// watched offline, so what is kept of it is read again.
+    fn sync_download_watch(&self) -> BoxFuture<'_, Result<Vec<SyncedWatch>, BackendError>> {
+        self.changing(move || self.inner.sync_download_watch())
+    }
 }
 
 #[cfg(test)]

@@ -30,6 +30,10 @@ use crate::backend::{
     ProfileSignIn, SearchRequest, SearchResults, Selection, Server, ServerKey, Session,
 };
 use crate::backend::{
+    DownloadEvent, DownloadOptionsInfo, DownloadSource, DownloadSpace, DownloadTracks,
+    LocalDownload, SyncedWatch,
+};
+use crate::backend::{
     EntryId, ItemDetail, Kinds, PlaySettings, PlaylistEdit, PlaylistEntry, PlaylistList,
     PlaylistNext, PlaylistPage, PlaylistSummary, PlaylistUpdate, ShareCandidatePage, Visibility,
 };
@@ -195,6 +199,8 @@ pub fn backend_error(error: sdk::SdkError) -> BackendError {
             resets_at,
         },
         E::NoSubtitleSource => BackendError::NoSubtitleSource,
+        E::DownloadNotReady => BackendError::DownloadNotReady,
+        E::Downloads(why) => BackendError::Downloads(why),
         E::UnknownServer(id) => BackendError::NotFound(id),
         E::UnknownIdentity(_) | E::Credential(_) | E::NotThisDevice | E::DeviceKeyRevoked => {
             BackendError::NotPaired
@@ -982,6 +988,100 @@ impl Client for SdkClient {
     ) -> tokio::sync::broadcast::Receiver<crate::backend::SubtitleTimingEvent> {
         self.client.subtitle_timing_events()
     }
+
+    fn downloads(&self) -> BoxFuture<'_, Vec<LocalDownload>> {
+        // Reads the manifests on disk.
+        Box::pin(async move {
+            let downloads = self.client.downloads();
+            self.handle
+                .spawn_blocking(move || downloads.list())
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "cannot list the downloads");
+                    Vec::new()
+                })
+        })
+    }
+
+    fn download<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<LocalDownload, BackendError>> {
+        let (downloads, key) = (self.client.downloads(), key.to_owned());
+        Box::pin(on_runtime(&self.handle, async move { downloads.get(&key) }))
+    }
+
+    fn pause_download<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> BoxFuture<'a, Result<LocalDownload, BackendError>> {
+        let (downloads, key) = (self.client.downloads(), key.to_owned());
+        Box::pin(on_runtime(&self.handle, async move {
+            downloads.pause(&key).await
+        }))
+    }
+
+    fn resume_download<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> BoxFuture<'a, Result<LocalDownload, BackendError>> {
+        let (downloads, key) = (self.client.downloads(), key.to_owned());
+        Box::pin(on_runtime(&self.handle, async move {
+            downloads.resume(&key).await
+        }))
+    }
+
+    fn retry_download<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> BoxFuture<'a, Result<LocalDownload, BackendError>> {
+        let (downloads, key) = (self.client.downloads(), key.to_owned());
+        Box::pin(on_runtime(&self.handle, async move {
+            downloads.retry(&key).await
+        }))
+    }
+
+    fn cancel_download<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), BackendError>> {
+        let (downloads, key) = (self.client.downloads(), key.to_owned());
+        Box::pin(on_runtime(&self.handle, async move {
+            downloads.cancel(&key).await
+        }))
+    }
+
+    fn delete_download<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), BackendError>> {
+        let (downloads, key) = (self.client.downloads(), key.to_owned());
+        Box::pin(on_runtime(&self.handle, async move {
+            downloads.delete(&key).await
+        }))
+    }
+
+    fn download_space(&self) -> BoxFuture<'_, Result<DownloadSpace, BackendError>> {
+        let downloads = self.client.downloads();
+        Box::pin(on_runtime(&self.handle, async move { downloads.space() }))
+    }
+
+    fn record_download_position<'a>(
+        &'a self,
+        key: &'a str,
+        position: Duration,
+    ) -> BoxFuture<'a, Result<LocalDownload, BackendError>> {
+        let (downloads, key) = (self.client.downloads(), key.to_owned());
+        Box::pin(on_runtime(&self.handle, async move {
+            downloads.record_position(&key, position).await
+        }))
+    }
+
+    fn set_download_watched<'a>(
+        &'a self,
+        key: &'a str,
+        watched: bool,
+    ) -> BoxFuture<'a, Result<LocalDownload, BackendError>> {
+        let (downloads, key) = (self.client.downloads(), key.to_owned());
+        Box::pin(on_runtime(&self.handle, async move {
+            downloads.set_watched(&key, watched).await
+        }))
+    }
+
+    fn download_events(&self) -> tokio::sync::broadcast::Receiver<DownloadEvent> {
+        self.client.download_events()
+    }
 }
 
 pub struct SdkSession {
@@ -1670,6 +1770,33 @@ impl Session for SdkSession {
         Box::pin(self.call(move |s| async move { s.set_playlist_settings(&id, settings).await }))
     }
 
+    fn has_downloads(&self) -> bool {
+        self.session.features().downloads
+    }
+
+    fn download_options<'a>(
+        &'a self,
+        id: &'a MediaId,
+    ) -> BoxFuture<'a, Result<DownloadOptionsInfo, BackendError>> {
+        let id = id.clone();
+        Box::pin(self.call(move |s| async move { s.download_options(&id).await }))
+    }
+
+    fn start_download<'a>(
+        &'a self,
+        id: &'a MediaId,
+        source: DownloadSource,
+        tracks: DownloadTracks,
+    ) -> BoxFuture<'a, Result<LocalDownload, BackendError>> {
+        let (id, downloads) = (id.clone(), self.client.downloads());
+        Box::pin(self.call(move |s| async move { downloads.start(&s, &id, source, tracks).await }))
+    }
+
+    fn sync_download_watch(&self) -> BoxFuture<'_, Result<Vec<SyncedWatch>, BackendError>> {
+        let downloads = self.client.downloads();
+        Box::pin(self.call(move |s| async move { downloads.sync_watch(&s).await }))
+    }
+
     fn begin_passkey_registration(&self) -> BoxFuture<'_, Result<PasskeyCreation, BackendError>> {
         Box::pin(self.call(|s| async move { s.begin_passkey_registration().await }))
     }
@@ -2057,6 +2184,22 @@ mod tests {
         assert_eq!(
             backend_error(sdk::SdkError::NoSubtitleSource),
             BackendError::NoSubtitleSource
+        );
+    }
+
+    #[test]
+    fn a_download_not_ready_on_the_server_is_its_own_error() {
+        assert_eq!(
+            backend_error(sdk::SdkError::DownloadNotReady),
+            BackendError::DownloadNotReady
+        );
+    }
+
+    #[test]
+    fn a_downloads_directory_that_fails_keeps_its_message() {
+        assert_eq!(
+            backend_error(sdk::SdkError::Downloads("no space left".into())),
+            BackendError::Downloads("no space left".into())
         );
     }
 
