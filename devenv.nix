@@ -79,9 +79,12 @@ in {
   env.GST_PLUGIN_SYSTEM_PATH_1_0 =
     lib.makeSearchPathOutput "lib" "lib/gstreamer-1.0" gstPlugins;
 
-  tasks."spoolframe-linux:licenses" = {
-    description = "Check the Linux client license boundary";
-    exec = "cargo deny --locked check licenses";
+  # cargo deny in full (deny.toml): advisories, bans, licenses (the GPL
+  # client's boundary) and sources. Zero warnings is the bar: deny.toml
+  # names only crates in the graph.
+  tasks."spoolframe-linux:deny" = {
+    description = "Check the Linux client's dependencies with cargo deny";
+    exec = "cargo deny --locked check";
   };
   # Settings › About › Open source licenses reads a committed list
   # (crates/spoolframe-linux-app/data/licenses.json); it fails here when
@@ -90,7 +93,7 @@ in {
     description = "Check the open source license list is current";
     exec = "python3 scripts/gen-licenses.py --check";
   };
-  tasks."ci:static".after = ["spoolframe-linux:licenses" "spoolframe-linux:licenses-list"];
+  tasks."ci:static".after = ["spoolframe-linux:deny" "spoolframe-linux:licenses-list"];
 
   # CI's phases: `devenv --profile ci tasks run ci:style ci:static ci:test`
   # (.forgejo/workflows/ci.yaml runs exactly these). The tools they call
@@ -176,6 +179,9 @@ in {
         description = "Tests with nextest under llvm-cov (JUnit + lcov)";
         exec = "cargo llvm-cov nextest --locked --workspace --profile ci --no-tests=warn --ignore-filename-regex '/\\.cargo/(registry|git)/' --lcov --output-path target/lcov.info";
       };
+      # Daily, in .forgejo/workflows/audit.yaml. cargo audit reads
+      # .cargo/audit.toml: deny.toml's accepted advisories, and warnings
+      # (unmaintained, yanked) fail it. One Cargo.lock, at the root.
       "ci:audit" = {
         description = "Audit dependencies for known vulnerabilities";
         exec = "cargo audit";

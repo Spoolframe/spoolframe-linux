@@ -20,7 +20,7 @@ env:
   NO_COLOR: "1"
 
 jobs:
-  # Formatting, the license check and clippy: no tests.
+  # Formatting, cargo deny, the license list and clippy: no tests.
   lint:
     name: "lint"
     runs-on: beefy
@@ -50,10 +50,12 @@ jobs:
         shell: devenv --no-tui shell --profile ci -- bash -eo pipefail {0}
         run: devenv --no-tui tasks run --profile ci ci:style
 
-      # ci:static runs spoolframe-linux:licenses first (cargo deny over the
-      # client's graph, deny.toml) and spoolframe-linux:licenses-list (the
-      # app's open source license list is current with Cargo.lock), then
-      # clippy over every target.
+      # ci:static runs spoolframe-linux:deny first (`cargo deny check` in
+      # full over the client's graph, deny.toml: advisories, bans, licenses,
+      # sources) and spoolframe-linux:licenses-list (the app's open source
+      # license list is current with Cargo.lock), then clippy over every
+      # target. New advisories against an unchanged Cargo.lock are caught
+      # by audit.yaml, daily.
       - name: ci:static
         shell: devenv --no-tui shell --profile ci -- bash -eo pipefail {0}
         run: devenv --no-tui tasks run --profile ci ci:static

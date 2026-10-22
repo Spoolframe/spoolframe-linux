@@ -1,0 +1,20 @@
+# cargo audit (ci:audit, daily in .forgejo/workflows/audit.yaml): the
+# advisories deny.toml accepts, with the reasons written there. Keep the
+# two lists the same.
+[advisories]
+ignore = [
+  # rsa: through webauthn-authenticator-rs; no RSA private-key operation.
+  "RUSTSEC-2023-0071",
+  # paste: unmaintained build-time proc-macro; none of it runs.
+  "RUSTSEC-2024-0436",
+  # zvariant, zbus_names, zvariant_derive: unmaintained, merged into zbus
+  # 6; oo7, ashpd and mpris-server have no zbus 6 release yet.
+  "RUSTSEC-2026-0370",
+  "RUSTSEC-2026-0371",
+  "RUSTSEC-2026-0372",
+]
+
+[output]
+# An unmaintained or yanked crate fails the audit too.
+deny = ["warnings"]
+quiet = false
