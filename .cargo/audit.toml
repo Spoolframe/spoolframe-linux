@@ -5,11 +5,6 @@
 ignore = [
   # paste: unmaintained build-time proc-macro; none of it runs.
   "RUSTSEC-2024-0436",
-  # zvariant, zbus_names, zvariant_derive: unmaintained, merged into zbus
-  # 6; mpris-server has no zbus 6 release yet.
-  "RUSTSEC-2026-0370",
-  "RUSTSEC-2026-0371",
-  "RUSTSEC-2026-0372",
 ]
 
 [output]

@@ -30,7 +30,6 @@ gst = { workspace = true }
 gst-play = { workspace = true }
 gst-base = { workspace = true }
 gst-plugin-gtk4 = { workspace = true }
-mpris-server = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 snmalloc-rs = { workspace = true }

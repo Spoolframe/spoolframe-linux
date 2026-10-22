@@ -71,8 +71,6 @@ gst-plugin-gtk4 = { version = "0.15", features = ["gtk_v4_20", "dmabuf", "waylan
 # QR codes for a phone to scan (P3-05's sign-in with your phone); the
 # encoder only, the app draws the modules itself.
 qrcode = { version = "0.14", default-features = false }
-# MPRIS on the session bus (P1-24): the desktop's Now Playing and media keys.
-mpris-server = "0.10"
 # A test's own directory under a random name, removed with it, so tests
 # running at once never share one (core's `testing` feature).
 spoolframe-test-dir = { version = "0.14.2", registry = "coldsteel" }
