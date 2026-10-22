@@ -6,9 +6,10 @@
 //! saying Stopped while nothing plays. Like the mini bar, the server is
 //! made once and the playback is attached and detached.
 //!
-//! zbus is built with its tokio backend here (oo7 asks for it), so every
-//! poll of the server's futures happens inside Relm4's runtime; the
-//! server's own handlers still run on the main loop, next to GTK.
+//! zbus drives the connection on an executor thread of its own (its
+//! async-io backend, now that oo7 no longer asks for tokio's); the
+//! server's own handlers still run on the main loop, next to GTK. Polls
+//! still happen inside Relm4's runtime, which the tokio backend needed.
 
 use std::cell::{Cell, RefCell};
 use std::future::Future;

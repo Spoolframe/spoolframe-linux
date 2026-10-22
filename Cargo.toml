@@ -119,8 +119,15 @@ libc = "0.2"
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
 
 # Secrets (the device key, session tokens) in the desktop's Secret
-# Service, never a plain file.
-oo7 = "0.6"
+# Service, never a plain file; in a Flatpak, in a file of the app's own
+# whose key the Secret portal keeps. Through libsecret (GNOME's library,
+# in the GNOME runtime), not oo7: oo7 0.6 is on zbus 5, whose zvariant,
+# zbus_names and zvariant_derive are unmaintained (RUSTSEC-2026-0370 to
+# 0372). v0_19: binary secrets, and a search that tells items apart.
+libsecret = { version = "0.9", features = ["v0_19"] }
+# GTK's GLib and GIO, for libsecret's errors and cancellables.
+glib = "0.22"
+gio = "0.22"
 
 # Artwork kept on this device, in memory and on disk.
 foyer = "0.22"

@@ -66,6 +66,8 @@ in {
       # A security key as a portable identity's root (P7-08): libfido2
       # signs CTAP2 over a hash the client chooses.
       pkgs.libfido2
+      # The device key and sessions in the Secret Service.
+      pkgs.libsecret
       # scripts/gen-licenses.py, the open source license list.
       pkgs.python3
     ]

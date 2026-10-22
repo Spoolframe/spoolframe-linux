@@ -15,7 +15,9 @@ async-trait = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-oo7 = { workspace = true }
+libsecret = { workspace = true }
+glib = { workspace = true }
+gio = { workspace = true }
 foyer = { workspace = true }
 anyhow = { workspace = true }
 directories = { workspace = true }

@@ -15,6 +15,7 @@
   systemdLibs,
   dbus,
   libfido2,
+  libsecret,
   openssl,
   rustPlatform,
   gst_all_1,
@@ -44,7 +45,8 @@
     # Passkeys: systemdLibs (libudev) for security keys; dbus (BlueZ) and
     # openssl (the tunnel's TLS) for the phone flow.
     # libfido2: a security key as a portable identity's root (P7-08).
-    buildInputs = [gtk4 libadwaita libGL systemdLibs dbus openssl libfido2] ++ gstPlugins;
+    # libsecret: the device key and sessions in the Secret Service.
+    buildInputs = [gtk4 libadwaita libGL systemdLibs dbus openssl libfido2 libsecret] ++ gstPlugins;
   };
 
   # Build dependencies separately for caching.

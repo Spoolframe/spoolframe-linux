@@ -153,11 +153,12 @@ fn in_flatpak() -> bool {
     Path::new("/.flatpak-info").exists()
 }
 
-/// Where oo7 keeps the app's secrets as a file of its own, which the app
-/// writes: in a Flatpak, `keyrings` under the app's private data
-/// directory (the Secret portal holds only the file's key). Outside one,
-/// oo7 asks the desktop's Secret Service, and `keyrings` there is the
-/// desktop's own keyring, never opened.
+/// Where libsecret keeps the app's secrets as a file of its own
+/// (`default.keyring`), which the app writes: in a Flatpak, `keyrings`
+/// under the app's private data directory (the Secret portal holds only
+/// the file's key). oo7, before it, kept the same file there. Outside one,
+/// libsecret asks the desktop's Secret Service, and `keyrings` there is
+/// the desktop's own keyring, never opened.
 fn keyring_file_dir(data: Option<&Path>, flatpak: bool) -> Option<PathBuf> {
     flatpak.then(|| data.map(|d| d.join("keyrings"))).flatten()
 }
@@ -794,7 +795,9 @@ pub fn self_check(confinement: Confinement, probe: &Path) -> bool {
         Err(e) => say(&format!("tls: {e}"), false),
     }
     match keyring_file_dir(Home::from_env().data.as_deref(), in_flatpak()) {
-        // As oo7 saves it: a new file beside the keyring, renamed over it.
+        // As libsecret saves it (g_file_replace_contents): a new file
+        // beside the keyring, renamed over it, the old one renamed to
+        // default.keyring~.
         Some(dir) => {
             let (temp, file) = (dir.join(".self-check-tmp"), dir.join("self-check"));
             match std::fs::write(&temp, b"ok")
@@ -906,9 +909,10 @@ mod tests {
         }
     }
 
-    /// In a Flatpak, oo7 keeps the app's secrets in a file of its own,
-    /// under the app's private data directory, as the tester's strace
-    /// showed: it must be written there.
+    /// In a Flatpak, libsecret keeps the app's secrets in a file of its
+    /// own, under the app's private data directory (`keyrings` under
+    /// g_get_user_data_dir(), where the tester's strace showed oo7's too):
+    /// it must be written there.
     #[test]
     fn in_a_flatpak_the_keyring_file_beside_the_data_is_the_apps() {
         assert_eq!(

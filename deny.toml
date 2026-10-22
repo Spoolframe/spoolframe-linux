@@ -32,13 +32,12 @@ ignore = [
   { id = "RUSTSEC-2024-0436", reason = "paste is an unmaintained build-time proc-macro; no code of it runs in the client" },
   # zvariant, zbus_names and zvariant_derive: unmaintained, not vulnerable.
   # zbus 6.0 took them in, as its wire and names modules and its derive
-  # macros. They come in through zbus 5, which oo7 0.6 (the keyring),
-  # ashpd 0.13 (oo7's portal) and mpris-server 0.10 (media keys) use; no
-  # release of the three is on zbus 6 yet (oo7 0.7 is a beta, on zbus
-  # 5.19). Drop these when they move.
-  { id = "RUSTSEC-2026-0370", reason = "zvariant is zbus 5's wire format, through oo7, ashpd and mpris-server; none has a zbus 6 release" },
-  { id = "RUSTSEC-2026-0371", reason = "zbus_names is zbus 5's name types, through oo7, ashpd and mpris-server; none has a zbus 6 release" },
-  { id = "RUSTSEC-2026-0372", reason = "zvariant_derive is zbus 5's build-time derive macros, through oo7, ashpd and mpris-server; none has a zbus 6 release" },
+  # macros. They come in through zbus 5, which mpris-server 0.10 (media
+  # keys) uses, with no zbus 6 release yet; the keyring is on libsecret
+  # now. Drop these when MPRIS moves off it.
+  { id = "RUSTSEC-2026-0370", reason = "zvariant is zbus 5's wire format, through mpris-server, which has no zbus 6 release" },
+  { id = "RUSTSEC-2026-0371", reason = "zbus_names is zbus 5's name types, through mpris-server, which has no zbus 6 release" },
+  { id = "RUSTSEC-2026-0372", reason = "zvariant_derive is zbus 5's build-time derive macros, through mpris-server, which has no zbus 6 release" },
 ]
 
 # Several versions of one crate come from upstream (iroh, webauthn-rs's
