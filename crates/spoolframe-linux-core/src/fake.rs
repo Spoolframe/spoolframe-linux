@@ -38,8 +38,8 @@ use crate::backend::{
     ServerKey, Session, TopResult, TrustedProfile,
 };
 use crate::backend::{
-    DownloadEstimate, DownloadEvent, DownloadOptionsInfo, DownloadReadiness, DownloadSource,
-    DownloadSpace, DownloadTracks, LocalDownload, OriginalDownload, SyncedWatch,
+    DownloadEstimate, DownloadEvent, DownloadFailure, DownloadOptionsInfo, DownloadReadiness,
+    DownloadSource, DownloadSpace, DownloadTracks, LocalDownload, OriginalDownload, SyncedWatch,
 };
 use crate::backend::{
     EntryId, Features, ItemDetail, Kinds, PlaySettings, PlaylistEdit, PlaylistEvent, PlaylistList,
@@ -3635,10 +3635,11 @@ impl FakeClient {
             .expect("a download that exists");
     }
 
-    /// Download `key` could not be made or kept, for `reason`.
-    pub fn fail_download(&self, key: &str, reason: &str) {
+    /// Download `key` could not be made or kept, for `reason`, which
+    /// `cause` says to the app.
+    pub fn fail_download(&self, key: &str, reason: &str, cause: DownloadFailure) {
         self.lock_downloads()
-            .fail(key, reason)
+            .fail(key, reason, cause)
             .expect("a download that exists");
     }
 

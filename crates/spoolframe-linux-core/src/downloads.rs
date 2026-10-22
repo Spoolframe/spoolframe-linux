@@ -107,7 +107,8 @@ mod tests {
 
     use super::*;
     use crate::backend::{
-        Client, DownloadFile, DownloadSource, DownloadState, DownloadTracks, FileTracks, Session,
+        Client, DownloadFailure, DownloadFile, DownloadSource, DownloadState, DownloadTracks,
+        FileTracks, Session,
     };
     use crate::fake::FakeClient;
     use crate::testing::ready;
@@ -262,6 +263,7 @@ mod tests {
             DownloadPhase::Paused,
             DownloadPhase::Failed {
                 reason: "gone".into(),
+                cause: DownloadFailure::SourceMissing,
             },
             DownloadPhase::Done,
         ];

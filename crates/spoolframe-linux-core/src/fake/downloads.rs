@@ -21,8 +21,9 @@ use spoolframe_types::{Container, Item, Marker, MediaTracks};
 use tokio::sync::broadcast;
 
 use crate::backend::{
-    BackendError, DownloadEvent, DownloadFile, DownloadPhase, DownloadSource, DownloadSpace,
-    DownloadState, DownloadTracks, FileTracks, LocalDownload, LocalWatch, SyncedWatch,
+    BackendError, DownloadEvent, DownloadFailure, DownloadFile, DownloadPhase, DownloadSource,
+    DownloadSpace, DownloadState, DownloadTracks, FileTracks, LocalDownload, LocalWatch,
+    SyncedWatch,
 };
 use spoolframe_protocol::downloads::OfflineWatchOutcome;
 
@@ -276,6 +277,8 @@ impl Store {
             phase: waiting(),
             received: 0,
             size: None,
+            // As a server says when it prepares one: about the file's size.
+            expected_size: Some(FILE_SIZE),
             file_path: None,
             file_url: None,
             note: None,
@@ -443,10 +446,16 @@ impl Store {
         synced
     }
 
-    pub fn fail(&mut self, key: &str, reason: &str) -> Result<LocalDownload, BackendError> {
+    pub fn fail(
+        &mut self,
+        key: &str,
+        reason: &str,
+        cause: DownloadFailure,
+    ) -> Result<LocalDownload, BackendError> {
         self.move_on(key, |d| {
             d.phase = DownloadPhase::Failed {
                 reason: reason.into(),
+                cause,
             };
         })
     }
@@ -774,7 +783,11 @@ mod tests {
         let paused = ready(client.pause_download(&key)).map(|d| d.phase);
         let retry_paused = ready(client.retry_download(&key)).is_err();
         let resumed = ready(client.resume_download(&key)).map(|d| d.phase);
-        client.fail_download(&key, "the conversion failed");
+        client.fail_download(
+            &key,
+            "the conversion failed",
+            DownloadFailure::ServerStoppedConverting,
+        );
         let retried = ready(client.retry_download(&key)).map(|d| d.phase);
         let waiting = DownloadPhase::Preparing {
             server: DownloadState::Waiting,
@@ -803,11 +816,12 @@ mod tests {
     fn a_failed_download_says_why() {
         let client = FakeClient::new(None);
         let key = start(andrey(&client).as_ref()).key;
-        client.fail_download(&key, "the file is gone");
+        client.fail_download(&key, "the file is gone", DownloadFailure::SourceMissing);
         assert_eq!(
             ready(client.download(&key)).map(|d| d.phase),
             Ok(DownloadPhase::Failed {
-                reason: "the file is gone".into()
+                reason: "the file is gone".into(),
+                cause: DownloadFailure::SourceMissing,
             })
         );
     }

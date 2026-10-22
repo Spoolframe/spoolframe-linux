@@ -14,8 +14,8 @@ use std::time::Duration;
 use adw::prelude::*;
 use gtk::glib;
 use spoolframe_linux_core::backend::{
-    BackendError, Client, DownloadEvent, DownloadPhase, DownloadSource, DownloadSpace,
-    DownloadState, DownloadTracks, LocalDownload, LocalWatch,
+    BackendError, Client, DownloadEvent, DownloadFailure, DownloadPhase, DownloadSource,
+    DownloadSpace, DownloadState, DownloadTracks, LocalDownload, LocalWatch,
 };
 use spoolframe_linux_core::format;
 use spoolframe_types::{ArtworkKind, Item, MediaId};
@@ -64,17 +64,45 @@ impl Act {
 /// What a download's buttons ask of the app: `Act` on this download.
 pub type Acts = Rc<dyn Fn(LocalDownload, Act)>;
 
-/// Whether a failed download is worth trying again. The SDK keeps no
-/// record of where it failed, but `size` tells: the server sets it once
-/// its file is ready. A failure with no size happened while the server
-/// prepared the file (it could not convert it, or the item is gone), and
-/// trying again prepares the same thing the same way. With a size, it
-/// failed on the way here or on this computer (the file arrived damaged,
-/// the disk was full, a read went wrong), which another try may not.
-/// Network trouble is never a failure: the SDK waits and tries by itself,
-/// saying so in `note`.
+/// Whether a failed download is worth trying again, by the SDK's cause:
+/// - no room: once the user frees some, it fits.
+/// - the network: a broken-off answer or a damaged file comes whole
+///   another time. (Not reaching the server is not a failure: the SDK
+///   waits and tries by itself, saying so in `note`.)
+/// - the server stopped converting: its conversion failed, or stopped
+///   with the server, and the cause does not say which; a server started
+///   again converts it again, and trying again is how to ask.
+/// - the media file is gone or changed on the server: the same request
+///   finds the same, so there is only Dismiss.
+/// - other, or a cause this build does not know (every failure from a
+///   server before 0.14.4 is other): by `size`, as before there were
+///   causes. The server sets it once its file is ready, so without one
+///   it failed while the server prepared the file, and another try
+///   prepares the same thing the same way; with one it failed on the way
+///   here or on this computer, which another try may not.
 pub fn retryable(download: &LocalDownload) -> bool {
-    matches!(download.phase, DownloadPhase::Failed { .. }) && download.size.is_some()
+    match &download.phase {
+        DownloadPhase::Failed { cause, .. } => match cause {
+            DownloadFailure::NoSpace { .. }
+            | DownloadFailure::Network
+            | DownloadFailure::ServerStoppedConverting => true,
+            DownloadFailure::SourceMissing => false,
+            DownloadFailure::Other | DownloadFailure::Unknown => download.size.is_some(),
+        },
+        _ => false,
+    }
+}
+
+/// The line under a failed download: for one short of room, how much
+/// more to free, in the app's sizes (the SDK's reason counts MiB); else
+/// the reason, as the SDK says it.
+fn failure_line(reason: &str, cause: &DownloadFailure) -> String {
+    match cause {
+        DownloadFailure::NoSpace { needed_bytes } => {
+            format!("Needs {} more free space", size(*needed_bytes))
+        }
+        _ => reason.to_owned(),
+    }
 }
 
 /// How a download shows: a heading ("Downloading · 63%"), a line under it,
@@ -91,10 +119,10 @@ pub struct Status {
 /// How `download` shows, in its phase. While the SDK waits to try again,
 /// its note says why, in place of the line under the heading.
 pub fn status(download: &LocalDownload) -> Status {
-    let version = version(&download.source);
     let note = download.note.clone();
     match &download.phase {
         DownloadPhase::Preparing { server } => {
+            let version = version_and_expected(download, &version(&download.source));
             let (heading, progress, detail) = match server {
                 DownloadState::Waiting => (
                     "Waiting on the server".to_owned(),
@@ -146,16 +174,19 @@ pub fn status(download: &LocalDownload) -> Status {
                 "Downloaded · {}",
                 size(download.size.unwrap_or(download.received))
             ),
-            detail: Some(match watch_line(download) {
-                Some(watch) => format!("{version} · {} · {watch}", tracks_line(download)),
-                None => format!("{version} · {}", tracks_line(download)),
+            detail: Some({
+                let version = version(&download.source);
+                match watch_line(download) {
+                    Some(watch) => format!("{version} · {} · {watch}", tracks_line(download)),
+                    None => format!("{version} · {}", tracks_line(download)),
+                }
             }),
             progress: None,
             acts: vec![Act::Play, Act::Delete],
         },
-        DownloadPhase::Failed { reason } => Status {
+        DownloadPhase::Failed { reason, cause } => Status {
             heading: "Couldn’t download".to_owned(),
-            detail: Some(reason.clone()),
+            detail: Some(failure_line(reason, cause)),
             progress: None,
             acts: match retryable(download) {
                 true => vec![Act::Retry, Act::Dismiss],
@@ -261,21 +292,48 @@ fn fraction(percent: impl Into<u64>) -> f64 {
     (percent.into().min(100) as f64) / 100.0
 }
 
-/// How much of the file is here, once its size is known.
+/// How much of the file is here, once its size is known, or about how
+/// much, from the size the server expected when it prepared it, once
+/// some of it came.
 fn percent(download: &LocalDownload) -> Option<u64> {
-    let size = download.size.filter(|s| *s > 0)?;
+    let expected = download.expected_size.filter(|_| download.received > 0);
+    let size = download.size.or(expected).filter(|s| *s > 0)?;
     Some((download.received.saturating_mul(100) / size).min(100))
 }
 
-/// "2.3 of 3.6 GB", once the size is known.
+/// "2.3 of 3.6 GB", once the size is known. Before, from the size the
+/// server expected: "2.3 of about 3.6 GB", or "about 3.6 GB" with none
+/// of it here.
 fn amount(download: &LocalDownload) -> Option<String> {
-    let whole = download.size?;
+    let Some(whole) = download.size else {
+        let expected = download.expected_size?;
+        return Some(match download.received {
+            0 => format!("about {}", size(expected)),
+            r if r >= GB && expected >= GB => {
+                format!(
+                    "{:.1} of about {:.1} GB",
+                    r as f64 / 1e9,
+                    expected as f64 / 1e9
+                )
+            }
+            r => format!("{} of about {}", size(r), size(expected)),
+        });
+    };
     Some(match (download.received, whole) {
         (r, s) if r >= GB && s >= GB => {
             format!("{:.1} of {:.1} GB", r as f64 / 1e9, s as f64 / 1e9)
         }
         (r, s) => format!("{} of {}", size(r), size(s)),
     })
+}
+
+/// "Mobile · about 2.8 GB" while the server prepares it, when it said how
+/// large it expects the file to be; else the version alone.
+fn version_and_expected(download: &LocalDownload, version: &str) -> String {
+    match download.size.or(download.expected_size) {
+        Some(bytes) => format!("{version} · about {}", size(bytes)),
+        None => version.to_owned(),
+    }
 }
 
 /// "14 min left", from the server's guess in seconds.
@@ -1373,29 +1431,84 @@ mod tests {
         in_phase(DownloadPhase::Preparing { server })
     }
 
+    fn failed(cause: DownloadFailure) -> LocalDownload {
+        in_phase(DownloadPhase::Failed {
+            reason: "it failed".into(),
+            cause,
+        })
+    }
+
     #[test]
-    fn a_conversion_failure_on_the_server_offers_no_retry() {
-        let failed = in_phase(DownloadPhase::Failed {
-            reason: "the conversion failed".into(),
-        });
+    fn no_room_the_network_and_a_stopped_conversion_offer_retry() {
+        let causes = [
+            DownloadFailure::NoSpace {
+                needed_bytes: 3_400_000_000,
+            },
+            DownloadFailure::Network,
+            DownloadFailure::ServerStoppedConverting,
+        ];
         assert_eq!(
-            (retryable(&failed), status(&failed).acts),
+            causes.map(|c| status(&failed(c)).acts),
+            [
+                vec![Act::Retry, Act::Dismiss],
+                vec![Act::Retry, Act::Dismiss],
+                vec![Act::Retry, Act::Dismiss]
+            ]
+        );
+    }
+
+    #[test]
+    fn a_media_file_gone_from_the_server_only_dismisses() {
+        let gone = LocalDownload {
+            size: Some(3_600_000_000),
+            ..failed(DownloadFailure::SourceMissing)
+        };
+        assert_eq!(
+            (retryable(&gone), status(&gone).acts),
             (false, vec![Act::Dismiss])
         );
     }
 
     #[test]
-    fn a_failure_on_the_way_here_offers_retry() {
-        let failed = LocalDownload {
-            size: Some(3_600_000_000),
-            received: 1_200_000_000,
-            ..in_phase(DownloadPhase::Failed {
-                reason: "The file arrived damaged; try again".into(),
-            })
-        };
+    fn another_cause_without_a_size_failed_on_the_server_and_offers_no_retry() {
+        let causes = [DownloadFailure::Other, DownloadFailure::Unknown];
         assert_eq!(
-            (retryable(&failed), status(&failed).acts),
-            (true, vec![Act::Retry, Act::Dismiss])
+            causes.map(|c| {
+                retryable(&LocalDownload {
+                    size: None,
+                    ..failed(c)
+                })
+            }),
+            [false, false]
+        );
+    }
+
+    #[test]
+    fn another_cause_with_a_size_failed_on_the_way_here_and_offers_retry() {
+        let causes = [DownloadFailure::Other, DownloadFailure::Unknown];
+        assert_eq!(
+            causes.map(|c| {
+                retryable(&LocalDownload {
+                    size: Some(3_600_000_000),
+                    received: 1_200_000_000,
+                    ..failed(c)
+                })
+            }),
+            [true, true]
+        );
+    }
+
+    #[test]
+    fn short_of_room_it_says_how_much_more_to_free() {
+        let shown = status(&in_phase(DownloadPhase::Failed {
+            reason: "Not enough space on this device: 3243 MB more needed".into(),
+            cause: DownloadFailure::NoSpace {
+                needed_bytes: 3_400_000_000,
+            },
+        }));
+        assert_eq!(
+            shown.detail.as_deref(),
+            Some("Needs 3.4 GB more free space")
         );
     }
 
@@ -1412,6 +1525,7 @@ mod tests {
     fn a_failed_download_says_why() {
         let failed = in_phase(DownloadPhase::Failed {
             reason: "the file is gone".into(),
+            cause: DownloadFailure::SourceMissing,
         });
         let shown = status(&failed);
         assert_eq!(
@@ -1435,6 +1549,7 @@ mod tests {
             source: DownloadSource::Profile {
                 name: "Mobile".into(),
             },
+            expected_size: None,
             ..preparing(DownloadState::Converting {
                 done_percent: Some(42),
                 eta_secs: Some(14 * 60),
@@ -1480,6 +1595,61 @@ mod tests {
                 vec![Act::Pause, Act::Cancel]
             )
         );
+    }
+
+    #[test]
+    fn waiting_says_about_how_large_the_server_expects_the_file() {
+        let shown = status(&LocalDownload {
+            expected_size: Some(2_800_000_000),
+            ..preparing(DownloadState::Waiting)
+        });
+        assert_eq!(
+            shown.detail.as_deref(),
+            Some("Original · about 2.8 GB · the server prepares it, then it downloads")
+        );
+    }
+
+    #[test]
+    fn before_its_size_is_known_a_download_counts_against_the_expected_one() {
+        let shown = status(&LocalDownload {
+            size: None,
+            expected_size: Some(2_800_000_000),
+            received: 1_400_000_000,
+            ..in_phase(DownloadPhase::Transferring)
+        });
+        assert_eq!(
+            (
+                shown.heading.as_str(),
+                shown.detail.as_deref(),
+                shown.progress
+            ),
+            ("Downloading · 50%", Some("1.4 of about 2.8 GB"), Some(0.5))
+        );
+    }
+
+    #[test]
+    fn paused_before_any_of_it_came_says_about_how_large_it_is() {
+        let shown = status(&LocalDownload {
+            size: None,
+            expected_size: Some(740_000_000),
+            received: 0,
+            ..in_phase(DownloadPhase::Paused)
+        });
+        assert_eq!(
+            (shown.heading.as_str(), shown.detail.as_deref()),
+            ("Paused", Some("about 740 MB"))
+        );
+    }
+
+    #[test]
+    fn the_real_size_wins_over_the_expected_one() {
+        let shown = status(&LocalDownload {
+            size: Some(3_600_000_000),
+            expected_size: Some(2_800_000_000),
+            received: 1_800_000_000,
+            ..in_phase(DownloadPhase::Transferring)
+        });
+        assert_eq!(shown.detail.as_deref(), Some("1.8 of 3.6 GB"));
     }
 
     #[test]

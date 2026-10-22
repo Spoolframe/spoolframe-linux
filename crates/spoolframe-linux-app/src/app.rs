@@ -6191,6 +6191,7 @@ mod tests {
             subtitle_search: true,
             downloads: true,
             music_downloads: false,
+            invite_lookup: false,
         };
 
     fn nothing_shown() -> Shown<'static> {

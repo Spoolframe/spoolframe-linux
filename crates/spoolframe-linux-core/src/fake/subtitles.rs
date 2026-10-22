@@ -231,6 +231,7 @@ impl Store {
             downloads: 0,
             rating: None,
             hearing_impaired: false,
+            forced: false,
             origin: SubtitleOrigin::Human,
             hash_match: false,
             rejected: false,

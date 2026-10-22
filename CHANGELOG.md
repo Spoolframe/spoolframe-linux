@@ -24,7 +24,13 @@
   finishes them with the window hidden, and opening Spoolframe again
   shows it; Quit stops them, and they go on from where they got to at
   the next start.
-- The SDK crates are 0.14.2. The download picker shows each version's
+- The SDK crates are 0.14.4. A failed download offers Try again by why
+  it failed: no room (its line says how much: "Needs 3.4 GB more free
+  space"), a broken-off or damaged transfer, or a conversion the server
+  stopped; a media file gone from the server offers only Dismiss. A
+  download the server is preparing shows about how large it will be
+  ("Mobile · about 2.8 GB"), and counts against that until the real
+  size is known. The download picker shows each version's
   size ("38.4 GB" for Original, "about 3.6 GB" for a profile) and
   whether it is ready on the server or the server converts it first,
   and with All tracks on, the footer shows the chosen version's size. The

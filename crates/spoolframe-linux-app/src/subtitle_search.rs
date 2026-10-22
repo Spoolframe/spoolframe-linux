@@ -778,6 +778,7 @@ mod tests {
             downloads: 31_402,
             rating: Some(90),
             hearing_impaired: false,
+            forced: false,
             origin: SubtitleOrigin::Human,
             hash_match: false,
             rejected: false,

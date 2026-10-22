@@ -475,8 +475,8 @@ pub use spoolframe_client_sdk::{
     SyncedWatch,
 };
 pub use spoolframe_protocol::downloads::{
-    DownloadEstimate, DownloadFile, DownloadOptionsInfo, DownloadReadiness, DownloadSource,
-    DownloadState, DownloadTracks, FileTracks, LeftOutSubtitle, OriginalDownload,
+    DownloadEstimate, DownloadFailure, DownloadFile, DownloadOptionsInfo, DownloadReadiness,
+    DownloadSource, DownloadState, DownloadTracks, FileTracks, LeftOutSubtitle, OriginalDownload,
 };
 
 /// The most a subtitle may be moved either way (PX-03): ten minutes, ms.

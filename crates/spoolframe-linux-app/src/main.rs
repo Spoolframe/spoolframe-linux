@@ -251,6 +251,7 @@ const FEATURES: sdk::Features = sdk::Features {
     subtitle_search: true,
     downloads: true,
     music_downloads: false,
+    invite_lookup: false,
 };
 
 /// The artwork cache, or none if it cannot be opened: images are then
@@ -347,6 +348,7 @@ mod tests {
                 subtitle_search: true,
                 downloads: true,
                 music_downloads: false,
+                invite_lookup: false,
             }
         );
     }
