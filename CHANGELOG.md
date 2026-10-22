@@ -39,6 +39,13 @@
   server; a server without them shows nothing new. On an item's page, a
   playlist shared with you says whose it is ("Alice’s"), as its card
   does, where the server names the owner.
+- Add a server looks an invite's code up before you join, on a server
+  that can say: "Invite from Andrey · consumer account · expires Oct
+  14", or that it expired, was used or revoked, or matches no invite,
+  and then Continue stays off (Save server only is still there for a
+  link). A server on this network says what it is on its row: the name
+  it answers with, its release, and "Invite only" with Use invite,
+  which takes the invite's code typed in as well as its link.
 - Up next shows the songs a playlist plays next, in the order they play,
   on a server that says what comes up (0.13): shuffled, the shuffled
   order; with Repeat All, round to the top; with Repeat One, the song

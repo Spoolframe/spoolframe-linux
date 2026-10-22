@@ -1,10 +1,11 @@
 //! The screens before the library: choose a server, choose who is
 //! watching, sign in. Laid out as in the UI mockups.
 
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use adw::prelude::*;
-use spoolframe_linux_core::backend::{Profile, ProfileSignIn, Server};
+use spoolframe_linux_core::backend::{LanServerInfo, Profile, ProfileSignIn, Server, ServerKey};
 
 use crate::markup::{Markup, markup};
 use crate::remote_sign_in::Via;
@@ -74,10 +75,17 @@ fn unreachable_banner(unreachable: &Unreachable) -> gtk::Box {
     card
 }
 
+/// What the servers on this network said of themselves, by key, and the
+/// way to use an invite's code at one.
+pub struct Nearby<'a> {
+    pub info: &'a HashMap<ServerKey, LanServerInfo>,
+    pub use_invite: &'a Choose<Server>,
+}
+
 pub fn servers(
     servers: &[Server],
-    choose: &Choose<Server>,
-    verify: &Choose<Server>,
+    (choose, verify): (&Choose<Server>, &Choose<Server>),
+    nearby_info: Nearby<'_>,
     add: &Rc<dyn Fn()>,
     (relays, set_relays): (bool, &Rc<dyn Fn(bool)>),
     unreachable: Option<&Unreachable>,
@@ -92,7 +100,8 @@ pub fn servers(
     if !nearby.is_empty() {
         let list = boxed_list();
         for server in nearby {
-            list.append(&nearby_row(server, choose));
+            let info = nearby_info.info.get(&server.key);
+            list.append(&nearby_row(server, info, choose, nearby_info.use_invite));
         }
         column.append(&section("On this network", &[list]));
     }
@@ -218,14 +227,21 @@ fn tile(icon: &str, tint: &str) -> gtk::Image {
 }
 
 /// A server on this network: its address and fingerprint, and Connect,
-/// filled for one whose fingerprint the user has checked.
-fn nearby_row(server: &Server, choose: &Choose<Server>) -> adw::ActionRow {
+/// filled for one whose fingerprint the user has checked. Once it has
+/// said what it is (`info`): the name it answers with, its release, and,
+/// if accounts there come only from invites, "Invite only" and Use invite.
+fn nearby_row(
+    server: &Server,
+    info: Option<&LanServerInfo>,
+    choose: &Choose<Server>,
+    use_invite: &Choose<Server>,
+) -> adw::ActionRow {
     let row = adw::ActionRow::builder()
         .use_markup(false)
         .css_classes(["server-row", "server-code"])
         .build();
-    row.set_title(&server.name);
-    row.set_subtitle(&nearby_subtitle(server));
+    row.set_title(info.map_or(&server.name, |i| &i.name));
+    row.set_subtitle(&nearby_line(server, info));
     row.add_prefix(&tile(
         crate::icons::SERVER,
         if server.verified {
@@ -246,6 +262,17 @@ fn nearby_row(server: &Server, choose: &Choose<Server>) -> adw::ActionRow {
     // Which of two servers with one name is the saved one.
     if server.pinned {
         row.add_suffix(&badge("Saved", "saved-badge"));
+    }
+    if invite_only(info) {
+        row.add_suffix(&badge("Invite only", "saved-badge"));
+        let invite = gtk::Button::builder()
+            .label("Use invite")
+            .valign(gtk::Align::Center)
+            .css_classes(["flat"])
+            .build();
+        let (server, use_invite) = (server.clone(), use_invite.clone());
+        invite.connect_clicked(move |_| use_invite(server.clone()));
+        row.add_suffix(&invite);
     }
     let (server, choose) = (server.clone(), choose.clone());
     connect.connect_clicked(move |_| choose(server.clone()));
@@ -324,6 +351,21 @@ fn nearby_subtitle(server: &Server) -> String {
         Some(address) => format!("{}  ·  {}", host(address), server.fingerprint),
         None => server.fingerprint.clone(),
     }
+}
+
+/// A nearby row's line: where it is and its fingerprint, then its release
+/// once it has said ("10.10.0.6  ·  K7QX-3MPA-9TRD-WF2H  ·  0.14.4").
+fn nearby_line(server: &Server, info: Option<&LanServerInfo>) -> String {
+    match info.filter(|i| !i.server_version.is_empty()) {
+        Some(info) => format!("{}  ·  {}", nearby_subtitle(server), info.server_version),
+        None => nearby_subtitle(server),
+    }
+}
+
+/// Whether a nearby row says "Invite only": once the server has said so,
+/// never before it has answered.
+fn invite_only(info: Option<&LanServerInfo>) -> bool {
+    info.is_some_and(|i| i.invite_only)
 }
 
 /// `10.10.0.6:7440` as `10.10.0.6`, `[fe80::1]:7430` as `fe80::1`.
@@ -1739,6 +1781,37 @@ mod tests {
         assert_eq!(
             nearby_subtitle(&nimble("10.10.0.6:7440")),
             "10.10.0.6  ·  VVWT-BWMQ-SZ8C-6ZDC"
+        );
+    }
+
+    fn said(invite_only: bool) -> LanServerInfo {
+        LanServerInfo {
+            key: ServerKey("f5e5a1c0d800".into()),
+            name: "Nimble".into(),
+            fingerprint: "VVWT-BWMQ-SZ8C-6ZDC".into(),
+            server_version: "0.14.4".into(),
+            protocol_version: 9,
+            invite_only,
+        }
+    }
+
+    #[test]
+    fn a_nearby_server_that_said_its_release_shows_it() {
+        assert_eq!(
+            nearby_line(&nimble("10.10.0.6:7440"), Some(&said(true))),
+            "10.10.0.6  ·  VVWT-BWMQ-SZ8C-6ZDC  ·  0.14.4"
+        );
+    }
+
+    #[test]
+    fn invite_only_shows_once_the_server_says_so_and_only_then() {
+        assert_eq!(
+            [
+                invite_only(Some(&said(true))),
+                invite_only(Some(&said(false))),
+                invite_only(None)
+            ],
+            [true, false, false]
         );
     }
 

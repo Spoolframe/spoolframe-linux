@@ -15,6 +15,7 @@ pub mod format;
 pub mod helper;
 pub mod history;
 pub mod identity;
+pub mod invites;
 pub mod markers;
 pub mod next_episode;
 pub mod passkey;

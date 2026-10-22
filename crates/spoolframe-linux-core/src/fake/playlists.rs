@@ -139,7 +139,7 @@ impl Store {
                 subtitle_search: true,
                 downloads: true,
                 music_downloads: false,
-                invite_lookup: false,
+                invite_lookup: true,
             },
             server: server.to_owned(),
             next_id: 1,

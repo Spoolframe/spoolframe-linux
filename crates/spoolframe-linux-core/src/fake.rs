@@ -50,6 +50,7 @@ use crate::backend::{
     TrackPreferencesInfo,
 };
 use crate::backend::{InviteKind, InviteOrigin, InviteSpec, InviteSummary, MintedInvite};
+use crate::backend::{InviteLookup, InviteOutcome, LanServerInfo};
 
 mod downloads;
 mod playlists;
@@ -3408,6 +3409,34 @@ pub const INVITE_CODE: &str = "QW7K2MFPXR4T";
 pub const EXPIRED_INVITE_CODE: &str = "EXPDEXPDEXPD";
 /// An invite code of the fake's whose every use is spent.
 pub const USED_INVITE_CODE: &str = "SPNTSPNTSPNT";
+/// An invite code of the fake's that an admin revoked: looked up, it says
+/// so; redeemed, it is wrong, as the server's redemption says.
+pub const REVOKED_INVITE_CODE: &str = "RVKDRVKDRVKD";
+/// An invite code whose lookup has an outcome this build does not know,
+/// as from a newer server; redeemed, it works as [`INVITE_CODE`] does.
+pub const NEWER_INVITE_CODE: &str = "NWRSNWRSNWRS";
+
+/// What the fake's server says invite code `code` is: `spent` once
+/// [`INVITE_CODE`]'s one use is.
+fn invite_outcome(code: &str, spent: bool) -> InviteOutcome {
+    let now = std::time::SystemTime::now();
+    match code {
+        INVITE_CODE | NEWER_INVITE_CODE if spent => InviteOutcome::Used,
+        INVITE_CODE => InviteOutcome::Valid {
+            kind: InviteKind::CreateUser,
+            role: spoolframe_types::Role::Consumer,
+            expires_at: now + Duration::from_secs(6 * 24 * 60 * 60),
+            inviter: Some("Andrey".into()),
+        },
+        NEWER_INVITE_CODE => InviteOutcome::Unknown,
+        EXPIRED_INVITE_CODE => InviteOutcome::Expired {
+            at: now - Duration::from_secs(2 * 24 * 60 * 60),
+        },
+        USED_INVITE_CODE => InviteOutcome::Used,
+        REVOKED_INVITE_CODE => InviteOutcome::Revoked,
+        _ => InviteOutcome::NoMatch,
+    }
+}
 
 fn basement() -> ServerKey {
     ServerKey("9fm0x2kq7wv4hj3n8spe1ac21".into())
@@ -3746,6 +3775,33 @@ impl FakeClient {
         .link()
     }
 
+    /// Cabin answers on this network too, not saved: the server to type
+    /// an invite's code at (its key, unlike the others', is one a link can
+    /// name).
+    pub fn with_cabin_nearby(self) -> Self {
+        self.servers
+            .lock()
+            .expect("fake state is never poisoned")
+            .push(Server {
+                key: cabin(),
+                name: "Cabin".into(),
+                addresses: vec!["192.168.1.40:7430".into()],
+                pinned: false,
+                fingerprint: fingerprint(&cabin()),
+                verified: false,
+                on_network: true,
+                verified_at: None,
+                last_connected_at: None,
+                server_id: Some("k7f3q2m4x6pq5z2a".into()),
+                advertised: Vec::new(),
+                relays: Vec::new(),
+                advertised_at: None,
+                use_relays: None,
+                relays_edited: false,
+            });
+        self
+    }
+
     /// Cabin, as an invite finds it: saved if it was.
     fn invited(
         &self,
@@ -3783,6 +3839,15 @@ impl FakeClient {
             relays_edited: false,
         });
         Ok((invite, server))
+    }
+
+    /// Invite lookup is listed by the app and the server, as the SDK asks
+    /// before sending a lookup.
+    fn invite_lookup_listed(&self) -> Result<(), BackendError> {
+        match self.lock_playlists().features.invite_lookup {
+            true => Ok(()),
+            false => Err(BackendError::Unsupported("spoolframe:invite-lookup".into())),
+        }
     }
 
     /// Cabin saved, verified: the invite came from its admin.
@@ -4275,6 +4340,62 @@ impl Client for FakeClient {
         Box::pin(async move { self.invited(link).map(|(_, server)| server) })
     }
 
+    fn look_up_invite<'a>(
+        &'a self,
+        link: &'a str,
+    ) -> BoxFuture<'a, Result<InviteLookup, BackendError>> {
+        Box::pin(async move {
+            let (invite, server) = self.invited(link)?;
+            let Some(code) = invite.code else {
+                return Err(BackendError::InvalidInput(
+                    "this invite has no code: it only finds the server".into(),
+                ));
+            };
+            self.invite_lookup_listed()?;
+            let spent = self.joined.lock().expect("fake state is never poisoned").1;
+            Ok(InviteLookup {
+                server,
+                outcome: invite_outcome(&code, spent),
+            })
+        })
+    }
+
+    fn look_up_invite_code<'a>(
+        &'a self,
+        key: &'a ServerKey,
+        _addresses: &'a [String],
+        typed: &'a str,
+    ) -> BoxFuture<'a, Result<InviteLookup, BackendError>> {
+        Box::pin(async move {
+            let code = crate::invites::parse_code(typed)?;
+            self.invite_lookup_listed()?;
+            let server = self.reach(key)?;
+            let spent = self.joined.lock().expect("fake state is never poisoned").1;
+            Ok(InviteLookup {
+                server,
+                outcome: invite_outcome(&code, spent),
+            })
+        })
+    }
+
+    fn lan_server_info<'a>(
+        &'a self,
+        key: &'a ServerKey,
+    ) -> BoxFuture<'a, Result<LanServerInfo, BackendError>> {
+        Box::pin(async move {
+            let server = self.reach(key)?;
+            // As every server so far: accounts only from invites.
+            Ok(LanServerInfo {
+                key: server.key,
+                name: server.name,
+                fingerprint: server.fingerprint,
+                server_version: "0.14.4".into(),
+                protocol_version: spoolframe_protocol::PROTOCOL_VERSION,
+                invite_only: true,
+            })
+        })
+    }
+
     fn save_invite_server<'a>(
         &'a self,
         link: &'a str,
@@ -4404,8 +4525,10 @@ impl Client for FakeClient {
             };
             let mut joined = self.joined.lock().expect("fake state is never poisoned");
             match code.as_str() {
-                INVITE_CODE if joined.1 => return Err(BackendError::InviteExhausted),
-                INVITE_CODE => {}
+                INVITE_CODE | NEWER_INVITE_CODE if joined.1 => {
+                    return Err(BackendError::InviteExhausted);
+                }
+                INVITE_CODE | NEWER_INVITE_CODE => {}
                 EXPIRED_INVITE_CODE => return Err(BackendError::InviteExpired),
                 USED_INVITE_CODE => return Err(BackendError::InviteExhausted),
                 _ => return Err(BackendError::InviteInvalid),
@@ -6078,6 +6201,95 @@ mod tests {
                 ready(client.redeem_invite(&link, "dad", None, "long enough")),
                 Err(BackendError::InviteExhausted)
             );
+        }
+
+        #[test]
+        fn a_looked_up_code_says_what_it_is_and_uses_nothing_up() {
+            let client = FakeClient::new(None);
+            let look = |code| {
+                ready(client.look_up_invite(&FakeClient::invite_link(Some(code))))
+                    .map(|l| l.outcome)
+            };
+            let valid = look(INVITE_CODE);
+            assert!(
+                matches!(&valid, Ok(InviteOutcome::Valid { inviter: Some(name), .. }) if name == "Andrey"),
+                "{valid:?}"
+            );
+            assert_eq!(
+                [
+                    look(USED_INVITE_CODE),
+                    look(REVOKED_INVITE_CODE),
+                    look("ABCDABCDABCD"),
+                    look(NEWER_INVITE_CODE),
+                ],
+                [
+                    Ok(InviteOutcome::Used),
+                    Ok(InviteOutcome::Revoked),
+                    Ok(InviteOutcome::NoMatch),
+                    Ok(InviteOutcome::Unknown),
+                ]
+            );
+            assert!(matches!(
+                look(EXPIRED_INVITE_CODE),
+                Ok(InviteOutcome::Expired { .. })
+            ));
+            // Looking used nothing up: it still redeems, once.
+            let link = FakeClient::invite_link(Some(INVITE_CODE));
+            assert!(ready(client.redeem_invite(&link, "mum", None, "long enough")).is_ok());
+            assert_eq!(look(INVITE_CODE), Ok(InviteOutcome::Used));
+        }
+
+        #[test]
+        fn a_code_typed_at_a_server_is_looked_up_there() {
+            let client = FakeClient::new(None);
+            let looked = ready(client.look_up_invite_code(&home_media(), &[], "rvkd-rvkd-rvkd"))
+                .map(|l| (l.server.name, l.outcome));
+            assert_eq!(looked, Ok(("Home Media".into(), InviteOutcome::Revoked)));
+        }
+
+        #[test]
+        fn text_that_cannot_be_a_code_is_refused_before_anything_is_sent() {
+            let client = FakeClient::new(None);
+            assert_eq!(
+                ready(client.look_up_invite_code(&basement(), &[], "QW7K")).map(|_| ()),
+                Err(BackendError::NotAnInviteCode)
+            );
+        }
+
+        #[test]
+        fn without_invite_lookup_a_lookup_is_unsupported() {
+            let client = FakeClient::new(None).with_features(Features::default());
+            assert!(matches!(
+                ready(client.look_up_invite(&FakeClient::invite_link(Some(INVITE_CODE)))),
+                Err(BackendError::Unsupported(_))
+            ));
+        }
+
+        #[test]
+        fn a_server_on_this_network_says_it_is_invite_only() {
+            let client = FakeClient::new(None);
+            let info = ready(client.lan_server_info(&home_media())).unwrap();
+            assert_eq!(
+                (
+                    info.name.as_str(),
+                    info.invite_only,
+                    info.server_version.as_str()
+                ),
+                ("Home Media", true, "0.14.4")
+            );
+        }
+
+        #[test]
+        fn redeeming_a_code_typed_at_a_server_on_this_network_joins_it() {
+            let client = FakeClient::new(None).with_cabin_nearby();
+            let server = ready(client.servers())
+                .unwrap()
+                .into_iter()
+                .find(|s| s.key == cabin())
+                .unwrap();
+            let link = crate::invites::code_link(&server, INVITE_CODE);
+            let profile = ready(client.redeem_invite(&link, "mum", None, "long enough")).unwrap();
+            assert_eq!(profile.server, cabin());
         }
 
         #[test]

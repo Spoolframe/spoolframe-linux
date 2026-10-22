@@ -112,6 +112,10 @@ pub enum BackendError {
     /// nothing was sent.
     #[error("this isn’t a Spoolframe invite")]
     NotAnInvite,
+    /// Typed text is not an invite's code, whatever its case, dashes or
+    /// spaces ([`crate::invites::parse_code`]); nothing was sent.
+    #[error("this isn’t an invite code")]
+    NotAnInviteCode,
     /// The invite's code is wrong or was revoked (P6-01). Saving the server
     /// still works.
     #[error("this invite doesn’t work")]
@@ -540,6 +544,57 @@ pub struct Invite {
     pub saved: bool,
 }
 
+/// What an invite's code is, as its server says before joining (SDK
+/// 0.14.4). Looking never uses it up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InviteOutcome {
+    /// It can be redeemed now.
+    Valid {
+        kind: InviteKind,
+        /// The role the account gets; the consumer's for a portable one.
+        role: spoolframe_types::Role,
+        expires_at: std::time::SystemTime,
+        /// The admin who made it, by display name; `None` when they have
+        /// none, or the server's command line made it.
+        inviter: Option<String>,
+    },
+    Expired {
+        at: std::time::SystemTime,
+    },
+    /// Every use it had is used.
+    Used,
+    Revoked,
+    /// No invite has this code. Each counts as a wrong guess; after a
+    /// few, [`BackendError::RateLimited`].
+    NoMatch,
+    /// An outcome this build does not know, from a newer server.
+    Unknown,
+}
+
+/// An invite looked up: who answered, and what its code is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InviteLookup {
+    /// As [`Client::connect_invite`] says it; not saved.
+    pub server: Server,
+    pub outcome: InviteOutcome,
+}
+
+/// A server heard on this network, as it says of itself before anyone
+/// signs in (its `Hello`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LanServerInfo {
+    pub key: ServerKey,
+    /// The name it answers with, which may be newer than the one heard.
+    pub name: String,
+    pub fingerprint: String,
+    /// Its release, as it says it.
+    pub server_version: String,
+    pub protocol_version: u32,
+    /// An account there is made only from an invite. True for a server
+    /// too old to say.
+    pub invite_only: bool,
+}
+
 /// What an invite an admin makes does when it is redeemed (PX-44).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InviteKind {
@@ -654,6 +709,35 @@ pub trait Client: Send + Sync {
     /// Connects to the server invite `link` names and says who answered,
     /// for "Is this the server you were invited to?". Nothing is saved.
     fn connect_invite<'a>(&'a self, link: &'a str) -> BoxFuture<'a, Result<Server, BackendError>>;
+
+    /// Connects as [`Client::connect_invite`] does and asks the server
+    /// what invite `link`'s code is; nothing is saved or used up.
+    /// [`BackendError::InvalidInput`] for a link without a code;
+    /// [`BackendError::Unsupported`] when the server cannot say (show the
+    /// join form as before); [`BackendError::RateLimited`] after too many
+    /// codes that match nothing.
+    fn look_up_invite<'a>(
+        &'a self,
+        link: &'a str,
+    ) -> BoxFuture<'a, Result<InviteLookup, BackendError>>;
+
+    /// The same for a code typed in, at `server`: a saved one, or one
+    /// heard on this network or at `addresses`.
+    /// [`BackendError::NotAnInviteCode`] before anything is sent, for
+    /// text that cannot be a code; else [`Client::look_up_invite`]'s.
+    fn look_up_invite_code<'a>(
+        &'a self,
+        server: &'a ServerKey,
+        addresses: &'a [String],
+        typed: &'a str,
+    ) -> BoxFuture<'a, Result<InviteLookup, BackendError>>;
+
+    /// What `server`, heard on this network, says of itself: connects,
+    /// sends only `Hello`, and saves nothing.
+    fn lan_server_info<'a>(
+        &'a self,
+        server: &'a ServerKey,
+    ) -> BoxFuture<'a, Result<LanServerInfo, BackendError>>;
 
     /// This computer's portable identity side (P7-08): its key-rooted
     /// identity and the root actions.

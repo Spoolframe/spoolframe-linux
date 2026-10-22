@@ -4,22 +4,84 @@
 //! then the join form for a link with a code, or the server saved for one
 //! without. A refused code offers "Save server only".
 //!
+//! Before Continue, a link's code is looked up at its server (SDK
+//! 0.14.4), and the summary says what it is: who it is from, or that it
+//! expired, was used or revoked, or matches nothing. Opened for a server
+//! on this network ("Use invite" on its row), the field also takes the
+//! code alone, typed in.
+//!
 //! The dialog draws; the app makes the calls and tells it what came back.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use adw::prelude::*;
-use spoolframe_linux_core::backend::{BackendError, Invite, Server};
+use spoolframe_linux_core::backend::{
+    BackendError, Invite, InviteKind, InviteLookup, InviteOutcome, Server, ServerKey,
+};
+use spoolframe_linux_core::invites;
 use spoolframe_types::Role;
 
 use crate::start::{action, field, with_cancel};
+
+/// An invite to look up before joining.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Lookup {
+    /// A link with a code, pasted or opened.
+    Link(String),
+    /// A code typed in at `server`, normalized; `link` is the one made
+    /// from it, which the answer comes back for.
+    Code {
+        link: String,
+        server: ServerKey,
+        addresses: Vec<String>,
+        code: String,
+    },
+}
+
+impl Lookup {
+    /// The link the answer is for.
+    pub fn link(&self) -> &str {
+        match self {
+            Lookup::Link(link) | Lookup::Code { link, .. } => link,
+        }
+    }
+}
+
+/// How long the field must rest before its invite is looked up: a code
+/// typed a character at a time is looked up once, and each code that
+/// matches nothing counts on the server as a wrong guess.
+const LOOKUP_PAUSE: Duration = Duration::from_millis(500);
+
+/// Which change of the field a lookup waits for. Each change makes every
+/// earlier wait stale, so only the one after the last change looks up.
+#[derive(Debug, Default)]
+pub struct Debounce(Cell<u64>);
+
+impl Debounce {
+    /// The field changed: the waits begun before are stale.
+    pub fn change(&self) {
+        self.0.set(self.0.get() + 1);
+    }
+
+    /// A wait begun now, for [`Debounce::is_current`] once it is over.
+    pub fn wait(&self) -> u64 {
+        self.0.get()
+    }
+
+    /// No change since `wait` began.
+    pub fn is_current(&self, wait: u64) -> bool {
+        self.0.get() == wait
+    }
+}
 
 /// What the dialog asks the app to do.
 pub struct Actions {
     /// Read the link in the field: nothing is sent.
     pub read: Rc<dyn Fn(String)>,
+    /// Ask the server what an invite's code is; nothing is used up.
+    pub look_up: Rc<dyn Fn(Lookup)>,
     /// Connect to the server the read link names, for its fingerprint.
     pub connect: Rc<dyn Fn(String)>,
     /// Save the server only: a link without a code, or a refused one.
@@ -43,7 +105,11 @@ pub struct InviteDialog {
     summary_where: gtk::Label,
     summary_terms: gtk::Label,
     summary_account: gtk::Label,
+    /// What the server says the code is, once looked up.
+    summary_outcome: gtk::Label,
     proceed: gtk::Button,
+    /// Save server only, for a link whose code no longer works.
+    save_instead: gtk::Button,
     check_who: gtk::Label,
     check_code: gtk::Label,
     check_site: gtk::Label,
@@ -62,19 +128,42 @@ pub struct InviteDialog {
     save_only: gtk::Button,
     saved_title: gtk::Label,
     sign_in: gtk::Button,
+    /// The server on this network the dialog was opened for, whose code
+    /// may be typed in.
+    at: Option<Server>,
+    look_up: Rc<dyn Fn(Lookup)>,
+    debounce: Rc<Debounce>,
     /// The link read, what it says, and who answered, once known.
     state: Rc<RefCell<State>>,
 }
 
 #[derive(Default)]
 struct State {
+    /// The link in the field, or the one made from the code typed.
     link: String,
+    /// A code typed in: its server came from this network, not the link.
+    typed: bool,
     invite: Option<Invite>,
+    looked_up: Looked,
     server: Option<Server>,
 }
 
+/// Where the lookup of the field's code is.
+#[derive(Debug, Default)]
+enum Looked {
+    /// None to make: no code, or the server cannot look one up.
+    #[default]
+    Not,
+    Waiting,
+    Answered(InviteOutcome),
+    /// It could not be asked; the join tells more.
+    Failed(String),
+}
+
 impl InviteDialog {
-    pub fn new(actions: Actions) -> Rc<Self> {
+    /// The dialog; `at`, a server on this network, takes its invite's
+    /// code typed in as well as a link.
+    pub fn new(actions: Actions, at: Option<Server>) -> Rc<Self> {
         let state = Rc::new(RefCell::new(State::default()));
         let stack = gtk::Stack::builder()
             .transition_type(gtk::StackTransitionType::Crossfade)
@@ -82,10 +171,15 @@ impl InviteDialog {
             .build();
 
         // 1 · The link, and what it says.
-        let lead = paragraph(
-            "Paste the link from your invite: an https://spoolframe.app link or a \
-             spoolframe:// one. Opening the link does the same.",
-        );
+        let lead = paragraph(&match &at {
+            Some(server) => format!(
+                "Type the code from your invite to {}, or paste the whole link.",
+                server.name
+            ),
+            None => "Paste the link from your invite: an https://spoolframe.app link or a \
+                     spoolframe:// one. Opening the link does the same."
+                .to_owned(),
+        });
         let link = gtk::TextView::builder()
             .wrap_mode(gtk::WrapMode::Char)
             .accepts_tab(false)
@@ -109,16 +203,24 @@ impl InviteDialog {
             .valign(gtk::Align::Center)
             .css_classes(["invite-badge", "caption-heading"])
             .build();
+        let summary_outcome = caption();
+        summary_outcome.set_visible(false);
         let summary = summary_card(
             &summary_name,
             &summary_where,
-            &summary_terms,
+            &[&summary_terms, &summary_outcome],
             &summary_account,
         );
         summary.set_visible(false);
         let paste = action("Paste", Some(crate::icons::PASTE), &["secondary"]);
         let proceed = action("Continue", None, &["suggested-action"]);
         proceed.set_sensitive(false);
+        let save_instead = gtk::Button::builder()
+            .label("Save server only")
+            .halign(gtk::Align::Center)
+            .visible(false)
+            .css_classes(["flat"])
+            .build();
         let by_key = gtk::Button::builder()
             .label("Add by its key instead")
             .halign(gtk::Align::Center)
@@ -126,10 +228,18 @@ impl InviteDialog {
             .build();
         let add = page_box();
         add.append(&lead);
-        add.append(&field("Invite link", &link_frame(&link)));
+        add.append(&field(
+            if at.is_some() {
+                "Invite code or link"
+            } else {
+                "Invite link"
+            },
+            &link_frame(&link),
+        ));
         add.append(&link_error);
         add.append(&summary);
         add.append(&pair(&paste, &proceed));
+        add.append(&save_instead);
         add.append(&by_key);
         stack.add_named(&add, Some("add"));
 
@@ -287,12 +397,13 @@ impl InviteDialog {
         stack.add_named(&saved, Some("saved"));
 
         let dialog = adw::Dialog::builder()
-            .title("Add a server")
+            .title(add_title(at.as_ref()))
             .content_width(520)
             .focus_widget(&link)
             .build();
         with_cancel(&dialog, &stack);
 
+        let look_up = actions.look_up.clone();
         let this = Rc::new(Self {
             dialog,
             stack,
@@ -303,7 +414,9 @@ impl InviteDialog {
             summary_where,
             summary_terms,
             summary_account,
+            summary_outcome,
             proceed,
+            save_instead,
             check_who,
             check_code,
             check_site,
@@ -322,6 +435,9 @@ impl InviteDialog {
             save_only,
             saved_title,
             sign_in,
+            at,
+            look_up,
+            debounce: Rc::default(),
             state,
         });
         this.wire(actions, &paste, &by_key, &back, &join_back, &close, &later);
@@ -339,7 +455,9 @@ impl InviteDialog {
         close: &gtk::Button,
         later: &gtk::Button,
     ) {
-        // Each change of the link is read again: reading sends nothing.
+        // Each change of the link is read again: reading sends nothing. A
+        // code typed at the dialog's server is read as the link made from
+        // it, and looked up once the field rests.
         {
             let (weak, read) = (Rc::downgrade(self), actions.read.clone());
             self.link.buffer().connect_changed(move |buffer| {
@@ -348,16 +466,48 @@ impl InviteDialog {
                     .text(&buffer.start_iter(), &buffer.end_iter(), false)
                     .trim()
                     .to_owned();
+                this.debounce.change();
                 this.state.replace(State {
                     link: text.clone(),
                     ..State::default()
                 });
                 this.summary.set_visible(false);
                 this.link_error.set_visible(false);
+                this.save_instead.set_visible(false);
                 this.proceed.set_sensitive(false);
-                if !text.is_empty() {
-                    read(text);
+                if text.is_empty() {
+                    return;
                 }
+                let typed = this.at.as_ref().and_then(|server| {
+                    let code = invites::parse_code(&text).ok()?;
+                    Some((server, code))
+                });
+                match typed {
+                    Some((server, code)) => {
+                        let link = invites::code_link(server, &code);
+                        {
+                            let mut state = this.state.borrow_mut();
+                            state.link = link.clone();
+                            state.typed = true;
+                        }
+                        this.wait_to_look_up(Lookup::Code {
+                            link: link.clone(),
+                            server: server.key.clone(),
+                            addresses: server.addresses.clone(),
+                            code,
+                        });
+                        read(link);
+                    }
+                    None => read(text),
+                }
+            });
+        }
+        {
+            let (weak, save) = (Rc::downgrade(self), actions.save.clone());
+            self.save_instead.connect_clicked(move |button| {
+                let Some(this) = weak.upgrade() else { return };
+                button.set_sensitive(false);
+                save(this.state.borrow().link.clone());
             });
         }
         {
@@ -477,8 +627,9 @@ impl InviteDialog {
     }
 
     /// What the link in the field says, or that it is not an invite.
-    /// An answer for a link no longer in the field is dropped.
-    pub fn read(&self, link: &str, answer: Result<Invite, BackendError>) {
+    /// An answer for a link no longer in the field is dropped. A pasted
+    /// link with a code is looked up once the field rests.
+    pub fn read(self: &Rc<Self>, link: &str, answer: Result<Invite, BackendError>) {
         if self.state.borrow().link != link {
             return;
         }
@@ -492,14 +643,104 @@ impl InviteDialog {
                 self.summary_terms.set_visible(!terms.is_empty());
                 self.summary_account.set_visible(invite.has_code);
                 self.summary.set_visible(true);
-                self.proceed.set_sensitive(true);
+                let typed = self.state.borrow().typed;
+                if invite.has_code && !typed {
+                    self.wait_to_look_up(Lookup::Link(link.to_owned()));
+                }
                 self.state.borrow_mut().invite = Some(invite);
+                self.show_lookup();
             }
             Err(e) => {
-                self.link_error.set_label(&link_refusal(&e));
+                let text = paste_refusal(&e, link, self.at.is_some());
+                self.link_error.set_label(&text);
                 self.link_error.set_visible(true);
             }
         }
+    }
+
+    /// What the server says the field's code is. An answer for a link no
+    /// longer in the field is dropped. A server that cannot say leaves
+    /// the join as it was.
+    pub fn looked_up(&self, link: &str, answer: Result<InviteLookup, BackendError>) {
+        if self.state.borrow().link != link {
+            return;
+        }
+        {
+            let mut state = self.state.borrow_mut();
+            state.looked_up = match answer {
+                Ok(lookup) => {
+                    // The server's terms, in place of the link's hints: a
+                    // typed code has none, and the join form shows them.
+                    if let (
+                        InviteOutcome::Valid {
+                            role, expires_at, ..
+                        },
+                        Some(invite),
+                    ) = (&lookup.outcome, state.invite.as_mut())
+                    {
+                        invite.role = Some(*role);
+                        invite.expires_at = Some(*expires_at);
+                    }
+                    Looked::Answered(lookup.outcome)
+                }
+                Err(BackendError::Unsupported(_)) => Looked::Not,
+                Err(e) => Looked::Failed(crate::app::sentence(&e.to_string())),
+            };
+        }
+        self.show_lookup();
+    }
+
+    /// Looks `lookup` up once the field has rested, unless it changed
+    /// again by then.
+    fn wait_to_look_up(self: &Rc<Self>, lookup: Lookup) {
+        self.state.borrow_mut().looked_up = Looked::Waiting;
+        let (weak, wait) = (Rc::downgrade(self), self.debounce.wait());
+        gtk::glib::timeout_add_local_once(LOOKUP_PAUSE, move || {
+            if let Some(this) = weak.upgrade()
+                && this.debounce.is_current(wait)
+            {
+                (this.look_up)(lookup);
+            }
+        });
+    }
+
+    /// The summary's lookup line and Continue, as the lookup stands.
+    fn show_lookup(&self) {
+        let state = self.state.borrow();
+        if state.invite.is_none() {
+            return;
+        }
+        let (line, joins, refused) = match &state.looked_up {
+            Looked::Not => (None, true, false),
+            Looked::Waiting => (Some("Checking the invite…".to_owned()), false, false),
+            Looked::Answered(outcome) => {
+                let (line, joins) = outcome_line(outcome, SystemTime::now());
+                (Some(line), joins, !joins)
+            }
+            Looked::Failed(why) => (Some(why.clone()), true, false),
+        };
+        self.summary_outcome.set_visible(line.is_some());
+        self.summary_outcome
+            .set_label(line.as_deref().unwrap_or_default());
+        if refused {
+            self.summary_outcome.add_css_class("error");
+        } else {
+            self.summary_outcome.remove_css_class("error");
+        }
+        self.proceed.set_sensitive(joins);
+        // A link the server's admin sent pins its server, so it can still
+        // be saved; a typed code's server was only heard on this network,
+        // and its row connects to it.
+        let saves = refused
+            && !state.typed
+            && matches!(
+                state.looked_up,
+                Looked::Answered(
+                    InviteOutcome::Expired { .. } | InviteOutcome::Used | InviteOutcome::Revoked
+                )
+            );
+        self.save_instead.set_visible(saves);
+        self.save_instead.set_sensitive(true);
     }
 
     /// Who answered for the invite: its fingerprint to check.
@@ -514,12 +755,12 @@ impl InviteDialog {
                 return;
             }
         };
-        let has_code = {
+        let (has_code, typed) = {
             let state = self.state.borrow();
             let invite = state.invite.as_ref();
             self.check_who
                 .set_label(&who_line(&server, invite.map_or(&[][..], |i| &i.relays)));
-            invite.is_some_and(|i| i.has_code)
+            (invite.is_some_and(|i| i.has_code), state.typed)
         };
         self.check_code.set_label(&server.fingerprint);
         match server.passkey_site() {
@@ -529,7 +770,7 @@ impl InviteDialog {
             }
             None => self.check_site.set_visible(false),
         }
-        self.check_how.set_label(&check_text(has_code));
+        self.check_how.set_label(&check_text(has_code, typed));
         self.connect.set_sensitive(true);
         for (name, code) in &self.join_strips {
             name.set_label(&server.name);
@@ -577,8 +818,13 @@ impl InviteDialog {
             }
             Err(e) => {
                 let text = crate::app::sentence(&e.to_string());
+                self.save_instead.set_sensitive(true);
                 match self.stack.visible_child_name().as_deref() {
                     Some("refused") => self.refusal_body.set_label(&text),
+                    Some("add") => {
+                        self.link_error.set_label(&text);
+                        self.link_error.set_visible(true);
+                    }
                     _ => {
                         self.check_how.set_label(&text);
                     }
@@ -593,7 +839,7 @@ impl InviteDialog {
     }
 
     fn show_add(&self) {
-        self.dialog.set_title("Add a server");
+        self.dialog.set_title(add_title(self.at.as_ref()));
         self.stack.set_visible_child_name("add");
     }
 
@@ -636,13 +882,94 @@ const PASSWORD_HINT: &str = "At least 8 characters.";
 const SAVED_BODY: &str = "This invite finds the server but makes no account. Sign in with your \
                           account, or ask an admin for an invite with one.";
 
+/// The dialog's title on its first page.
+fn add_title(at: Option<&Server>) -> &'static str {
+    match at {
+        Some(_) => "Use an invite",
+        None => "Add a server",
+    }
+}
+
 /// Under the link: why it is not an invite.
 fn link_refusal(error: &BackendError) -> String {
     match error {
         BackendError::NotAnInvite => {
             "This isn’t a Spoolframe invite. Copy the whole link and try again.".to_owned()
         }
+        BackendError::NotAnInviteCode => {
+            "That isn’t an invite code. A code is 12 letters and digits, like QW7K-2MFP-XR4T."
+                .to_owned()
+        }
         other => crate::app::sentence(&other.to_string()),
+    }
+}
+
+/// Under the field, for `text` that did not read as a link: opened for a
+/// server, the field takes a code too, so it is neither; else a code
+/// alone, with no server to ask, is told where it goes.
+fn paste_refusal(error: &BackendError, text: &str, takes_codes: bool) -> String {
+    match error {
+        BackendError::NotAnInvite if takes_codes => link_refusal(&BackendError::NotAnInviteCode),
+        BackendError::NotAnInvite if invites::parse_code(text).is_ok() => {
+            "That’s an invite’s code, not its link. Paste the whole link, or choose Use invite on \
+             the server’s row under On this network."
+                .to_owned()
+        }
+        other => link_refusal(other),
+    }
+}
+
+/// What the server says a code is, as the summary says it, and whether
+/// Continue goes on to the join: "Invite from Andrey · consumer account
+/// · expires Oct 14", or why it does not. An outcome this build does not
+/// know may still work, so it may be tried.
+fn outcome_line(outcome: &InviteOutcome, now: SystemTime) -> (String, bool) {
+    match outcome {
+        InviteOutcome::Valid {
+            kind,
+            role,
+            expires_at,
+            inviter,
+        } => {
+            let mut parts = vec![match inviter {
+                Some(name) => format!("Invite from {name}"),
+                None => "A working invite".to_owned(),
+            }];
+            match (kind, role) {
+                (InviteKind::CreateUser, Role::Admin) => parts.push("admin account".to_owned()),
+                (InviteKind::CreateUser, _) => parts.push("consumer account".to_owned()),
+                (InviteKind::PortableAccount, _) => {
+                    parts.push("access for your identity".to_owned())
+                }
+                _ => {}
+            }
+            parts.push(if *expires_at <= now {
+                "expires now".to_owned()
+            } else {
+                format!("expires {}", month_day(*expires_at))
+            });
+            (parts.join(" · "), true)
+        }
+        InviteOutcome::Expired { at } => (
+            format!("This invite expired {}. Ask for a new one.", month_day(*at)),
+            false,
+        ),
+        InviteOutcome::Used => (
+            "This invite has been used. Ask for a new one.".to_owned(),
+            false,
+        ),
+        InviteOutcome::Revoked => (
+            "This invite was revoked. Ask for a new one.".to_owned(),
+            false,
+        ),
+        InviteOutcome::NoMatch => (
+            "No invite has this code. Check it, or ask for a new invite.".to_owned(),
+            false,
+        ),
+        InviteOutcome::Unknown => (
+            "The server didn’t say whether this invite works. You can still try it.".to_owned(),
+            true,
+        ),
     }
 }
 
@@ -750,11 +1077,21 @@ fn who_line(server: &Server, relays: &[String]) -> String {
     }
 }
 
-/// Under the fingerprint: why it can be trusted, and what comes next.
-fn check_text(has_code: bool) -> String {
-    let mut text = "The invite names this key, so Spoolframe connects to nothing else. To be \
-                    sure, ask whoever invited you to read the code from their server."
-        .to_owned();
+/// Under the fingerprint: why it can be trusted, and what comes next. A
+/// code typed in names no key: the server was heard on this network.
+fn check_text(has_code: bool, typed: bool) -> String {
+    let mut text = match typed {
+        true => {
+            "This server was found on this network, and your code names no key. Ask \
+                 whoever invited you to read the code from their server, to be sure it is \
+                 theirs."
+        }
+        false => {
+            "The invite names this key, so Spoolframe connects to nothing else. To be \
+                  sure, ask whoever invited you to read the code from their server."
+        }
+    }
+    .to_owned();
     if has_code {
         text.push_str(" Then you choose a username and password.");
     }
@@ -854,7 +1191,7 @@ fn server_strip() -> (gtk::Box, gtk::Label, gtk::Label) {
 fn summary_card(
     name: &gtk::Label,
     place: &gtk::Label,
-    terms: &gtk::Label,
+    terms: &[&gtk::Label],
     account: &gtk::Label,
 ) -> gtk::Box {
     let card = gtk::Box::builder()
@@ -877,7 +1214,9 @@ fn summary_card(
         .build();
     lines.append(name);
     lines.append(place);
-    lines.append(terms);
+    for line in terms {
+        lines.append(*line);
+    }
     card.append(&lines);
     card.append(account);
     card
@@ -897,7 +1236,9 @@ fn hinted(label: &str, entry: &impl IsA<gtk::Widget>, error: &gtk::Label, hint: 
 mod tests {
     use super::*;
     use spoolframe_linux_core::backend::{Client, ServerKey};
-    use spoolframe_linux_core::fake::{EXPIRED_INVITE_CODE, FakeClient, INVITE_CODE};
+    use spoolframe_linux_core::fake::{
+        EXPIRED_INVITE_CODE, FakeClient, INVITE_CODE, REVOKED_INVITE_CODE,
+    };
     use std::time::Duration;
 
     fn invite(has_code: bool) -> Invite {
@@ -929,15 +1270,146 @@ mod tests {
     fn a_link_without_a_code_promises_no_account() {
         let (_, _, terms) = summary_lines(&invite(false), SystemTime::now());
         assert_eq!(terms, "");
-        assert!(!check_text(false).contains("username"));
-        assert!(check_text(true).ends_with("Then you choose a username and password."));
+        assert!(!check_text(false, false).contains("username"));
+        assert!(check_text(true, false).ends_with("Then you choose a username and password."));
+    }
+
+    #[test]
+    fn a_typed_code_does_not_claim_to_name_the_key() {
+        assert!(check_text(true, true).starts_with("This server was found on this network"));
     }
 
     #[test]
     fn a_paste_that_is_not_an_invite_says_so() {
         assert_eq!(
-            link_refusal(&BackendError::NotAnInvite),
+            paste_refusal(&BackendError::NotAnInvite, "hello", false),
             "This isn’t a Spoolframe invite. Copy the whole link and try again."
+        );
+    }
+
+    #[test]
+    fn opened_for_a_server_text_that_is_neither_says_it_is_not_a_code() {
+        assert_eq!(
+            paste_refusal(&BackendError::NotAnInvite, "hello", true),
+            "That isn’t an invite code. A code is 12 letters and digits, like QW7K-2MFP-XR4T."
+        );
+    }
+
+    #[test]
+    fn the_sdks_not_an_invite_code_says_what_a_code_is() {
+        assert_eq!(
+            link_refusal(&BackendError::NotAnInviteCode),
+            "That isn’t an invite code. A code is 12 letters and digits, like QW7K-2MFP-XR4T."
+        );
+    }
+
+    #[test]
+    fn a_code_pasted_with_no_server_to_ask_is_told_where_it_goes() {
+        assert!(
+            paste_refusal(&BackendError::NotAnInvite, "qw7k-2mfp-xr4t", false)
+                .starts_with("That’s an invite’s code, not its link.")
+        );
+    }
+
+    fn valid(inviter: Option<&str>, kind: InviteKind, role: Role) -> InviteOutcome {
+        InviteOutcome::Valid {
+            kind,
+            role,
+            expires_at: SystemTime::now() + Duration::from_secs(6 * 24 * 3600),
+            inviter: inviter.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_working_invite_says_whom_from_what_it_makes_and_until_when() {
+        let (line, joins) = outcome_line(
+            &valid(Some("Andrey"), InviteKind::CreateUser, Role::Consumer),
+            SystemTime::now(),
+        );
+        assert!(
+            line.starts_with("Invite from Andrey · consumer account · expires "),
+            "{line}"
+        );
+        assert!(joins);
+    }
+
+    #[test]
+    fn a_working_invite_with_no_inviter_says_what_it_makes() {
+        let (line, _) = outcome_line(
+            &valid(None, InviteKind::PortableAccount, Role::Consumer),
+            SystemTime::now(),
+        );
+        assert!(
+            line.starts_with("A working invite · access for your identity · expires "),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn an_admins_invite_says_so() {
+        let (line, _) = outcome_line(
+            &valid(Some("Andrey"), InviteKind::CreateUser, Role::Admin),
+            SystemTime::now(),
+        );
+        assert!(line.contains(" · admin account · "), "{line}");
+    }
+
+    #[test]
+    fn a_code_that_no_longer_works_does_not_join() {
+        let joins: Vec<bool> = [
+            InviteOutcome::Expired {
+                at: SystemTime::now() - Duration::from_secs(3600),
+            },
+            InviteOutcome::Used,
+            InviteOutcome::Revoked,
+            InviteOutcome::NoMatch,
+        ]
+        .iter()
+        .map(|o| outcome_line(o, SystemTime::now()).1)
+        .collect();
+        assert_eq!(joins, [false, false, false, false]);
+    }
+
+    #[test]
+    fn each_refusal_has_its_own_words() {
+        let lines: Vec<String> = [
+            InviteOutcome::Used,
+            InviteOutcome::Revoked,
+            InviteOutcome::NoMatch,
+        ]
+        .iter()
+        .map(|o| outcome_line(o, SystemTime::now()).0)
+        .collect();
+        assert_eq!(
+            lines,
+            [
+                "This invite has been used. Ask for a new one.",
+                "This invite was revoked. Ask for a new one.",
+                "No invite has this code. Check it, or ask for a new invite."
+            ]
+        );
+    }
+
+    #[test]
+    fn an_outcome_this_build_does_not_know_may_still_be_tried() {
+        assert_eq!(
+            outcome_line(&InviteOutcome::Unknown, SystemTime::now()),
+            (
+                "The server didn’t say whether this invite works. You can still try it.".to_owned(),
+                true
+            )
+        );
+    }
+
+    #[test]
+    fn a_change_makes_the_wait_before_it_stale() {
+        let debounce = Debounce::default();
+        let first = debounce.wait();
+        debounce.change();
+        let second = debounce.wait();
+        assert_eq!(
+            (debounce.is_current(first), debounce.is_current(second)),
+            (false, true)
         );
     }
 
@@ -966,26 +1438,35 @@ mod tests {
     struct Asked(RefCell<Vec<String>>);
 
     fn dialog(asked: &Rc<Asked>) -> Rc<InviteDialog> {
+        dialog_at(asked, None)
+    }
+
+    fn dialog_at(asked: &Rc<Asked>, at: Option<Server>) -> Rc<InviteDialog> {
         let note = |asked: &Rc<Asked>, what: &'static str| {
             let asked = asked.clone();
             move || asked.0.borrow_mut().push(what.to_owned())
         };
-        let (read, connect, save, join, sign_in, by_key) = (
+        let (read, look_up, connect, save, join, sign_in, by_key) = (
             note(asked, "read"),
+            note(asked, "look up"),
             note(asked, "connect"),
             note(asked, "save"),
             note(asked, "join"),
             note(asked, "sign in"),
             note(asked, "by key"),
         );
-        InviteDialog::new(Actions {
-            read: Rc::new(move |_| read()),
-            connect: Rc::new(move |_| connect()),
-            save: Rc::new(move |_| save()),
-            join: Rc::new(move |_, _, _, _| join()),
-            sign_in: Rc::new(move |_| sign_in()),
-            by_key: Rc::new(by_key),
-        })
+        InviteDialog::new(
+            Actions {
+                read: Rc::new(move |_| read()),
+                look_up: Rc::new(move |_| look_up()),
+                connect: Rc::new(move |_| connect()),
+                save: Rc::new(move |_| save()),
+                join: Rc::new(move |_, _, _, _| join()),
+                sign_in: Rc::new(move |_| sign_in()),
+                by_key: Rc::new(by_key),
+            },
+            at,
+        )
     }
 
     fn ready<T>(future: impl std::future::Future<Output = T>) -> T {
@@ -1017,6 +1498,22 @@ mod tests {
         dialog.read(&link, ready(client.read_invite(&link)));
         assert!(dialog.summary.is_visible() && dialog.summary_account.is_visible());
         assert_eq!(dialog.summary_name.label(), "Cabin");
+        // Continue waits for the server to say what the code is.
+        assert_eq!(
+            (
+                dialog.summary_outcome.label().as_str(),
+                dialog.proceed.is_sensitive()
+            ),
+            ("Checking the invite…", false)
+        );
+        dialog.looked_up(&link, ready(client.look_up_invite(&link)));
+        assert!(
+            dialog
+                .summary_outcome
+                .label()
+                .starts_with("Invite from Andrey · consumer account · expires ")
+        );
+        assert!(dialog.proceed.is_sensitive());
         dialog.proceed.emit_clicked();
         dialog.connected(ready(client.connect_invite(&link)));
         assert_eq!(dialog.page(), "check");
@@ -1047,8 +1544,70 @@ mod tests {
         assert_eq!(dialog.dialog.title(), "Cabin added");
         dialog.sign_in.emit_clicked();
         assert_eq!(
-            *asked.0.borrow(),
+            without_lookups(&asked),
             ["read", "read", "connect", "save", "sign in"]
+        );
+    }
+
+    /// What was asked, but the lookups, which go when the field has
+    /// rested, whenever the main loop runs.
+    fn without_lookups(asked: &Asked) -> Vec<String> {
+        let asked = asked.0.borrow();
+        asked.iter().filter(|a| *a != "look up").cloned().collect()
+    }
+
+    /// Opened for a server on this network: a code typed in is looked
+    /// up there, a revoked one stops the join with no Save server only,
+    /// and text that cannot be a code says so.
+    #[test]
+    #[ignore = "needs a display; run on its own"]
+    fn a_code_typed_at_a_server_is_looked_up_before_joining() {
+        gtk::init().unwrap();
+        adw::init().unwrap();
+        let client = FakeClient::new(None).with_cabin_nearby();
+        let cabin = ready(client.servers())
+            .unwrap()
+            .into_iter()
+            .find(|s| s.name == "Cabin")
+            .unwrap();
+        let asked = Rc::new(Asked::default());
+        let dialog = dialog_at(&asked, Some(cabin.clone()));
+        assert_eq!(dialog.dialog.title(), "Use an invite");
+
+        let look = |typed: &str| {
+            dialog.set_link(typed);
+            let link = dialog.state.borrow().link.clone();
+            dialog.read(&link, ready(client.read_invite(&link)));
+            dialog.looked_up(
+                &link,
+                ready(client.look_up_invite_code(&cabin.key, &cabin.addresses, typed)),
+            );
+        };
+        look("qw7k-2mfp-xr4t");
+        assert_eq!(dialog.summary_name.label(), "Cabin");
+        assert!(
+            dialog
+                .summary_outcome
+                .label()
+                .starts_with("Invite from Andrey")
+        );
+        assert!(dialog.proceed.is_sensitive());
+
+        look(REVOKED_INVITE_CODE);
+        assert_eq!(
+            (
+                dialog.summary_outcome.label().as_str(),
+                dialog.proceed.is_sensitive(),
+                dialog.save_instead.is_visible()
+            ),
+            ("This invite was revoked. Ask for a new one.", false, false)
+        );
+
+        dialog.set_link("hello");
+        dialog.read("hello", ready(client.read_invite("hello")));
+        assert_eq!(
+            dialog.link_error.label(),
+            "That isn’t an invite code. A code is 12 letters and digits, like QW7K-2MFP-XR4T."
         );
     }
 }

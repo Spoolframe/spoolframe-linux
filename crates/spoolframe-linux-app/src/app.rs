@@ -5,6 +5,7 @@
 //! stack's root is the page the sidebar picks; a card pushes its item's page
 //! on top, with a Back button and swipe-back.
 
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,10 +14,11 @@ use adw::prelude::*;
 use gtk::glib;
 use relm4::{Component, ComponentParts, ComponentSender};
 use spoolframe_linux_core::backend::{
-    BackendError, ChosenTracks, Client, ConnectionState, EntryId, HomeScreen, Invite, ItemDetail,
-    Kinds, Liked, Person, PlaySettings, PlaylistEdit, PlaylistEvent, PlaylistList, PlaylistNext,
-    PlaylistPage, PlaylistRef, PlaylistSummary, PlaylistUpdate, Profile, ProfileSignIn,
-    SearchScope, Selection, Server, ServerKey, Session, TrackPreferencesInfo, Visibility,
+    BackendError, ChosenTracks, Client, ConnectionState, EntryId, HomeScreen, Invite, InviteLookup,
+    ItemDetail, Kinds, LanServerInfo, Liked, Person, PlaySettings, PlaylistEdit, PlaylistEvent,
+    PlaylistList, PlaylistNext, PlaylistPage, PlaylistRef, PlaylistSummary, PlaylistUpdate,
+    Profile, ProfileSignIn, SearchScope, Selection, Server, ServerKey, Session,
+    TrackPreferencesInfo, Visibility,
 };
 use spoolframe_linux_core::backend::{
     DownloadEvent, DownloadOptionsInfo, DownloadSource, DownloadSpace, DownloadTracks,
@@ -162,6 +164,11 @@ pub struct App {
     /// heard only on a later listing; it is opened once, not on every
     /// change after.
     opened_last_server: bool,
+    /// What each server heard on this network said of itself (its name,
+    /// release, and whether it is invite only), for its row; and every
+    /// one asked, answered or not, so each is asked once a run.
+    lan_info: HashMap<ServerKey, LanServerInfo>,
+    lan_asked: HashSet<ServerKey>,
     /// The saved server the last try could not reach, and what this device
     /// knows of reaching it: Choose a server's banner.
     unreachable: Option<(Server, spoolframe_linux_core::backend::Reachability)>,
@@ -377,6 +384,11 @@ pub enum Msg {
     /// "Add a server": from an invite link (P6-01), pasted, or opened
     /// from the desktop when given one.
     OpenAddServer(Option<String>),
+    /// "Use invite" on a server on this network: its invite's code, typed
+    /// in, or a link.
+    UseInviteAt(Server),
+    /// Ask a server what an invite's code is, before joining.
+    LookUpInvite(crate::invite::Lookup),
     /// The way without an invite: a server's key and an address.
     OpenAddServerByKey,
     AddServer(String, String),
@@ -595,6 +607,10 @@ pub enum Loaded {
     ServerAdded(Result<Server, BackendError>),
     /// What a pasted link says, for the link it was read from (P6-01).
     InviteRead(String, Result<Invite, BackendError>),
+    /// What an invite's code is, for the link it was looked up by.
+    InviteLookedUp(String, Result<InviteLookup, BackendError>),
+    /// What a server on this network said of itself.
+    LanServerInfo(ServerKey, Result<LanServerInfo, BackendError>),
     /// Who answered for an invite.
     InviteConnected(Result<Server, BackendError>),
     /// The server an invite names, saved.
@@ -1198,6 +1214,8 @@ impl Component for App {
             library_cache: None,
             library: None,
             opened_last_server: false,
+            lan_info: HashMap::new(),
+            lan_asked: HashSet::new(),
             unreachable: None,
             starting: true,
             needs_sign_in: None,
@@ -1399,11 +1417,17 @@ impl Component for App {
                 });
             }
             Msg::OpenAddServer(link) => {
-                let dialog = crate::invite::InviteDialog::new(invite_actions(&sender));
+                let dialog = crate::invite::InviteDialog::new(invite_actions(&sender), None);
                 dialog.dialog.present(Some(root));
                 if let Some(link) = link {
                     dialog.set_link(&link);
                 }
+                widgets.invite = Some(dialog);
+            }
+            Msg::UseInviteAt(server) => {
+                let dialog =
+                    crate::invite::InviteDialog::new(invite_actions(&sender), Some(server));
+                dialog.dialog.present(Some(root));
                 widgets.invite = Some(dialog);
             }
             Msg::ReadInvite(link) => {
@@ -1411,6 +1435,21 @@ impl Component for App {
                 self.command(&sender, async move {
                     let read = client.read_invite(&link).await;
                     Loaded::InviteRead(link, read)
+                });
+            }
+            Msg::LookUpInvite(lookup) => {
+                let client = self.client.clone();
+                self.command(&sender, async move {
+                    let looked = match &lookup {
+                        crate::invite::Lookup::Link(link) => client.look_up_invite(link).await,
+                        crate::invite::Lookup::Code {
+                            server,
+                            addresses,
+                            code,
+                            ..
+                        } => client.look_up_invite_code(server, addresses, code).await,
+                    };
+                    Loaded::InviteLookedUp(lookup.link().to_owned(), looked)
                 });
             }
             Msg::ConnectInvite(link) => {
@@ -2664,6 +2703,21 @@ impl Component for App {
                     self.opened_last_server = true;
                     self.load_profiles(server.clone(), &sender);
                 }
+                // What each server newly heard on this network says of
+                // itself: one connect each, with only Hello sent.
+                for server in servers.iter().filter(|s| s.on_network) {
+                    if self.lan_asked.insert(server.key.clone()) {
+                        let (client, key) = (self.client.clone(), server.key.clone());
+                        self.command(&sender, async move {
+                            let info = client.lan_server_info(&key).await;
+                            Loaded::LanServerInfo(key, info)
+                        });
+                    }
+                }
+                let use_invite: start::Choose<Server> = {
+                    let sender = sender.clone();
+                    Rc::new(move |s| sender.input(Msg::UseInviteAt(s)))
+                };
                 let choose: start::Choose<Server> = {
                     let sender = sender.clone();
                     Rc::new(move |s| sender.input(Msg::ChooseServer(s)))
@@ -2706,8 +2760,11 @@ impl Component for App {
                 });
                 widgets.servers.set_child(Some(&start::servers(
                     &servers,
-                    &choose,
-                    &verify,
+                    (&choose, &verify),
+                    start::Nearby {
+                        info: &self.lan_info,
+                        use_invite: &use_invite,
+                    },
                     &add,
                     (self.settings.use_relays(), &set_relays),
                     unreachable.as_ref(),
@@ -2734,6 +2791,20 @@ impl Component for App {
                 if let Some(dialog) = &widgets.invite {
                     dialog.read(&link, read);
                 }
+            }
+            Loaded::InviteLookedUp(link, looked) => {
+                if let Some(dialog) = &widgets.invite {
+                    dialog.looked_up(&link, looked);
+                }
+            }
+            // Its row is drawn again with what it said; one that did not
+            // answer keeps what the network heard.
+            Loaded::LanServerInfo(key, Ok(info)) => {
+                self.lan_info.insert(key, info);
+                self.load_servers(&sender);
+            }
+            Loaded::LanServerInfo(key, Err(e)) => {
+                tracing::debug!(server = %key.short(), error = %e, "no Hello from a server on this network");
             }
             // A key claiming a saved server's id: the identity alert, as
             // for any connect.
@@ -5872,8 +5943,13 @@ fn invite_actions(sender: &ComponentSender<App>) -> crate::invite::Actions {
         let sender = sender.clone();
         Rc::new(move || sender.input(Msg::OpenAddServerByKey))
     };
+    let look_up: Rc<dyn Fn(crate::invite::Lookup)> = {
+        let sender = sender.clone();
+        Rc::new(move |lookup| sender.input(Msg::LookUpInvite(lookup)))
+    };
     crate::invite::Actions {
         read: send(Msg::ReadInvite),
+        look_up,
         connect: send(Msg::ConnectInvite),
         save: send(Msg::SaveInviteServer),
         join,
@@ -6191,7 +6267,7 @@ mod tests {
             subtitle_search: true,
             downloads: true,
             music_downloads: false,
-            invite_lookup: false,
+            invite_lookup: true,
         };
 
     fn nothing_shown() -> Shown<'static> {

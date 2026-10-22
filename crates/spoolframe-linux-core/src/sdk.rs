@@ -41,7 +41,10 @@ use crate::backend::{
     FinishPasskeyRegistration, FinishPasskeySignIn, PasskeyCreation, PasskeyInfo, PasskeyRequest,
     TrackPreferencesInfo, Trust, TrustedProfile,
 };
-use crate::backend::{InviteKind, InviteOrigin, InviteSpec, InviteSummary, MintedInvite};
+use crate::backend::{
+    InviteKind, InviteLookup, InviteOrigin, InviteOutcome, InviteSpec, InviteSummary,
+    LanServerInfo, MintedInvite,
+};
 use crate::backend::{SubtitleDownloaded, SubtitleSearch, SubtitleTiming};
 use crate::storage::Storage;
 
@@ -51,6 +54,35 @@ fn invite_kind(kind: sdk::InviteKind) -> InviteKind {
         sdk::InviteKind::PortableAccount => InviteKind::PortableAccount,
         sdk::InviteKind::Federation => InviteKind::Federation,
         _ => InviteKind::Unknown,
+    }
+}
+
+/// The SDK's invite looked up, in the UI's types.
+fn invite_lookup(lookup: sdk::InviteLookup) -> InviteLookup {
+    InviteLookup {
+        server: server(lookup.server),
+        outcome: invite_outcome(lookup.outcome),
+    }
+}
+
+fn invite_outcome(outcome: sdk::InviteOutcome) -> InviteOutcome {
+    match outcome {
+        sdk::InviteOutcome::Valid {
+            kind,
+            role,
+            expires_at,
+            inviter,
+        } => InviteOutcome::Valid {
+            kind: invite_kind(kind),
+            role,
+            expires_at,
+            inviter,
+        },
+        sdk::InviteOutcome::Expired { at } => InviteOutcome::Expired { at },
+        sdk::InviteOutcome::Used => InviteOutcome::Used,
+        sdk::InviteOutcome::Revoked => InviteOutcome::Revoked,
+        sdk::InviteOutcome::NoMatch => InviteOutcome::NoMatch,
+        sdk::InviteOutcome::Unknown => InviteOutcome::Unknown,
     }
 }
 
@@ -170,6 +202,7 @@ pub fn backend_error(error: sdk::SdkError) -> BackendError {
         E::LastSignInMethod => BackendError::LastSignInMethod,
         E::UpdateRequired { server_protocol } => BackendError::UpdateRequired { server_protocol },
         E::NotAnInvite => BackendError::NotAnInvite,
+        E::NotAnInviteCode => BackendError::NotAnInviteCode,
         E::InviteInvalid => BackendError::InviteInvalid,
         E::InviteExpired => BackendError::InviteExpired,
         E::InviteExhausted => BackendError::InviteExhausted,
@@ -519,6 +552,62 @@ impl Client for SdkClient {
             )
             .await
             .map(server)
+        })
+    }
+
+    fn look_up_invite<'a>(
+        &'a self,
+        link: &'a str,
+    ) -> BoxFuture<'a, Result<InviteLookup, BackendError>> {
+        Box::pin(async move {
+            let (client, link) = (self.client.clone(), link.to_owned());
+            on_runtime(
+                &self.handle,
+                async move { client.look_up_invite(&link).await },
+            )
+            .await
+            .map(invite_lookup)
+        })
+    }
+
+    fn look_up_invite_code<'a>(
+        &'a self,
+        key: &'a ServerKey,
+        addresses: &'a [String],
+        typed: &'a str,
+    ) -> BoxFuture<'a, Result<InviteLookup, BackendError>> {
+        Box::pin(async move {
+            let (client, id, typed) = (self.client.clone(), key.0.clone(), typed.to_owned());
+            // Hints only: one that is not an address is left out, as the
+            // SDK leaves out a link's.
+            let addrs = addresses.iter().filter_map(|a| a.parse().ok()).collect();
+            on_runtime(&self.handle, async move {
+                client.look_up_invite_code(&id, addrs, &typed).await
+            })
+            .await
+            .map(invite_lookup)
+        })
+    }
+
+    fn lan_server_info<'a>(
+        &'a self,
+        key: &'a ServerKey,
+    ) -> BoxFuture<'a, Result<LanServerInfo, BackendError>> {
+        Box::pin(async move {
+            let (client, id) = (self.client.clone(), key.0.clone());
+            let info = on_runtime(
+                &self.handle,
+                async move { client.lan_server_info(&id).await },
+            )
+            .await?;
+            Ok(LanServerInfo {
+                key: ServerKey(info.endpoint_id),
+                name: info.name,
+                fingerprint: info.fingerprint,
+                server_version: info.server_version,
+                protocol_version: info.protocol_version,
+                invite_only: info.invite_only,
+            })
         })
     }
 
@@ -2285,6 +2374,10 @@ mod tests {
     fn invite_refusals_keep_their_kind() {
         for (sdk, backend) in [
             (sdk::SdkError::NotAnInvite, BackendError::NotAnInvite),
+            (
+                sdk::SdkError::NotAnInviteCode,
+                BackendError::NotAnInviteCode,
+            ),
             (sdk::SdkError::InviteInvalid, BackendError::InviteInvalid),
             (sdk::SdkError::InviteExpired, BackendError::InviteExpired),
             (
