@@ -4,6 +4,9 @@ members = [
     "crates/spoolframe-linux-core",
     "crates/spoolframe-linux-app",
 ]
+# The patched webauthn crates (vendor/VENDORED.md) are path dependencies,
+# not members: cargo fmt, clippy and test leave them as upstream wrote them.
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.6.1"
@@ -86,6 +89,12 @@ glib-build-tools = "0.22"
 # for that and for its phone (caBLE) support; see the passkey commits.
 # `cable`, the phone flow, brings OpenSSL back: its websocket uses
 # tokio-tungstenite with native-tls, which the crate fixes (accepted).
+# No `rsa` (default-features = false): the crates come patched from vendor/
+# ([patch.crates-io] below), so the rsa crate (RUSTSEC-2023-0071, no fixed
+# release) is not built at all. The client never needs RSA: it checks no
+# key's signature or attestation, it passes them to the server, which
+# verifies them; an RS256 passkey still works. Only the library's own
+# RS256 checks, which the client does not call, now fail as unsupported.
 webauthn-authenticator-rs = { version = "=0.6.1-dev", default-features = false, features = ["usb", "cable"] }
 webauthn-rs-proto = "=0.6.1-dev"
 # Reads the passkey's id out of a key's attestation object: the library
@@ -126,3 +135,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Error handling
 thiserror = "2"
 anyhow = "1"
+
+# The webauthn-rs crates with rsa made optional, from vendor/ (VENDORED.md
+# there says what changed). Same versions as crates.io, so the pinned
+# =0.6.1-dev resolves to them. Drop the four when crypto-glue and
+# webauthn-rs release an optional rsa.
+[patch.crates-io]
+crypto-glue = { path = "vendor/crypto-glue" }
+webauthn-attestation-ca = { path = "vendor/webauthn-attestation-ca" }
+webauthn-authenticator-rs = { path = "vendor/webauthn-authenticator-rs" }
+webauthn-rs-core = { path = "vendor/webauthn-rs-core" }

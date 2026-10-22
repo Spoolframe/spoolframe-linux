@@ -3,8 +3,6 @@
 # two lists the same.
 [advisories]
 ignore = [
-  # rsa: through webauthn-authenticator-rs; no RSA private-key operation.
-  "RUSTSEC-2023-0071",
   # paste: unmaintained build-time proc-macro; none of it runs.
   "RUSTSEC-2024-0436",
   # zvariant, zbus_names, zvariant_derive: unmaintained, merged into zbus

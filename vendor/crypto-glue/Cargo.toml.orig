@@ -1,0 +1,80 @@
+[package]
+name = "crypto-glue"
+description = "A facade over the RustCrypto ecosystem"
+version = "0.1.15"
+edition = "2021"
+license = "MPL-2.0"
+homepage = "https://github.com/kanidm/crypto-glue/"
+repository = "https://github.com/kanidm/crypto-glue/"
+authors = ["William Brown <william@blackhats.net.au>"]
+
+[features]
+default = [ "alloc", "rsa" ]
+alloc = [ "argon2/alloc" ]
+# RSA keys and RS256 signatures. Off, rsa (RUSTSEC-2023-0071) is not built
+# and RSA signatures fail as an unimplemented algorithm.
+rsa = [ "dep:rsa" ]
+
+[profile.dev.package.num-bigint-dig]
+opt-level = 3
+
+[dependencies]
+aes = "0.8.1"
+aes-gcm = "0.10.3"
+aes-kw = "0.2.1"
+argon2 = { version = "0.5.2" }
+base64 = { version = "^0.22.1" }
+cbc = "0.1.2"
+cipher = { version = "0.4", features = ["block-padding", "alloc"] }
+crypto-common = { version = "=0.1", features = ["rand_core"] }
+der = "0.7.9"
+# dhkem = "0.0.1-alpha"
+ecdsa = "0.16"
+elliptic-curve = { version = "0.13", features = ["arithmetic", "sec1"] }
+spki = "0.7.3"
+hex = "0.4.3"
+hkdf = "0.12.4"
+hmac = "0.12"
+
+p256 = { version = "0.13", features = ["ecdh", "pem"] }
+p384 = "0.13"
+p521 = "0.13"
+pbkdf2 = "0.12"
+pkcs8 = { version = "0.10.2", features = ["encryption"] }
+rand = "0.8.4"
+rsa = { version = "0.9.10", features = ["sha2", "pem"], optional = true }
+
+sec1 = "0.7.3"
+
+x509-cert = { version = "0.2", features = ["builder", "hazmat"] }
+const-oid = "0.9"
+
+serde = "^1.0.228"
+sha1 = "0.10"
+sha2 = "0.10"
+subtle = "^2.6.1"
+tracing = "^0.1.37"
+
+## WARNING - 0.14.8 and above introduces a deprecation warning to ALL functions in generic-array.
+##           We can't really do much about it until the rustCrypto ecosystem either upgrades to
+##           1.x, or they complete their move to their "hybrid-array" crate.
+generic-array = { version = "=0.14.7", features = ["serde", "zeroize"] }
+hybrid-array = { version = "0.4", features = ["serde", "zeroize"] }
+zeroize = { version = "1.6.0", features = ["serde"] }
+
+uuid = { version = "1", features = ["v4"] }
+
+# concat-kdf = { git = "https://github.com/RustCrypto/KDFs.git", rev = "b1d7fe67b3053deef498563adcf415ec631d1cd8" }
+# concat-kdf = "0.2.0-pre"
+
+kbkdf = { version = "0.1.0-rc.1" }
+hmac-pre = { package = "hmac", version = "0.13.0-rc.5", default-features = false }
+sha2-pre = { package = "sha2", version = "0.11.0-rc.5", default-features = false }
+digest-pre = { package = "digest", version = "0.11.0-rc.11", default-features = false, features = ["mac"] }
+crypto-common-pre = { package = "crypto-common", version = "0.2.0-rc.15", features = ["rand_core"] }
+
+[dev-dependencies]
+rustls = { version = "0.23", default-features = false, features = ["custom-provider", "std"] }
+rustls-rustcrypto = "0.0.2-alpha"
+tracing-subscriber = "^0.3.20"
+

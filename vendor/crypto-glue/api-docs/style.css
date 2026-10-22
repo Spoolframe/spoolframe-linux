@@ -1,0 +1,19 @@
+#dev-header {
+    background-color: var(--code-block-background-color);
+    color: var(--main-color);
+    z-index: 400;
+    position: absolute;
+    left: 0;
+    top: 0;
+    right: 0;
+    height: 45px;
+    padding-top: 10px;
+    padding-bottom: 10px;
+    text-align: center;
+    font-family: sans-serif;
+    box-shadow: 0 0 5px 0 var(--kbd-box-shadow-color);
+}
+
+body {
+    padding-top: 45px !important;
+}

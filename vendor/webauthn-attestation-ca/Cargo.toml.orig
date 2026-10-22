@@ -1,0 +1,22 @@
+[package]
+name = "webauthn-attestation-ca"
+readme = "README.md"
+description = "Webauthn Attestation CA Descriptions"
+
+version = { workspace = true }
+authors = { workspace = true }
+rust-version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+homepage = { workspace = true }
+repository = { workspace = true }
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+serde.workspace = true
+serde_with.workspace = true
+tracing.workspace = true
+uuid = { workspace = true, features = ["serde"] }
+# No rsa: these are certificates, nothing here verifies with them.
+crypto-glue = { workspace = true, default-features = false, features = ["alloc"] }

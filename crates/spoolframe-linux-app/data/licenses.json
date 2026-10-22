@@ -3640,19 +3640,6 @@
 "Apache-2.0": 6,
 "MIT": 1
 },
-"version": "0.8.6"
-},
-{
-"copyright": [
-"Copyright (c) 2014 The Rust Project Developers"
-],
-"group": "app",
-"license": "MIT OR Apache-2.0",
-"name": "num-bigint-dig",
-"texts": {
-"Apache-2.0": 6,
-"MIT": 1
-},
 "version": "0.9.1"
 },
 {
@@ -4105,19 +4092,6 @@
 "copyright": [
 "Copyright (c) 2021-2023 The RustCrypto Project Developers"
 ],
-"group": "app",
-"license": "Apache-2.0 OR MIT",
-"name": "pkcs1",
-"texts": {
-"Apache-2.0": 2,
-"MIT": 1
-},
-"version": "0.7.5"
-},
-{
-"copyright": [
-"Copyright (c) 2021-2023 The RustCrypto Project Developers"
-],
 "group": "sdk",
 "license": "Apache-2.0 OR MIT",
 "name": "pkcs5",
@@ -4538,19 +4512,6 @@
 "MIT": 1
 },
 "version": "0.4.0"
-},
-{
-"copyright": [
-"Copyright (c) RustCrypto Developers, dignifiedquire"
-],
-"group": "app",
-"license": "MIT OR Apache-2.0",
-"name": "rsa",
-"texts": {
-"Apache-2.0": 6,
-"MIT": 1
-},
-"version": "0.9.10"
 },
 {
 "copyright": [

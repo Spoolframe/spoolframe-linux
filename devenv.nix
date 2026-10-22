@@ -175,9 +175,11 @@ in {
       # Registry sources are left out by any path: kache remaps cargo's home
       # to /kache/.cargo, which llvm-cov's own filter (the real home) misses,
       # and genhtml then fails on macro code from crates it cannot find.
+      # vendor/ (the patched webauthn crates) is left out the same way: it
+      # is upstream's code, not the client's.
       "ci:test" = {
         description = "Tests with nextest under llvm-cov (JUnit + lcov)";
-        exec = "cargo llvm-cov nextest --locked --workspace --profile ci --no-tests=warn --ignore-filename-regex '/\\.cargo/(registry|git)/' --lcov --output-path target/lcov.info";
+        exec = "cargo llvm-cov nextest --locked --workspace --profile ci --no-tests=warn --ignore-filename-regex '/\\.cargo/(registry|git)/|/vendor/' --lcov --output-path target/lcov.info";
       };
       # Daily, in .forgejo/workflows/audit.yaml. cargo audit reads
       # .cargo/audit.toml: deny.toml's accepted advisories, and warnings
