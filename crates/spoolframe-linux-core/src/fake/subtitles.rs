@@ -255,6 +255,8 @@ impl Store {
                 downloads: 412,
                 rating: Some(60),
                 origin: SubtitleOrigin::MachineTranslated,
+                // Signs and foreign lines only, as OpenSubtitles marks it.
+                forced: true,
                 ..result("opensubtitles:1002", format!("{dotted}.1080p.WEB-DL"))
             },
             SubtitleResult {

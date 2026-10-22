@@ -39,6 +39,10 @@
   server; a server without them shows nothing new. On an item's page, a
   playlist shared with you says whose it is ("Alice’s"), as its card
   does, where the server names the owner.
+- Settings › Playback › Subtitles gets Forced subtitles (no preference,
+  prefer, avoid, only) for subtitle search results, and Only SDH beside
+  the other SDH choices; both are kept on the server with the rest. A
+  forced result in a subtitle search says "Forced" on its line.
 - Add a server looks an invite's code up before you join, on a server
   that can say: "Invite from Andrey · consumer account · expires Oct
   14", or that it expired, was used or revoked, or matches no invite,

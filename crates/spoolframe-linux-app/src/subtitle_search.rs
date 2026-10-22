@@ -45,7 +45,9 @@ pub fn thousands(n: u64) -> String {
 }
 
 /// What a result's second line says: its language and site, then what
-/// marks it (hearing impaired, who made it), its rating and downloads.
+/// marks it (hearing impaired, forced, who made it), its rating and
+/// downloads. Forced is only the parts in another language; a site that
+/// does not say (SubDL), or a server before 0.14.4, says nothing.
 pub fn result_line(result: &SubtitleResult) -> String {
     let mut parts = vec![
         format::language(&result.language),
@@ -53,6 +55,9 @@ pub fn result_line(result: &SubtitleResult) -> String {
     ];
     if result.hearing_impaired {
         parts.push("HI".into());
+    }
+    if result.forced {
+        parts.push("Forced".into());
     }
     match result.origin {
         SubtitleOrigin::MachineTranslated => parts.push("Machine-translated".into()),
@@ -813,6 +818,17 @@ mod tests {
             ..result()
         });
         assert_eq!(line, "English · SubDL · HI · Machine-translated");
+    }
+
+    #[test]
+    fn a_forced_result_says_so() {
+        let line = result_line(&SubtitleResult {
+            forced: true,
+            rating: None,
+            downloads: 0,
+            ..result()
+        });
+        assert_eq!(line, "English · OpenSubtitles · Forced");
     }
 
     #[test]

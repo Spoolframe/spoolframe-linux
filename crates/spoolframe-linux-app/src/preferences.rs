@@ -13,7 +13,7 @@ use spoolframe_linux_core::backend::{Client, LocalDownload, Reachability, Server
 use spoolframe_linux_core::format;
 use spoolframe_linux_core::theme::Theme;
 use spoolframe_types::{
-    AudioRole, BitmapPreference, SdhPreference, SubtitleMode, TrackPreferences,
+    AudioRole, BitmapPreference, ForcedPreference, SdhPreference, SubtitleMode, TrackPreferences,
 };
 
 /// When subtitles show, in the order the dialog lists them.
@@ -27,11 +27,32 @@ const MODES: [(SubtitleMode, &str); 4] = [
     (SubtitleMode::Always, "Always"),
 ];
 
-const SDH: [(SdhPreference, &str); 3] = [
+const SDH: [(SdhPreference, &str); 4] = [
     (SdhPreference::Accept, "No preference"),
     (SdhPreference::Prefer, "Prefer SDH"),
     (SdhPreference::Avoid, "Avoid SDH"),
+    (SdhPreference::Only, "Only SDH"),
 ];
+
+/// Forced subtitles (only the parts in another language) among a subtitle
+/// search's results: playback follows Show subtitles.
+const FORCED: [(ForcedPreference, &str); 4] = [
+    (ForcedPreference::Accept, "No preference"),
+    (ForcedPreference::Prefer, "Prefer forced"),
+    (ForcedPreference::Avoid, "Avoid forced"),
+    (ForcedPreference::Only, "Only forced"),
+];
+
+/// Which of `choices` a combo row shows for `value`: the first, for one
+/// it does not list.
+fn shown_choice<T: PartialEq>(choices: &[(T, &str)], value: &T) -> u32 {
+    choices.iter().position(|(c, _)| c == value).unwrap_or(0) as u32
+}
+
+/// The choice a combo row has `selected`; none past its list.
+fn picked_choice<T: Copy>(choices: &[(T, &str)], selected: u32) -> Option<T> {
+    choices.get(selected as usize).map(|(c, _)| *c)
+}
 
 /// What the Servers page needs: the client, to list and change saved
 /// servers, the one in use and who is signed in on it, and what the app
@@ -467,6 +488,7 @@ struct PlaybackRows {
     mode: adw::ComboRow,
     subtitle_languages: adw::EntryRow,
     sdh: adw::ComboRow,
+    forced: adw::ComboRow,
     bitmap: adw::ComboRow,
     ocr_offered: bool,
 }
@@ -491,8 +513,11 @@ impl PlaybackRows {
         }
         preferences.subtitles.languages =
             format::parse_language_list(&self.subtitle_languages.text());
-        if let Some((sdh, _)) = SDH.get(self.sdh.selected() as usize) {
-            preferences.subtitles.sdh = *sdh;
+        if let Some(sdh) = picked_choice(&SDH, self.sdh.selected()) {
+            preferences.subtitles.sdh = sdh;
+        }
+        if let Some(forced) = picked_choice(&FORCED, self.forced.selected()) {
+            preferences.subtitles.forced = forced;
         }
         preferences.subtitles.bitmap = bitmap_saved(
             self.original.subtitles.bitmap,
@@ -1422,11 +1447,14 @@ fn track_groups(info: TrackPreferencesInfo, set_tracks: SetTracks) -> [adw::Pref
         .use_markup(false)
         .title("Subtitles for the deaf (SDH)")
         .model(&gtk::StringList::new(&SDH.map(|(_, name)| name)))
-        .selected(
-            SDH.iter()
-                .position(|(s, _)| *s == preferences.subtitles.sdh)
-                .unwrap_or(0) as u32,
-        )
+        .selected(shown_choice(&SDH, &preferences.subtitles.sdh))
+        .build();
+    let forced = adw::ComboRow::builder()
+        .use_markup(false)
+        .title("Forced subtitles")
+        .subtitle("Only the parts in another language, among subtitle search results")
+        .model(&gtk::StringList::new(&FORCED.map(|(_, name)| name)))
+        .selected(shown_choice(&FORCED, &preferences.subtitles.forced))
         .build();
     let subtitles = adw::PreferencesGroup::builder()
         .title("Subtitles")
@@ -1451,6 +1479,7 @@ fn track_groups(info: TrackPreferencesInfo, set_tracks: SetTracks) -> [adw::Pref
     subtitles.add(&mode);
     subtitles.add(&subtitle_languages);
     subtitles.add(&sdh);
+    subtitles.add(&forced);
     subtitles.add(&bitmap);
 
     let rows = PlaybackRows {
@@ -1461,6 +1490,7 @@ fn track_groups(info: TrackPreferencesInfo, set_tracks: SetTracks) -> [adw::Pref
         mode,
         subtitle_languages,
         sdh,
+        forced,
         bitmap,
         ocr_offered,
     };
@@ -1476,7 +1506,7 @@ fn track_groups(info: TrackPreferencesInfo, set_tracks: SetTracks) -> [adw::Pref
         let save = save.clone();
         switch.connect_active_notify(move |_| save());
     }
-    for combo in [&rows.mode, &rows.sdh, &rows.bitmap] {
+    for combo in [&rows.mode, &rows.sdh, &rows.forced, &rows.bitmap] {
         let save = save.clone();
         combo.connect_selected_notify(move |_| save());
     }
@@ -1493,6 +1523,46 @@ mod tests {
     use super::*;
 
     use crate::reachability::tests::{NOW, cabin};
+
+    #[test]
+    fn only_sdh_is_offered_and_saved_as_it_is() {
+        let shown = shown_choice(&SDH, &SdhPreference::Only);
+        assert_eq!(
+            (SDH[shown as usize].1, picked_choice(&SDH, shown)),
+            ("Only SDH", Some(SdhPreference::Only))
+        );
+    }
+
+    #[test]
+    fn each_forced_choice_is_saved_as_it_is_shown() {
+        let all = [
+            ForcedPreference::Accept,
+            ForcedPreference::Prefer,
+            ForcedPreference::Avoid,
+            ForcedPreference::Only,
+        ];
+        assert_eq!(
+            all.map(|f| picked_choice(&FORCED, shown_choice(&FORCED, &f))),
+            all.map(Some)
+        );
+    }
+
+    #[test]
+    fn a_forced_preference_from_before_shows_as_no_preference() {
+        let before: spoolframe_types::SubtitlePreferences = serde_json::from_str(
+            r#"{"mode":"always","languages":[],"sdh":"accept","bitmap":"text"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            FORCED[shown_choice(&FORCED, &before.forced) as usize].1,
+            "No preference"
+        );
+    }
+
+    #[test]
+    fn a_row_past_its_choices_changes_nothing() {
+        assert_eq!(picked_choice(&FORCED, 9), None);
+    }
 
     #[test]
     fn downloads_are_totalled_by_the_name_of_their_server() {
