@@ -4618,7 +4618,7 @@
 "ISC": 13,
 "MIT": 1
 },
-"version": "0.23.45"
+"version": "0.23.46"
 },
 {
 "copyright": [
@@ -4672,7 +4672,7 @@
 "texts": {
 "ISC": 114
 },
-"version": "0.103.15"
+"version": "0.103.16"
 },
 {
 "copyright": [
@@ -6092,7 +6092,7 @@
 "texts": {
 "CDLA-Permissive-2.0": 148
 },
-"version": "1.0.9"
+"version": "1.0.10"
 },
 {
 "copyright": [],
