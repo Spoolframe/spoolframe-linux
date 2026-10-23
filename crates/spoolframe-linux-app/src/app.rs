@@ -5816,8 +5816,8 @@ pub fn portable_refusal(error: &BackendError, server: &str) -> (String, String) 
         BackendError::WrongCredentials => (
             format!("No access on {server}"),
             format!(
-                "Your identity isn’t a guest on {server} and isn’t tied to an account here. Ask \
-                 for an invite."
+                "Your identity isn’t a guest on {server} and isn’t tied to an account here. New \
+                 here? You join with an invite from the person who runs it."
             ),
         ),
         BackendError::NotPaired => (
@@ -6021,10 +6021,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_identity_with_no_access_is_told_to_ask_for_an_invite() {
+    fn an_identity_with_no_access_is_told_it_has_none() {
         assert_eq!(
             portable_refusal(&BackendError::WrongCredentials, "Home Media").0,
             "No access on Home Media"
+        );
+    }
+
+    /// Every server is invite only, so there is nobody to ask: the words
+    /// say how one joins (LinuxPortableStates, canvas v19).
+    #[test]
+    fn an_identity_with_no_access_is_told_how_one_joins() {
+        assert_eq!(
+            portable_refusal(&BackendError::WrongCredentials, "Home Media").1,
+            "Your identity isn’t a guest on Home Media and isn’t tied to an account here. New \
+             here? You join with an invite from the person who runs it."
         );
     }
 
