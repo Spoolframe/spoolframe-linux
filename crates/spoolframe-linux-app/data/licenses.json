@@ -1020,7 +1020,7 @@
 "Apache-2.0": 8,
 "MIT": 1
 },
-"version": "0.4.2"
+"version": "0.4.5"
 },
 {
 "copyright": [
@@ -5321,7 +5321,7 @@
 "texts": {
 "MIT": 130
 },
-"version": "1.53.1"
+"version": "1.54.1"
 },
 {
 "copyright": [
