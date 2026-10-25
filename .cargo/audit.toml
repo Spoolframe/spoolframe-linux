@@ -5,6 +5,10 @@
 ignore = [
   # paste: unmaintained build-time proc-macro; none of it runs.
   "RUSTSEC-2024-0436",
+  # crypto-bigint 0.5 through elliptic-curve 0.13 (webauthn caBLE's ECDH,
+  # the SDK's p256 0.13): accepted until webauthn-rs moves to crypto-glue
+  # 0.2.
+  "RUSTSEC-2026-0387",
 ]
 
 [output]
