@@ -98,6 +98,7 @@ mod tests {
             subtitle: None,
             reasons: Vec::new(),
             ladder: Vec::new(),
+            source_codec: None,
         };
         assert_eq!(encoded_height(Some(&encode)), Some(540));
         assert_eq!(encoded_height(None), None);

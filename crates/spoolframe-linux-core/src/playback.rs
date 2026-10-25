@@ -208,6 +208,7 @@ mod tests {
         let sdr = spoolframe_types::DisplayCapabilities {
             bit_depth: None,
             hdr: Some(Default::default()),
+            video_codecs: None,
         };
         let options = PlaybackOptions {
             display: Some(sdr.clone()),

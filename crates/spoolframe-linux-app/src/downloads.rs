@@ -72,8 +72,10 @@ pub type Acts = Rc<dyn Fn(LocalDownload, Act)>;
 /// - the server stopped converting: its conversion failed, or stopped
 ///   with the server, and the cause does not say which; a server started
 ///   again converts it again, and trying again is how to ask.
-/// - the media file is gone or changed on the server: the same request
-///   finds the same, so there is only Dismiss.
+/// - the media file is gone or changed on the server, or a paired
+///   server's item is no longer shared (P8-07; this client names no
+///   federation, so it does not see one): the same request finds the
+///   same, so there is only Dismiss.
 /// - other, or a cause this build does not know (every failure from a
 ///   server before 0.14.4 is other): by `size`, as before there were
 ///   causes. The server sets it once its file is ready, so without one
@@ -86,7 +88,7 @@ pub fn retryable(download: &LocalDownload) -> bool {
             DownloadFailure::NoSpace { .. }
             | DownloadFailure::Network
             | DownloadFailure::ServerStoppedConverting => true,
-            DownloadFailure::SourceMissing => false,
+            DownloadFailure::SourceMissing | DownloadFailure::NoLongerAvailable => false,
             DownloadFailure::Other | DownloadFailure::Unknown => download.size.is_some(),
         },
         _ => false,
@@ -1465,6 +1467,18 @@ mod tests {
         };
         assert_eq!(
             (retryable(&gone), status(&gone).acts),
+            (false, vec![Act::Dismiss])
+        );
+    }
+
+    #[test]
+    fn an_item_no_longer_shared_only_dismisses() {
+        let unshared = LocalDownload {
+            size: Some(3_600_000_000),
+            ..failed(DownloadFailure::NoLongerAvailable)
+        };
+        assert_eq!(
+            (retryable(&unshared), status(&unshared).acts),
             (false, vec![Act::Dismiss])
         );
     }

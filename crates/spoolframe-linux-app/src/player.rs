@@ -1453,6 +1453,7 @@ mod tests {
             }),
             reasons: vec!["video 0: hevc is not supported".into()],
             ladder: Vec::new(),
+            source_codec: None,
         }
     }
 
@@ -1492,6 +1493,7 @@ mod tests {
             subtitle: None,
             reasons: Vec::new(),
             ladder: Vec::new(),
+            source_codec: None,
         };
         assert_eq!(PlanSummary::of(&remux).badge, "Remux");
     }
@@ -1506,6 +1508,7 @@ mod tests {
                 codec: AudioCodec::Aac,
             }),
             subtitle: None,
+            source_codec: None,
         };
         assert_eq!(PlanSummary::of(&direct).badge, "Direct");
     }
@@ -1520,6 +1523,7 @@ mod tests {
                 format: SubtitleFormat::Srt,
                 delivery,
             }),
+            source_codec: None,
         }
     }
 

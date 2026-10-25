@@ -2643,6 +2643,11 @@ impl Playback {
             }
         };
         let mut start = managed.snapshot();
+        tracing::debug!(
+            converted = matches!(start.plan, PlaybackPlan::Converted { .. }),
+            source_codec = ?source_codec(&start.plan),
+            "the plan"
+        );
         if tracks.is_some() {
             current.track_list.replace(tracks);
         }
@@ -3200,6 +3205,17 @@ fn subtitle_change(playing: Option<Selection>, track: u32) -> Selection {
     Selection {
         audio: playing.and_then(|s| s.audio),
         subtitle: Some(track),
+    }
+}
+
+/// The source's video as the server judged it, an RFC 6381 string
+/// ("hvc1.2.4.L153.B0"), for the log: `None` with no video, or from a
+/// server before 0.15.0, or for a plan that plays nothing.
+fn source_codec(plan: &PlaybackPlan) -> Option<&str> {
+    match plan {
+        PlaybackPlan::Direct { source_codec, .. }
+        | PlaybackPlan::Converted { source_codec, .. } => source_codec.as_deref(),
+        _ => None,
     }
 }
 
@@ -3914,6 +3930,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_plan_says_the_source_it_judged() {
+        let plan = PlaybackPlan::Direct {
+            container: spoolframe_types::Container::Matroska,
+            video: Some(spoolframe_types::VideoCodec::Hevc),
+            audio: None,
+            subtitle: None,
+            source_codec: Some("hvc1.2.4.L153.B0".into()),
+        };
+        assert_eq!(source_codec(&plan), Some("hvc1.2.4.L153.B0"));
+    }
+
     fn converted_with(action: SubtitleAction) -> PlaybackPlan {
         PlaybackPlan::Converted {
             delivery: Delivery::Progressive,
@@ -3923,6 +3951,7 @@ mod tests {
             subtitle: Some(spoolframe_protocol::ConvertedSubtitle { index: 0, action }),
             reasons: Vec::new(),
             ladder: Vec::new(),
+            source_codec: None,
         }
     }
 

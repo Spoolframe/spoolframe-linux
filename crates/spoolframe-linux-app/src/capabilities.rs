@@ -134,6 +134,8 @@ pub fn display(show_hdr: bool) -> spoolframe_types::DisplayCapabilities {
         } else {
             std::collections::BTreeSet::new()
         }),
+        // Hello's list, which is none: the server plans by codec alone.
+        video_codecs: None,
     }
 }
 

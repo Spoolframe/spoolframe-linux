@@ -172,6 +172,7 @@ fn library(key: &str, title: &str, kind: LibraryKind) -> Library {
         id: LibraryId::new(Namespace::Plex, key).expect("fixture keys are not empty"),
         title: title.into(),
         kind,
+        server: None,
     }
 }
 
@@ -961,6 +962,8 @@ impl FakeSession {
             continue_watching: self.items_with_state(&continue_ids),
             next_up: self.items_with_state(&next_up),
             recently_added: self.items_with_state(&self.catalog.recently_added),
+            unavailable: Vec::new(),
+            servers: Vec::new(),
         }
     }
 
@@ -1173,10 +1176,12 @@ impl FakeSession {
             reasons: vec!["video 0: hevc is not supported; encoded to h264".into()],
             // Progressive: no HLS variants (PX-21).
             ladder: Vec::new(),
+            source_codec: video.then(|| "hvc1.2.4.L153.B0".into()),
         }
     }
 
     fn plan_for(item: &Item, tracks: &MediaTracks, selection: Selection) -> PlaybackPlan {
+        let video = !matches!(item, Item::Track(_));
         let subtitle = selection.subtitle.and_then(|i| {
             let track = tracks.subtitles.get(i as usize)?;
             Some(PlannedSubtitle {
@@ -1195,12 +1200,13 @@ impl FakeSession {
         });
         PlaybackPlan::Direct {
             container: Container::Matroska,
-            video: (!matches!(item, Item::Track(_))).then_some(VideoCodec::H264),
+            video: video.then_some(VideoCodec::H264),
             audio: Some(PlannedAudio {
                 index: selection.audio.unwrap_or(0),
                 codec: AudioCodec::Aac,
             }),
             subtitle,
+            source_codec: video.then(|| "avc1.640028".into()),
         }
     }
 

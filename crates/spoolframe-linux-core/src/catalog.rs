@@ -1163,6 +1163,7 @@ mod tests {
                     id: LibraryId::new(Namespace::Plex, *name).unwrap(),
                     title: (*name).into(),
                     kind: spoolframe_types::LibraryKind::Movies,
+                    server: None,
                 })
                 .collect(),
         )
