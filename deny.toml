@@ -31,12 +31,11 @@ ignore = [
   # binary.
   { id = "RUSTSEC-2024-0436", reason = "paste is an unmaintained build-time proc-macro; no code of it runs in the client" },
   # crypto-bigint 0.5: constant-time operations could branch on secrets,
-  # fixed only in 0.7.6. It comes through elliptic-curve 0.13: the SDK's
-  # p256 0.13 (until SDK 0.15.1 moves it to 0.14) and our vendored
-  # crypto-glue 0.1.15 under webauthn-rs, where caBLE's P-256 ECDH uses
-  # secret keys. Accepted until webauthn-rs moves to crypto-glue 0.2;
-  # then this goes.
-  { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 through elliptic-curve 0.13 (SDK p256 0.13, vendored crypto-glue 0.1 for webauthn caBLE ECDH); accepted until webauthn-rs moves to crypto-glue 0.2" },
+  # fixed only in 0.7.6. It comes through elliptic-curve 0.13, from our
+  # vendored crypto-glue 0.1.15 under webauthn-rs, where caBLE's P-256
+  # ECDH uses secret keys (the SDK is on p256 0.14 since 0.15.1).
+  # Accepted until webauthn-rs moves to crypto-glue 0.2; then this goes.
+  { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 through elliptic-curve 0.13 from vendored crypto-glue 0.1 (webauthn caBLE ECDH); accepted until webauthn-rs moves to crypto-glue 0.2" },
 ]
 
 # Several versions of one crate come from upstream (iroh, webauthn-rs's

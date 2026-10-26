@@ -320,7 +320,7 @@
 "Copyright (c) 2014 Steve \"Sc00bz\" Thomas (steve at tobtu dot com)",
 "Copyright (c) 2022 The RustCrypto Project Developers"
 ],
-"group": "sdk",
+"group": "app",
 "license": "Apache-2.0 OR MIT",
 "name": "base16ct",
 "texts": {
@@ -610,7 +610,7 @@
 "Copyright (c) 2018-2022 RustCrypto Developers",
 "Copyright (c) 2018 Artyom Pavlov"
 ],
-"group": "sdk",
+"group": "app",
 "license": "MIT OR Apache-2.0",
 "name": "cbc",
 "texts": {
@@ -868,6 +868,19 @@
 },
 {
 "copyright": [
+"Copyright (c) 2023-2026 The RustCrypto Project Developers"
+],
+"group": "sdk",
+"license": "MIT OR Apache-2.0",
+"name": "cpubits",
+"texts": {
+"Apache-2.0": 2,
+"MIT": 1
+},
+"version": "0.1.1"
+},
+{
+"copyright": [
 "Copyright (c) 2020-2025 The RustCrypto Project Developers"
 ],
 "group": "sdk",
@@ -948,7 +961,7 @@
 "copyright": [
 "Copyright (c) 2021 The RustCrypto Project Developers"
 ],
-"group": "sdk",
+"group": "app",
 "license": "Apache-2.0 OR MIT",
 "name": "crypto-bigint",
 "texts": {
@@ -956,6 +969,19 @@
 "MIT": 1
 },
 "version": "0.5.5"
+},
+{
+"copyright": [
+"Copyright (c) 2021-2026 The RustCrypto Project Developers"
+],
+"group": "sdk",
+"license": "Apache-2.0 OR MIT",
+"name": "crypto-bigint",
+"texts": {
+"Apache-2.0": 2,
+"MIT": 1
+},
+"version": "0.7.9"
 },
 {
 "copyright": [
@@ -1115,7 +1141,7 @@
 "copyright": [
 "Copyright (c) 2020-2023 The RustCrypto Project Developers"
 ],
-"group": "sdk",
+"group": "app",
 "license": "Apache-2.0 OR MIT",
 "name": "der",
 "texts": {
@@ -1247,7 +1273,7 @@
 "Copyright 2018-2022 RustCrypto Developers",
 "Copyright (c) 2018-2022 RustCrypto Developers"
 ],
-"group": "sdk",
+"group": "app",
 "license": "Apache-2.0 OR MIT",
 "name": "ecdsa",
 "texts": {
@@ -1255,6 +1281,20 @@
 "MIT": 1
 },
 "version": "0.16.9"
+},
+{
+"copyright": [
+"Copyright 2018-2022 RustCrypto Developers",
+"Copyright (c) 2018-2026 RustCrypto Developers"
+],
+"group": "sdk",
+"license": "Apache-2.0 OR MIT",
+"name": "ecdsa",
+"texts": {
+"Apache-2.0": 40,
+"MIT": 1
+},
+"version": "0.17.0"
 },
 {
 "copyright": [
@@ -1299,7 +1339,7 @@
 "copyright": [
 "Copyright (c) 2020-2022 RustCrypto Developers"
 ],
-"group": "sdk",
+"group": "app",
 "license": "Apache-2.0 OR MIT",
 "name": "elliptic-curve",
 "texts": {
@@ -1307,6 +1347,19 @@
 "MIT": 1
 },
 "version": "0.13.8"
+},
+{
+"copyright": [
+"Copyright (c) 2020-2026 RustCrypto Developers"
+],
+"group": "sdk",
+"license": "Apache-2.0 OR MIT",
+"name": "elliptic-curve",
+"texts": {
+"Apache-2.0": 2,
+"MIT": 1
+},
+"version": "0.14.3"
 },
 {
 "copyright": [
@@ -1428,7 +1481,7 @@
 "copyright": [
 "Copyright (c) 2017 Sean Bowe"
 ],
-"group": "sdk",
+"group": "app",
 "license": "MIT OR Apache-2.0",
 "name": "ff",
 "texts": {
@@ -1436,6 +1489,19 @@
 "MIT": 45
 },
 "version": "0.13.1"
+},
+{
+"copyright": [
+"Copyright (c) 2017 Sean Bowe"
+],
+"group": "sdk",
+"license": "MIT OR Apache-2.0",
+"name": "ff",
+"texts": {
+"Apache-2.0": 6,
+"MIT": 45
+},
+"version": "0.14.0"
 },
 {
 "copyright": [
@@ -1466,7 +1532,7 @@
 "copyright": [
 "Copyright (c) Nathaniel McCallum"
 ],
-"group": "sdk",
+"group": "app",
 "license": "Apache-2.0",
 "name": "flagset",
 "texts": {
@@ -2025,7 +2091,7 @@
 "copyright": [
 "Copyright (c) Sean Bowe, Jack Grigg"
 ],
-"group": "sdk",
+"group": "app",
 "license": "MIT OR Apache-2.0",
 "name": "group",
 "texts": {
@@ -2033,6 +2099,19 @@
 "MIT": 1
 },
 "version": "0.13.0"
+},
+{
+"copyright": [
+"Copyright (c) Sean Bowe, Jack Grigg"
+],
+"group": "sdk",
+"license": "MIT OR Apache-2.0",
+"name": "group",
+"texts": {
+"Apache-2.0": 6,
+"MIT": 1
+},
+"version": "0.14.0"
 },
 {
 "copyright": [
@@ -2378,7 +2457,7 @@
 "Copyright (c) 2015-2018 Vlad Filippov",
 "Copyright (c) 2018-2021 RustCrypto Developers"
 ],
-"group": "sdk",
+"group": "app",
 "license": "MIT OR Apache-2.0",
 "name": "hkdf",
 "texts": {
@@ -2391,7 +2470,7 @@
 "copyright": [
 "Copyright (c) 2017 Artyom Pavlov"
 ],
-"group": "sdk",
+"group": "app",
 "license": "MIT OR Apache-2.0",
 "name": "hmac",
 "texts": {
@@ -2404,7 +2483,7 @@
 "copyright": [
 "Copyright (c) 2017 Artyom Pavlov"
 ],
-"group": "app",
+"group": "sdk",
 "license": "MIT OR Apache-2.0",
 "name": "hmac",
 "texts": {
@@ -3521,7 +3600,7 @@
 "copyright": [
 "Copyright (c) 2014 The Rust Project Developers"
 ],
-"group": "app",
+"group": "sdk",
 "license": "MIT OR Apache-2.0",
 "name": "num-traits",
 "texts": {
@@ -3662,7 +3741,7 @@
 "copyright": [
 "Copyright (c) 2020-2023 RustCrypto Developers"
 ],
-"group": "sdk",
+"group": "app",
 "license": "Apache-2.0 OR MIT",
 "name": "p256",
 "texts": {
@@ -3670,6 +3749,19 @@
 "MIT": 1
 },
 "version": "0.13.2"
+},
+{
+"copyright": [
+"Copyright (c) 2020-2026 RustCrypto Developers"
+],
+"group": "sdk",
+"license": "Apache-2.0 OR MIT",
+"name": "p256",
+"texts": {
+"Apache-2.0": 2,
+"MIT": 1
+},
+"version": "0.14.0"
 },
 {
 "copyright": [
@@ -3790,7 +3882,7 @@
 "Copyright (c) 2017 Artyom Pavlov",
 "Copyright (c) 2018-2023 The RustCrypto Project Developers"
 ],
-"group": "sdk",
+"group": "app",
 "license": "MIT OR Apache-2.0",
 "name": "pbkdf2",
 "texts": {
@@ -3803,7 +3895,7 @@
 "copyright": [
 "Copyright (c) 2021 The RustCrypto Project Developers"
 ],
-"group": "sdk",
+"group": "app",
 "license": "Apache-2.0 OR MIT",
 "name": "pem-rfc7468",
 "texts": {
@@ -3864,7 +3956,7 @@
 "copyright": [
 "Copyright (c) 2021-2023 The RustCrypto Project Developers"
 ],
-"group": "sdk",
+"group": "app",
 "license": "Apache-2.0 OR MIT",
 "name": "pkcs5",
 "texts": {
@@ -3877,7 +3969,7 @@
 "copyright": [
 "Copyright (c) 2020-2023 The RustCrypto Project Developers"
 ],
-"group": "sdk",
+"group": "app",
 "license": "Apache-2.0 OR MIT",
 "name": "pkcs8",
 "texts": {
@@ -3991,6 +4083,32 @@
 },
 {
 "copyright": [
+"Copyright (c) 2024-2026 RustCrypto Developers"
+],
+"group": "sdk",
+"license": "Apache-2.0 OR MIT",
+"name": "primefield",
+"texts": {
+"Apache-2.0": 2,
+"MIT": 1
+},
+"version": "0.14.0"
+},
+{
+"copyright": [
+"Copyright (c) 2020-2023 RustCrypto Developers"
+],
+"group": "app",
+"license": "Apache-2.0 OR MIT",
+"name": "primeorder",
+"texts": {
+"Apache-2.0": 2,
+"MIT": 1
+},
+"version": "0.13.6"
+},
+{
+"copyright": [
 "Copyright (c) 2020-2023 RustCrypto Developers"
 ],
 "group": "sdk",
@@ -4000,7 +4118,7 @@
 "Apache-2.0": 2,
 "MIT": 1
 },
-"version": "0.13.6"
+"version": "0.14.0"
 },
 {
 "copyright": [
@@ -4237,7 +4355,7 @@
 "Copyright 2018-2022 RustCrypto Developers",
 "Copyright (c) 2018-2022 RustCrypto Developers"
 ],
-"group": "sdk",
+"group": "app",
 "license": "Apache-2.0 OR MIT",
 "name": "rfc6979",
 "texts": {
@@ -4245,6 +4363,20 @@
 "MIT": 1
 },
 "version": "0.4.0"
+},
+{
+"copyright": [
+"Copyright 2018-2022 RustCrypto Developers",
+"Copyright (c) 2018-2026 RustCrypto Developers"
+],
+"group": "sdk",
+"license": "Apache-2.0 OR MIT",
+"name": "rfc6979",
+"texts": {
+"Apache-2.0": 40,
+"MIT": 1
+},
+"version": "0.6.0"
 },
 {
 "copyright": [
@@ -4385,7 +4517,7 @@
 "copyright": [
 "Copyright (c) 2019 Eric McCorkle"
 ],
-"group": "sdk",
+"group": "app",
 "license": "MIT OR Apache-2.0",
 "name": "salsa20",
 "texts": {
@@ -4411,7 +4543,7 @@
 "copyright": [
 "Copyright (c) 2021-2023 The RustCrypto Project Developers"
 ],
-"group": "sdk",
+"group": "app",
 "license": "MIT OR Apache-2.0",
 "name": "scrypt",
 "texts": {
@@ -4424,7 +4556,7 @@
 "copyright": [
 "Copyright (c) 2021-2022 The RustCrypto Project Developers"
 ],
-"group": "sdk",
+"group": "app",
 "license": "Apache-2.0 OR MIT",
 "name": "sec1",
 "texts": {
@@ -4432,6 +4564,19 @@
 "MIT": 1
 },
 "version": "0.7.3"
+},
+{
+"copyright": [
+"Copyright (c) 2021-2026 The RustCrypto Project Developers"
+],
+"group": "sdk",
+"license": "Apache-2.0 OR MIT",
+"name": "sec1",
+"texts": {
+"Apache-2.0": 2,
+"MIT": 1
+},
+"version": "0.8.1"
 },
 {
 "copyright": [
@@ -4650,7 +4795,7 @@
 "copyright": [
 "Copyright (c) 2018-2023 RustCrypto Developers"
 ],
-"group": "sdk",
+"group": "app",
 "license": "Apache-2.0 OR MIT",
 "name": "signature",
 "texts": {
@@ -4814,7 +4959,7 @@
 "copyright": [
 "Copyright (c) 2021-2023 The RustCrypto Project Developers"
 ],
-"group": "sdk",
+"group": "app",
 "license": "Apache-2.0 OR MIT",
 "name": "spki",
 "texts": {
@@ -4847,7 +4992,7 @@
 "Apache-2.0": 0,
 "MIT": 1
 },
-"version": "0.15.0"
+"version": "0.15.1"
 },
 {
 "copyright": [
@@ -4884,7 +5029,7 @@
 "Apache-2.0": 0,
 "MIT": 1
 },
-"version": "0.15.0"
+"version": "0.15.1"
 },
 {
 "copyright": [
@@ -4897,7 +5042,7 @@
 "Apache-2.0": 0,
 "MIT": 1
 },
-"version": "0.15.0"
+"version": "0.15.1"
 },
 {
 "copyright": [
@@ -5760,6 +5905,20 @@
 "CDLA-Permissive-2.0": 144
 },
 "version": "1.0.10"
+},
+{
+"copyright": [
+"Copyright (c) 2026 RustCrypto Developers",
+"Copyright (c) 2018-2025 `group` crate developers"
+],
+"group": "sdk",
+"license": "Apache-2.0 OR MIT",
+"name": "wnaf",
+"texts": {
+"Apache-2.0": 2,
+"MIT": 1
+},
+"version": "0.14.1"
 },
 {
 "copyright": [
