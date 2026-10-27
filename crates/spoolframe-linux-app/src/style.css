@@ -1389,6 +1389,27 @@ button.alert-response.destructive {
   padding: 16px 20px;
 }
 
+/* An active filter under the library's name: its chips, each with a
+   remove button, Clear all, and how many it keeps. */
+.library-filters {
+  margin: 4px 28px 0;
+}
+
+.filter-chip {
+  padding: 2px 2px 2px 10px;
+}
+
+.filter-chip-remove {
+  min-width: 22px;
+  min-height: 22px;
+  padding: 0;
+}
+
+/* The Sort and Filter menus. */
+.library-menu > contents {
+  padding: 10px 12px;
+}
+
 .library-grid > child {
   padding: 8px;
 }

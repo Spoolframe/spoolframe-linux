@@ -24,6 +24,7 @@ mod invite;
 mod key_prompt;
 mod leave_server;
 mod library;
+mod library_browse;
 mod licenses;
 mod licenses_page;
 mod logo;

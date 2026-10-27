@@ -336,6 +336,11 @@ pub struct AppWidgets {
     /// Says when the connection is not up.
     banner: adw::Banner,
     library_heading: gtk::Label,
+    /// A library's Sort and Filter menus, in the root header while it
+    /// shows.
+    library_controls: adw::Bin,
+    /// A library's active filter, under its name.
+    library_bar: adw::Bin,
     /// The root header's title, at its start.
     root_title: gtk::Label,
     /// The root page's header bar: search puts its field there.
@@ -999,6 +1004,8 @@ impl Component for App {
             new_playlist.connect_clicked(move |_| sender.input(Msg::NewPlaylist(None)));
         }
         header.pack_end(&new_playlist);
+        let library_controls = adw::Bin::new();
+        header.pack_end(&library_controls);
         let content = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             // 32 between rows, less the room each row keeps for a lifted
@@ -1022,9 +1029,14 @@ impl Component for App {
             .visible(false)
             .css_classes(["title-2", "library-heading"])
             .build();
+        let library_bar = adw::Bin::new();
         let root_toolbar = views::toolbar(
             &header,
-            &[banner.upcast_ref(), library_heading.upcast_ref()],
+            &[
+                banner.upcast_ref(),
+                library_heading.upcast_ref(),
+                library_bar.upcast_ref(),
+            ],
             &scroller,
         );
         let root_page = adw::NavigationPage::builder()
@@ -1283,6 +1295,8 @@ impl Component for App {
                 profile_server,
                 banner,
                 library_heading,
+                library_controls,
+                library_bar,
                 root_title,
                 root_header: header.clone(),
                 sign_in: None,
@@ -1863,16 +1877,23 @@ impl Component for App {
                 skeleton.add_css_class("loading");
                 widgets.content.append(&skeleton);
                 // A newer choice in the sidebar aborts this one.
-                let (scroller, content) = (widgets.scroller.clone(), widgets.content.clone());
+                let content = widgets.content.clone();
+                let slots = library::Slots {
+                    scroller: widgets.scroller.clone(),
+                    controls: widgets.library_controls.clone(),
+                    bar: widgets.library_bar.clone(),
+                    toasts: widgets.toasts.clone(),
+                };
                 let heading = widgets.library_heading.clone();
                 let cards = self.cards.clone();
                 self.root_load = Some(glib::spawn_future_local(async move {
                     let title = library.title.clone();
-                    match cache.grid(library, cards).await {
-                        Ok(grid) => {
+                    // The grid goes in the scroller, the menus in the
+                    // header.
+                    match cache.open(library, cards, slots).await {
+                        Ok(()) => {
                             heading.set_label(&title);
                             heading.set_visible(true);
-                            scroller.set_child(Some(&grid));
                         }
                         Err(e) => {
                             clear(&content);
@@ -5610,9 +5631,12 @@ fn clear(content: &gtk::Box) {
 }
 
 /// Puts the root page's ordinary content back in its scrolled area, in
-/// place of a library grid.
+/// place of a library grid, and takes the library's menus and filter bar
+/// away with it.
 fn show_content(widgets: &AppWidgets) {
     widgets.library_heading.set_visible(false);
+    widgets.library_controls.set_child(gtk::Widget::NONE);
+    widgets.library_bar.set_child(gtk::Widget::NONE);
     if widgets.scroller.child().as_ref() != Some(widgets.content.upcast_ref()) {
         widgets.scroller.set_child(Some(&widgets.content));
     }

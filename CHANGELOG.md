@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- A library can be sorted and filtered, by what its server offers for
+  it: Sort, in the library's header, orders it by title, release date,
+  date added, last played, rating, audience rating, duration or size,
+  either way; Filter keeps what is unwatched, in progress or watched, of
+  some genres, from and until a year, of some content ratings,
+  resolutions or dynamic ranges, applied as they are ticked. An active
+  filter shows as chips under the library's name, each removable, with
+  Clear all and how many it keeps of all ("37 of 412"); one that keeps
+  nothing says so, with Clear filters. Each library keeps its choice
+  while its profile is signed in, until Spoolframe quits.
 - Downloads, on a server that has them: a film's or an episode's page
   gets Download, which asks for the version (Original or one of the
   server's profiles) and the tracks (all, or a choice), and shows the
