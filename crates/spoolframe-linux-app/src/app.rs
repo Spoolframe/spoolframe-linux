@@ -5444,9 +5444,10 @@ fn connection_text(name: &str, state: &ConnectionState) -> (String, Option<Strin
             "offline".to_owned(),
             Some(format!("Not connected to {name}.")),
         ),
-        ConnectionState::Stopped(BackendError::UpdateRequired { .. }) => {
-            ("update needed".to_owned(), Some(update_text(name)))
-        }
+        ConnectionState::Stopped(BackendError::UpdateRequired { server_protocol }) => (
+            "update needed".to_owned(),
+            Some(update_text(name, *server_protocol)),
+        ),
         ConnectionState::Stopped(why) => (
             "not connected".to_owned(),
             Some(format!("Not connected to {name}: {why}.")),
@@ -5455,13 +5456,32 @@ fn connection_text(name: &str, state: &ConnectionState) -> (String, Option<Strin
 }
 
 /// What to do when this app and the server speak different protocol
-/// revisions. Whatever revision the server said, it says nothing of which
-/// side is older: SDK 0.16 restarted the numbering at 1, so a 0.15 server
-/// says 15 to an app on 1. Either side may need the update.
-fn update_text(name: &str) -> String {
-    format!(
-        "This app and {name} speak different versions of Spoolframe. Update the app, or ask the server's admin to update the server."
-    )
+/// revisions. SDK 0.16 restarted the numbering at 1, so the number says
+/// nothing by itself (a 0.15 server says 15 to an app on 1), but who sends
+/// one does: a 0.16 or later server refuses any other revision at Hello
+/// and names none, so only a server from before the reset, which took our
+/// Hello, says its revision. That one is the older side. A server that
+/// names none may be either.
+fn update_text(name: &str, server_protocol: Option<u32>) -> String {
+    match server_protocol {
+        Some(_) => format!(
+            "{} runs an older Spoolframe. Ask its admin to update the server.",
+            capitalized(name)
+        ),
+        None => format!(
+            "This app and {name} speak different versions of Spoolframe. Update the app, or ask the server's admin to update the server."
+        ),
+    }
+}
+
+/// `text` with its first letter in upper case, for a name that starts a
+/// sentence ("the server").
+fn capitalized(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
 }
 
 /// How many albums Home's "Recently played music" shows, and how many of
@@ -5731,9 +5751,10 @@ fn error_status(error: &BackendError, retry: Option<Rc<dyn Fn()>>) -> adw::Statu
             "Not available right now",
             format!("{} Try again once it is back.", sentence(why)),
         ),
-        BackendError::UpdateRequired { .. } => {
-            ("Spoolframe needs updating", update_text("the server"))
-        }
+        BackendError::UpdateRequired { server_protocol } => (
+            "Spoolframe needs updating",
+            update_text("the server", *server_protocol),
+        ),
         other => ("Could not load this page", sentence(&other.to_string())),
     };
     let page = adw::StatusPage::builder()
@@ -5956,7 +5977,9 @@ fn server_error(
             };
             start::server_id_changed(name, saved, now, remove).present(Some(root));
         }
-        (BackendError::UpdateRequired { .. }, _) => toast_text(widgets, &update_text(name)),
+        (BackendError::UpdateRequired { server_protocol }, _) => {
+            toast_text(widgets, &update_text(name, *server_protocol))
+        }
         (other, _) => toast(widgets, other),
     }
 }
@@ -6004,33 +6027,50 @@ mod tests {
         connection_text("Home Media", &state)
     }
 
-    const SPEAK_DIFFERENT_VERSIONS: &str = "This app and Home Media speak different versions of \
-        Spoolframe. Update the app, or ask the server's admin to update the server.";
-
     /// A 0.15 server says revision 15 to this app on 1 (0.16 restarted
-    /// the numbering): it is the older one, so the banner must not call
-    /// it newer. The SDK has stopped dialling, so it is not
+    /// the numbering): only a server from before the reset names its
+    /// revision, so it is the older one and is told to update, never
+    /// called newer. The SDK has stopped dialling, so it is not
     /// "reconnecting" either.
     #[test]
-    fn a_server_on_revision_15_is_told_to_update_one_side_or_the_other() {
+    fn a_server_on_revision_15_is_the_one_to_update() {
         assert_eq!(
             banner_once_stopped(BackendError::UpdateRequired {
                 server_protocol: Some(15)
             }),
             (
                 "update needed".to_owned(),
-                Some(SPEAK_DIFFERENT_VERSIONS.to_owned())
+                Some(
+                    "Home Media runs an older Spoolframe. Ask its admin to update the server."
+                        .to_owned()
+                )
             )
         );
     }
 
-    /// A server that only refused this app's revision says the same.
+    /// A server that only refused this app's revision may be either side.
     #[test]
-    fn a_server_that_refused_our_revision_is_told_the_same() {
+    fn a_server_that_refused_our_revision_could_be_either_side() {
         let (_, banner) = banner_once_stopped(BackendError::UpdateRequired {
             server_protocol: None,
         });
-        assert_eq!(banner.as_deref(), Some(SPEAK_DIFFERENT_VERSIONS));
+        assert_eq!(
+            banner.as_deref(),
+            Some(
+                "This app and Home Media speak different versions of Spoolframe. Update the app, \
+                 or ask the server's admin to update the server."
+            )
+        );
+    }
+
+    /// The error page names "the server" mid-sentence, and starts the
+    /// older-server sentence with it in capitals.
+    #[test]
+    fn the_older_server_sentence_starts_with_a_capital() {
+        assert_eq!(
+            update_text("the server", Some(15)),
+            "The server runs an older Spoolframe. Ask its admin to update the server."
+        );
     }
 
     /// Any other reason the SDK stopped dialling is shown as it is, in
