@@ -26,6 +26,7 @@ ICONS=(
   download users info
   list-music pin pin-off pencil book-open
   heart infinity
+  arrow-down-wide-narrow funnel funnel-x
 )
 
 here="$(cd "$(dirname "$0")" && pwd)"

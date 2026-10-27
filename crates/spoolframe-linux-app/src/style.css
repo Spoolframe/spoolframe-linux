@@ -1389,23 +1389,63 @@ button.alert-response.destructive {
   padding: 16px 20px;
 }
 
-/* An active filter under the library's name: its chips, each with a
-   remove button, Clear all, and how many it keeps. */
+/* An active filter under the library's name: "Kept for", its chips (one
+   per part, accent-tinted by .chip.accent), each with a remove button,
+   and Clear all, as LinuxLibrarySortFilter. */
 .library-filters {
   margin: 4px 28px 0;
 }
 
-.filter-chip {
-  padding: 2px 2px 2px 10px;
-}
-
-.filter-chip-remove {
-  min-width: 22px;
-  min-height: 22px;
+.library-filters > flowboxchild {
   padding: 0;
 }
 
-/* The Sort and Filter menus. */
+.filter-kept {
+  margin-right: 4px;
+}
+
+.filter-chip {
+  min-height: 30px;
+  padding: 0 4px 0 12px;
+  font-weight: 600;
+}
+
+.filter-chip-remove {
+  min-width: 24px;
+  min-height: 24px;
+  padding: 0;
+}
+
+/* Clear all among the chips reads as a link, underlined. */
+.filter-clear label {
+  text-decoration: underline;
+}
+
+/* The Filters button's count of the parts in use. */
+.filter-badge {
+  min-width: 18px;
+  min-height: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background-color: var(--accent-bg-color);
+  color: var(--accent-fg-color);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+/* The Filters pane, the split view's sidebar: 320 px wide, as the
+   boards. */
+.library-filter-pane {
+  padding: 12px 18px 16px;
+}
+
+.filter-reset {
+  min-height: 26px;
+  padding: 0 8px;
+  font-size: 12px;
+}
+
+/* The Sort menu. */
 .library-menu > contents {
   padding: 10px 12px;
 }

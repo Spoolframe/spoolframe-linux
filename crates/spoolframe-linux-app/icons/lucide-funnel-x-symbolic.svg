@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- @license lucide-static v1.50.0 - ISC -->
+
+<svg
+   class="lucide lucide-funnel-x"
+   width="24"
+   height="24"
+   viewBox="0 0 24 24"
+   version="1.1"
+   id="svg3"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <defs
+     id="defs3" />
+  <path
+     style="baseline-shift:baseline;display:inline;overflow:visible;vector-effect:none;fill:#000000;stroke:none;stroke-linecap:butt;stroke-linejoin:miter;enable-background:accumulate;stop-color:#000000;stop-opacity:1;opacity:1"
+     d="M 3,2 C 2.1718984,2.000299 1.46686,2.5235849 1.171875,3.1875 0.87688997,3.8514151 0.96079682,4.7250933 1.515625,5.3398437 L 8.7421875,13.330078 C 8.9086411,13.514033 8.9998876,13.751915 9,14 v 6 c -3.523e-4,0.755933 0.4292608,1.45116 1.105469,1.789062 l 2,1 C 13.398193,23.435039 15.000674,22.445138 15,21 v -7 c 1.12e-4,-0.248085 0.09136,-0.485967 0.257813,-0.669922 a 1.0001,1.0001 0 0 0 0.002,-0.002 l 0.425781,-0.472656 a 1,1 0 0 0 -0.07227,-1.41211 1,1 0 0 0 -1.412109,0.07227 l -0.425781,0.472656 C 13.276771,12.539328 13.000337,13.256849 13,14 v 7 l -2,-1 v -6 c -3.37e-4,-0.743151 -0.276771,-1.460672 -0.775391,-2.011719 L 3,4 h 9.53125 a 1,1 0 0 0 1,-1 1,1 0 0 0 -1,-1 z"
+     id="path1" />
+  <path
+     style="baseline-shift:baseline;display:inline;overflow:visible;vector-effect:none;fill:#000000;stroke:none;stroke-linecap:butt;stroke-linejoin:miter;enable-background:accumulate;stop-color:#000000;stop-opacity:1;opacity:1"
+     d="m 15.792969,2.7929688 a 1,1 0 0 0 0,1.4140624 l 5,5.0000001 a 1,1 0 0 0 1.414062,0 1,1 0 0 0 0,-1.4140626 l -5,-4.9999999 a 1,1 0 0 0 -1.414062,0 z"
+     id="path2" />
+  <path
+     style="baseline-shift:baseline;display:inline;overflow:visible;vector-effect:none;fill:#000000;stroke:none;stroke-linecap:butt;stroke-linejoin:miter;enable-background:accumulate;stop-color:#000000;stop-opacity:1;opacity:1"
+     d="m 20.792969,2.7929688 -5,4.9999999 a 1,1 0 0 0 0,1.4140626 1,1 0 0 0 1.414062,0 l 5,-5.0000001 a 1,1 0 0 0 0,-1.4140624 1,1 0 0 0 -1.414062,0 z"
+     id="path3" />
+</svg>

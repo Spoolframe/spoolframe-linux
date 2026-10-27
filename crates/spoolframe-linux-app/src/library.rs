@@ -12,11 +12,12 @@
 //! Every library's first page is fetched in the background as soon as the
 //! libraries are known, so even a first visit rarely waits.
 //!
-//! A library can be sorted and filtered from the page's header ([`View`]),
-//! by what it says it offers. Sorted or filtered pages are fetched afresh
-//! and not kept; the choice itself is saved per profile and library
-//! ([`SavedChoices`]), and comes back when the library opens again, after a
-//! restart too.
+//! A library can be sorted from the header bar's Sort menu and filtered
+//! from the Filters pane beside the grid ([`View`]), by what it says it
+//! offers. Sorted or filtered pages are fetched afresh and not kept; the
+//! choice itself is saved per profile and library ([`SavedChoices`]), and
+//! comes back when the library opens again, after a restart too, with a
+//! toast the first time in a session.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -26,11 +27,13 @@ use std::sync::Arc;
 use adw::prelude::*;
 use gtk::{gio, glib};
 use spoolframe_linux_core::backend::{
-    BackendError, ItemFilter, ItemFilterValues, ItemSort, Session, SortKey,
+    BackendError, Counted, FilterPart, ItemFilter, ItemFilterValues, ItemSort, Session, SortKey,
 };
 use spoolframe_types::{Item, Library, LibraryId};
 
-use crate::library_browse::{self as browse, Body, Chip, Choice, First, Plan, Request, Value};
+use crate::library_browse::{
+    self as browse, Body, Choice, First, Noun, Plan, Request, Section, Value,
+};
 use crate::saved_choices::SavedChoices;
 use crate::views::{self, Cards};
 
@@ -144,6 +147,9 @@ pub struct Cache {
     /// sorted and filtered as it was left, until the choice is changed or
     /// cleared.
     choices: Choices,
+    /// The libraries opened this session: a saved choice is "back" only
+    /// on the first, not each time the library opens again.
+    opened: RefCell<HashSet<String>>,
     /// The library page showing, or shown last. Its menus hold it only
     /// weakly; the next library opened replaces it.
     shown: RefCell<Option<Rc<View>>>,
@@ -157,6 +163,7 @@ impl Cache {
             session,
             libraries: RefCell::new(HashMap::new()),
             choices: Rc::new(RefCell::new(choices)),
+            opened: RefCell::new(HashSet::new()),
             shown: RefCell::new(None),
         })
     }
@@ -223,9 +230,9 @@ impl Cache {
     }
 
     /// Opens `library` in `slots`: its grid, sorted and filtered as it was
-    /// left, and the header's Sort and Filter menus; or what went wrong
-    /// getting its first page. A library seen before shows at once, and
-    /// refreshes behind it.
+    /// left, the header's Sort menu and Filters button, and the Filters
+    /// pane; or what went wrong getting its first page. A library seen
+    /// before shows at once, and refreshes behind it.
     pub async fn open(
         &self,
         library: Library,
@@ -258,19 +265,22 @@ impl Cache {
             }
         };
         let choice = self.choices.borrow().get(&key).cloned().unwrap_or_default();
+        let plan = browse::plan(&choice, values.as_ref());
         // A sorted or filtered first page is waited for as a plain one is,
         // so the page lands whole.
-        let first = match browse::plan(&choice, values.as_ref()) {
+        let first = match &plan {
             Plan::Sorted(request) => {
-                match sorted_first(&self.session, &library.id, &request).await {
+                match sorted_first(&self.session, &library.id, request).await {
                     First::Failed(e) => return Err(e),
                     first => Some(first),
                 }
             }
             Plan::Plain | Plan::Refused(_) => None,
         };
+        let greet = browse::greets(&choice, &plan, self.opened.borrow_mut().insert(key));
         let view = View::new(Shared {
             session: self.session.clone(),
+            noun: browse::noun(library.kind),
             library,
             cards,
             slots,
@@ -278,7 +288,7 @@ impl Cache {
             values,
             choices: self.choices.clone(),
         });
-        view.start(choice, first);
+        view.start(choice, first, greet);
         self.shown.replace(Some(view));
         Ok(())
     }
@@ -299,10 +309,13 @@ async fn sorted_first(session: &Arc<dyn Session>, library: &LibraryId, request: 
 pub struct Slots {
     /// The grid, or the empty state.
     pub scroller: gtk::ScrolledWindow,
-    /// In the header: the Sort and Filter menus.
+    /// At the header bar's end: the Sort menu and the Filters button.
     pub controls: adw::Bin,
-    /// Under the library's name: the active filter's chips.
+    /// Over the grid: the library's name and count, then the chips.
     pub bar: adw::Bin,
+    /// Around the bar and the grid: its sidebar, at the right, is the
+    /// Filters pane, and the grid stays in view beside it.
+    pub pane: adw::OverlaySplitView,
     pub toasts: adw::ToastOverlay,
 }
 
@@ -310,6 +323,8 @@ pub struct Slots {
 struct Shared {
     session: Arc<dyn Session>,
     library: Library,
+    /// What the library's items are called, for its count.
+    noun: Noun,
     cards: Rc<Cards>,
     slots: Slots,
     /// The library unsorted and unfiltered: the cached pages, and the
@@ -321,7 +336,7 @@ struct Shared {
     choices: Choices,
 }
 
-/// A library page: its grid, and the menus that sort and filter it.
+/// A library page: its grid, the Sort menu and the Filters pane.
 pub struct View {
     shared: Shared,
     choice: RefCell<Choice>,
@@ -331,43 +346,81 @@ pub struct View {
     /// while it is still there: the user has not gone elsewhere.
     shown: RefCell<Option<gtk::Widget>>,
     widgets: Widgets,
+    /// What it told the user, for the tests: a toast overlay does not say.
+    #[cfg(test)]
+    toasted: RefCell<Vec<String>>,
 }
 
-/// The menus' and the bar's widgets, to show a choice made elsewhere (a
-/// chip removed, a fall back) in them.
+/// The menu's, the pane's and the bar's widgets, to show a choice made
+/// elsewhere (a chip removed, a fall back) in them.
 struct Widgets {
     sort: gtk::MenuButton,
+    /// The Sort button's text: "Released · Newest".
+    sort_label: gtk::Label,
     keys: Vec<(SortKey, gtk::CheckButton)>,
+    /// The two direction rows, top first; which is which follows the key
+    /// ([`browse::menu_directions`]).
     directions: [gtk::CheckButton; 2],
-    filter: gtk::MenuButton,
+    /// The line under the Sort menu.
+    note: gtk::Label,
+    /// The keys the menu lists, for the note.
+    offered: Vec<SortKey>,
+    filters: gtk::ToggleButton,
+    /// On the Filters button: how many parts are in use.
+    badge: gtk::Label,
+    /// The Filters pane, the split view's sidebar.
+    pane: gtk::ScrolledWindow,
+    /// The pane's Clear all.
+    clear: gtk::Button,
+    /// Watched's three toggles.
+    toggles: Vec<(Value, gtk::ToggleButton)>,
     checks: Vec<(Value, gtk::CheckButton)>,
-    /// The years offered, oldest first, and the From and To dropdowns.
+    /// Rows past a long section's first ones, shown once ticked or once
+    /// "Show all" is pressed.
+    more: Vec<gtk::CheckButton>,
+    resets: Vec<(FilterPart, gtk::Button)>,
+    /// The years offered, newest first, and the From and To dropdowns.
     years: Option<(Vec<u16>, gtk::DropDown, gtk::DropDown)>,
     bar: gtk::Box,
     chips: gtk::FlowBox,
-    count: gtk::Label,
+    /// The count's number, set apart, and the rest: "37", " of 412 films".
+    count: (gtk::Label, gtk::Label),
+    /// The two together, named as one line for a screen reader.
+    counted: gtk::Box,
     empty: adw::StatusPage,
 }
 
 impl View {
     fn new(shared: Shared) -> Rc<Self> {
         Rc::new_cyclic(|view: &Weak<View>| {
-            let widgets = Widgets::new(view, shared.values.as_ref());
+            let widgets = Widgets::new(view, &shared);
             shared.slots.controls.set_child(Some(&widgets.header()));
             shared.slots.bar.set_child(Some(&widgets.bar));
+            shared.slots.pane.set_sidebar(Some(&widgets.pane));
+            // The pane opens closed; the button and the pane (closed by a
+            // click beside it when it overlays) follow each other.
+            widgets
+                .filters
+                .bind_property("active", &shared.slots.pane, "show-sidebar")
+                .bidirectional()
+                .sync_create()
+                .build();
             View {
                 shared,
                 choice: RefCell::new(Choice::default()),
                 generation: std::cell::Cell::new(0),
                 shown: RefCell::new(None),
                 widgets,
+                #[cfg(test)]
+                toasted: RefCell::new(Vec::new()),
             }
         })
     }
 
     /// Shows `choice`, with its `first` page when it was fetched; a choice
-    /// the library refuses falls back.
-    fn start(self: &Rc<Self>, choice: Choice, first: Option<First>) {
+    /// the library refuses falls back. With `greet`, the user is told the
+    /// saved choice is back, once it shows.
+    fn start(self: &Rc<Self>, choice: Choice, first: Option<First>, greet: bool) {
         self.choice.replace(choice.clone());
         self.sync();
         match (browse::plan(&choice, self.shared.values.as_ref()), first) {
@@ -377,8 +430,26 @@ impl View {
                 }
             }
             (Plan::Refused(why), _) => self.fall_back(&why),
-            _ => self.put(grid(&self.shared.plain, self.shared.cards.clone()).upcast()),
+            _ => self.plain(),
         }
+        // Not when the server refused it after all: that fell back.
+        if greet && *self.choice.borrow() == choice {
+            self.greet();
+        }
+    }
+
+    /// "Your sort and filters for Movies are back.", with Clear all, which
+    /// puts the library back to its default order and everything.
+    fn greet(self: &Rc<Self>) {
+        let text = browse::restored_text(&self.shared.library.title);
+        let toast = crate::markup::toast(&text);
+        toast.set_button_label(Some("Clear all"));
+        toast.connect_button_clicked(on(&Rc::downgrade(self), |view| {
+            view.change(|c| *c = Choice::default())
+        }));
+        self.shared.slots.toasts.add_toast(toast);
+        #[cfg(test)]
+        self.toasted.borrow_mut().push(text);
     }
 
     /// Changes the choice by `edit`, and shows it if it changed.
@@ -390,8 +461,8 @@ impl View {
         }
     }
 
-    /// Saves `choice` for the library, shows it in the menus and the bar,
-    /// and loads the grid for it from its first page.
+    /// Saves `choice` for the library, shows it in the menu, the pane and
+    /// the bar, and loads the grid for it from its first page.
     fn choose(self: &Rc<Self>, choice: Choice) {
         self.shared
             .choices
@@ -407,7 +478,7 @@ impl View {
         self.generation.set(generation);
         let choice = self.choice.borrow().clone();
         match browse::plan(&choice, self.shared.values.as_ref()) {
-            Plan::Plain => self.put(grid(&self.shared.plain, self.shared.cards.clone()).upcast()),
+            Plan::Plain => self.plain(),
             Plan::Refused(why) => self.fall_back(&why),
             Plan::Sorted(request) => {
                 let view = Rc::downgrade(self);
@@ -425,6 +496,12 @@ impl View {
                 });
             }
         }
+    }
+
+    /// The library as `items` gives it, and its own count.
+    fn plain(&self) {
+        self.count(None);
+        self.put(grid(&self.shared.plain, self.shared.cards.clone()).upcast());
     }
 
     /// Whether load `generation` is the latest, and the page still shows.
@@ -445,6 +522,8 @@ impl View {
         first: First,
         generation: u64,
     ) -> Option<BackendError> {
+        // A sort alone keeps every item: the library's own count.
+        let filters = request.filter.is_some();
         match first {
             First::Items(items, total) => {
                 let refused: Rc<dyn Fn()> = {
@@ -467,12 +546,12 @@ impl View {
                 });
                 pages.resize(total);
                 pages.fill(0, items);
-                self.count(total);
+                self.count(filters.then_some(total));
                 self.put(grid(&pages, self.shared.cards.clone()).upcast());
                 None
             }
             First::Nothing => {
-                self.count(0);
+                self.count(Some(0));
                 self.put(self.widgets.empty.clone().upcast());
                 None
             }
@@ -498,9 +577,19 @@ impl View {
         self.shown.replace(Some(widget));
     }
 
-    fn count(&self, kept: u32) {
+    /// The count beside the library's name: `kept` of all, or all.
+    fn count(&self, kept: Option<u32>) {
         let all = self.shared.plain.store.n_items();
-        self.widgets.count.set_label(&browse::count_text(kept, all));
+        let (number, rest) = browse::count_parts(kept, all, self.shared.noun);
+        self.widgets.count.0.set_label(&number);
+        self.widgets.count.1.set_label(&rest);
+        self.widgets
+            .counted
+            .update_property(&[gtk::accessible::Property::Label(&browse::count_text(
+                kept,
+                all,
+                self.shared.noun,
+            ))]);
     }
 
     fn toast(&self, text: &str) {
@@ -508,49 +597,75 @@ impl View {
             .slots
             .toasts
             .add_toast(crate::markup::toast(text));
+        #[cfg(test)]
+        self.toasted.borrow_mut().push(text.to_owned());
     }
 
-    /// Shows the choice in the menus, the Sort button's label and the
-    /// chips. Ticks set here to what they already are change nothing.
+    /// Shows the choice in the Sort menu and its button, the pane, the
+    /// badge and the chips. Ticks set here to what they already are change
+    /// nothing.
     fn sync(self: &Rc<Self>) {
         let choice = self.choice.borrow().clone();
+        let filter = &choice.filter;
         let widgets = &self.widgets;
-        widgets.sort.set_label(&browse::sort_label(choice.sort));
-        if let Some((_, radio)) = widgets.keys.iter().find(|(k, _)| *k == choice.sort.key) {
+        let key = choice.sort.key;
+        widgets
+            .sort_label
+            .set_label(&browse::sort_label(choice.sort));
+        if let Some((_, radio)) = widgets.keys.iter().find(|(k, _)| *k == key) {
             radio.set_active(true);
         }
-        for (radio, label) in widgets
-            .directions
-            .iter()
-            .zip(browse::directions(choice.sort.key))
-        {
-            radio.set_label(Some(label));
+        let order = browse::menu_directions(key);
+        for (radio, descending) in widgets.directions.iter().zip(order) {
+            radio.set_label(Some(browse::directions(key)[usize::from(descending)]));
+            if descending == choice.sort.descending {
+                radio.set_active(true);
+            }
         }
-        widgets.directions[usize::from(choice.sort.descending)].set_active(true);
+        let note = browse::sort_note(key, self.shared.noun, &widgets.offered);
+        widgets.note.set_label(note.as_deref().unwrap_or_default());
+        widgets.note.set_visible(note.is_some());
+
+        for (value, toggle) in &widgets.toggles {
+            toggle.set_active(choice.has(value));
+        }
         for (value, check) in &widgets.checks {
             check.set_active(choice.has(value));
         }
+        for check in &widgets.more {
+            if check.is_active() {
+                check.set_visible(true);
+            }
+        }
+        for (part, reset) in &widgets.resets {
+            reset.set_visible(browse::in_use(filter, *part));
+        }
         if let Some((years, from, to)) = &widgets.years {
-            from.set_selected(year_index(years, choice.filter.year_from));
-            to.set_selected(year_index(years, choice.filter.year_to));
+            from.set_selected(year_index(years, filter.year_from));
+            to.set_selected(year_index(years, filter.year_to));
         }
-        widgets.chips.remove_all();
-        for (chip, text) in browse::chips(&choice.filter) {
-            widgets
-                .chips
-                .append(&chip_widget(&Rc::downgrade(self), chip, &text));
-        }
-        let clear = gtk::Button::builder()
-            .label("Clear all")
-            .valign(gtk::Align::Center)
-            .css_classes(["flat"])
-            .build();
-        clear.connect_clicked(on(&Rc::downgrade(self), |view| {
-            view.change(|c| c.filter = ItemFilter::default())
-        }));
-        widgets.chips.append(&clear);
+        widgets.clear.set_sensitive(choice.filters());
+
+        let parts = browse::parts_in_use(filter);
+        widgets.badge.set_label(&parts.to_string());
         widgets
-            .bar
+            .badge
+            .update_property(&[gtk::accessible::Property::Label(&browse::badge_label(
+                parts,
+            ))]);
+        widgets.badge.set_visible(parts > 0);
+
+        let view = Rc::downgrade(self);
+        widgets.chips.remove_all();
+        widgets.chips.append(&kept_for(&self.shared.library.title));
+        for (part, text) in browse::chips(filter) {
+            widgets.chips.append(&chip_widget(&view, part, &text));
+        }
+        widgets
+            .chips
+            .append(&clear_all(&view, &["flat", "filter-clear"]));
+        widgets
+            .chips
             .set_visible(choice.filters() && self.shared.values.is_some());
     }
 }
@@ -563,6 +678,19 @@ fn on<W>(view: &Weak<View>, act: impl Fn(&Rc<View>) + 'static) -> impl Fn(&W) + 
             act(&view);
         }
     }
+}
+
+/// A Clear all: every filter part off; the sort stays.
+fn clear_all(view: &Weak<View>, classes: &[&str]) -> gtk::Button {
+    let clear = gtk::Button::builder()
+        .label("Clear all")
+        .valign(gtk::Align::Center)
+        .css_classes(classes)
+        .build();
+    clear.connect_clicked(on(view, |view| {
+        view.change(|c| c.filter = ItemFilter::default())
+    }));
+    clear
 }
 
 /// The dropdown position of `year`: "Any" is the first.
@@ -578,11 +706,25 @@ fn year_at(years: &[u16], index: u32) -> Option<u16> {
         .and_then(|i| years.get(i).copied())
 }
 
-/// A chip of the active filter, with a button that takes it off.
-fn chip_widget(view: &Weak<View>, chip: Chip, text: &str) -> gtk::Widget {
+/// The chips row's start: "Kept for Movies", by a clock turning back.
+fn kept_for(library: &str) -> gtk::Widget {
+    let kept = gtk::Box::builder()
+        .spacing(6)
+        .valign(gtk::Align::Center)
+        .tooltip_text("Kept for this library until you change it")
+        .css_classes(["dim-label", "caption-heading", "filter-kept"])
+        .build();
+    kept.append(&gtk::Image::from_icon_name(crate::icons::HISTORY));
+    kept.append(&gtk::Label::new(Some(&browse::kept_for(library))));
+    kept.upcast()
+}
+
+/// A part's chip, with a button that resets the part.
+fn chip_widget(view: &Weak<View>, part: FilterPart, text: &str) -> gtk::Widget {
     let widget = gtk::Box::builder()
         .spacing(2)
-        .css_classes(["chip", "filter-chip"])
+        .valign(gtk::Align::Center)
+        .css_classes(["chip", "accent", "filter-chip"])
         .build();
     widget.append(&gtk::Label::new(Some(text)));
     let remove = gtk::Button::builder()
@@ -591,197 +733,442 @@ fn chip_widget(view: &Weak<View>, chip: Chip, text: &str) -> gtk::Widget {
         .valign(gtk::Align::Center)
         .css_classes(["flat", "circular", "filter-chip-remove"])
         .build();
-    remove.connect_clicked(on(view, move |view| view.change(|c| c.remove(&chip))));
+    remove.connect_clicked(on(view, move |view| view.change(|c| c.reset(part))));
     widget.append(&remove);
     widget.upcast()
 }
 
 impl Widgets {
-    /// The menus for what `values` offers, each hidden when it offers
-    /// nothing; with no values, neither shows.
-    fn new(view: &Weak<View>, values: Option<&ItemFilterValues>) -> Self {
+    /// The Sort menu and the Filters pane for what the library offers,
+    /// each button hidden when it offers nothing; with no values, neither
+    /// shows.
+    fn new(view: &Weak<View>, shared: &Shared) -> Self {
         let default = ItemFilterValues::default();
-        let values = values.unwrap_or(&default);
+        let values = shared.values.as_ref().unwrap_or(&default);
+        let (sort, sort_label, keys, directions, note, offered) = sort_menu(view, values);
 
-        // Sort: the keys, then the two directions worded for the key.
+        // The pane: its header, then a section per part, applied as it
+        // is ticked.
         let column = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
-            .spacing(2)
+            .spacing(18)
+            .css_classes(["library-filter-pane"])
             .build();
-        column.append(&heading("Sort by"));
-        let mut keys = Vec::new();
-        let mut group: Option<gtk::CheckButton> = None;
-        for key in browse::sort_keys(values) {
-            let radio = radio(&mut group, browse::key_label(key).unwrap_or_default());
-            radio.connect_toggled(when_on(view, move |view| view.change(|c| c.sort.key = key)));
-            column.append(&radio);
-            keys.push((key, radio));
-        }
-        column.append(
-            &gtk::Separator::builder()
-                .margin_top(4)
-                .margin_bottom(4)
+        let head = gtk::Box::builder().spacing(8).build();
+        head.append(
+            &gtk::Label::builder()
+                .label("Filters")
+                .xalign(0.0)
+                .hexpand(true)
+                .css_classes(["title-4"])
                 .build(),
         );
-        let mut group = None;
-        let directions = [false, true].map(|descending| {
-            let radio = radio(&mut group, "");
-            radio.connect_toggled(when_on(view, move |view| {
-                view.change(|c| c.sort.descending = descending)
-            }));
-            column.append(&radio);
-            radio
-        });
-        let sort = gtk::MenuButton::builder()
-            .label(browse::sort_label(ItemSort::DEFAULT))
-            .tooltip_text("Sort the library")
-            .popover(&popover(&column))
-            .visible(!keys.is_empty())
+        let clear = clear_all(view, &[]);
+        head.append(&clear);
+        column.append(&head);
+        let mut parts = Parts::default();
+        let sections = browse::sections(values);
+        for section in &sections {
+            column.append(&parts.section(view, section));
+        }
+        let pane = gtk::ScrolledWindow::builder()
+            .child(&column)
+            .hscrollbar_policy(gtk::PolicyType::Never)
             .build();
 
-        // Filter: a section per part, applied as it is ticked.
-        let column = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .spacing(2)
+        let badge = gtk::Label::builder()
+            .visible(false)
+            .valign(gtk::Align::Center)
+            .css_classes(["filter-badge", "numeric"])
             .build();
-        let mut checks = Vec::new();
-        let mut years = None;
-        let sections = browse::sections(values);
-        for (n, section) in sections.iter().enumerate() {
-            let title = heading(section.title);
-            if n > 0 {
-                title.set_margin_top(10);
-            }
-            column.append(&title);
-            match &section.body {
-                Body::Checks(list) => {
-                    let rows = gtk::Box::builder()
-                        .orientation(gtk::Orientation::Vertical)
-                        .build();
-                    for check in list {
-                        let button = gtk::CheckButton::with_label(&check.label);
-                        let value = check.value.clone();
-                        let weak = view.clone();
-                        button.connect_toggled(move |button| {
-                            if let Some(view) = weak.upgrade() {
-                                let on = button.is_active();
-                                view.change(|c| c.set(&value, on));
-                            }
-                        });
-                        rows.append(&button);
-                        checks.push((check.value.clone(), button));
-                    }
-                    // A long list (genres) scrolls in its section.
-                    column.append(
-                        &gtk::ScrolledWindow::builder()
-                            .child(&rows)
-                            .hscrollbar_policy(gtk::PolicyType::Never)
-                            .max_content_height(240)
-                            .propagate_natural_height(true)
-                            .build(),
-                    );
-                }
-                Body::Years(offered) => {
-                    let names: Vec<String> = std::iter::once("Any".to_owned())
-                        .chain(offered.iter().map(u16::to_string))
-                        .collect();
-                    let names: Vec<&str> = names.iter().map(String::as_str).collect();
-                    let row = gtk::Box::builder().spacing(8).build();
-                    let pick = |label: &str, set: fn(&mut Choice, Option<u16>)| {
-                        row.append(&gtk::Label::new(Some(label)));
-                        let dropdown = gtk::DropDown::from_strings(&names);
-                        dropdown.update_property(&[gtk::accessible::Property::Label(&format!(
-                            "{label} year"
-                        ))]);
-                        let (weak, offered) = (view.clone(), offered.clone());
-                        dropdown.connect_selected_notify(move |dropdown| {
-                            if let Some(view) = weak.upgrade() {
-                                let year = year_at(&offered, dropdown.selected());
-                                view.change(|c| set(c, year));
-                            }
-                        });
-                        row.append(&dropdown);
-                        dropdown
-                    };
-                    let from = pick("From", Choice::set_year_from);
-                    let to = pick("To", Choice::set_year_to);
-                    column.append(&row);
-                    years = Some((offered.clone(), from, to));
-                }
-            }
-        }
-        let filter = gtk::MenuButton::builder()
-            .label("Filter")
-            .tooltip_text("Filter the library")
-            .popover(&popover(
-                // Every section together may be taller than the window.
-                &gtk::ScrolledWindow::builder()
-                    .child(&column)
-                    .hscrollbar_policy(gtk::PolicyType::Never)
-                    .max_content_height(520)
-                    .propagate_natural_height(true)
-                    .build(),
-            ))
+        let content = gtk::Box::builder().spacing(8).build();
+        content.append(&gtk::Image::from_icon_name(crate::icons::FILTER));
+        content.append(&gtk::Label::new(Some("Filters")));
+        content.append(&badge);
+        let filters = gtk::ToggleButton::builder()
+            .child(&content)
+            .tooltip_text("Show the filters")
             .visible(!sections.is_empty())
             .build();
 
-        // The bar: the chips and Clear all, then the count.
+        // Over the grid: the name and its count, then the chips (the
+        // view fills them), which wrap.
+        let count = (
+            gtk::Label::builder()
+                .css_classes(["heading", "numeric"])
+                .build(),
+            gtk::Label::builder()
+                .css_classes(["dim-label", "numeric"])
+                .build(),
+        );
+        let title = gtk::Box::builder()
+            .spacing(12)
+            .css_classes(["library-heading"])
+            .build();
+        title.append(
+            &gtk::Label::builder()
+                .label(&shared.library.title)
+                .xalign(0.0)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .css_classes(["title-1"])
+                .build(),
+        );
+        let counted = gtk::Box::builder().valign(gtk::Align::Baseline).build();
+        counted.append(&count.0);
+        counted.append(&count.1);
+        title.append(&counted);
         let chips = gtk::FlowBox::builder()
             .selection_mode(gtk::SelectionMode::None)
-            .column_spacing(6)
-            .row_spacing(6)
+            .column_spacing(8)
+            .row_spacing(8)
             .max_children_per_line(64)
-            .hexpand(true)
-            .valign(gtk::Align::Center)
-            .build();
-        let count = gtk::Label::builder()
-            .valign(gtk::Align::Center)
-            .css_classes(["dim-label", "numeric"])
-            .build();
-        let bar = gtk::Box::builder()
-            .spacing(12)
             .visible(false)
             .css_classes(["library-filters"])
             .build();
-        bar.append(&chips);
-        bar.append(&count);
-
-        let clear = gtk::Button::builder()
-            .label("Clear filters")
-            .halign(gtk::Align::Center)
-            .css_classes(["pill", "suggested-action"])
+        let bar = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
             .build();
-        clear.connect_clicked(on(view, |view| {
-            view.change(|c| c.filter = ItemFilter::default())
-        }));
+        bar.append(&title);
+        bar.append(&chips);
+
         let empty = adw::StatusPage::builder()
-            .icon_name(crate::icons::SEARCH)
+            .icon_name(crate::icons::NO_MATCH)
             .title("No items match these filters")
-            .child(&clear)
+            // A status page's description is markup; the library's name
+            // is the server's.
+            .description(crate::markup::plain(&browse::nothing_matches_text(
+                shared.noun,
+                &shared.library.title,
+            )))
+            .child(&{
+                let clear = clear_all(view, &["pill", "suggested-action"]);
+                clear.set_halign(gtk::Align::Center);
+                clear
+            })
             .vexpand(true)
             .build();
 
         Widgets {
             sort,
+            sort_label,
             keys,
             directions,
-            filter,
-            checks,
-            years,
+            note,
+            offered,
+            filters,
+            badge,
+            pane,
+            clear,
+            toggles: parts.toggles,
+            checks: parts.checks,
+            more: parts.more,
+            resets: parts.resets,
+            years: parts.years,
             bar,
             chips,
             count,
+            counted,
             empty,
         }
     }
 
-    /// The header's part: Sort, then Filter.
+    /// The header bar's part: Sort, then Filters.
     fn header(&self) -> gtk::Box {
-        let header = gtk::Box::builder().spacing(6).build();
+        let header = gtk::Box::builder().spacing(8).build();
         header.append(&self.sort);
-        header.append(&self.filter);
+        header.append(&self.filters);
         header
     }
+}
+
+/// The Sort menu's widgets: its button and the button's label, the key
+/// rows, the two direction rows, the note and the keys listed.
+type SortMenu = (
+    gtk::MenuButton,
+    gtk::Label,
+    Vec<(SortKey, gtk::CheckButton)>,
+    [gtk::CheckButton; 2],
+    gtk::Label,
+    Vec<SortKey>,
+);
+
+/// "Sort by", the library's keys, the two directions worded for the key
+/// and a note on what sorts last.
+fn sort_menu(view: &Weak<View>, values: &ItemFilterValues) -> SortMenu {
+    let column = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .build();
+    column.append(&heading("Sort by"));
+    let offered = browse::sort_keys(values);
+    let mut keys = Vec::new();
+    let mut group: Option<gtk::CheckButton> = None;
+    for &key in &offered {
+        let radio = radio(&mut group, browse::key_label(key).unwrap_or_default());
+        radio.connect_toggled(when_on(view, move |view| view.change(|c| c.sort.key = key)));
+        column.append(&radio);
+        keys.push((key, radio));
+    }
+    column.append(
+        &gtk::Separator::builder()
+            .margin_top(4)
+            .margin_bottom(4)
+            .build(),
+    );
+    let mut group = None;
+    let directions = [0, 1].map(|row: usize| {
+        let radio = radio(&mut group, "");
+        radio.connect_toggled(when_on(view, move |view| {
+            view.change(|c| c.sort.descending = browse::menu_directions(c.sort.key)[row])
+        }));
+        column.append(&radio);
+        radio
+    });
+    let note = gtk::Label::builder()
+        .xalign(0.0)
+        .wrap(true)
+        .max_width_chars(30)
+        .margin_top(6)
+        .css_classes(["caption", "dim-label"])
+        .build();
+    column.append(&note);
+
+    let sort_label = gtk::Label::new(Some(&browse::sort_label(ItemSort::DEFAULT)));
+    let content = gtk::Box::builder().spacing(8).build();
+    content.append(&gtk::Image::from_icon_name(crate::icons::SORT));
+    content.append(&sort_label);
+    let sort = gtk::MenuButton::builder()
+        .child(&content)
+        .always_show_arrow(true)
+        .tooltip_text("Sort the library")
+        .popover(
+            &gtk::Popover::builder()
+                .child(&column)
+                .width_request(240)
+                .css_classes(["library-menu"])
+                .build(),
+        )
+        .visible(!keys.is_empty())
+        .build();
+    (sort, sort_label, keys, directions, note, offered)
+}
+
+/// The pane's sections as they are built, and the widgets that show a
+/// choice in them.
+#[derive(Default)]
+struct Parts {
+    toggles: Vec<(Value, gtk::ToggleButton)>,
+    checks: Vec<(Value, gtk::CheckButton)>,
+    more: Vec<gtk::CheckButton>,
+    resets: Vec<(FilterPart, gtk::Button)>,
+    years: Option<(Vec<u16>, gtk::DropDown, gtk::DropDown)>,
+}
+
+impl Parts {
+    /// A section: its name and Reset (shown while the part is in use),
+    /// then its values.
+    fn section(&mut self, view: &Weak<View>, section: &Section) -> gtk::Box {
+        let part = section.part;
+        let column = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(4)
+            .build();
+        let head = gtk::Box::builder().spacing(8).build();
+        let title = heading(section.title);
+        title.set_hexpand(true);
+        title.set_margin_top(0);
+        head.append(&title);
+        let reset = gtk::Button::builder()
+            .label("Reset")
+            .visible(false)
+            .tooltip_text(format!("Reset {}", section.title.to_lowercase()))
+            .css_classes(["flat", "accent", "filter-reset"])
+            .build();
+        reset.connect_clicked(on(view, move |view| view.change(|c| c.reset(part))));
+        head.append(&reset);
+        self.resets.push((part, reset));
+        column.append(&head);
+        match (&section.body, part) {
+            (Body::Checks(list), FilterPart::Watched) => column.append(&self.watched(view, list)),
+            (Body::Checks(list), _) => self.checks(view, part, list, &column),
+            (Body::Years(offered), _) => column.append(&self.years(view, offered)),
+        }
+        column
+    }
+
+    /// Watched: a toggle per state, any of them on (an item in any of
+    /// them is kept), none on for every item.
+    fn watched(&mut self, view: &Weak<View>, list: &[browse::Check]) -> gtk::Box {
+        let row = gtk::Box::builder()
+            .homogeneous(true)
+            .css_classes(["linked"])
+            .build();
+        for check in list {
+            let toggle = gtk::ToggleButton::with_label(&check.label);
+            let (value, weak) = (check.value.clone(), view.clone());
+            toggle.connect_toggled(move |toggle| {
+                if let Some(view) = weak.upgrade() {
+                    let on = toggle.is_active();
+                    view.change(|c| c.set(&value, on));
+                }
+            });
+            row.append(&toggle);
+            self.toggles.push((check.value.clone(), toggle));
+        }
+        row
+    }
+
+    /// A check row per value with its count when the server says, laid
+    /// out in [`browse::columns`]; a long single column shows its first
+    /// rows and "Show all".
+    fn checks(
+        &mut self,
+        view: &Weak<View>,
+        part: FilterPart,
+        list: &[browse::Check],
+        column: &gtk::Box,
+    ) {
+        let across = browse::columns(part, list.len());
+        let grid = gtk::Grid::builder()
+            .column_spacing(16)
+            .column_homogeneous(true)
+            .build();
+        let folds = across == 1 && list.len() > browse::SHOWN_CHECKS;
+        let mut more = Vec::new();
+        for (n, check) in list.iter().enumerate() {
+            let button = check_row(check);
+            let value = check.value.clone();
+            let weak = view.clone();
+            button.connect_toggled(move |button| {
+                if let Some(view) = weak.upgrade() {
+                    let on = button.is_active();
+                    view.change(|c| c.set(&value, on));
+                }
+            });
+            let n = n as u32;
+            grid.attach(&button, (n % across) as i32, (n / across) as i32, 1, 1);
+            if folds && n as usize >= browse::SHOWN_CHECKS {
+                button.set_visible(false);
+                more.push(button.clone());
+            }
+            self.checks.push((check.value.clone(), button));
+        }
+        column.append(&grid);
+        if folds {
+            let show_all = gtk::Button::builder()
+                .label(browse::show_all_label(part, list.len()))
+                .halign(gtk::Align::Start)
+                .css_classes(["flat", "accent"])
+                .build();
+            let rows = more.clone();
+            show_all.connect_clicked(move |button| {
+                rows.iter().for_each(|row| row.set_visible(true));
+                button.set_visible(false);
+            });
+            column.append(&show_all);
+        }
+        self.more.extend(more);
+    }
+
+    /// Years: From and to, each a dropdown of "Any" and the years, newest
+    /// first, with their counts.
+    fn years(&mut self, view: &Weak<View>, offered: &[Counted<u16>]) -> gtk::Box {
+        let years: Vec<u16> = offered.iter().map(|c| c.value).collect();
+        let row = gtk::Box::builder().spacing(8).build();
+        let pick = |label: &str, name: &str, set: fn(&mut Choice, Option<u16>)| {
+            row.append(
+                &gtk::Label::builder()
+                    .label(label)
+                    .css_classes(["dim-label"])
+                    .build(),
+            );
+            let dropdown = year_dropdown(offered);
+            dropdown.update_property(&[gtk::accessible::Property::Label(name)]);
+            let (weak, years) = (view.clone(), years.clone());
+            dropdown.connect_selected_notify(move |dropdown| {
+                if let Some(view) = weak.upgrade() {
+                    let year = year_at(&years, dropdown.selected());
+                    view.change(|c| set(c, year));
+                }
+            });
+            row.append(&dropdown);
+            dropdown
+        };
+        let from = pick("From", "From year", Choice::set_year_from);
+        let to = pick("to", "To year", Choice::set_year_to);
+        self.years = Some((years, from, to));
+        row
+    }
+}
+
+/// A value's check row: its name, and its count at the end when the
+/// server sent one.
+fn check_row(check: &browse::Check) -> gtk::CheckButton {
+    let row = gtk::Box::builder().spacing(8).build();
+    row.append(
+        &gtk::Label::builder()
+            .label(&check.label)
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .build(),
+    );
+    if let Some(count) = check.count {
+        row.append(
+            &gtk::Label::builder()
+                .label(count.to_string())
+                .css_classes(["caption", "dim-label", "numeric"])
+                .build(),
+        );
+    }
+    let button = gtk::CheckButton::builder().child(&row).build();
+    button.update_property(&[gtk::accessible::Property::Label(&check.label)]);
+    button
+}
+
+/// A year dropdown: "Any", then `offered`; its list shows each year's
+/// count, its button the year alone.
+fn year_dropdown(offered: &[Counted<u16>]) -> gtk::DropDown {
+    let names: Vec<String> = std::iter::once("Any".to_owned())
+        .chain(offered.iter().map(|c| c.value.to_string()))
+        .collect();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let dropdown = gtk::DropDown::from_strings(&names);
+    dropdown.set_hexpand(true);
+    let counts: Vec<Option<u32>> = std::iter::once(None)
+        .chain(offered.iter().map(|c| c.count))
+        .collect();
+    let factory = gtk::SignalListItemFactory::new();
+    factory.connect_setup(|_, item| {
+        let item = item.downcast_ref::<gtk::ListItem>().expect("a list item");
+        let row = gtk::Box::builder().spacing(12).build();
+        row.append(&gtk::Label::builder().xalign(0.0).hexpand(true).build());
+        row.append(
+            &gtk::Label::builder()
+                .css_classes(["caption", "dim-label", "numeric"])
+                .build(),
+        );
+        item.set_child(Some(&row));
+    });
+    factory.connect_bind(move |_, item| {
+        let item = item.downcast_ref::<gtk::ListItem>().expect("a list item");
+        let name = item.item().and_downcast::<gtk::StringObject>();
+        let year = item.child().and_then(|row| row.first_child());
+        let count = year.as_ref().and_then(|y| y.next_sibling());
+        let (Some(name), Some(year), Some(count)) = (
+            name,
+            year.and_downcast::<gtk::Label>(),
+            count.and_downcast::<gtk::Label>(),
+        ) else {
+            return;
+        };
+        year.set_label(&name.string());
+        let n = counts.get(item.position() as usize).copied().flatten();
+        count.set_label(&n.map(|n| n.to_string()).unwrap_or_default());
+        count.set_visible(n.is_some());
+    });
+    dropdown.set_list_factory(Some(&factory));
+    dropdown
 }
 
 /// A radio in `group`, the first made its leader.
@@ -834,14 +1221,6 @@ fn heading(text: &str) -> gtk::Label {
         .build()
 }
 
-fn popover(child: &impl IsA<gtk::Widget>) -> gtk::Popover {
-    gtk::Popover::builder()
-        .child(child)
-        .width_request(260)
-        .css_classes(["library-menu"])
-        .build()
-}
-
 /// A grid over `pages`; their items fill in as they arrive.
 fn grid(pages: &Rc<Pages>, cards: Rc<Cards>) -> gtk::GridView {
     let store = pages.store.clone();
@@ -890,8 +1269,9 @@ fn grid(pages: &Rc<Pages>, cards: Rc<Cards>) -> gtk::GridView {
 
 #[cfg(test)]
 mod tests {
-    use spoolframe_linux_core::backend::Client;
+    use spoolframe_linux_core::backend::{Client, WatchedState};
     use spoolframe_linux_core::fake::FakeClient;
+    use spoolframe_types::LibraryKind;
 
     use super::*;
 
@@ -934,7 +1314,7 @@ mod tests {
 
     /// The fake's library of `kind` opened in fresh slots, once its page
     /// shows; the cache, the view and the scroller.
-    fn opened(kind: spoolframe_types::LibraryKind) -> (Rc<Cache>, Rc<View>, gtk::ScrolledWindow) {
+    fn opened(kind: LibraryKind) -> (Rc<Cache>, Rc<View>, gtk::ScrolledWindow) {
         let cache = cache(SavedChoices::default());
         let (view, scroller) = open_in(&cache, kind);
         (cache, view, scroller)
@@ -950,16 +1330,17 @@ mod tests {
         Cache::new(session, choices)
     }
 
-    /// The library of `kind` opened again from `cache`.
-    fn open_in(
-        cache: &Rc<Cache>,
-        kind: spoolframe_types::LibraryKind,
-    ) -> (Rc<View>, gtk::ScrolledWindow) {
-        let library = spoolframe_linux_core::testing::ready(cache.session.libraries())
+    fn library_of(cache: &Cache, kind: LibraryKind) -> Library {
+        spoolframe_linux_core::testing::ready(cache.session.libraries())
             .unwrap()
             .into_iter()
             .find(|l| l.kind == kind)
-            .unwrap();
+            .unwrap()
+    }
+
+    /// The library of `kind` opened again from `cache`.
+    fn open_in(cache: &Rc<Cache>, kind: LibraryKind) -> (Rc<View>, gtk::ScrolledWindow) {
+        let library = library_of(cache, kind);
         let cards = Rc::new(Cards {
             open: Rc::new(|_| {}),
             art: None,
@@ -975,6 +1356,7 @@ mod tests {
             scroller: scroller.clone(),
             controls: adw::Bin::new(),
             bar: adw::Bin::new(),
+            pane: adw::OverlaySplitView::new(),
             toasts: adw::ToastOverlay::new(),
         };
         let done = Rc::new(std::cell::Cell::new(false));
@@ -993,10 +1375,19 @@ mod tests {
         (view, scroller)
     }
 
+    /// The direction row now worded `label`.
+    fn direction<'a>(view: &'a View, label: &str) -> &'a gtk::CheckButton {
+        view.widgets
+            .directions
+            .iter()
+            .find(|radio| radio.label().as_deref() == Some(label))
+            .unwrap()
+    }
+
     #[test]
     #[ignore = "needs a display; run on its own"]
     fn a_library_opened_again_keeps_its_sort() {
-        let (cache, view, _) = opened(spoolframe_types::LibraryKind::Movies);
+        let (cache, view, _) = opened(LibraryKind::Movies);
         let (_, added) = view
             .widgets
             .keys
@@ -1004,12 +1395,9 @@ mod tests {
             .find(|(key, _)| *key == SortKey::Added)
             .unwrap();
         added.set_active(true);
-        view.widgets.directions[1].set_active(true);
-        let (again, _) = open_in(&cache, spoolframe_types::LibraryKind::Movies);
-        assert_eq!(
-            again.widgets.sort.label().as_deref(),
-            Some("Date added, newest first")
-        );
+        direction(&view, "Newest").set_active(true);
+        let (again, _) = open_in(&cache, LibraryKind::Movies);
+        assert_eq!(again.widgets.sort_label.label(), "Added · Newest");
     }
 
     /// As after a restart: a new cache, its choices read from the file.
@@ -1025,18 +1413,15 @@ mod tests {
                 &FakeClient::profile("andrey"),
             )
         };
-        let (view, _) = open_in(&cache(saved()), spoolframe_types::LibraryKind::Movies);
+        let (view, _) = open_in(&cache(saved()), LibraryKind::Movies);
         view.change(|c| {
             c.sort = ItemSort {
                 key: SortKey::Added,
                 descending: true,
             }
         });
-        let (again, _) = open_in(&cache(saved()), spoolframe_types::LibraryKind::Movies);
-        assert_eq!(
-            again.widgets.sort.label().as_deref(),
-            Some("Date added, newest first")
-        );
+        let (again, _) = open_in(&cache(saved()), LibraryKind::Movies);
+        assert_eq!(again.widgets.sort_label.label(), "Added · Newest");
     }
 
     fn grid_length(scroller: &gtk::ScrolledWindow) -> u32 {
@@ -1047,40 +1432,140 @@ mod tests {
             .map_or(0, |model| model.n_items())
     }
 
-    #[test]
-    #[ignore = "needs a display; run on its own"]
-    fn ticking_a_genre_narrows_the_grid_and_counts_it() {
-        let (_cache, view, scroller) = opened(spoolframe_types::LibraryKind::Movies);
-        let (_, drama) = view
+    fn count_text(view: &View) -> String {
+        let (number, rest) = &view.widgets.count;
+        format!("{}{}", number.label(), rest.label())
+    }
+
+    fn check<'a>(view: &'a View, value: &Value) -> &'a gtk::CheckButton {
+        let (_, check) = view
             .widgets
             .checks
             .iter()
-            .find(|(value, _)| *value == Value::Genre("Drama".into()))
+            .find(|(v, _)| v == value)
             .unwrap();
-        drama.set_active(true);
+        check
+    }
+
+    #[test]
+    #[ignore = "needs a display; run on its own"]
+    fn ticking_a_genre_narrows_the_grid_and_counts_it() {
+        let (_cache, view, scroller) = opened(LibraryKind::Movies);
+        check(&view, &Value::Genre("Drama".into())).set_active(true);
         assert!(crate::ui_test::spin_until(
             std::time::Duration::from_secs(5),
-            || view.widgets.count.label() == "4 of 8" && grid_length(&scroller) == 4
+            || count_text(&view) == "4 of 8 films" && grid_length(&scroller) == 4
         ));
     }
 
     #[test]
     #[ignore = "needs a display; run on its own"]
+    fn an_unfiltered_library_counts_all_its_items() {
+        let (_cache, view, _) = opened(LibraryKind::Movies);
+        assert_eq!(count_text(&view), "8 films");
+    }
+
+    #[test]
+    #[ignore = "needs a display; run on its own"]
     fn a_music_library_offers_no_watched_filter() {
-        let (_cache, view, _) = opened(spoolframe_types::LibraryKind::Music);
-        assert!(
-            !view
-                .widgets
-                .checks
-                .iter()
-                .any(|(value, _)| matches!(value, Value::Watched(_)))
+        let (_cache, view, _) = opened(LibraryKind::Music);
+        assert!(view.widgets.toggles.is_empty());
+    }
+
+    #[test]
+    #[ignore = "needs a display; run on its own"]
+    fn a_watched_toggle_keeps_items_in_that_state() {
+        let (_cache, view, _) = opened(LibraryKind::Movies);
+        let (_, unwatched) = view
+            .widgets
+            .toggles
+            .iter()
+            .find(|(v, _)| *v == Value::Watched(WatchedState::Unwatched))
+            .unwrap();
+        unwatched.set_active(true);
+        assert_eq!(
+            view.choice.borrow().filter.watched,
+            vec![WatchedState::Unwatched]
         );
     }
 
     #[test]
     #[ignore = "needs a display; run on its own"]
+    fn the_badge_counts_the_parts_in_use() {
+        let (_cache, view, _) = opened(LibraryKind::Movies);
+        view.change(|c| {
+            c.set(&Value::Genre("Drama".into()), true);
+            c.set(&Value::Genre("Science Fiction".into()), true);
+            c.set(&Value::Watched(WatchedState::Unwatched), true);
+        });
+        let badge = &view.widgets.badge;
+        assert_eq!((badge.label().as_str(), badge.is_visible()), ("2", true));
+    }
+
+    #[test]
+    #[ignore = "needs a display; run on its own"]
+    fn a_parts_reset_shows_while_it_is_in_use() {
+        let (_cache, view, _) = opened(LibraryKind::Movies);
+        view.change(|c| c.set(&Value::Genre("Drama".into()), true));
+        let shown: Vec<FilterPart> = view
+            .widgets
+            .resets
+            .iter()
+            .filter(|(_, reset)| reset.is_visible())
+            .map(|(part, _)| *part)
+            .collect();
+        assert_eq!(shown, vec![FilterPart::Genres]);
+    }
+
+    #[test]
+    #[ignore = "needs a display; run on its own"]
+    fn the_filters_button_opens_the_pane() {
+        let (_cache, view, _) = opened(LibraryKind::Movies);
+        view.widgets.filters.set_active(true);
+        assert!(view.shared.slots.pane.shows_sidebar());
+    }
+
+    /// A choice saved before this session, as one read from the file.
+    fn saved_drama(cache: &Cache) {
+        let id = library_of(cache, LibraryKind::Movies).id.to_string();
+        let mut drama = Choice::default();
+        drama.set(&Value::Genre("Drama".into()), true);
+        cache.choices.borrow_mut().set(&id, drama);
+    }
+
+    #[test]
+    #[ignore = "needs a display; run on its own"]
+    fn a_saved_choice_is_said_to_be_back_on_opening() {
+        let cache = cache(SavedChoices::default());
+        saved_drama(&cache);
+        let (view, _) = open_in(&cache, LibraryKind::Movies);
+        assert_eq!(
+            *view.toasted.borrow(),
+            vec![browse::restored_text(&view.shared.library.title)]
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a display; run on its own"]
+    fn a_saved_choice_is_said_to_be_back_once_a_session() {
+        let cache = cache(SavedChoices::default());
+        saved_drama(&cache);
+        open_in(&cache, LibraryKind::Movies);
+        let (again, _) = open_in(&cache, LibraryKind::Movies);
+        assert!(again.toasted.borrow().is_empty());
+    }
+
+    #[test]
+    #[ignore = "needs a display; run on its own"]
+    fn the_default_opens_without_a_toast() {
+        let (_cache, view, _) = opened(LibraryKind::Movies);
+        assert!(view.toasted.borrow().is_empty());
+    }
+
+    #[test]
+    #[ignore = "needs a display; run on its own"]
     fn clearing_a_filter_that_keeps_nothing_shows_the_library_again() {
-        let (_cache, view, scroller) = opened(spoolframe_types::LibraryKind::Movies);
+        let (_cache, view, scroller) = opened(LibraryKind::Movies);
         view.change(|c| {
             c.set(&Value::Genre("Horror".into()), true);
             c.set(
@@ -1102,7 +1587,7 @@ mod tests {
     #[test]
     #[ignore = "needs a display; run on its own"]
     fn a_choice_the_library_refuses_falls_back_to_everything() {
-        let (cache, view, _) = opened(spoolframe_types::LibraryKind::Shows);
+        let (cache, view, _) = opened(LibraryKind::Shows);
         let id = view.shared.library.id.to_string();
         let refused = Choice {
             sort: ItemSort {
@@ -1117,29 +1602,29 @@ mod tests {
         assert_eq!(
             (
                 cache.choices.borrow().get(&id).cloned(),
-                view.widgets.sort.label()
+                view.widgets.sort_label.label()
             ),
-            (None, Some("Title, A to Z".into()))
+            (None, "Title · A to Z".into())
         );
     }
 
     #[test]
     fn any_year_is_the_dropdowns_first_place() {
-        assert_eq!(year_index(&[1979, 1995], None), 0);
+        assert_eq!(year_index(&[1995, 1979], None), 0);
     }
 
     #[test]
     fn a_year_sits_after_any() {
-        assert_eq!(year_index(&[1979, 1995], Some(1995)), 2);
+        assert_eq!(year_index(&[1995, 1979], Some(1979)), 2);
     }
 
     #[test]
     fn the_first_place_picks_any_year() {
-        assert_eq!(year_at(&[1979, 1995], 0), None);
+        assert_eq!(year_at(&[1995, 1979], 0), None);
     }
 
     #[test]
     fn a_later_place_picks_its_year() {
-        assert_eq!(year_at(&[1979, 1995], 1), Some(1979));
+        assert_eq!(year_at(&[1995, 1979], 1), Some(1995));
     }
 }

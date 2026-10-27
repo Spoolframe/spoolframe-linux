@@ -335,12 +335,15 @@ pub struct AppWidgets {
     profile_server: gtk::Label,
     /// Says when the connection is not up.
     banner: adw::Banner,
-    library_heading: gtk::Label,
-    /// A library's Sort and Filter menus, in the root header while it
-    /// shows.
+    /// A library's Sort menu and Filters button, in the root header while
+    /// it shows.
     library_controls: adw::Bin,
-    /// A library's active filter, under its name.
+    /// A library's name and count, then its active filter's chips, over
+    /// its grid.
     library_bar: adw::Bin,
+    /// Around the bar and the scrolled content: a library's Filters pane
+    /// is its sidebar, at the right; empty and closed elsewhere.
+    library_pane: adw::OverlaySplitView,
     /// The root header's title, at its start.
     root_title: gtk::Label,
     /// The root page's header bar: search puts its field there.
@@ -1022,23 +1025,22 @@ impl Component for App {
             .child(&content)
             .vexpand(true)
             .build();
-        // A library's name over its grid: the grid scrolls on its own (it
-        // loads as it goes), so the heading stays above it.
-        let library_heading = gtk::Label::builder()
-            .xalign(0.0)
-            .visible(false)
-            .css_classes(["title-2", "library-heading"])
-            .build();
+        // A library's name, count and chips over its grid: the grid
+        // scrolls on its own (it loads as it goes), so they stay above it.
         let library_bar = adw::Bin::new();
-        let root_toolbar = views::toolbar(
-            &header,
-            &[
-                banner.upcast_ref(),
-                library_heading.upcast_ref(),
-                library_bar.upcast_ref(),
-            ],
-            &scroller,
-        );
+        let library_column = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        library_column.append(&library_bar);
+        library_column.append(&scroller);
+        // The Filters pane at the right, as the boards have it: beside the
+        // grid, which stays in view; over it in a narrow window.
+        let library_pane = adw::OverlaySplitView::builder()
+            .content(&library_column)
+            .sidebar_position(gtk::PackType::End)
+            .show_sidebar(false)
+            .min_sidebar_width(320.0)
+            .max_sidebar_width(320.0)
+            .build();
+        let root_toolbar = views::toolbar(&header, &[banner.upcast_ref()], &library_pane);
         let root_page = adw::NavigationPage::builder()
             .title("Home")
             .child(&root_toolbar)
@@ -1058,11 +1060,20 @@ impl Component for App {
             .sidebar(&sidebar_page)
             .content(&content_page)
             .build();
+        // Short of room for the grid beside it, the Filters pane goes over
+        // the grid. Added first: of the breakpoints that match, the last
+        // added applies, and the narrow one collapses the pane too.
+        let middling = adw::Breakpoint::new(
+            adw::BreakpointCondition::parse("max-width: 1000sp").expect("a valid condition"),
+        );
+        middling.add_setter(&library_pane, "collapsed", Some(&true.to_value()));
+        root.add_breakpoint(middling);
         // A narrow window shows one pane at a time, sidebar or content.
         let narrow = adw::Breakpoint::new(
             adw::BreakpointCondition::parse("max-width: 760sp").expect("a valid condition"),
         );
         narrow.add_setter(&split, "collapsed", Some(&true.to_value()));
+        narrow.add_setter(&library_pane, "collapsed", Some(&true.to_value()));
         root.add_breakpoint(narrow);
         // Collapsed, picking a row goes on to its pane.
         sidebar.list.connect_row_activated(glib::clone!(
@@ -1294,9 +1305,9 @@ impl Component for App {
                 profile_name,
                 profile_server,
                 banner,
-                library_heading,
                 library_controls,
                 library_bar,
+                library_pane,
                 root_title,
                 root_header: header.clone(),
                 sign_in: None,
@@ -1882,23 +1893,17 @@ impl Component for App {
                     scroller: widgets.scroller.clone(),
                     controls: widgets.library_controls.clone(),
                     bar: widgets.library_bar.clone(),
+                    pane: widgets.library_pane.clone(),
                     toasts: widgets.toasts.clone(),
                 };
-                let heading = widgets.library_heading.clone();
                 let cards = self.cards.clone();
                 self.root_load = Some(glib::spawn_future_local(async move {
-                    let title = library.title.clone();
-                    // The grid goes in the scroller, the menus in the
-                    // header.
-                    match cache.open(library, cards, slots).await {
-                        Ok(()) => {
-                            heading.set_label(&title);
-                            heading.set_visible(true);
-                        }
-                        Err(e) => {
-                            clear(&content);
-                            content.append(&error_status(&e, None));
-                        }
+                    // The grid goes in the scroller, its name and chips
+                    // over it, the menus in the header and the filters in
+                    // the pane.
+                    if let Err(e) = cache.open(library, cards, slots).await {
+                        clear(&content);
+                        content.append(&error_status(&e, None));
                     }
                 }));
             }
@@ -5634,12 +5639,13 @@ fn clear(content: &gtk::Box) {
 }
 
 /// Puts the root page's ordinary content back in its scrolled area, in
-/// place of a library grid, and takes the library's menus and filter bar
-/// away with it.
+/// place of a library grid, and takes the library's menus, bar and
+/// Filters pane away with it.
 fn show_content(widgets: &AppWidgets) {
-    widgets.library_heading.set_visible(false);
     widgets.library_controls.set_child(gtk::Widget::NONE);
     widgets.library_bar.set_child(gtk::Widget::NONE);
+    widgets.library_pane.set_show_sidebar(false);
+    widgets.library_pane.set_sidebar(gtk::Widget::NONE);
     if widgets.scroller.child().as_ref() != Some(widgets.content.upcast_ref()) {
         widgets.scroller.set_child(Some(&widgets.content));
     }

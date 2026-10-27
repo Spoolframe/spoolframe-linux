@@ -114,6 +114,10 @@ pub const HEART: &str = "lucide-heart-symbolic";
 pub const HEART_FULL: &str = "heart-filled-symbolic";
 pub const HEART_HALF: &str = "heart-half-symbolic";
 pub const ALL_TRACKS: &str = "lucide-infinity-symbolic";
+// A library's Sort menu and Filters pane in the header.
+pub const SORT: &str = "lucide-arrow-down-wide-narrow-symbolic";
+pub const FILTER: &str = "lucide-funnel-symbolic";
+pub const NO_MATCH: &str = "lucide-funnel-x-symbolic";
 
 /// Every name above, for the tests.
 #[cfg(test)]
@@ -193,6 +197,9 @@ const ALL: &[&str] = &[
     HEART_FULL,
     HEART_HALF,
     ALL_TRACKS,
+    SORT,
+    FILTER,
+    NO_MATCH,
 ];
 
 #[cfg(test)]

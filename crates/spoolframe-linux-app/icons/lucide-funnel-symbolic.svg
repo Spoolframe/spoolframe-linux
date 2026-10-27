@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- @license lucide-static v1.50.0 - ISC -->
+
+<svg
+   class="lucide lucide-funnel"
+   width="24"
+   height="24"
+   viewBox="0 0 24 24"
+   version="1.1"
+   id="svg1"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <defs
+     id="defs1" />
+  <path
+     style="baseline-shift:baseline;display:inline;overflow:visible;vector-effect:none;fill:#000000;stroke:none;stroke-linecap:butt;stroke-linejoin:miter;enable-background:accumulate;stop-color:#000000;stop-opacity:1;opacity:1"
+     d="M 3,2 C 2.1718984,2.000299 1.46686,2.5235849 1.171875,3.1875 0.87688997,3.8514151 0.96079682,4.7250933 1.515625,5.3398437 L 8.7421875,13.330078 C 8.9086411,13.514033 8.9998876,13.751915 9,14 v 6 c -3.523e-4,0.755933 0.4292608,1.45116 1.105469,1.789062 l 2,1 C 13.398193,23.435039 15.000674,22.445138 15,21 v -7 c 1.12e-4,-0.248085 0.09136,-0.485967 0.257813,-0.669922 L 22.482422,5.3398437 C 23.036725,4.7256791 23.120266,3.8531528 22.826172,3.1894531 22.532077,2.5257535 21.829266,2.0019513 21.001953,2 A 1.0001,1.0001 0 0 0 21,2 Z m 0,2 h 17.998047 l -7.222656,7.988281 C 13.276771,12.539328 13.000337,13.256849 13,14 v 7 l -2,-1 v -6 c -3.37e-4,-0.743151 -0.276771,-1.460672 -0.775391,-2.011719 z"
+     id="path1" />
+</svg>

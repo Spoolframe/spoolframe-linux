@@ -1,7 +1,8 @@
-//! What a library page's Sort and Filter menus say and ask, apart from
-//! their widgets: the user's choice for a library, the request it makes,
-//! the labels, the chips of an active filter and its count, and what a
-//! refused request falls back to.
+//! What a library page's Sort menu and Filters pane say and ask, apart
+//! from their widgets: the user's choice for a library, the request it
+//! makes, the labels, the chips of an active filter, the badge and the
+//! count, the toast on a choice that came back, and what a refused
+//! request falls back to.
 //!
 //! The library says what it can be sorted and filtered by
 //! ([`ItemFilterValues`]); what it does not say, or says in a value this
@@ -11,7 +12,7 @@ use spoolframe_linux_core::backend::{
     BackendError, Counted, DynamicRange, FilterPart, ItemFilter, ItemFilterValues, ItemSort,
     Resolution, Session, SortKey, WatchedState,
 };
-use spoolframe_types::{Item, LibraryId};
+use spoolframe_types::{Item, LibraryId, LibraryKind};
 
 /// Said when the server refuses a sort or filter the library listed: it
 /// changed since, and the page shows it all again.
@@ -115,15 +116,60 @@ impl Choice {
         }
     }
 
-    /// Without what `chip` stands for.
-    pub fn remove(&mut self, chip: &Chip) {
-        match chip {
-            Chip::Value(value) => self.set(value, false),
-            Chip::Years => {
-                self.filter.year_from = None;
-                self.filter.year_to = None;
+    /// Without `part`: its Reset, and its chip's remove button. The other
+    /// parts and the sort stay.
+    pub fn reset(&mut self, part: FilterPart) {
+        let filter = &mut self.filter;
+        match part {
+            FilterPart::Watched => filter.watched.clear(),
+            FilterPart::Genres => filter.genres.clear(),
+            FilterPart::Years => {
+                filter.year_from = None;
+                filter.year_to = None;
             }
+            FilterPart::ContentRatings => filter.content_ratings.clear(),
+            FilterPart::Resolutions => filter.resolutions.clear(),
+            FilterPart::DynamicRanges => filter.dynamic_ranges.clear(),
+            FilterPart::Unknown => {}
         }
+    }
+}
+
+/// The parts of a filter in the order the pane, the chips and the badge
+/// take them.
+const PARTS: [FilterPart; 6] = [
+    FilterPart::Watched,
+    FilterPart::Genres,
+    FilterPart::Years,
+    FilterPart::ContentRatings,
+    FilterPart::Resolutions,
+    FilterPart::DynamicRanges,
+];
+
+/// Whether `filter` keeps items by `part`: what shows its Reset.
+pub fn in_use(filter: &ItemFilter, part: FilterPart) -> bool {
+    match part {
+        FilterPart::Watched => !filter.watched.is_empty(),
+        FilterPart::Genres => !filter.genres.is_empty(),
+        FilterPart::Years => filter.year_from.is_some() || filter.year_to.is_some(),
+        FilterPart::ContentRatings => !filter.content_ratings.is_empty(),
+        FilterPart::Resolutions => !filter.resolutions.is_empty(),
+        FilterPart::DynamicRanges => !filter.dynamic_ranges.is_empty(),
+        FilterPart::Unknown => false,
+    }
+}
+
+/// The Filters button's badge: how many parts are in use, not how many
+/// values ("Sci-Fi or Thriller" is one).
+pub fn parts_in_use(filter: &ItemFilter) -> usize {
+    PARTS.iter().filter(|&&part| in_use(filter, part)).count()
+}
+
+/// The badge's name for a screen reader: "5 filters in use".
+pub fn badge_label(parts: usize) -> String {
+    match parts {
+        1 => "1 filter in use".to_owned(),
+        n => format!("{n} filters in use"),
     }
 }
 
@@ -206,12 +252,45 @@ pub fn answer_to(error: BackendError) -> First {
     }
 }
 
+/// What a library's items are called, one and many: "37 of 412 films".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Noun {
+    pub one: &'static str,
+    pub many: &'static str,
+}
+
+impl Noun {
+    /// The word for `n` of them.
+    pub fn of(self, n: u32) -> &'static str {
+        if n == 1 { self.one } else { self.many }
+    }
+}
+
+/// What a library of `kind` lists. A music library lists its artists (the
+/// boards say albums; the server's top-level items are artists).
+pub fn noun(kind: LibraryKind) -> Noun {
+    match kind {
+        LibraryKind::Movies => Noun {
+            one: "film",
+            many: "films",
+        },
+        LibraryKind::Shows => Noun {
+            one: "show",
+            many: "shows",
+        },
+        LibraryKind::Music => Noun {
+            one: "artist",
+            many: "artists",
+        },
+    }
+}
+
 /// A sort key's name; `None` for one this build does not know.
 pub fn key_label(key: SortKey) -> Option<&'static str> {
     Some(match key {
         SortKey::Title => "Title",
-        SortKey::Released => "Release date",
-        SortKey::Added => "Date added",
+        SortKey::Released => "Released",
+        SortKey::Added => "Added",
         SortKey::LastPlayed => "Last played",
         SortKey::Rating => "Rating",
         SortKey::AudienceRating => "Audience rating",
@@ -225,32 +304,72 @@ pub fn key_label(key: SortKey) -> Option<&'static str> {
 pub fn directions(key: SortKey) -> [&'static str; 2] {
     match key {
         SortKey::Title => ["A to Z", "Z to A"],
-        SortKey::Released | SortKey::Added | SortKey::LastPlayed => {
-            ["Oldest first", "Newest first"]
-        }
-        SortKey::Rating | SortKey::AudienceRating => ["Lowest first", "Highest first"],
-        SortKey::Duration => ["Shortest first", "Longest first"],
-        SortKey::Size => ["Smallest first", "Largest first"],
+        SortKey::Released | SortKey::Added => ["Oldest", "Newest"],
+        SortKey::LastPlayed => ["Longest ago", "Recently"],
+        SortKey::Rating | SortKey::AudienceRating => ["Lowest", "Highest"],
+        SortKey::Duration => ["Shortest", "Longest"],
+        SortKey::Size => ["Smallest", "Largest"],
         SortKey::Unknown => ["Ascending", "Descending"],
     }
 }
 
-/// The Sort button's label: "Date added, newest first".
+/// The Sort menu's two direction rows, top first, as whether each is
+/// descending: A to Z leads for a title, the newest or largest for the
+/// rest.
+pub fn menu_directions(key: SortKey) -> [bool; 2] {
+    match key {
+        SortKey::Title | SortKey::Unknown => [false, true],
+        _ => [true, false],
+    }
+}
+
+/// The Sort button's label: "Released · Newest".
 pub fn sort_label(sort: ItemSort) -> String {
     let key = key_label(sort.key).unwrap_or("Title");
     let direction = directions(sort.key)[usize::from(sort.descending)];
-    // "A to Z" keeps its capital; "Newest first" reads on in lower case.
-    let direction = match sort.key {
-        SortKey::Title => direction.to_owned(),
-        _ => {
-            let mut chars = direction.chars();
-            chars
-                .next()
-                .map(|c| c.to_lowercase().chain(chars).collect())
-                .unwrap_or_default()
-        }
+    format!("{key} · {direction}")
+}
+
+/// The line under the Sort menu: where items without the key's value go,
+/// or, for a key every item has, what the library cannot be sorted by.
+/// `offered` is the menu's keys.
+pub fn sort_note(key: SortKey, noun: Noun, offered: &[SortKey]) -> Option<String> {
+    let many = capitalized(noun.many);
+    let missing = match key {
+        SortKey::Released => Some("without a release date"),
+        SortKey::LastPlayed => Some("never played"),
+        SortKey::Rating | SortKey::AudienceRating => Some("without a rating"),
+        _ => None,
     };
-    format!("{key}, {direction}")
+    if let Some(missing) = missing {
+        return Some(format!("{many} {missing} come last, either way."));
+    }
+    let lacks = |keys: &[SortKey]| !keys.iter().any(|k| offered.contains(k));
+    let absent: Vec<&str> = [
+        (lacks(&[SortKey::Duration]), "duration"),
+        (lacks(&[SortKey::Size]), "size"),
+        (
+            lacks(&[SortKey::Rating, SortKey::AudienceRating]),
+            "ratings",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(absent, name)| absent.then_some(name))
+    .collect();
+    let (last, rest) = absent.split_last()?;
+    let names = match rest {
+        [] => (*last).to_owned(),
+        rest => format!("{} or {last}", rest.join(", ")),
+    };
+    Some(format!("This library has no {names} to sort by."))
+}
+
+fn capitalized(word: &str) -> String {
+    let mut chars = word.chars();
+    chars
+        .next()
+        .map(|c| c.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
 }
 
 /// The keys the Sort menu lists: the library's, in its order.
@@ -286,7 +405,8 @@ impl Value {
             Value::Resolution(Resolution::Hd) => "720p",
             Value::Resolution(Resolution::Sd) => "SD",
             Value::DynamicRange(DynamicRange::Sdr) => "SDR",
-            Value::DynamicRange(DynamicRange::Hdr) => "HDR",
+            // The server keeps Dolby Vision under HDR too.
+            Value::DynamicRange(DynamicRange::Hdr) => "HDR (includes Dolby Vision)",
             Value::DynamicRange(DynamicRange::DolbyVision) => "Dolby Vision",
             Value::Watched(WatchedState::Unknown)
             | Value::Resolution(Resolution::Unknown)
@@ -297,31 +417,26 @@ impl Value {
     }
 }
 
-/// A check row's title: the value, and how many items have it when the
-/// server says ("Drama · 42").
-pub fn counted_label(label: &str, count: Option<u32>) -> String {
-    match count {
-        Some(count) => format!("{label} · {count}"),
-        None => label.to_owned(),
-    }
-}
-
-/// One check row of the Filter menu.
+/// One check row of the Filters pane (or, for Watched, one toggle).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Check {
     pub value: Value,
     pub label: String,
+    /// How many items have it; `None` when the server did not say, and
+    /// the row shows no count.
+    pub count: Option<u32>,
 }
 
-/// What a section of the Filter menu holds.
+/// What a section of the Filters pane holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Body {
     Checks(Vec<Check>),
-    /// The years to pick a From and a To of, oldest first.
-    Years(Vec<u16>),
+    /// The years to pick a From and a To of, newest first, as the
+    /// dropdowns list them, each with its count when the server says.
+    Years(Vec<Counted<u16>>),
 }
 
-/// One section of the Filter menu: a part of the filter.
+/// One section of the Filters pane: a part of the filter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Section {
     pub part: FilterPart,
@@ -329,7 +444,33 @@ pub struct Section {
     pub body: Body,
 }
 
-/// The Filter menu's sections: each part the library offers, in its
+/// How many check rows a section shows before its "Show all".
+pub const SHOWN_CHECKS: usize = 6;
+
+/// The button under a long section: "Show all 23 genres".
+pub fn show_all_label(part: FilterPart, n: usize) -> String {
+    let what = match part {
+        FilterPart::Genres => "genres",
+        FilterPart::ContentRatings => "content ratings",
+        FilterPart::Resolutions => "resolutions",
+        FilterPart::DynamicRanges => "dynamic ranges",
+        FilterPart::Watched | FilterPart::Years | FilterPart::Unknown => "values",
+    };
+    format!("Show all {n} {what}")
+}
+
+/// How many columns a section's `n` check rows take, as the boards lay
+/// them: short names (ratings, resolutions) side by side, three across
+/// from five of them; long ones (genres, ranges) one under another.
+pub fn columns(part: FilterPart, n: usize) -> u32 {
+    match part {
+        FilterPart::ContentRatings | FilterPart::Resolutions if n > 4 => 3,
+        FilterPart::ContentRatings | FilterPart::Resolutions => 2,
+        _ => 1,
+    }
+}
+
+/// The Filters pane's sections: each part the library offers, in its
 /// order, with the values it lists. A part with nothing to pick is left
 /// out.
 pub fn sections(values: &ItemFilterValues) -> Vec<Section> {
@@ -338,8 +479,12 @@ pub fn sections(values: &ItemFilterValues) -> Vec<Section> {
             list.iter()
                 .filter_map(|c| {
                     let value = value(c.value.clone());
-                    let label = counted_label(&value.label()?, c.count);
-                    Some(Check { value, label })
+                    let label = value.label()?;
+                    Some(Check {
+                        value,
+                        label,
+                        count: c.count,
+                    })
                 })
                 .collect(),
         )
@@ -362,16 +507,20 @@ pub fn sections(values: &ItemFilterValues) -> Vec<Section> {
                     .map(|state| {
                         let value = Value::Watched(state);
                         let label = value.label().unwrap_or_default();
-                        Check { value, label }
+                        Check {
+                            value,
+                            label,
+                            count: None,
+                        }
                     })
                     .collect(),
                 ),
             ),
             FilterPart::Genres => ("Genres", checks(&values.genres, Value::Genre)),
             FilterPart::Years => {
-                let mut years: Vec<u16> = values.years.iter().map(|c| c.value).collect();
-                years.sort_unstable();
-                years.dedup();
+                let mut years = values.years.clone();
+                years.sort_by_key(|c| std::cmp::Reverse(c.value));
+                years.dedup_by_key(|c| c.value);
                 ("Years", Body::Years(years))
             }
             FilterPart::ContentRatings => (
@@ -398,46 +547,69 @@ pub fn sections(values: &ItemFilterValues) -> Vec<Section> {
     sections
 }
 
-/// What a chip under the header stands for, and takes off when removed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Chip {
-    Value(Value),
-    /// The year range, as one chip.
-    Years,
+/// The chips over the grid: one per part in use, its values joined by
+/// "or" ("Sci-Fi or Thriller"), as the pane orders the parts. Removing
+/// one resets its part ([`Choice::reset`]). Values this build cannot name
+/// are left out, and a part with none it can name has no chip.
+pub fn chips(filter: &ItemFilter) -> Vec<(FilterPart, String)> {
+    fn named(values: impl Iterator<Item = Value>) -> Option<String> {
+        let names: Vec<String> = values.filter_map(|v| v.label()).collect();
+        (!names.is_empty()).then(|| names.join(" or "))
+    }
+    PARTS
+        .into_iter()
+        .filter_map(|part| {
+            let text = match part {
+                FilterPart::Watched => named(filter.watched.iter().map(|s| Value::Watched(*s))),
+                FilterPart::Genres => named(filter.genres.iter().cloned().map(Value::Genre)),
+                FilterPart::Years => years_text(filter.year_from, filter.year_to),
+                FilterPart::ContentRatings => named(
+                    filter
+                        .content_ratings
+                        .iter()
+                        .cloned()
+                        .map(Value::ContentRating),
+                ),
+                FilterPart::Resolutions => {
+                    named(filter.resolutions.iter().map(|r| Value::Resolution(*r)))
+                }
+                FilterPart::DynamicRanges => named(
+                    filter
+                        .dynamic_ranges
+                        .iter()
+                        .map(|r| Value::DynamicRange(*r)),
+                ),
+                FilterPart::Unknown => None,
+            };
+            Some((part, text?))
+        })
+        .collect()
 }
 
-/// The chips of `filter`, each with its text, in the filter's own order.
-pub fn chips(filter: &ItemFilter) -> Vec<(Chip, String)> {
-    let mut chips = Vec::new();
-    let mut add = |value: Value| {
-        if let Some(label) = value.label() {
-            chips.push((Chip::Value(value), label));
-        }
-    };
-    filter.watched.iter().for_each(|s| add(Value::Watched(*s)));
-    filter
-        .genres
-        .iter()
-        .for_each(|g| add(Value::Genre(g.clone())));
-    let years = years_text(filter.year_from, filter.year_to);
-    filter
-        .content_ratings
-        .iter()
-        .for_each(|r| add(Value::ContentRating(r.clone())));
-    filter
-        .resolutions
-        .iter()
-        .for_each(|r| add(Value::Resolution(*r)));
-    filter
-        .dynamic_ranges
-        .iter()
-        .for_each(|r| add(Value::DynamicRange(*r)));
-    if let Some(years) = years {
-        // After the genres, as the parts go.
-        let at = filter.watched.len() + filter.genres.len();
-        chips.insert(at.min(chips.len()), (Chip::Years, years));
-    }
-    chips
+/// The start of the chips row: the choice is saved for this library.
+pub fn kept_for(library: &str) -> String {
+    format!("Kept for {library}")
+}
+
+/// Told on opening a library whose saved sort and filters came back.
+pub fn restored_text(library: &str) -> String {
+    format!("Your sort and filters for {library} are back.")
+}
+
+/// Whether opening a library tells the user its choice came back: only
+/// the first time it opens in the session (`first`), only for a choice
+/// other than the default, and only when that choice is shown (`plan`),
+/// not refused or left out for want of the library's values.
+pub fn greets(choice: &Choice, plan: &Plan, first: bool) -> bool {
+    first && *choice != Choice::default() && matches!(plan, Plan::Sorted(_))
+}
+
+/// The empty state's line, under "No items match these filters".
+pub fn nothing_matches_text(noun: Noun, library: &str) -> String {
+    format!(
+        "Remove a filter above, or clear them all to see every {} in {library}.",
+        noun.one
+    )
 }
 
 /// The year chip's text: "1990–1999", "From 2010", "Until 1985", or one
@@ -452,9 +624,20 @@ pub fn years_text(from: Option<u16>, to: Option<u16>) -> Option<String> {
     }
 }
 
-/// How many a filter keeps of the library: "37 of 412".
-pub fn count_text(kept: u32, all: u32) -> String {
-    format!("{kept} of {all}")
+/// How many a filter keeps of the library, the number apart so it can
+/// stand out: ("37", " of 412 films"). Without a filter, the library's
+/// own count: ("412", " films").
+pub fn count_parts(kept: Option<u32>, all: u32, noun: Noun) -> (String, String) {
+    match kept {
+        Some(kept) => (kept.to_string(), format!(" of {all} {}", noun.of(all))),
+        None => (all.to_string(), format!(" {}", noun.of(all))),
+    }
+}
+
+/// [`count_parts`] as one line: "37 of 412 films".
+pub fn count_text(kept: Option<u32>, all: u32, noun: Noun) -> String {
+    let (number, rest) = count_parts(kept, all, noun);
+    number + &rest
 }
 
 #[cfg(test)]
@@ -550,16 +733,25 @@ mod tests {
 
     #[test]
     fn the_default_sort_reads_title_a_to_z() {
-        assert_eq!(sort_label(ItemSort::DEFAULT), "Title, A to Z");
+        assert_eq!(sort_label(ItemSort::DEFAULT), "Title · A to Z");
     }
 
     #[test]
     fn the_sort_label_says_the_key_and_its_direction() {
         let sort = ItemSort {
-            key: SortKey::Added,
+            key: SortKey::Released,
             descending: true,
         };
-        assert_eq!(sort_label(sort), "Date added, newest first");
+        assert_eq!(sort_label(sort), "Released · Newest");
+    }
+
+    #[test]
+    fn last_played_newest_first_reads_recently() {
+        let sort = ItemSort {
+            key: SortKey::LastPlayed,
+            descending: true,
+        };
+        assert_eq!(sort_label(sort), "Last played · Recently");
     }
 
     #[test]
@@ -569,15 +761,66 @@ mod tests {
             worded,
             vec![
                 ["A to Z", "Z to A"],
-                ["Oldest first", "Newest first"],
-                ["Oldest first", "Newest first"],
-                ["Oldest first", "Newest first"],
-                ["Lowest first", "Highest first"],
-                ["Lowest first", "Highest first"],
-                ["Shortest first", "Longest first"],
-                ["Smallest first", "Largest first"],
+                ["Oldest", "Newest"],
+                ["Oldest", "Newest"],
+                ["Longest ago", "Recently"],
+                ["Lowest", "Highest"],
+                ["Lowest", "Highest"],
+                ["Shortest", "Longest"],
+                ["Smallest", "Largest"],
             ]
         );
+    }
+
+    #[test]
+    fn the_sort_menu_lists_a_title_a_to_z_first() {
+        assert_eq!(menu_directions(SortKey::Title), [false, true]);
+    }
+
+    #[test]
+    fn the_sort_menu_lists_a_date_newest_first() {
+        assert_eq!(menu_directions(SortKey::Released), [true, false]);
+    }
+
+    fn films() -> Noun {
+        noun(LibraryKind::Movies)
+    }
+
+    #[test]
+    fn a_release_date_sort_notes_where_undated_films_go() {
+        assert_eq!(
+            sort_note(SortKey::Released, films(), &SortKey::ALL).as_deref(),
+            Some("Films without a release date come last, either way.")
+        );
+    }
+
+    #[test]
+    fn a_key_every_item_has_notes_what_the_library_cannot_sort_by() {
+        let offered = [
+            SortKey::Title,
+            SortKey::Released,
+            SortKey::Added,
+            SortKey::LastPlayed,
+            SortKey::Duration,
+        ];
+        assert_eq!(
+            sort_note(SortKey::Duration, films(), &offered).as_deref(),
+            Some("This library has no size or ratings to sort by.")
+        );
+    }
+
+    #[test]
+    fn a_library_with_every_key_has_no_note_by_title() {
+        assert_eq!(sort_note(SortKey::Title, films(), &SortKey::ALL), None);
+    }
+
+    #[test]
+    fn each_kind_names_what_it_lists() {
+        let nouns: Vec<&str> = [LibraryKind::Movies, LibraryKind::Shows, LibraryKind::Music]
+            .into_iter()
+            .map(|kind| noun(kind).many)
+            .collect();
+        assert_eq!(nouns, vec!["films", "shows", "artists"]);
     }
 
     #[test]
@@ -589,14 +832,67 @@ mod tests {
         assert_eq!(sort_keys(&values), vec![SortKey::Added, SortKey::Title]);
     }
 
-    #[test]
-    fn a_count_follows_its_value() {
-        assert_eq!(counted_label("Drama", Some(42)), "Drama · 42");
+    fn genres(counts: &[Option<u32>]) -> Body {
+        let values = ItemFilterValues {
+            genres: counts
+                .iter()
+                .enumerate()
+                .map(|(n, &count)| Counted {
+                    value: format!("Genre {n}"),
+                    count,
+                })
+                .collect(),
+            filters: vec![FilterPart::Genres],
+            ..ItemFilterValues::default()
+        };
+        sections(&values).remove(0).body
     }
 
     #[test]
-    fn a_value_without_a_count_is_its_name_alone() {
-        assert_eq!(counted_label("Drama", None), "Drama");
+    fn a_value_keeps_the_count_the_server_sent() {
+        let Body::Checks(checks) = genres(&[Some(42)]) else {
+            panic!("no checks");
+        };
+        assert_eq!(checks[0].count, Some(42));
+    }
+
+    #[test]
+    fn a_value_the_server_sent_no_count_for_shows_none() {
+        let Body::Checks(checks) = genres(&[None]) else {
+            panic!("no checks");
+        };
+        assert_eq!(
+            (checks[0].label.as_str(), checks[0].count),
+            ("Genre 0", None)
+        );
+    }
+
+    #[test]
+    fn hdr_says_it_includes_dolby_vision() {
+        assert_eq!(
+            Value::DynamicRange(DynamicRange::Hdr).label().as_deref(),
+            Some("HDR (includes Dolby Vision)")
+        );
+    }
+
+    #[test]
+    fn a_long_section_offers_to_show_all_its_values() {
+        assert_eq!(show_all_label(FilterPart::Genres, 23), "Show all 23 genres");
+    }
+
+    #[test]
+    fn six_content_ratings_sit_three_across() {
+        assert_eq!(columns(FilterPart::ContentRatings, 6), 3);
+    }
+
+    #[test]
+    fn four_resolutions_sit_two_across() {
+        assert_eq!(columns(FilterPart::Resolutions, 4), 2);
+    }
+
+    #[test]
+    fn genres_sit_one_under_another() {
+        assert_eq!(columns(FilterPart::Genres, 6), 1);
     }
 
     #[test]
@@ -633,7 +929,8 @@ mod tests {
             sections(&values)[0].body,
             Body::Checks(vec![Check {
                 value: Value::Resolution(Resolution::Uhd),
-                label: "4K · 2".into()
+                label: "4K".into(),
+                count: Some(2),
             }])
         );
     }
@@ -648,18 +945,19 @@ mod tests {
     }
 
     #[test]
-    fn years_are_offered_oldest_first() {
+    fn years_are_offered_newest_first() {
         let values = ItemFilterValues {
-            years: [2016, 1995, 1979]
+            years: [1995, 2016, 1979]
                 .map(|value| Counted { value, count: None })
                 .to_vec(),
             filters: vec![FilterPart::Years],
             ..ItemFilterValues::default()
         };
-        assert_eq!(
-            sections(&values)[0].body,
-            Body::Years(vec![1979, 1995, 2016])
-        );
+        let Body::Years(years) = &sections(&values)[0].body else {
+            panic!("no years");
+        };
+        let years: Vec<u16> = years.iter().map(|c| c.value).collect();
+        assert_eq!(years, vec![2016, 1995, 1979]);
     }
 
     #[test]
@@ -714,29 +1012,170 @@ mod tests {
         assert_eq!(years_text(None, Some(1985)).as_deref(), Some("Until 1985"));
     }
 
-    #[test]
-    fn chips_name_each_value_with_the_years_as_one() {
-        let mut choice = genre("Drama");
-        choice.set(&Value::Watched(WatchedState::Unwatched), true);
+    /// Movies' board: Unwatched, Sci-Fi or Thriller, 1990–2016, 4K, HDR.
+    fn boards_choice() -> Choice {
+        let mut choice = Choice::default();
+        choice.set(&Value::DynamicRange(DynamicRange::Hdr), true);
         choice.set(&Value::Resolution(Resolution::Uhd), true);
+        choice.set(&Value::Genre("Sci-Fi".into()), true);
+        choice.set(&Value::Genre("Thriller".into()), true);
+        choice.set(&Value::Watched(WatchedState::Unwatched), true);
         choice.set_year_from(Some(1990));
-        choice.set_year_to(Some(1999));
-        let texts: Vec<String> = chips(&choice.filter).into_iter().map(|(_, t)| t).collect();
-        assert_eq!(texts, vec!["Unwatched", "Drama", "1990–1999", "4K"]);
+        choice.set_year_to(Some(2016));
+        choice
     }
 
     #[test]
-    fn removing_the_year_chip_clears_both_ends() {
+    fn chips_name_each_part_its_values_joined_by_or() {
+        let texts: Vec<String> = chips(&boards_choice().filter)
+            .into_iter()
+            .map(|(_, t)| t)
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                "Unwatched",
+                "Sci-Fi or Thriller",
+                "1990–2016",
+                "4K",
+                "HDR (includes Dolby Vision)"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_value_this_build_cannot_name_gets_no_chip() {
+        let mut choice = Choice::default();
+        choice.set(&Value::Watched(WatchedState::Unknown), true);
+        assert!(chips(&choice.filter).is_empty());
+    }
+
+    #[test]
+    fn the_badge_counts_parts_not_values() {
+        assert_eq!(parts_in_use(&boards_choice().filter), 5);
+    }
+
+    #[test]
+    fn no_filter_has_no_parts_in_use() {
+        assert_eq!(parts_in_use(&ItemFilter::default()), 0);
+    }
+
+    #[test]
+    fn one_part_in_use_is_named_so() {
+        assert_eq!(badge_label(1), "1 filter in use");
+    }
+
+    #[test]
+    fn a_year_from_alone_puts_the_years_in_use() {
+        let mut choice = Choice::default();
+        choice.set_year_from(Some(1990));
+        assert!(in_use(&choice.filter, FilterPart::Years));
+    }
+
+    #[test]
+    fn resetting_the_years_clears_both_ends() {
         let mut choice = Choice::default();
         choice.set_year_from(Some(1990));
         choice.set_year_to(Some(1999));
-        choice.remove(&Chip::Years);
+        choice.reset(FilterPart::Years);
         assert!(choice.filter.is_empty());
     }
 
     #[test]
-    fn the_count_says_how_many_of_all() {
-        assert_eq!(count_text(37, 412), "37 of 412");
+    fn resetting_a_part_leaves_the_others_and_the_sort() {
+        let mut choice = boards_choice();
+        choice.sort = ItemSort {
+            key: SortKey::Released,
+            descending: true,
+        };
+        choice.reset(FilterPart::Genres);
+        assert_eq!(
+            (
+                parts_in_use(&choice.filter),
+                choice.filter.genres.len(),
+                choice.sort.key
+            ),
+            (4, 0, SortKey::Released)
+        );
+    }
+
+    #[test]
+    fn the_count_says_how_many_of_all_films() {
+        assert_eq!(count_text(Some(37), 412, films()), "37 of 412 films");
+    }
+
+    #[test]
+    fn without_a_filter_the_count_is_the_librarys() {
+        assert_eq!(count_text(None, 412, films()), "412 films");
+    }
+
+    #[test]
+    fn one_film_is_one() {
+        assert_eq!(count_text(None, 1, films()), "1 film");
+    }
+
+    #[test]
+    fn the_count_sets_its_number_apart() {
+        assert_eq!(
+            count_parts(Some(37), 412, films()),
+            ("37".to_owned(), " of 412 films".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_chips_row_says_whose_choice_it_is() {
+        assert_eq!(kept_for("Movies"), "Kept for Movies");
+    }
+
+    #[test]
+    fn the_toast_says_the_choice_is_back() {
+        assert_eq!(
+            restored_text("Movies"),
+            "Your sort and filters for Movies are back."
+        );
+    }
+
+    #[test]
+    fn the_empty_state_says_what_clearing_shows() {
+        assert_eq!(
+            nothing_matches_text(films(), "Movies"),
+            "Remove a filter above, or clear them all to see every film in Movies."
+        );
+    }
+
+    fn shown(choice: &Choice) -> Plan {
+        Plan::Sorted(choice.request().unwrap())
+    }
+
+    #[test]
+    fn a_restored_choice_greets_on_the_first_open() {
+        let choice = genre("Drama");
+        assert!(greets(&choice, &shown(&choice), true));
+    }
+
+    #[test]
+    fn a_restored_choice_does_not_greet_again() {
+        let choice = genre("Drama");
+        assert!(!greets(&choice, &shown(&choice), false));
+    }
+
+    #[test]
+    fn the_default_does_not_greet() {
+        assert!(!greets(&Choice::default(), &Plan::Plain, true));
+    }
+
+    #[test]
+    fn a_refused_choice_does_not_greet() {
+        assert!(!greets(
+            &genre("Drama"),
+            &Plan::Refused("gone".into()),
+            true
+        ));
+    }
+
+    #[test]
+    fn a_choice_shown_plainly_for_want_of_values_does_not_greet() {
+        assert!(!greets(&genre("Drama"), &Plan::Plain, true));
     }
 
     #[test]
@@ -790,7 +1229,7 @@ mod tests {
         else {
             panic!("no items");
         };
-        assert_eq!(count_text(kept, all), "4 of 8");
+        assert_eq!(count_text(Some(kept), all, films()), "4 of 8 films");
     }
 
     #[test]
