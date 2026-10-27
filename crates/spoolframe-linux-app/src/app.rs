@@ -5444,10 +5444,9 @@ fn connection_text(name: &str, state: &ConnectionState) -> (String, Option<Strin
             "offline".to_owned(),
             Some(format!("Not connected to {name}.")),
         ),
-        ConnectionState::Stopped(BackendError::UpdateRequired { server_protocol }) => (
-            "update needed".to_owned(),
-            Some(update_text(name, *server_protocol)),
-        ),
+        ConnectionState::Stopped(BackendError::UpdateRequired { .. }) => {
+            ("update needed".to_owned(), Some(update_text(name)))
+        }
         ConnectionState::Stopped(why) => (
             "not connected".to_owned(),
             Some(format!("Not connected to {name}: {why}.")),
@@ -5456,21 +5455,13 @@ fn connection_text(name: &str, state: &ConnectionState) -> (String, Option<Strin
 }
 
 /// What to do when this app and the server speak different protocol
-/// revisions: whichever is older needs updating, when the server said its
-/// revision.
-fn update_text(name: &str, server_protocol: Option<u32>) -> String {
-    let ours = spoolframe_protocol::PROTOCOL_VERSION;
-    match server_protocol {
-        Some(theirs) if theirs > ours => {
-            format!("{name} runs a newer Spoolframe. Update this app to connect.")
-        }
-        Some(theirs) if theirs < ours => {
-            format!("{name} runs an older Spoolframe. Ask its admin to update the server.")
-        }
-        _ => format!(
-            "This app and {name} speak different versions. Update Spoolframe, or ask the server's admin to update it."
-        ),
-    }
+/// revisions. Whatever revision the server said, it says nothing of which
+/// side is older: SDK 0.16 restarted the numbering at 1, so a 0.15 server
+/// says 15 to an app on 1. Either side may need the update.
+fn update_text(name: &str) -> String {
+    format!(
+        "This app and {name} speak different versions of Spoolframe. Update the app, or ask the server's admin to update the server."
+    )
 }
 
 /// How many albums Home's "Recently played music" shows, and how many of
@@ -5740,10 +5731,9 @@ fn error_status(error: &BackendError, retry: Option<Rc<dyn Fn()>>) -> adw::Statu
             "Not available right now",
             format!("{} Try again once it is back.", sentence(why)),
         ),
-        BackendError::UpdateRequired { server_protocol } => (
-            "Spoolframe needs updating",
-            update_text("The server", *server_protocol),
-        ),
+        BackendError::UpdateRequired { .. } => {
+            ("Spoolframe needs updating", update_text("the server"))
+        }
         other => ("Could not load this page", sentence(&other.to_string())),
     };
     let page = adw::StatusPage::builder()
@@ -5966,9 +5956,7 @@ fn server_error(
             };
             start::server_id_changed(name, saved, now, remove).present(Some(root));
         }
-        (BackendError::UpdateRequired { server_protocol }, _) => {
-            toast_text(widgets, &update_text(name, *server_protocol))
-        }
+        (BackendError::UpdateRequired { .. }, _) => toast_text(widgets, &update_text(name)),
         (other, _) => toast(widgets, other),
     }
 }
@@ -6016,32 +6004,33 @@ mod tests {
         connection_text("Home Media", &state)
     }
 
-    /// An app older than the server is told to update itself, not that
-    /// it is reconnecting: the SDK has stopped dialling.
+    const SPEAK_DIFFERENT_VERSIONS: &str = "This app and Home Media speak different versions of \
+        Spoolframe. Update the app, or ask the server's admin to update the server.";
+
+    /// A 0.15 server says revision 15 to this app on 1 (0.16 restarted
+    /// the numbering): it is the older one, so the banner must not call
+    /// it newer. The SDK has stopped dialling, so it is not
+    /// "reconnecting" either.
     #[test]
-    fn an_app_too_old_for_the_server_says_to_update_it() {
-        let newer = spoolframe_protocol::PROTOCOL_VERSION + 1;
+    fn a_server_on_revision_15_is_told_to_update_one_side_or_the_other() {
         assert_eq!(
             banner_once_stopped(BackendError::UpdateRequired {
-                server_protocol: Some(newer)
+                server_protocol: Some(15)
             }),
             (
                 "update needed".to_owned(),
-                Some("Home Media runs a newer Spoolframe. Update this app to connect.".to_owned())
+                Some(SPEAK_DIFFERENT_VERSIONS.to_owned())
             )
         );
     }
 
+    /// A server that only refused this app's revision says the same.
     #[test]
-    fn a_server_older_than_the_app_is_its_admins_to_update() {
-        let older = spoolframe_protocol::PROTOCOL_VERSION - 1;
+    fn a_server_that_refused_our_revision_is_told_the_same() {
         let (_, banner) = banner_once_stopped(BackendError::UpdateRequired {
-            server_protocol: Some(older),
+            server_protocol: None,
         });
-        assert_eq!(
-            banner.as_deref(),
-            Some("Home Media runs an older Spoolframe. Ask its admin to update the server.")
-        );
+        assert_eq!(banner.as_deref(), Some(SPEAK_DIFFERENT_VERSIONS));
     }
 
     /// Any other reason the SDK stopped dialling is shown as it is, in

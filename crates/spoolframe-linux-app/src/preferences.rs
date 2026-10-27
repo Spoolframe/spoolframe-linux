@@ -937,7 +937,7 @@ fn list_guests(
     });
 }
 
-/// "Version 0.6.1 · protocol 14".
+/// "Version 0.6.1 · protocol 1".
 pub fn version_line() -> String {
     format!(
         "Version {} · protocol {}",

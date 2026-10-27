@@ -104,8 +104,9 @@ pub enum BackendError {
     Busy,
     /// This app and the server speak different protocol revisions, so
     /// they cannot talk; one of them needs updating. `server_protocol` is
-    /// the server's revision when it said it: above this app's
-    /// [`spoolframe_protocol::PROTOCOL_VERSION`] the app is the older.
+    /// the server's revision when it said it. It does not say which side
+    /// is older: SDK 0.16 restarted the numbering at 1, so a 0.15 server
+    /// says 15.
     #[error("the server speaks another protocol revision; update Spoolframe or the server")]
     UpdateRequired { server_protocol: Option<u32> },
     /// Pasted or opened text is not a Spoolframe invite link (P6-01);
