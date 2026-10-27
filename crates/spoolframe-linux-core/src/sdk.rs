@@ -45,6 +45,7 @@ use crate::backend::{
     InviteKind, InviteLookup, InviteOrigin, InviteOutcome, InviteSpec, InviteSummary,
     LanServerInfo, MintedInvite,
 };
+use crate::backend::{ItemFilter, ItemFilterValues, ItemSort};
 use crate::backend::{SubtitleDownloaded, SubtitleSearch, SubtitleTiming};
 use crate::storage::Storage;
 
@@ -1251,6 +1252,31 @@ impl Session for SdkSession {
             let page = s.items(&library, offset, limit).await?;
             Ok((page.items, page.total))
         }))
+    }
+
+    fn items_sorted<'a>(
+        &'a self,
+        library: &'a LibraryId,
+        offset: u32,
+        limit: u32,
+        sort: Option<ItemSort>,
+        filter: Option<&'a ItemFilter>,
+    ) -> BoxFuture<'a, Result<(Vec<Item>, u32), BackendError>> {
+        let (library, filter) = (library.clone(), filter.cloned());
+        Box::pin(self.call(move |s| async move {
+            let page = s
+                .items_sorted(&library, offset, limit, sort, filter)
+                .await?;
+            Ok((page.items, page.total))
+        }))
+    }
+
+    fn item_filter_values<'a>(
+        &'a self,
+        library: &'a LibraryId,
+    ) -> BoxFuture<'a, Result<ItemFilterValues, BackendError>> {
+        let library = library.clone();
+        Box::pin(self.call(move |s| async move { s.item_filter_values(&library).await }))
     }
 
     fn item<'a>(

@@ -9,7 +9,8 @@
 //! for each read); when what comes back differs, the catalog says which
 //! read changed on [`Catalog::changes`], and the page showing it reads it
 //! again, getting the new value, which is fresh, so no re-read follows.
-//! Search is not kept: each one is asked of the server.
+//! Search is not kept: each one is asked of the server. Nor are a
+//! library's sorted or filtered pages and what it filters by.
 //!
 //! Entries are kept per session (server and user), so switching profile
 //! back shows that profile's Home at once and never another's. A change
@@ -444,6 +445,32 @@ impl Session for CachedSession {
                 _ => Err(mismatch()),
             }
         })
+    }
+
+    /// Asked of the server each time, never kept, and never answered from
+    /// the plain pages [`Session::items`] keeps: a sorted or filtered page
+    /// holds other items than the plain one at the same offset. Keeping
+    /// them would need the sort and the filter in the key, and every
+    /// change of a control is a new key, mostly read once: little would be
+    /// answered from it, while it pushed the plain pages out.
+    fn items_sorted<'a>(
+        &'a self,
+        library: &'a LibraryId,
+        offset: u32,
+        limit: u32,
+        sort: Option<ItemSort>,
+        filter: Option<&'a ItemFilter>,
+    ) -> BoxFuture<'a, Result<(Vec<Item>, u32), BackendError>> {
+        self.inner
+            .items_sorted(library, offset, limit, sort, filter)
+    }
+
+    /// Not kept either: read once when a library's controls are shown.
+    fn item_filter_values<'a>(
+        &'a self,
+        library: &'a LibraryId,
+    ) -> BoxFuture<'a, Result<ItemFilterValues, BackendError>> {
+        self.inner.item_filter_values(library)
     }
 
     fn item<'a>(
@@ -1471,6 +1498,64 @@ mod tests {
             library: None,
         };
         ready(session.search(&request)).unwrap();
+        assert_eq!(f.catalog.len(&scope("andrey")), 0);
+    }
+
+    fn movies() -> LibraryId {
+        LibraryId::new(Namespace::Plex, "1").unwrap()
+    }
+
+    fn newest_first() -> ItemSort {
+        ItemSort {
+            key: SortKey::Released,
+            descending: true,
+        }
+    }
+
+    #[test]
+    fn a_sorted_page_is_not_kept() {
+        let f = fixture();
+        let (_media, session) = cached(&f);
+        ready(session.items_sorted(&movies(), 0, 3, Some(newest_first()), None)).unwrap();
+        assert_eq!(f.catalog.len(&scope("andrey")), 0);
+    }
+
+    #[test]
+    fn a_sorted_page_is_not_answered_from_the_plain_page_kept() {
+        let f = fixture();
+        let (_media, session) = cached(&f);
+        ready(session.items(&movies(), 0, 3)).unwrap();
+        let (sorted, _) =
+            ready(session.items_sorted(&movies(), 0, 3, Some(newest_first()), None)).unwrap();
+        let (asked, _) =
+            ready(
+                session
+                    .inner
+                    .items_sorted(&movies(), 0, 3, Some(newest_first()), None),
+            )
+            .unwrap();
+        assert_eq!(sorted, asked);
+    }
+
+    #[test]
+    fn a_filtered_page_counts_what_the_filter_keeps_not_the_plain_total() {
+        let f = fixture();
+        let (_media, session) = cached(&f);
+        ready(session.items(&movies(), 0, 3)).unwrap();
+        let thrillers = ItemFilter {
+            genres: vec!["Thriller".into()],
+            ..ItemFilter::default()
+        };
+        let (_, total) =
+            ready(session.items_sorted(&movies(), 0, 3, None, Some(&thrillers))).unwrap();
+        assert_eq!(total, 2);
+    }
+
+    #[test]
+    fn what_a_library_filters_by_is_not_kept() {
+        let f = fixture();
+        let (_media, session) = cached(&f);
+        ready(session.item_filter_values(&movies())).unwrap();
         assert_eq!(f.catalog.len(&scope("andrey")), 0);
     }
 

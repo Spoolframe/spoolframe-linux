@@ -32,6 +32,13 @@ pub use spoolframe_types::Platform;
 use spoolframe_types::{
     ArtworkId, Item, Library, LibraryId, MediaId, MediaTracks, SubtitleFormat, TrackPreferences,
 };
+/// Sorting and filtering a library (SDK 0.16), in the types' own shapes:
+/// what [`Session::items_sorted`] is asked and what
+/// [`Session::item_filter_values`] lists to build the controls from.
+pub use spoolframe_types::{
+    Counted, DynamicRange, FilterPart, ItemFilter, ItemFilterValues, ItemSort, Resolution, SortKey,
+    WatchedState,
+};
 pub use spoolframe_types::{
     Marker, MarkerKind, Person, PersonId, PersonRole, SearchKind, SearchScope,
 };
@@ -1081,6 +1088,30 @@ pub trait Session: Send + Sync {
         offset: u32,
         limit: u32,
     ) -> BoxFuture<'a, Result<(Vec<Item>, u32), BackendError>>;
+
+    /// [`Session::items`] in `sort`'s order (title A to Z when `None`),
+    /// only those `filter` keeps, and how many it keeps in all. Items
+    /// without a value for the key come last both ways; ties go by title,
+    /// then id. A key, a filter part or a range the library does not list
+    /// in [`Session::item_filter_values`] is
+    /// [`BackendError::InvalidInput`]; check with
+    /// [`ItemFilterValues::refuses`] before asking.
+    fn items_sorted<'a>(
+        &'a self,
+        library: &'a LibraryId,
+        offset: u32,
+        limit: u32,
+        sort: Option<ItemSort>,
+        filter: Option<&'a ItemFilter>,
+    ) -> BoxFuture<'a, Result<(Vec<Item>, u32), BackendError>>;
+
+    /// What a library can be sorted and filtered by, and the values its
+    /// items have, with how many have each: what the controls are built
+    /// from.
+    fn item_filter_values<'a>(
+        &'a self,
+        library: &'a LibraryId,
+    ) -> BoxFuture<'a, Result<ItemFilterValues, BackendError>>;
 
     /// An item and its children: a show's seasons, a season's episodes, an
     /// artist's albums, an album's tracks.

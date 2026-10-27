@@ -51,7 +51,9 @@ use crate::backend::{
 };
 use crate::backend::{InviteKind, InviteOrigin, InviteSpec, InviteSummary, MintedInvite};
 use crate::backend::{InviteLookup, InviteOutcome, LanServerInfo};
+use crate::backend::{ItemFilter, ItemFilterValues, ItemSort};
 
+mod browse;
 mod downloads;
 mod playlists;
 mod subtitles;
@@ -206,6 +208,9 @@ struct Catalog {
     recently_added: Vec<MediaId>,
     /// The people a search finds (P3-09), with the items they are in.
     people: Vec<(Person, Vec<MediaId>)>,
+    /// What a sort and a filter read of each top-level item beyond its
+    /// own fields (SDK 0.16).
+    facts: HashMap<MediaId, browse::Facts>,
 }
 
 impl Catalog {
@@ -217,6 +222,7 @@ impl Catalog {
             order: Vec::new(),
             recently_added: Vec::new(),
             people: Vec::new(),
+            facts: HashMap::new(),
         };
 
         let mut alien = movie("1", "Alien", 1979, 117);
@@ -335,6 +341,7 @@ impl Catalog {
             }));
         }
         catalog.children.insert(album, tracks);
+        catalog.add_facts(&severance, &andor, &artist);
 
         catalog.libraries = vec![
             (library("1", "Movies", LibraryKind::Movies), movie_ids),
@@ -345,6 +352,161 @@ impl Catalog {
             (library("3", "Music", LibraryKind::Music), vec![artist]),
         ];
         catalog
+    }
+
+    /// What sorting and filtering read (SDK 0.16): each movie's age
+    /// rating and release day on its item, and the rest, as Plex's listing
+    /// has it, in [`Catalog::facts`]. Contact has no release day and no
+    /// file details, Dune: Part Two no critic rating, and Andor no
+    /// audience rating, for the items without a value; Alien and Blade
+    /// Runner run as long, Alien and Heat are rated as well by audiences,
+    /// for the ties.
+    fn add_facts(&mut self, severance: &MediaId, andor: &MediaId, artist: &MediaId) {
+        use spoolframe_types::{CalendarDate, DynamicRange as Range, Resolution as Res};
+        const ADDED: i64 = 1_750_000_000;
+        const DAY: i64 = 86_400;
+        let day = |(y, m, d)| CalendarDate::new(y, m, d);
+        let genres = |names: &[&str]| names.iter().map(|g| (*g).to_owned()).collect();
+        type Film<'a> = (
+            &'a str,
+            &'a str,
+            Option<(u16, u8, u8)>,
+            i64,
+            Option<u16>,
+            Option<u16>,
+            &'a [&'a str],
+            Option<Res>,
+            Option<Range>,
+        );
+        let films: [Film; 8] = [
+            (
+                "1",
+                "R",
+                Some((1979, 5, 25)),
+                1,
+                Some(93),
+                Some(94),
+                &["Horror", "Science Fiction"],
+                Some(Res::FullHd),
+                Some(Range::Sdr),
+            ),
+            (
+                "2",
+                "PG-13",
+                Some((2016, 11, 11)),
+                8,
+                Some(94),
+                Some(82),
+                &["Drama", "Science Fiction"],
+                Some(Res::Uhd),
+                Some(Range::DolbyVision),
+            ),
+            (
+                "3",
+                "R",
+                Some((1995, 12, 15)),
+                7,
+                Some(88),
+                Some(94),
+                &["Crime", "Drama"],
+                Some(Res::FullHd),
+                Some(Range::Sdr),
+            ),
+            (
+                "4",
+                "R",
+                Some((1982, 6, 25)),
+                6,
+                Some(89),
+                Some(91),
+                &["Science Fiction", "Thriller"],
+                Some(Res::Uhd),
+                Some(Range::Hdr),
+            ),
+            (
+                "5",
+                "R",
+                Some((2009, 7, 10)),
+                5,
+                Some(90),
+                Some(89),
+                &["Drama", "Science Fiction"],
+                Some(Res::Hd),
+                Some(Range::Sdr),
+            ),
+            (
+                "6",
+                "R",
+                Some((2007, 4, 6)),
+                4,
+                Some(76),
+                Some(73),
+                &["Science Fiction", "Thriller"],
+                Some(Res::Sd),
+                Some(Range::Sdr),
+            ),
+            (
+                "7",
+                "PG",
+                None,
+                3,
+                Some(68),
+                Some(84),
+                &["Drama", "Science Fiction"],
+                None,
+                None,
+            ),
+            (
+                "8",
+                "PG-13",
+                Some((2024, 3, 1)),
+                2,
+                None,
+                Some(95),
+                &["Adventure", "Science Fiction"],
+                Some(Res::Uhd),
+                Some(Range::DolbyVision),
+            ),
+        ];
+        for (key, age, released, added, rating, audience, names, resolution, range) in films {
+            let id = media(MediaKind::Movie, key);
+            let released = released.and_then(day);
+            if let Some(Item::Movie(m)) = self.items.get_mut(&id) {
+                m.content_rating = Some(age.into());
+                m.release_date = released;
+            }
+            let facts = browse::Facts {
+                released,
+                added_at: Some(ADDED + added * DAY),
+                rating,
+                audience_rating: audience,
+                genres: genres(names),
+                resolution,
+                dynamic_range: range,
+            };
+            self.facts.insert(id, facts);
+        }
+        let show = |released, added, rating, audience| browse::Facts {
+            released: day(released),
+            added_at: Some(ADDED + added * DAY),
+            rating,
+            audience_rating: audience,
+            ..browse::Facts::default()
+        };
+        self.facts.insert(
+            severance.clone(),
+            show((2022, 2, 18), 10, Some(97), Some(89)),
+        );
+        self.facts
+            .insert(andor.clone(), show((2022, 9, 21), 9, Some(84), None));
+        self.facts.insert(
+            artist.clone(),
+            browse::Facts {
+                added_at: Some(ADDED + 11 * DAY),
+                genres: genres(&["Electronic"]),
+                ..browse::Facts::default()
+            },
+        );
     }
 
     fn add(&mut self, item: Item) {
@@ -881,6 +1043,89 @@ impl FakeSession {
             .collect()
     }
 
+    /// The movies or episodes `id` is watched by: itself, or a show's
+    /// episodes.
+    fn watchable(&self, id: &MediaId) -> Vec<MediaId> {
+        match self.catalog.items.get(id) {
+            Some(Item::Show(_)) => self
+                .catalog
+                .children
+                .get(id)
+                .into_iter()
+                .flatten()
+                .flat_map(|season| self.catalog.children.get(season).into_iter().flatten())
+                .cloned()
+                .collect(),
+            Some(Item::Movie(_)) => vec![id.clone()],
+            _ => Vec::new(),
+        }
+    }
+
+    /// The top-level items of `library`, in the listing's order, as a sort
+    /// and a filter read them, with the library's kind.
+    fn browsed(
+        &self,
+        library: &LibraryId,
+    ) -> Result<(LibraryKind, Vec<browse::Browsed>), BackendError> {
+        use spoolframe_types::WatchedState;
+        let (library, ids) = self
+            .catalog
+            .libraries
+            .iter()
+            .find(|(l, _)| &l.id == library)
+            .ok_or_else(|| BackendError::NotFound(library.to_string()))?;
+        let watch = self.watch();
+        let browsed = ids
+            .iter()
+            .filter_map(|id| self.catalog.items.get(id))
+            .map(|item| {
+                let id = item.id();
+                let facts = self.catalog.facts.get(id).cloned().unwrap_or_default();
+                let mut browsed = match item {
+                    Item::Movie(m) => {
+                        let mut b = browse::Browsed::new(id.clone(), &m.title, facts);
+                        b.year = m.year;
+                        b.content_rating = m.content_rating.clone();
+                        b.duration_ms = m.duration.map(|d| d.as_millis() as u64);
+                        b
+                    }
+                    Item::Show(s) => {
+                        let mut b = browse::Browsed::new(id.clone(), &s.title, facts);
+                        b.year = s.year;
+                        b.content_rating = s.content_rating.clone();
+                        b.genres = s.genres.clone();
+                        b
+                    }
+                    Item::Artist(a) => browse::Browsed::new(id.clone(), &a.name, facts),
+                    other => browse::Browsed::new(id.clone(), &other.id().to_string(), facts),
+                };
+                // As the server judges it: a show by its episodes.
+                let watchable = self.watchable(id);
+                if !watchable.is_empty() {
+                    let states: Vec<PlaybackState> =
+                        watchable.iter().map(|w| watch.get(w)).collect();
+                    browsed.watched = Some(if states.iter().all(|s| s.watched) {
+                        WatchedState::Watched
+                    } else if states.iter().any(|s| s.watched || s.position.is_some()) {
+                        WatchedState::InProgress
+                    } else {
+                        WatchedState::Unwatched
+                    });
+                    browsed.last_played = watchable
+                        .iter()
+                        .flat_map(|w| {
+                            let played = watch.plays.get(w).map(|(_, at)| *at);
+                            [watch.viewed.get(w).copied(), played]
+                        })
+                        .flatten()
+                        .max();
+                }
+                browsed
+            })
+            .collect();
+        Ok((library.kind, browsed))
+    }
+
     /// What hiding `id` hides: an episode hides its whole show.
     /// The show an episode belongs to.
     fn show_of(&self, id: &MediaId) -> Option<MediaId> {
@@ -1334,6 +1579,45 @@ impl Session for FakeSession {
                 .cloned()
                 .collect();
             Ok((self.items_with_state(&page), ids.len() as u32))
+        })
+    }
+
+    fn items_sorted<'a>(
+        &'a self,
+        library: &'a LibraryId,
+        offset: u32,
+        limit: u32,
+        sort: Option<ItemSort>,
+        filter: Option<&'a ItemFilter>,
+    ) -> BoxFuture<'a, Result<(Vec<Item>, u32), BackendError>> {
+        Box::pin(async move {
+            self.catalog()?;
+            let (kind, mut items) = self.browsed(library)?;
+            // An empty filter keeps everything, as the SDK leaves it out.
+            let filter = filter.filter(|f| !f.is_empty());
+            browse::check(kind, sort.as_ref(), filter)?;
+            if let Some(filter) = filter {
+                items.retain(|item| browse::keeps(filter, item));
+            }
+            browse::order(sort.unwrap_or(ItemSort::DEFAULT), &mut items);
+            let page: Vec<MediaId> = items
+                .iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .map(|item| item.media.clone())
+                .collect();
+            Ok((self.items_with_state(&page), items.len() as u32))
+        })
+    }
+
+    fn item_filter_values<'a>(
+        &'a self,
+        library: &'a LibraryId,
+    ) -> BoxFuture<'a, Result<ItemFilterValues, BackendError>> {
+        Box::pin(async move {
+            self.catalog()?;
+            let (kind, items) = self.browsed(library)?;
+            Ok(browse::values(kind, &items))
         })
     }
 
@@ -8029,5 +8313,688 @@ mod subtitle_sync_tests {
             ),
             (Some(synced.clone()), Some(synced))
         );
+    }
+}
+
+/// Sorting and filtering a library (SDK 0.16) on the fake server.
+#[cfg(test)]
+mod browse_tests {
+    use super::*;
+    use crate::backend::{Counted, DynamicRange, FilterPart, Resolution, SortKey, WatchedState};
+    use crate::testing::ready;
+
+    fn session_for(username: &str) -> Arc<dyn Session> {
+        let session = FakeClient::new(None)
+            .session(&FakeClient::profile(username))
+            .unwrap();
+        if username == "alice" {
+            ready(session.unlock(FAKE_PIN)).unwrap();
+        }
+        session
+    }
+
+    fn movies() -> LibraryId {
+        library("1", "Movies", LibraryKind::Movies).id
+    }
+
+    fn shows() -> LibraryId {
+        library("2", "TV Shows", LibraryKind::Shows).id
+    }
+
+    fn music() -> LibraryId {
+        library("3", "Music", LibraryKind::Music).id
+    }
+
+    fn title(item: &Item) -> String {
+        match item {
+            Item::Movie(m) => m.title.clone(),
+            Item::Show(s) => s.title.clone(),
+            Item::Artist(a) => a.name.clone(),
+            other => other.id().to_string(),
+        }
+    }
+
+    fn sorted_as(
+        username: &str,
+        library: &LibraryId,
+        sort: Option<ItemSort>,
+        filter: Option<&ItemFilter>,
+    ) -> Result<(Vec<String>, u32), BackendError> {
+        let session = session_for(username);
+        let (items, total) = ready(session.items_sorted(library, 0, 100, sort, filter))?;
+        Ok((items.iter().map(title).collect(), total))
+    }
+
+    /// Andrey's movies by `key`, titles only.
+    fn movies_by(key: SortKey, descending: bool) -> Vec<String> {
+        let sort = ItemSort { key, descending };
+        sorted_as("andrey", &movies(), Some(sort), None).unwrap().0
+    }
+
+    /// Andrey's movies `filter` keeps, titles only, A to Z.
+    fn movies_kept(filter: ItemFilter) -> Vec<String> {
+        sorted_as("andrey", &movies(), None, Some(&filter))
+            .unwrap()
+            .0
+    }
+
+    fn refused(library: &LibraryId, sort: Option<ItemSort>, filter: Option<&ItemFilter>) -> bool {
+        matches!(
+            sorted_as("andrey", library, sort, filter),
+            Err(BackendError::InvalidInput(_))
+        )
+    }
+
+    fn values_of(library: &LibraryId) -> ItemFilterValues {
+        ready(session_for("andrey").item_filter_values(library)).unwrap()
+    }
+
+    fn counted<T>(pairs: impl IntoIterator<Item = (T, u32)>) -> Vec<Counted<T>> {
+        pairs
+            .into_iter()
+            .map(|(value, count)| Counted {
+                value,
+                count: Some(count),
+            })
+            .collect()
+    }
+
+    fn named(pairs: &[(&str, u32)]) -> Vec<Counted<String>> {
+        counted(pairs.iter().map(|(name, n)| ((*name).to_owned(), *n)))
+    }
+
+    #[test]
+    fn no_sort_is_by_title_a_to_z() {
+        assert_eq!(
+            sorted_as("andrey", &movies(), None, None).unwrap().0,
+            [
+                "Alien",
+                "Arrival",
+                "Blade Runner",
+                "Contact",
+                "Dune: Part Two",
+                "Heat",
+                "Moon",
+                "Sunshine"
+            ]
+        );
+    }
+
+    #[test]
+    fn by_title_descending_is_z_to_a() {
+        assert_eq!(
+            movies_by(SortKey::Title, true),
+            [
+                "Sunshine",
+                "Moon",
+                "Heat",
+                "Dune: Part Two",
+                "Contact",
+                "Blade Runner",
+                "Arrival",
+                "Alien"
+            ]
+        );
+    }
+
+    #[test]
+    fn by_release_oldest_first_puts_one_without_a_date_last() {
+        assert_eq!(
+            movies_by(SortKey::Released, false),
+            [
+                "Alien",
+                "Blade Runner",
+                "Heat",
+                "Sunshine",
+                "Moon",
+                "Arrival",
+                "Dune: Part Two",
+                "Contact"
+            ]
+        );
+    }
+
+    #[test]
+    fn by_release_newest_first_still_puts_one_without_a_date_last() {
+        assert_eq!(
+            movies_by(SortKey::Released, true),
+            [
+                "Dune: Part Two",
+                "Arrival",
+                "Moon",
+                "Sunshine",
+                "Heat",
+                "Blade Runner",
+                "Alien",
+                "Contact"
+            ]
+        );
+    }
+
+    #[test]
+    fn by_added_newest_first() {
+        assert_eq!(
+            movies_by(SortKey::Added, true),
+            [
+                "Arrival",
+                "Heat",
+                "Blade Runner",
+                "Moon",
+                "Sunshine",
+                "Contact",
+                "Dune: Part Two",
+                "Alien"
+            ]
+        );
+    }
+
+    #[test]
+    fn by_rating_highest_first_puts_one_unrated_last() {
+        assert_eq!(
+            movies_by(SortKey::Rating, true),
+            [
+                "Arrival",
+                "Alien",
+                "Moon",
+                "Blade Runner",
+                "Heat",
+                "Sunshine",
+                "Contact",
+                "Dune: Part Two"
+            ]
+        );
+    }
+
+    #[test]
+    fn by_rating_lowest_first_also_puts_one_unrated_last() {
+        assert_eq!(
+            movies_by(SortKey::Rating, false).last().map(String::as_str),
+            Some("Dune: Part Two")
+        );
+    }
+
+    #[test]
+    fn by_audience_rating_a_tie_goes_by_title() {
+        assert_eq!(
+            movies_by(SortKey::AudienceRating, true),
+            [
+                "Dune: Part Two",
+                "Alien",
+                "Heat",
+                "Blade Runner",
+                "Moon",
+                "Contact",
+                "Arrival",
+                "Sunshine"
+            ]
+        );
+    }
+
+    #[test]
+    fn by_duration_shortest_first_a_tie_goes_by_title() {
+        assert_eq!(
+            movies_by(SortKey::Duration, false),
+            [
+                "Moon",
+                "Sunshine",
+                "Arrival",
+                "Alien",
+                "Blade Runner",
+                "Contact",
+                "Dune: Part Two",
+                "Heat"
+            ]
+        );
+    }
+
+    #[test]
+    fn by_duration_longest_first_a_tie_still_goes_a_to_z() {
+        assert_eq!(
+            movies_by(SortKey::Duration, true),
+            [
+                "Heat",
+                "Dune: Part Two",
+                "Contact",
+                "Alien",
+                "Blade Runner",
+                "Arrival",
+                "Sunshine",
+                "Moon"
+            ]
+        );
+    }
+
+    #[test]
+    fn by_last_played_a_show_never_played_comes_last_both_ways() {
+        let order = |descending| {
+            let sort = ItemSort {
+                key: SortKey::LastPlayed,
+                descending,
+            };
+            sorted_as("andrey", &shows(), Some(sort), None).unwrap().0
+        };
+        assert_eq!(
+            [order(false), order(true)],
+            [["Severance", "Andor"], ["Severance", "Andor"]]
+        );
+    }
+
+    #[test]
+    fn a_watched_filter_keeps_the_movies_watched() {
+        assert_eq!(
+            movies_kept(ItemFilter {
+                watched: vec![WatchedState::Watched],
+                ..ItemFilter::default()
+            }),
+            ["Arrival", "Blade Runner"]
+        );
+    }
+
+    #[test]
+    fn two_watch_states_keep_either() {
+        assert_eq!(
+            movies_kept(ItemFilter {
+                watched: vec![WatchedState::Unwatched, WatchedState::InProgress],
+                ..ItemFilter::default()
+            }),
+            [
+                "Alien",
+                "Contact",
+                "Dune: Part Two",
+                "Heat",
+                "Moon",
+                "Sunshine"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_show_none_of_whose_episodes_was_played_is_unwatched() {
+        let unwatched = ItemFilter {
+            watched: vec![WatchedState::Unwatched],
+            ..ItemFilter::default()
+        };
+        assert_eq!(
+            sorted_as("alice", &shows(), None, Some(&unwatched))
+                .unwrap()
+                .0,
+            ["Andor"]
+        );
+    }
+
+    #[test]
+    fn a_genre_filter_matches_case_aside() {
+        assert_eq!(
+            movies_kept(ItemFilter {
+                genres: vec!["thriller".into()],
+                ..ItemFilter::default()
+            }),
+            ["Blade Runner", "Sunshine"]
+        );
+    }
+
+    #[test]
+    fn two_genres_keep_either() {
+        assert_eq!(
+            movies_kept(ItemFilter {
+                genres: vec!["Crime".into(), "Horror".into()],
+                ..ItemFilter::default()
+            }),
+            ["Alien", "Heat"]
+        );
+    }
+
+    #[test]
+    fn a_decade_keeps_the_years_in_it() {
+        assert_eq!(
+            movies_kept(ItemFilter {
+                year_from: Some(1990),
+                year_to: Some(1999),
+                ..ItemFilter::default()
+            }),
+            ["Contact", "Heat"]
+        );
+    }
+
+    #[test]
+    fn a_year_from_alone_has_no_end() {
+        assert_eq!(
+            movies_kept(ItemFilter {
+                year_from: Some(2009),
+                ..ItemFilter::default()
+            }),
+            ["Arrival", "Dune: Part Two", "Moon"]
+        );
+    }
+
+    #[test]
+    fn two_content_ratings_keep_either_case_aside() {
+        assert_eq!(
+            movies_kept(ItemFilter {
+                content_ratings: vec!["pg".into(), "PG-13".into()],
+                ..ItemFilter::default()
+            }),
+            ["Arrival", "Contact", "Dune: Part Two"]
+        );
+    }
+
+    #[test]
+    fn a_resolution_filter_leaves_out_a_movie_without_one() {
+        assert_eq!(
+            movies_kept(ItemFilter {
+                resolutions: vec![Resolution::Uhd, Resolution::Sd],
+                ..ItemFilter::default()
+            }),
+            ["Arrival", "Blade Runner", "Dune: Part Two", "Sunshine"]
+        );
+    }
+
+    #[test]
+    fn hdr_keeps_dolby_vision_too() {
+        assert_eq!(
+            movies_kept(ItemFilter {
+                dynamic_ranges: vec![DynamicRange::Hdr],
+                ..ItemFilter::default()
+            }),
+            ["Arrival", "Blade Runner", "Dune: Part Two"]
+        );
+    }
+
+    #[test]
+    fn dolby_vision_keeps_only_dolby_vision() {
+        assert_eq!(
+            movies_kept(ItemFilter {
+                dynamic_ranges: vec![DynamicRange::DolbyVision],
+                ..ItemFilter::default()
+            }),
+            ["Arrival", "Dune: Part Two"]
+        );
+    }
+
+    #[test]
+    fn sdr_keeps_neither_hdr_nor_dolby_vision() {
+        assert_eq!(
+            movies_kept(ItemFilter {
+                dynamic_ranges: vec![DynamicRange::Sdr],
+                ..ItemFilter::default()
+            }),
+            ["Alien", "Heat", "Moon", "Sunshine"]
+        );
+    }
+
+    #[test]
+    fn the_parts_of_a_filter_all_have_to_match() {
+        assert_eq!(
+            movies_kept(ItemFilter {
+                genres: vec!["Drama".into()],
+                year_from: Some(2000),
+                ..ItemFilter::default()
+            }),
+            ["Arrival", "Moon"]
+        );
+    }
+
+    #[test]
+    fn a_filter_and_a_sort_go_together() {
+        let sort = ItemSort {
+            key: SortKey::Released,
+            descending: true,
+        };
+        let filter = ItemFilter {
+            genres: vec!["Thriller".into()],
+            ..ItemFilter::default()
+        };
+        assert_eq!(
+            sorted_as("andrey", &movies(), Some(sort), Some(&filter))
+                .unwrap()
+                .0,
+            ["Sunshine", "Blade Runner"]
+        );
+    }
+
+    #[test]
+    fn the_total_counts_only_what_the_filter_keeps() {
+        let filter = ItemFilter {
+            genres: vec!["Science Fiction".into()],
+            ..ItemFilter::default()
+        };
+        let session = session_for("andrey");
+        let (_, total) = ready(session.items_sorted(&movies(), 0, 2, None, Some(&filter))).unwrap();
+        assert_eq!(total, 7);
+    }
+
+    #[test]
+    fn a_page_is_the_sorted_filtered_items_from_its_offset() {
+        let filter = ItemFilter {
+            genres: vec!["Science Fiction".into()],
+            ..ItemFilter::default()
+        };
+        let session = session_for("andrey");
+        let (items, _) = ready(session.items_sorted(&movies(), 2, 2, None, Some(&filter))).unwrap();
+        assert_eq!(
+            items.iter().map(title).collect::<Vec<_>>(),
+            ["Blade Runner", "Contact"]
+        );
+    }
+
+    #[test]
+    fn an_empty_filter_keeps_everything() {
+        assert_eq!(
+            sorted_as("andrey", &movies(), None, Some(&ItemFilter::default()))
+                .unwrap()
+                .1,
+            8
+        );
+    }
+
+    #[test]
+    fn a_sort_by_size_is_refused_as_plex_has_none() {
+        let size = ItemSort {
+            key: SortKey::Size,
+            descending: false,
+        };
+        assert!(refused(&movies(), Some(size), None));
+    }
+
+    #[test]
+    fn a_tv_library_refuses_a_resolution_filter() {
+        let filter = ItemFilter {
+            resolutions: vec![Resolution::Uhd],
+            ..ItemFilter::default()
+        };
+        assert!(refused(&shows(), None, Some(&filter)));
+    }
+
+    #[test]
+    fn a_music_library_refuses_a_watched_filter() {
+        let filter = ItemFilter {
+            watched: vec![WatchedState::Watched],
+            ..ItemFilter::default()
+        };
+        assert!(refused(&music(), None, Some(&filter)));
+    }
+
+    #[test]
+    fn an_unknown_watch_state_is_refused() {
+        let filter = ItemFilter {
+            watched: vec![WatchedState::Unknown],
+            ..ItemFilter::default()
+        };
+        assert!(refused(&movies(), None, Some(&filter)));
+    }
+
+    #[test]
+    fn years_out_of_order_are_refused() {
+        let filter = ItemFilter {
+            year_from: Some(2000),
+            year_to: Some(1990),
+            ..ItemFilter::default()
+        };
+        assert!(refused(&movies(), None, Some(&filter)));
+    }
+
+    #[test]
+    fn what_is_refused_is_what_the_values_refuse() {
+        let duration = ItemSort {
+            key: SortKey::Duration,
+            descending: false,
+        };
+        assert_eq!(
+            (
+                values_of(&shows()).refuses(Some(&duration), None).is_some(),
+                refused(&shows(), Some(duration), None)
+            ),
+            (true, true)
+        );
+    }
+
+    #[test]
+    fn a_library_not_on_the_server_is_not_found() {
+        let elsewhere = library("99", "Elsewhere", LibraryKind::Movies).id;
+        assert!(matches!(
+            sorted_as("andrey", &elsewhere, None, None),
+            Err(BackendError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn a_movie_library_sorts_by_every_key_but_size() {
+        assert_eq!(
+            values_of(&movies()).sorts,
+            [
+                SortKey::Title,
+                SortKey::Released,
+                SortKey::Added,
+                SortKey::LastPlayed,
+                SortKey::Rating,
+                SortKey::AudienceRating,
+                SortKey::Duration
+            ]
+        );
+    }
+
+    #[test]
+    fn a_movie_library_filters_by_every_part() {
+        assert_eq!(
+            values_of(&movies()).filters,
+            [
+                FilterPart::Watched,
+                FilterPart::Genres,
+                FilterPart::Years,
+                FilterPart::ContentRatings,
+                FilterPart::Resolutions,
+                FilterPart::DynamicRanges
+            ]
+        );
+    }
+
+    #[test]
+    fn a_tv_library_has_no_resolution_filter() {
+        assert_eq!(
+            values_of(&shows()).filters,
+            [
+                FilterPart::Watched,
+                FilterPart::Genres,
+                FilterPart::Years,
+                FilterPart::ContentRatings
+            ]
+        );
+    }
+
+    #[test]
+    fn a_music_library_has_no_watched_filter() {
+        assert_eq!(values_of(&music()).filters, [FilterPart::Genres]);
+    }
+
+    #[test]
+    fn a_music_library_sorts_by_title_and_when_added() {
+        assert_eq!(values_of(&music()).sorts, [SortKey::Title, SortKey::Added]);
+    }
+
+    #[test]
+    fn genres_are_counted_by_name() {
+        assert_eq!(
+            values_of(&movies()).genres,
+            named(&[
+                ("Adventure", 1),
+                ("Crime", 1),
+                ("Drama", 4),
+                ("Horror", 1),
+                ("Science Fiction", 7),
+                ("Thriller", 2),
+            ])
+        );
+    }
+
+    #[test]
+    fn years_are_newest_first() {
+        assert_eq!(
+            values_of(&movies()).years,
+            counted([
+                (2024, 1),
+                (2016, 1),
+                (2009, 1),
+                (2007, 1),
+                (1997, 1),
+                (1995, 1),
+                (1982, 1),
+                (1979, 1),
+            ])
+        );
+    }
+
+    #[test]
+    fn content_ratings_are_counted_by_name() {
+        assert_eq!(
+            values_of(&movies()).content_ratings,
+            named(&[("PG", 1), ("PG-13", 2), ("R", 5)])
+        );
+    }
+
+    #[test]
+    fn resolutions_are_largest_first() {
+        assert_eq!(
+            values_of(&movies()).resolutions,
+            counted([
+                (Resolution::Uhd, 3),
+                (Resolution::FullHd, 2),
+                (Resolution::Hd, 1),
+                (Resolution::Sd, 1),
+            ])
+        );
+    }
+
+    #[test]
+    fn an_hdr_count_includes_dolby_vision() {
+        assert_eq!(
+            values_of(&movies()).dynamic_ranges,
+            counted([
+                (DynamicRange::Sdr, 4),
+                (DynamicRange::Hdr, 3),
+                (DynamicRange::DolbyVision, 2),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_tv_library_lists_no_resolutions_or_ranges() {
+        let values = values_of(&shows());
+        assert_eq!(
+            (values.resolutions.len(), values.dynamic_ranges.len()),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn a_tv_librarys_genres_come_from_its_shows() {
+        assert_eq!(
+            values_of(&shows()).genres,
+            named(&[("Drama", 2), ("Science Fiction", 2)])
+        );
+    }
+
+    #[test]
+    fn a_music_librarys_genres_come_from_its_artists() {
+        assert_eq!(values_of(&music()).genres, named(&[("Electronic", 1)]));
     }
 }
