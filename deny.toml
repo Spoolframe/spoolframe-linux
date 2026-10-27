@@ -36,6 +36,27 @@ ignore = [
   # ECDH uses secret keys (the SDK is on p256 0.14 since 0.15.1).
   # Accepted until webauthn-rs moves to crypto-glue 0.2; then this goes.
   { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 through elliptic-curve 0.13 from vendored crypto-glue 0.1 (webauthn caBLE ECDH); accepted until webauthn-rs moves to crypto-glue 0.2" },
+  # zstd 0.13.3 and zstd-safe 7.3.0 (dated 2026-10-16): stream, dictionary,
+  # context-clone, Seekable and legacy-frame memory bugs, fixed only in
+  # zstd 0.14.3 and zstd-safe 8.2.0. They come through foyer-storage 0.22.6
+  # (artwork's disk cache), whose newest release and main branch need zstd
+  # 0.13 with no feature to drop it. foyer's compression is off here (its
+  # default, Compression::None), so entries are written without zstd; only
+  # an entry whose header says zstd, in the client's own cache files, would
+  # reach the decoder. Accepted until foyer moves to zstd 0.14; then these go.
+  { id = "RUSTSEC-2026-0391", reason = "zstd 0.13 / zstd-safe 7 through foyer-storage 0.22, which needs zstd 0.13; its compression is off here, so no zstd code runs on entries the client wrote" },
+  { id = "RUSTSEC-2026-0395", reason = "zstd 0.13 / zstd-safe 7 through foyer-storage 0.22, which needs zstd 0.13; its compression is off here, so no zstd code runs on entries the client wrote" },
+  { id = "RUSTSEC-2026-0396", reason = "zstd 0.13 / zstd-safe 7 through foyer-storage 0.22, which needs zstd 0.13; its compression is off here, so no zstd code runs on entries the client wrote" },
+  { id = "RUSTSEC-2026-0397", reason = "zstd 0.13 / zstd-safe 7 through foyer-storage 0.22, which needs zstd 0.13; its compression is off here, so no zstd code runs on entries the client wrote" },
+  { id = "RUSTSEC-2026-0398", reason = "zstd 0.13 / zstd-safe 7 through foyer-storage 0.22, which needs zstd 0.13; its compression is off here, so no zstd code runs on entries the client wrote" },
+  { id = "RUSTSEC-2026-0399", reason = "zstd 0.13 / zstd-safe 7 through foyer-storage 0.22, which needs zstd 0.13; its compression is off here, so no zstd code runs on entries the client wrote" },
+  { id = "RUSTSEC-2026-0400", reason = "zstd 0.13 / zstd-safe 7 through foyer-storage 0.22, which needs zstd 0.13; its compression is off here, so no zstd code runs on entries the client wrote" },
+  { id = "RUSTSEC-2026-0401", reason = "zstd 0.13 / zstd-safe 7 through foyer-storage 0.22, which needs zstd 0.13; its compression is off here, so no zstd code runs on entries the client wrote" },
+  { id = "RUSTSEC-2026-0402", reason = "zstd 0.13 / zstd-safe 7 through foyer-storage 0.22, which needs zstd 0.13; its compression is off here, so no zstd code runs on entries the client wrote" },
+  { id = "RUSTSEC-2026-0403", reason = "zstd 0.13 / zstd-safe 7 through foyer-storage 0.22, which needs zstd 0.13; its compression is off here, so no zstd code runs on entries the client wrote" },
+  { id = "RUSTSEC-2026-0404", reason = "zstd 0.13 / zstd-safe 7 through foyer-storage 0.22, which needs zstd 0.13; its compression is off here, so no zstd code runs on entries the client wrote" },
+  { id = "RUSTSEC-2026-0405", reason = "zstd 0.13 / zstd-safe 7 through foyer-storage 0.22, which needs zstd 0.13; its compression is off here, so no zstd code runs on entries the client wrote" },
+  { id = "RUSTSEC-2026-0406", reason = "zstd 0.13 / zstd-safe 7 through foyer-storage 0.22, which needs zstd 0.13; its compression is off here, so no zstd code runs on entries the client wrote" },
 ]
 
 # Several versions of one crate come from upstream (iroh, webauthn-rs's

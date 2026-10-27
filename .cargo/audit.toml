@@ -9,6 +9,21 @@ ignore = [
   # crypto-glue 0.1 (webauthn caBLE's ECDH): accepted until webauthn-rs
   # moves to crypto-glue 0.2.
   "RUSTSEC-2026-0387",
+  # zstd 0.13 / zstd-safe 7 through foyer-storage 0.22, compression off:
+  # accepted until foyer moves to zstd 0.14. deny.toml says more.
+  "RUSTSEC-2026-0391",
+  "RUSTSEC-2026-0395",
+  "RUSTSEC-2026-0396",
+  "RUSTSEC-2026-0397",
+  "RUSTSEC-2026-0398",
+  "RUSTSEC-2026-0399",
+  "RUSTSEC-2026-0400",
+  "RUSTSEC-2026-0401",
+  "RUSTSEC-2026-0402",
+  "RUSTSEC-2026-0403",
+  "RUSTSEC-2026-0404",
+  "RUSTSEC-2026-0405",
+  "RUSTSEC-2026-0406",
 ]
 
 [output]
