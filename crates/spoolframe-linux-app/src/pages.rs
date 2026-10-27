@@ -50,8 +50,7 @@ pub struct PlayableActions {
     pub remember: Rc<dyn Fn(Selection)>,
     /// Forgets them: back to the user's preferences.
     pub forget: Rc<dyn Fn()>,
-    /// Subtitles from subtitle sites (PX-02); none where the server has
-    /// no subtitle search.
+    /// Subtitles from subtitle sites (PX-02); none with no server.
     pub subtitles: Option<SubtitleActions>,
 }
 
@@ -81,8 +80,7 @@ pub struct Under<'a> {
     /// The playlists holding it (PX-40).
     pub playlists: Option<&'a gtk::Widget>,
     /// Its Download action (PX-38): a button beside Resume, and the
-    /// download's state under them. None where the server has no
-    /// downloads.
+    /// download's state under them. None with no server.
     pub download: Option<&'a crate::downloads::ItemDownload>,
 }
 

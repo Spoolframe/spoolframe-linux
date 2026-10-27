@@ -699,27 +699,6 @@ mod tests {
     }
 
     #[test]
-    fn without_the_feature_nothing_is_offered_or_sent() {
-        let client = FakeClient::new(None).without_downloads();
-        let session = andrey(&client);
-        let unsupported = Some(BackendError::Unsupported("spoolframe:downloads".into()));
-        assert_eq!(
-            (
-                session.has_downloads(),
-                ready(session.download_options(&alien())).err(),
-                ready(session.start_download(
-                    &alien(),
-                    DownloadSource::Original,
-                    DownloadTracks::All
-                ))
-                .err(),
-                ready(session.sync_download_watch()).err(),
-            ),
-            (false, unsupported.clone(), unsupported.clone(), unsupported)
-        );
-    }
-
-    #[test]
     fn the_downloads_list_when_the_server_has_gone() {
         let client = FakeClient::new(None);
         let key = start(andrey(&client).as_ref()).key;

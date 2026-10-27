@@ -38,7 +38,7 @@ impl Row {
 /// What the sidebar knows of the session's playlists.
 #[derive(Debug, Clone, Copy)]
 pub enum Playlists<'a> {
-    /// The server has none (no `spoolframe:playlists`): no row for them.
+    /// No session (no server): no row for them.
     Off,
     /// Not listed yet: the Playlists row, and Pinned once they are.
     Loading,

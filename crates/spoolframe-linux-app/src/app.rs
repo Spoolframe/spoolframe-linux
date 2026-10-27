@@ -1,7 +1,7 @@
 //! The main window. It opens on "Choose a server" (or straight on "Who's
 //! watching" for the server used last), then shows the library: a sidebar
-//! of Home, Search, the libraries and, where the server has them, playlists
-//! with the user's pinned ones, and a navigation stack on the right. The
+//! of Home, Search, the libraries and playlists with the user's pinned
+//! ones, and a navigation stack on the right. The
 //! stack's root is the page the sidebar picks; a card pushes its item's page
 //! on top, with a Back button and swipe-back.
 
@@ -2244,7 +2244,7 @@ impl Component for App {
                 }
             }
             Msg::OpenDownloadPicker(item) => {
-                let Some(session) = self.session.clone().filter(|s| s.has_downloads()) else {
+                let Some(session) = self.session.clone() else {
                     return;
                 };
                 let client = self.client.clone();
@@ -2256,7 +2256,7 @@ impl Component for App {
                 });
             }
             Msg::StartDownload(id, source, tracks) => {
-                let Some(session) = self.session.clone().filter(|s| s.has_downloads()) else {
+                let Some(session) = self.session.clone() else {
                     return;
                 };
                 self.command(&sender, async move {
@@ -3201,7 +3201,9 @@ impl Component for App {
                     },
                     subtitles: self.subtitle_actions(&item, &sender),
                 };
-                let download = download_offered(self.session.as_deref()).then(|| {
+                // Download is offered with a server (PX-38); downloads
+                // already made show on the Downloads page either way.
+                let download = self.session.is_some().then(|| {
                     let open: Rc<dyn Fn()> = {
                         let (sender, item) = (sender.clone(), item.clone());
                         Rc::new(move || {
@@ -3879,13 +3881,12 @@ impl App {
                 let sender = sender.clone();
                 Rc::new(move |person| sender.input(Msg::OpenPerson(Box::new(person))))
             }),
-            // Offered on items' menus only where the server has playlists.
-            add_to_playlist: session.has_playlists().then(|| -> views::AddToPlaylist {
+            add_to_playlist: Some({
                 let sender = sender.clone();
                 Rc::new(move |item| sender.input(Msg::AddToPlaylist(Box::new(item))))
             }),
             // New for each session: one's hearts are not another's.
-            hearts: session.has_liked().then(|| {
+            hearts: Some({
                 let (like, ask) = (sender.clone(), sender.clone());
                 crate::hearts::Hearts::new(
                     Rc::new(move |items, likes, before| {
@@ -4203,14 +4204,14 @@ impl App {
         }
     }
 
-    /// Hears subtitle timing changes (PX-03), where the session has
-    /// subtitle sync: the playing item's subtitle is read again when its
-    /// timing changes. A missed one is only a subtitle shown as before.
+    /// Hears subtitle timing changes (PX-03) while there is a session: the
+    /// playing item's subtitle is read again when its timing changes. A
+    /// missed one is only a subtitle shown as before.
     fn watch_subtitle_timing(&mut self, sender: &ComponentSender<Self>) {
         if let Some(watch) = self.timing_watch.take() {
             watch.abort();
         }
-        if !self.session.as_ref().is_some_and(|s| s.has_subtitle_sync()) {
+        if self.session.is_none() {
             return;
         }
         let mut events = self.client.subtitle_timing_events();
@@ -4229,8 +4230,6 @@ impl App {
         }));
     }
 
-    /// The session, if its server has playlists: nothing of them is sent
-    /// to one without.
     /// The playlist page shown with the modes of the playback playing
     /// it, when one does: they are the user's latest.
     fn sync_playlist_view(&self) {
@@ -4242,8 +4241,10 @@ impl App {
         }
     }
 
+    /// The session playlists are read and changed through: none with no
+    /// server, when no playlist is shown.
     fn playlist_session(&self) -> Option<Arc<dyn Session>> {
-        self.session.clone().filter(|s| s.has_playlists())
+        self.session.clone()
     }
 
     /// The sidebar for the libraries and playlists known now.
@@ -4333,8 +4334,7 @@ impl App {
         refs: &[PlaylistRef],
         sender: &ComponentSender<Self>,
     ) -> Option<gtk::Widget> {
-        let has = self.playlist_session().is_some();
-        let refs = playlists::shown_refs(has, refs)?;
+        let refs = playlists::shown_refs(refs)?;
         let play: Rc<dyn Fn(String)> = {
             let sender = sender.clone();
             Rc::new(move |id| {
@@ -4353,7 +4353,7 @@ impl App {
     }
 
     /// A show page's playlist tabs (PX-40): those holding any of its
-    /// episodes, if any and the server has playlists. A tab opens the
+    /// episodes, if any. A tab opens the
     /// playlist's page over the show's, as the boards link it, so Back
     /// returns to the show.
     fn playlist_tabs(
@@ -4361,8 +4361,7 @@ impl App {
         refs: &[PlaylistRef],
         sender: &ComponentSender<Self>,
     ) -> Option<pages::ShowPlaylists> {
-        let has = self.playlist_session().is_some();
-        let refs = playlists::shown_refs(has, refs)?.to_vec();
+        let refs = playlists::shown_refs(refs)?.to_vec();
         let open: Rc<dyn Fn(String)> = {
             let sender = sender.clone();
             Rc::new(move |id| sender.input(Msg::OpenPlaylistOver(id)))
@@ -4371,7 +4370,7 @@ impl App {
     }
 
     /// What the item page's subtitle picker does with subtitle sites
-    /// (PX-02), where the server searches them: a film's or an episode's.
+    /// (PX-02), with a server to search them: a film's or an episode's.
     /// A track just downloaded for this item is shown picked, once.
     fn subtitle_actions(
         &mut self,
@@ -4383,13 +4382,7 @@ impl App {
             .take()
             .filter(|(id, _)| id == item.id())
             .map(|(_, track)| track);
-        if !self
-            .session
-            .as_ref()
-            .is_some_and(|s| s.has_subtitle_search())
-        {
-            return None;
-        }
+        self.session.as_ref()?;
         let id = item.id().clone();
         Some(pages::SubtitleActions {
             find: {
@@ -4640,11 +4633,7 @@ impl App {
             }
             self.shutdown_calls.retain(|call| !call.is_finished());
             let calls = playback.stop_waitable();
-            match self
-                .session
-                .clone()
-                .filter(|s| playback.is_local() && s.has_downloads())
-            {
+            match self.session.clone().filter(|_| playback.is_local()) {
                 Some(session) => self.shutdown_calls.push(sync_watch_after(calls, session)),
                 None => self.shutdown_calls.extend(calls),
             }
@@ -5144,7 +5133,7 @@ impl App {
             // The artist and the album as the server has them: one opened
             // from a track's menu carries only its ID.
             Item::Artist(artist) => self.command(sender, async move {
-                match read_item(backend.as_ref(), &artist.id).await {
+                match backend.item_detail(&artist.id).await {
                     Ok(ItemDetail {
                         item: Item::Artist(full),
                         children,
@@ -5156,23 +5145,22 @@ impl App {
                 }
             }),
             Item::Album(album) => self.command(sender, async move {
-                let (album, tracks, refs, liked) =
-                    match read_item(backend.as_ref(), &album.id).await {
-                        Ok(ItemDetail {
-                            item: Item::Album(full),
-                            children,
-                            playlists,
-                            liked,
-                            liked_children,
-                        }) => (full, Ok(children), playlists, liked.map(|_| liked_children)),
-                        Ok(detail) => (
-                            album,
-                            Ok(detail.children),
-                            detail.playlists,
-                            detail.liked.map(|_| detail.liked_children),
-                        ),
-                        Err(e) => (album, Err(e), Vec::new(), None),
-                    };
+                let (album, tracks, refs, liked) = match backend.item_detail(&album.id).await {
+                    Ok(ItemDetail {
+                        item: Item::Album(full),
+                        children,
+                        playlists,
+                        liked,
+                        liked_children,
+                    }) => (full, Ok(children), playlists, liked.map(|_| liked_children)),
+                    Ok(detail) => (
+                        album,
+                        Ok(detail.children),
+                        detail.playlists,
+                        detail.liked.map(|_| detail.liked_children),
+                    ),
+                    Err(e) => (album, Err(e), Vec::new(), None),
+                };
                 let loaded = async {
                     let tracks = tracks?;
                     let artist = match &album.artist_name {
@@ -5263,7 +5251,7 @@ async fn show_with_seasons(
     Result<Vec<SeasonEpisodes>, BackendError>,
     Vec<PlaylistRef>,
 ) {
-    let (full, children, refs) = match read_item(backend, &show.id).await {
+    let (full, children, refs) = match backend.item_detail(&show.id).await {
         Ok(ItemDetail {
             item: Item::Show(full),
             children,
@@ -5342,20 +5330,6 @@ fn reads_of_playable(item: &Item) -> Vec<MediaId> {
     }
 }
 
-async fn read_item(session: &dyn Session, id: &MediaId) -> Result<ItemDetail, BackendError> {
-    if session.has_playlists() {
-        return session.item_detail(id).await;
-    }
-    let (item, children) = session.item(id).await?;
-    Ok(ItemDetail {
-        item,
-        children,
-        playlists: Vec::new(),
-        liked: None,
-        liked_children: Vec::new(),
-    })
-}
-
 async fn tracks_of(session: &dyn Session, item: Item) -> Result<Vec<AlbumTracks>, BackendError> {
     match item {
         Item::Track(ref track) => {
@@ -5387,7 +5361,7 @@ async fn tracks_of(session: &dyn Session, item: Item) -> Result<Vec<AlbumTracks>
 /// `item` as the server has it now, with its watch state; the copy given
 /// when the server cannot say.
 async fn fresh(session: &dyn Session, item: Item) -> (Item, Vec<PlaylistRef>) {
-    match read_item(session, item.id()).await {
+    match session.item_detail(item.id()).await {
         Ok(detail) => (detail.item, detail.playlists),
         Err(_) => (item, Vec::new()),
     }
@@ -5396,13 +5370,6 @@ async fn fresh(session: &dyn Session, item: Item) -> (Item, Vec<PlaylistRef>) {
 fn open_with(sender: &ComponentSender<App>) -> views::Open {
     let sender = sender.clone();
     Rc::new(move |item| sender.input(Msg::Open(Box::new(item))))
-}
-
-/// Whether an item page offers Download (PX-38): only where the server
-/// and the app both do downloads, as the board's "No downloads here" has
-/// it. Downloads already made show on the Downloads page either way.
-fn download_offered(session: Option<&dyn Session>) -> bool {
-    session.is_some_and(|s| s.has_downloads())
 }
 
 /// Waits for `calls`, a download's last places written here, then sends
@@ -5511,13 +5478,9 @@ fn update_text(name: &str, server_protocol: Option<u32>) -> String {
 const RECENT_ALBUMS: usize = 12;
 const RECENT_TRACKS: u32 = 100;
 
-/// The albums of the tracks played lately, for Home (PX-52): none
-/// without play history, and none, said in the log, when the server
-/// could not say. The row is a convenience; Home opens without it.
+/// The albums of the tracks played lately, for Home (PX-52): none, said
+/// in the log, when the server could not say. The row is a convenience; Home opens without it.
 async fn recent_albums(session: &dyn Session) -> Vec<Album> {
-    if !session.has_play_history() {
-        return Vec::new();
-    }
     let tracks = Kinds {
         tracks: true,
         ..Kinds::default()
@@ -5566,20 +5529,17 @@ fn playlist_actions(
             let (sender, id) = (sender.clone(), id.to_owned());
             Rc::new(move |settings| sender.input(Msg::PlaylistSettings(id.clone(), settings)))
         },
-        // Only where the server shares by name.
-        people: session.filter(|s| s.has_playlist_sharing()).map(
-            |session| -> crate::share_picker::People {
-                let (session, id) = (session.clone(), id.to_owned());
-                Rc::new(move |query, offset| {
-                    let (session, id) = (session.clone(), id.clone());
-                    relm4::spawn(async move {
-                        session
-                            .share_candidates(&id, &query, offset, PEOPLE_PAGE)
-                            .await
-                    })
+        people: session.map(|session| -> crate::share_picker::People {
+            let (session, id) = (session.clone(), id.to_owned());
+            Rc::new(move |query, offset| {
+                let (session, id) = (session.clone(), id.clone());
+                relm4::spawn(async move {
+                    session
+                        .share_candidates(&id, &query, offset, PEOPLE_PAGE)
+                        .await
                 })
-            },
-        ),
+            })
+        }),
         play: {
             let (sender, id) = (sender.clone(), id.to_owned());
             Rc::new(move |from, settings| {
@@ -5619,19 +5579,16 @@ fn playlist_actions(
             let (sender, id) = (sender.clone(), id.to_owned());
             Rc::new(move || sender.input(Msg::DeletePlaylist(id.clone())))
         },
-        // Only where the server has covers (PX-53).
-        cover: session
-            .filter(|s| s.has_playlist_art())
-            .map(|_| playlists::CoverActions {
-                choose: {
-                    let (sender, id) = (sender.clone(), id.to_owned());
-                    Rc::new(move || sender.input(Msg::ChooseCover(id.clone())))
-                },
-                remove: {
-                    let (sender, id) = (sender.clone(), id.to_owned());
-                    Rc::new(move || sender.input(Msg::RemoveCover(id.clone())))
-                },
-            }),
+        cover: session.map(|_| playlists::CoverActions {
+            choose: {
+                let (sender, id) = (sender.clone(), id.to_owned());
+                Rc::new(move || sender.input(Msg::ChooseCover(id.clone())))
+            },
+            remove: {
+                let (sender, id) = (sender.clone(), id.to_owned());
+                Rc::new(move || sender.input(Msg::RemoveCover(id.clone())))
+            },
+        }),
     }
 }
 
@@ -6216,12 +6173,6 @@ mod tests {
         assert_eq!(andor_page_playlists(client), ["Andor: the heists"]);
     }
 
-    #[test]
-    fn a_server_without_playlists_gives_the_page_none() {
-        let client = spoolframe_linux_core::fake::FakeClient::new(None).without_playlists();
-        assert_eq!(andor_page_playlists(client), Vec::<String>::new());
-    }
-
     fn home_recent_albums(client: spoolframe_linux_core::fake::FakeClient) -> Vec<String> {
         use spoolframe_linux_core::testing::ready;
         let session = client
@@ -6238,48 +6189,6 @@ mod tests {
         let client = spoolframe_linux_core::fake::FakeClient::new(None);
         assert_eq!(home_recent_albums(client), ["Low Tide"]);
     }
-
-    #[test]
-    fn without_play_history_home_lists_no_recent_music() {
-        let client = spoolframe_linux_core::fake::FakeClient::new(None).with_features(
-            spoolframe_linux_core::backend::Features {
-                play_history: false,
-                ..FEATURES_ALL
-            },
-        );
-        assert_eq!(home_recent_albums(client), Vec::<String>::new());
-    }
-
-    #[test]
-    fn a_server_without_downloads_offers_no_download_action() {
-        let profile = spoolframe_linux_core::fake::FakeClient::profile("andrey");
-        let without = spoolframe_linux_core::fake::FakeClient::new(None).without_downloads();
-        let with = spoolframe_linux_core::fake::FakeClient::new(None);
-        assert_eq!(
-            (
-                download_offered(Some(without.session(&profile).unwrap().as_ref())),
-                download_offered(Some(with.session(&profile).unwrap().as_ref())),
-                download_offered(None)
-            ),
-            (false, true, false)
-        );
-    }
-
-    const FEATURES_ALL: spoolframe_linux_core::backend::Features =
-        spoolframe_linux_core::backend::Features {
-            playlists: true,
-            liked: true,
-            last_viewed: true,
-            playlist_sharing: true,
-            play_history: true,
-            playlist_art: true,
-            playlist_upcoming: true,
-            subtitle_sync: true,
-            subtitle_search: true,
-            downloads: true,
-            music_downloads: false,
-            invite_lookup: true,
-        };
 
     fn nothing_shown() -> Shown<'static> {
         Shown {

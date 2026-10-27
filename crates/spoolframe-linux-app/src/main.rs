@@ -219,11 +219,11 @@ const CLOSE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// How the SDK opens, from the user's settings: with or without relays
 /// (P6-03), which it cannot change while it runs, and with its downloads
 /// (PX-38) in a directory under the app's data, the one place the sandbox
-/// lets it write to.
+/// lets it write to. No experimental feature is asked for: this app uses
+/// neither HTTP playback nor federation.
 fn client_options(settings: &settings::Settings) -> sdk::ClientOptions {
     sdk::ClientOptions {
         relays: settings.use_relays(),
-        features: FEATURES,
         downloads_dir: downloads_dir(),
         ..sdk::ClientOptions::default()
     }
@@ -234,25 +234,6 @@ fn client_options(settings: &settings::Settings) -> sdk::ClientOptions {
 pub fn downloads_dir() -> Option<std::path::PathBuf> {
     spoolframe_linux_core::paths::data_dir().map(|dir| dir.join("downloads"))
 }
-
-/// The regular features this app handles, listed to every server: the
-/// SDK turns on none by itself (since 0.11), and a session has those the
-/// server lists too. Each is shown only where the session has it
-/// (`Session::has_*`).
-const FEATURES: sdk::Features = sdk::Features {
-    playlists: true,
-    liked: true,
-    last_viewed: true,
-    playlist_sharing: true,
-    play_history: true,
-    playlist_art: true,
-    playlist_upcoming: true,
-    subtitle_sync: true,
-    subtitle_search: true,
-    downloads: true,
-    music_downloads: false,
-    invite_lookup: true,
-};
 
 /// The artwork cache, or none if it cannot be opened: images are then
 /// fetched each time, which is slower but works.
@@ -328,28 +309,15 @@ mod tests {
         );
     }
 
-    /// The SDK lists no feature an app does not ask for (0.11): playlists
-    /// and the rest are asked for, whatever the settings.
+    /// Every regular feature is base protocol since SDK 0.16; the two
+    /// experimental ones (HTTP playback, federation) are not asked for.
     #[test]
-    fn the_sdk_opens_with_every_feature_the_app_handles() {
+    fn the_sdk_opens_asking_for_no_experimental_feature() {
         let dir = tempfile::tempdir().unwrap();
         let settings = settings::Settings::at(&dir.path().join("settings.ini"));
         assert_eq!(
-            client_options(&settings).features,
-            sdk::Features {
-                playlists: true,
-                liked: true,
-                last_viewed: true,
-                playlist_sharing: true,
-                play_history: true,
-                playlist_art: true,
-                playlist_upcoming: true,
-                subtitle_sync: true,
-                subtitle_search: true,
-                downloads: true,
-                music_downloads: false,
-                invite_lookup: true,
-            }
+            client_options(&settings).experimental,
+            sdk::Experimental::default()
         );
     }
 }

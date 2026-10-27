@@ -1697,28 +1697,6 @@ mod tests {
     }
 
     #[test]
-    fn without_the_feature_upcoming_and_settings_alone_are_refused() {
-        let client = FakeClient::new(None).without_playlist_upcoming();
-        let andrey = session(&client, "andrey");
-        let (all, _) = all_entries(andrey.as_ref());
-        let refused = || BackendError::Unsupported("spoolframe:playlist-upcoming".into());
-        assert_eq!(
-            (
-                andrey.has_playlist_upcoming(),
-                ready(andrey.upcoming_in_playlist(&all, 5)).err(),
-                ready(andrey.set_playlist_settings(&all, shuffled())).err(),
-                page(andrey.as_ref(), &all).settings,
-            ),
-            (
-                false,
-                Some(refused()),
-                Some(refused()),
-                PlaySettings::default()
-            )
-        );
-    }
-
-    #[test]
     fn a_film_is_refused_by_an_episodes_playlist_until_movies_are_ticked() {
         let client = FakeClient::new(None);
         let andrey = session(&client, "andrey");
@@ -1951,26 +1929,6 @@ mod tests {
                 vec![],
                 vec!["New this month".to_owned()],
                 vec!["Road trip".to_owned()],
-            )
-        );
-    }
-
-    #[test]
-    fn a_server_without_the_feature_shows_no_playlists() {
-        let client = FakeClient::new(None).without_playlists();
-        let andrey = session(&client, "andrey");
-        assert_eq!(
-            (
-                andrey.has_playlists(),
-                ready(andrey.playlists()).map(|_| ()),
-                ready(andrey.item_detail(&media(MediaKind::Show, "60")))
-                    .unwrap()
-                    .playlists,
-            ),
-            (
-                false,
-                Err(BackendError::Unsupported("spoolframe:playlists".into())),
-                vec![],
             )
         );
     }
@@ -2517,28 +2475,6 @@ mod tests {
     }
 
     #[test]
-    fn without_liked_there_are_no_builtins_and_no_hearts() {
-        let client = FakeClient::new(None).with_features(crate::backend::Features {
-            playlists: true,
-            ..crate::backend::Features::default()
-        });
-        let andrey = session(&client, "andrey");
-        let list = ready(andrey.playlists()).unwrap().playlists;
-        assert_eq!(
-            (
-                sections(&list).builtin.len(),
-                heart(andrey.as_ref(), &album()),
-                ready(andrey.like(&[track(1)])).err()
-            ),
-            (
-                0,
-                None,
-                Some(BackendError::Unsupported("spoolframe:liked".into()))
-            )
-        );
-    }
-
-    #[test]
     fn a_full_heart_unlikes_and_any_other_likes() {
         assert_eq!(
             [Liked::All, Liked::Some, Liked::None].map(heart_likes),
@@ -2583,21 +2519,6 @@ mod tests {
     }
 
     #[test]
-    fn without_sharing_by_name_a_shared_playlist_names_no_owner() {
-        let client = FakeClient::new(None).with_features(crate::backend::Features {
-            playlists: true,
-            ..crate::backend::Features::default()
-        });
-        let list = ready(session(&client, "andrey").playlists())
-            .unwrap()
-            .playlists;
-        assert_eq!(
-            owner_line(named(&list, "Road trip")),
-            "Shared with you · you can edit"
-        );
-    }
-
-    #[test]
     fn everyone_but_the_user_can_be_shared_with_by_name() {
         let andrey = session(&FakeClient::new(None), "andrey");
         assert_eq!(
@@ -2639,22 +2560,6 @@ mod tests {
         assert_eq!(
             ready(alice.share_candidates(&heists, "", 0, 50)),
             Err(BackendError::PlaylistReadOnly)
-        );
-    }
-
-    #[test]
-    fn without_sharing_by_name_no_one_is_listed() {
-        let client = FakeClient::new(None).with_features(crate::backend::Features {
-            playlists: true,
-            ..crate::backend::Features::default()
-        });
-        let andrey = session(&client, "andrey");
-        let id = movie_night(andrey.as_ref());
-        assert_eq!(
-            ready(andrey.share_candidates(&id, "", 0, 50)),
-            Err(BackendError::Unsupported(
-                "spoolframe:playlist-sharing".into()
-            ))
         );
     }
 

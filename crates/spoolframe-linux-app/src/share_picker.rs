@@ -1,7 +1,6 @@
-//! "Share with someone", from the editor's Add someone
-//! (`spoolframe:playlist-sharing`): the people the server says the
-//! playlist can go to, searched by name or username and shown a page at a
-//! time, each with their username and whether they are an account here or
+//! "Share with someone", from the editor's Add someone: the people the
+//! server says the playlist can go to, searched by name or username and
+//! shown a page at a time, each with their username and whether they are an account here or
 //! a portable user. No board draws it; it is laid out as "Add to
 //! playlist" is: a list in a dialog, one click picking.
 

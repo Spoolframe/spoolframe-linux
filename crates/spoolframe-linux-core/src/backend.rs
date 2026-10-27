@@ -487,9 +487,7 @@ pub use spoolframe_protocol::downloads::{
 pub const MAX_SUBTITLE_OFFSET_MS: i64 = 10 * 60 * 1000;
 
 /// Playlists (PX-40), in the protocol's and the SDK's own types.
-pub use spoolframe_client_sdk::{
-    Features, PlaylistChange, PlaylistEvent, PlaylistList, PlaylistUpdate,
-};
+pub use spoolframe_client_sdk::{PlaylistChange, PlaylistEvent, PlaylistList, PlaylistUpdate};
 pub use spoolframe_protocol::MAX_READ;
 pub use spoolframe_protocol::playlists::{
     Builtin, EntryId, ItemKind, Kinds, Liked, PinNote, PinNoteReason, PlaySettings, PlaylistEdit,
@@ -1456,22 +1454,10 @@ pub trait Session: Send + Sync {
     /// [`Session::can_leave`], asked of the server again.
     fn can_leave_now(&self) -> BoxFuture<'_, Result<bool, BackendError>>;
 
-    /// Whether the server has playlists (PX-40, `spoolframe:playlists`),
-    /// as it said when this session was made. Without them every call
-    /// below is [`BackendError::Unsupported`] and nothing is sent, so the
-    /// whole feature is hidden.
-    fn has_playlists(&self) -> bool;
-
-    /// Whether the session has Liked and All, and hearts (PX-43,
-    /// `spoolframe:liked`): never without playlists. Without it the
-    /// playlists list neither, and no heart is shown.
-    fn has_liked(&self) -> bool;
-
     /// Likes tracks or albums (PX-43): those not liked yet go to the top
     /// of the user's Liked, an album's tracks in order. 1 to 100 at a
     /// time, tracks and albums only ([`BackendError::KindNotAllowed`]).
-    /// Liked as it is after. Without [`Session::has_liked`],
-    /// [`BackendError::Unsupported`], unsent.
+    /// Liked as it is after.
     fn like<'a>(
         &'a self,
         items: &'a [MediaId],
@@ -1483,22 +1469,11 @@ pub trait Session: Send + Sync {
         items: &'a [MediaId],
     ) -> BoxFuture<'a, Result<PlaylistSummary, BackendError>>;
 
-    /// Whether items' playback states say when each was last viewed
-    /// (`spoolframe:last-viewed`). Data only: without it the field is
-    /// `None` everywhere, and nothing says "Viewed".
-    fn has_last_viewed(&self) -> bool;
-
-    /// Whether playlists are shared by name (`spoolframe:playlist-sharing`):
-    /// [`Session::share_candidates`], and the names of a playlist's owner
-    /// and of whom it is shared with. Never without playlists.
-    fn has_playlist_sharing(&self) -> bool;
-
-    /// Whom playlist `id` can be shared with (`spoolframe:playlist-sharing`):
+    /// Whom playlist `id` can be shared with:
     /// a page from `offset` of at most `limit` (200), by display name,
     /// and how many match in all; with a `query`, only those whose name
     /// or username holds it. Everyone but the user. Only whoever manages
-    /// the playlist may ask ([`BackendError::PlaylistReadOnly`]); without
-    /// [`Session::has_playlist_sharing`], [`BackendError::Unsupported`].
+    /// the playlist may ask ([`BackendError::PlaylistReadOnly`]).
     fn share_candidates<'a>(
         &'a self,
         id: &'a str,
@@ -1507,43 +1482,12 @@ pub trait Session: Send + Sync {
         limit: u32,
     ) -> BoxFuture<'a, Result<ShareCandidatePage, BackendError>>;
 
-    /// Whether the server keeps play history (PX-52,
-    /// `spoolframe:play-history`): [`Session::recently_played`], and play
-    /// counts on item pages.
-    fn has_play_history(&self) -> bool;
-
-    /// Whether playlists have covers (PX-53, `spoolframe:playlist-art`):
-    /// each playlist's `artwork` (an uploaded cover, a mosaic, or Liked's
-    /// and All's tiles), fetched as any artwork is, and setting or taking
-    /// away a cover. Never without playlists. Without it no playlist has
-    /// `artwork`, and the app draws its own mosaic.
-    fn has_playlist_art(&self) -> bool;
-
-    /// Whether the server says what comes up in a playlist and saves its
-    /// play settings alone (`spoolframe:playlist-upcoming`):
-    /// [`Session::upcoming_in_playlist`] and
-    /// [`Session::set_playlist_settings`]. Never without playlists.
-    /// Without it Up next shows a playlist in its own order, and the
-    /// settings are saved by playing.
-    fn has_playlist_upcoming(&self) -> bool;
-
-    /// Whether external text subtitles are synced and offset on the server
-    /// (PX-03, `spoolframe:subtitle-sync`): a track's `timing`, and Sync,
-    /// Use original timing and the offset control.
-    fn has_subtitle_sync(&self) -> bool;
-
-    /// Whether the server finds and downloads subtitles from subtitle
-    /// sites (PX-02, `spoolframe:subtitle-search`): "Find subtitles…", and
-    /// a downloaded track's `download`.
-    fn has_subtitle_search(&self) -> bool;
-
     /// What the server's subtitle sites have for item `id` (PX-02), in
     /// `language` (`en`, `pt-BR`) or, with `None`, the languages the
     /// server offers first: one list, best first, and how each site's
     /// part went. Never kept by the catalog: the server keeps it a day.
     /// [`BackendError::NoSubtitleSource`] when the server has no site set
-    /// up. Without [`Session::has_subtitle_search`],
-    /// [`BackendError::Unsupported`], unsent.
+    /// up.
     fn search_subtitles<'a>(
         &'a self,
         id: &'a MediaId,
@@ -1563,9 +1507,7 @@ pub trait Session: Send + Sync {
 
     /// Syncs item `id`'s external text subtitle `track` to the file, in
     /// the background (PX-03): its timing now, `Syncing`; the outcome
-    /// comes as a [`SubtitleTimingEvent`]. Without
-    /// [`Session::has_subtitle_sync`], [`BackendError::Unsupported`],
-    /// unsent.
+    /// comes as a [`SubtitleTimingEvent`].
     fn sync_subtitle<'a>(
         &'a self,
         id: &'a MediaId,
@@ -1604,9 +1546,7 @@ pub trait Session: Send + Sync {
     /// once, by its latest counted play, newest first, a page of at most
     /// `limit` (500), and how many in all. `kinds` keeps only films,
     /// episodes or tracks; `None`, every kind. Each item's playback
-    /// state has its play count and when it was last played. Without
-    /// [`Session::has_play_history`], [`BackendError::Unsupported`],
-    /// unsent.
+    /// state has its play count and when it was last played.
     fn recently_played(
         &self,
         kinds: Option<Kinds>,
@@ -1659,9 +1599,7 @@ pub trait Session: Send + Sync {
     /// [`MAX_ART_PIXELS`]. Its new `artwork`. Whoever may edit its entries
     /// may ([`BackendError::NotAllowed`] for anyone else, and on Liked and
     /// All); past the limits [`BackendError::ImageTooLarge`], a picture
-    /// the server cannot read [`BackendError::ImageUnreadable`]. Without
-    /// [`Session::has_playlist_art`], [`BackendError::Unsupported`],
-    /// unsent.
+    /// the server cannot read [`BackendError::ImageUnreadable`].
     fn set_playlist_art<'a>(
         &'a self,
         id: &'a str,
@@ -1715,8 +1653,7 @@ pub trait Session: Send + Sync {
     /// when it alone is (it plays again). The shuffled round's order
     /// while shuffling, else the playlist's; from the top again with
     /// Repeat All, so an entry may come more than once. With no place,
-    /// from the top. Without [`Session::has_playlist_upcoming`],
-    /// [`BackendError::Unsupported`], unsent.
+    /// from the top.
     fn upcoming_in_playlist<'a>(
         &'a self,
         id: &'a str,
@@ -1726,26 +1663,16 @@ pub trait Session: Send + Sync {
     /// Keeps `settings` as how the user plays playlist `id`, playing
     /// nothing: the place and the shuffled round stay. Shuffle turned on
     /// shuffles anew from the place, so the whole playlist is ahead;
-    /// turned off, the playlist's order from the place. Without
-    /// [`Session::has_playlist_upcoming`], [`BackendError::Unsupported`],
-    /// unsent.
+    /// turned off, the playlist's order from the place.
     fn set_playlist_settings<'a>(
         &'a self,
         id: &'a str,
         settings: PlaySettings,
     ) -> BoxFuture<'a, Result<(), BackendError>>;
 
-    /// Whether the server and this app both do downloads for offline
-    /// viewing (PX-38, `spoolframe:downloads`): [`Session::download_options`],
-    /// [`Session::start_download`] and [`Session::sync_download_watch`].
-    /// What was downloaded already plays and lists without it.
-    fn has_downloads(&self) -> bool;
-
     /// What may be downloaded of film or episode `id`: its tracks, the
     /// choice to tick first, the optimized profiles, what original
     /// quality would be, and the subtitles a download would leave out.
-    /// Without [`Session::has_downloads`], [`BackendError::Unsupported`],
-    /// unsent.
     fn download_options<'a>(
         &'a self,
         id: &'a MediaId,
@@ -1755,8 +1682,7 @@ pub trait Session: Send + Sync {
     /// the server prepares it now (a refusal is this call's error), and
     /// the SDK moves it on in the background; follow it with
     /// [`Client::download_events`]. Started again, the same download as
-    /// before. Without [`Session::has_downloads`],
-    /// [`BackendError::Unsupported`], unsent.
+    /// before.
     fn start_download<'a>(
         &'a self,
         id: &'a MediaId,
@@ -1766,8 +1692,7 @@ pub trait Session: Send + Sync {
 
     /// Sends what this user watched offline to the server, for every
     /// download of theirs there: what became of each item. One the server
-    /// has newer takes the server's state on the download. Without
-    /// [`Session::has_downloads`], [`BackendError::Unsupported`], unsent.
+    /// has newer takes the server's state on the download.
     fn sync_download_watch(&self) -> BoxFuture<'_, Result<Vec<SyncedWatch>, BackendError>>;
 }
 

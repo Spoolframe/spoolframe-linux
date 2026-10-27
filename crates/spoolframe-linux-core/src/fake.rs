@@ -42,7 +42,7 @@ use crate::backend::{
     DownloadSource, DownloadSpace, DownloadTracks, LocalDownload, OriginalDownload, SyncedWatch,
 };
 use crate::backend::{
-    EntryId, Features, ItemDetail, Kinds, PlaySettings, PlaylistEdit, PlaylistEvent, PlaylistList,
+    EntryId, ItemDetail, Kinds, PlaySettings, PlaylistEdit, PlaylistEvent, PlaylistList,
     PlaylistNext, PlaylistPage, PlaylistSummary, PlaylistUpdate, Visibility,
 };
 use crate::backend::{
@@ -472,18 +472,14 @@ impl WatchState {
     }
 
     /// `id`'s state as the session is shown it: with when it was last
-    /// viewed and its plays, for the features it has. The real server
+    /// viewed and its plays. The real server
     /// sends them only on some replies (Home's rows, an item's details,
     /// Recently played); the fake sends them wherever an item has a
     /// state, which no screen relies on.
-    fn shown(&self, id: &MediaId, features: Features) -> PlaybackState {
+    fn shown(&self, id: &MediaId) -> PlaybackState {
         let mut state = self.get(id);
-        if features.last_viewed {
-            state.last_viewed_at = self.viewed.get(id).copied();
-        }
-        if features.play_history
-            && let Some((count, at)) = self.plays.get(id)
-        {
+        state.last_viewed_at = self.viewed.get(id).copied();
+        if let Some((count, at)) = self.plays.get(id) {
             state.play_count = *count;
             state.last_played_at = Some(*at);
         }
@@ -572,9 +568,6 @@ pub struct FakeSession {
     saved: Saved,
     /// Every user's playlists (PX-40), the client's.
     playlists: Arc<Mutex<playlists::Store>>,
-    /// The features this session has, as the store had them when it was
-    /// made: read without its lock, which item reads may hold.
-    features: Features,
     /// The server's subtitle sites and what was downloaded (PX-02), for
     /// everyone.
     subtitles: Arc<Mutex<subtitles::Store>>,
@@ -790,12 +783,7 @@ impl FakeSession {
             },
             _ => FakePin::default(),
         };
-        let features = playlists
-            .lock()
-            .expect("fake state is never poisoned")
-            .features;
         let session = FakeSession {
-            features,
             catalog,
             watch: Mutex::new(WatchState::default()),
             serving,
@@ -876,10 +864,10 @@ impl FakeSession {
     fn with_state(&self, item: &Item, watch: &WatchState) -> Item {
         let mut item = item.clone();
         match &mut item {
-            Item::Movie(m) => m.playback = watch.shown(&m.id, self.features),
-            Item::Episode(e) => e.playback = watch.shown(&e.id, self.features),
+            Item::Movie(m) => m.playback = watch.shown(&m.id),
+            Item::Episode(e) => e.playback = watch.shown(&e.id),
             // A track has no resume point, but it has plays (PX-52).
-            Item::Track(t) => t.playback = watch.shown(&t.id, self.features),
+            Item::Track(t) => t.playback = watch.shown(&t.id),
             _ => {}
         }
         item
@@ -968,17 +956,16 @@ impl FakeSession {
     }
 
     /// An item's tracks, each external text subtitle with its timing
-    /// where the session has subtitle sync (PX-03).
+    /// (PX-03).
     fn tracks_of(&self, item: &Item) -> MediaTracks {
         let mut tracks = self.untimed_tracks(item);
-        if self.features.subtitle_sync {
-            let store = self.lock_subtitles();
-            for (n, track) in tracks.subtitles.iter_mut().enumerate() {
-                if track.external {
-                    track.timing = Some(store.timing_of(item.id(), n as u32, OWN_SUBTITLES));
-                }
+        let store = self.lock_subtitles();
+        for (n, track) in tracks.subtitles.iter_mut().enumerate() {
+            if track.external {
+                track.timing = Some(store.timing_of(item.id(), n as u32, OWN_SUBTITLES));
             }
         }
+        drop(store);
         tracks
     }
 
@@ -1038,11 +1025,10 @@ impl FakeSession {
                 ]
                 .into_iter()
                 // Those downloaded from a subtitle site (PX-02), after.
-                .chain(self.lock_subtitles().tracks(
-                    item.id(),
-                    self.asker(&display_name(&self.username)),
-                    self.features.subtitle_search,
-                ))
+                .chain(
+                    self.lock_subtitles()
+                        .tracks(item.id(), self.asker(&display_name(&self.username))),
+                )
                 .collect(),
             },
         }
@@ -1381,32 +1367,25 @@ impl Session for FakeSession {
                     .collect(),
                 _ => Vec::new(),
             };
-            let heart = match (store.features.liked, id.kind()) {
-                (false, _) => None,
-                (true, MediaKind::Track) => Some(match liked.contains(id) {
+            let heart = match id.kind() {
+                MediaKind::Track => Some(match liked.contains(id) {
                     true => crate::backend::Liked::All,
                     false => crate::backend::Liked::None,
                 }),
-                (true, MediaKind::Album) => Some(match liked_children.len() {
+                MediaKind::Album => Some(match liked_children.len() {
                     0 => crate::backend::Liked::None,
                     n if n == children.len() => crate::backend::Liked::All,
                     _ => crate::backend::Liked::Some,
                 }),
-                (true, _) => None,
+                _ => None,
             };
-            // Only for a client that listed the feature; none otherwise.
-            let playlists = match store.features.playlists {
-                true => {
-                    let mut held: std::collections::HashSet<MediaId> = self
-                        .leaves(std::slice::from_ref(id))
-                        .iter()
-                        .map(|i| i.id().clone())
-                        .collect();
-                    held.insert(id.clone());
-                    store.holding(&held, self.viewer())
-                }
-                false => Vec::new(),
-            };
+            let mut held: std::collections::HashSet<MediaId> = self
+                .leaves(std::slice::from_ref(id))
+                .iter()
+                .map(|i| i.id().clone())
+                .collect();
+            held.insert(id.clone());
+            let playlists = store.holding(&held, self.viewer());
             Ok(ItemDetail {
                 item,
                 children,
@@ -2396,14 +2375,6 @@ impl Session for FakeSession {
         })
     }
 
-    fn has_playlists(&self) -> bool {
-        self.features.playlists
-    }
-
-    fn has_liked(&self) -> bool {
-        self.features.liked
-    }
-
     fn like<'a>(
         &'a self,
         items: &'a [MediaId],
@@ -2426,34 +2397,6 @@ impl Session for FakeSession {
         })
     }
 
-    fn has_last_viewed(&self) -> bool {
-        self.features.last_viewed
-    }
-
-    fn has_playlist_sharing(&self) -> bool {
-        self.features.playlist_sharing
-    }
-
-    fn has_play_history(&self) -> bool {
-        self.features.play_history
-    }
-
-    fn has_playlist_art(&self) -> bool {
-        self.features.playlist_art
-    }
-
-    fn has_playlist_upcoming(&self) -> bool {
-        self.features.playlist_upcoming
-    }
-
-    fn has_subtitle_sync(&self) -> bool {
-        self.features.subtitle_sync
-    }
-
-    fn has_subtitle_search(&self) -> bool {
-        self.features.subtitle_search
-    }
-
     fn search_subtitles<'a>(
         &'a self,
         id: &'a MediaId,
@@ -2461,7 +2404,6 @@ impl Session for FakeSession {
     ) -> BoxFuture<'a, Result<SubtitleSearch, BackendError>> {
         Box::pin(async move {
             self.guard()?;
-            self.subtitle_search_listed()?;
             let title = crate::playlists::title(self.catalog.get(id)?);
             self.lock_subtitles().search(id, &title, language)
         })
@@ -2474,7 +2416,6 @@ impl Session for FakeSession {
     ) -> BoxFuture<'a, Result<SubtitleDownloaded, BackendError>> {
         Box::pin(async move {
             self.guard()?;
-            self.subtitle_search_listed()?;
             let title = crate::playlists::title(self.catalog.get(id)?);
             let name = display_name(&self.username);
             let asker = self.asker(&name);
@@ -2490,7 +2431,6 @@ impl Session for FakeSession {
     ) -> BoxFuture<'a, Result<SubtitleTiming, BackendError>> {
         Box::pin(async move {
             self.guard()?;
-            self.subtitle_sync_listed()?;
             self.catalog.get(id)?;
             self.lock_subtitles().sync(id, track, OWN_SUBTITLES)
         })
@@ -2503,7 +2443,6 @@ impl Session for FakeSession {
     ) -> BoxFuture<'a, Result<SubtitleTiming, BackendError>> {
         Box::pin(async move {
             self.guard()?;
-            self.subtitle_sync_listed()?;
             self.catalog.get(id)?;
             self.lock_subtitles().original(id, track, OWN_SUBTITLES)
         })
@@ -2517,7 +2456,6 @@ impl Session for FakeSession {
     ) -> BoxFuture<'a, Result<SubtitleTiming, BackendError>> {
         Box::pin(async move {
             self.guard()?;
-            self.subtitle_sync_listed()?;
             self.catalog.get(id)?;
             let name = display_name(&self.username);
             let asker = self.asker(&name);
@@ -2533,7 +2471,6 @@ impl Session for FakeSession {
     ) -> BoxFuture<'a, Result<(), BackendError>> {
         Box::pin(async move {
             self.guard()?;
-            self.subtitle_search_listed()?;
             let name = display_name(&self.username);
             let asker = self.asker(&name);
             self.lock_subtitles().remove(id, download, asker)
@@ -2562,11 +2499,6 @@ impl Session for FakeSession {
     ) -> BoxFuture<'_, Result<(Vec<Item>, u32), BackendError>> {
         Box::pin(async move {
             self.guard()?;
-            if !self.features.play_history {
-                return Err(BackendError::Unsupported(
-                    spoolframe_protocol::features::PLAY_HISTORY.into(),
-                ));
-            }
             let watch = self.watch();
             let mut played: Vec<(&MediaId, i64)> =
                 watch.plays.iter().map(|(id, (_, at))| (id, *at)).collect();
@@ -2596,7 +2528,6 @@ impl Session for FakeSession {
         Box::pin(async move {
             self.guard()?;
             let store = self.lock_playlists();
-            store.check()?;
             Ok(store.list(self.viewer()))
         })
     }
@@ -2610,7 +2541,6 @@ impl Session for FakeSession {
         Box::pin(async move {
             self.guard()?;
             let store = self.lock_playlists();
-            store.check()?;
             let viewer = self.viewer();
             let (playlist, stored) = store.seen(id, viewer)?;
             let liked = store.liked(&self.username);
@@ -2817,17 +2747,12 @@ impl Session for FakeSession {
         })
     }
 
-    fn has_downloads(&self) -> bool {
-        self.features.downloads
-    }
-
     fn download_options<'a>(
         &'a self,
         id: &'a MediaId,
     ) -> BoxFuture<'a, Result<DownloadOptionsInfo, BackendError>> {
         Box::pin(async move {
             self.catalog()?;
-            self.downloads_listed()?;
             let tracks = self.tracks_of(self.downloadable(id)?);
             // The first audio track and every subtitle, as the server
             // ticks for a viewer who prefers English.
@@ -2877,7 +2802,6 @@ impl Session for FakeSession {
     ) -> BoxFuture<'a, Result<LocalDownload, BackendError>> {
         Box::pin(async move {
             self.catalog()?;
-            self.downloads_listed()?;
             let item = self.downloadable(id)?;
             let media_tracks = self.tracks_of(item);
             if let DownloadTracks::Chosen { audio, subtitles } = &tracks {
@@ -2913,7 +2837,6 @@ impl Session for FakeSession {
     fn sync_download_watch(&self) -> BoxFuture<'_, Result<Vec<SyncedWatch>, BackendError>> {
         Box::pin(async move {
             self.catalog()?;
-            self.downloads_listed()?;
             Ok(self.lock_downloads().sync(&self.server.0, &self.username))
         })
     }
@@ -3235,16 +3158,6 @@ impl FakeSession {
         self.downloads.lock().expect("fake state is never poisoned")
     }
 
-    /// Refuses a download call without the feature, unsent.
-    fn downloads_listed(&self) -> Result<(), BackendError> {
-        match self.features.downloads {
-            true => Ok(()),
-            false => Err(BackendError::Unsupported(
-                spoolframe_protocol::features::DOWNLOADS.into(),
-            )),
-        }
-    }
-
     /// `id`'s item, which must be a film or an episode: the only kinds
     /// that download here.
     fn downloadable(&self, id: &MediaId) -> Result<&Item, BackendError> {
@@ -3253,26 +3166,6 @@ impl FakeSession {
             _ => Err(BackendError::InvalidInput(format!(
                 "{id}: only films and episodes download"
             ))),
-        }
-    }
-
-    /// Refuses a subtitle sync call without the feature, unsent.
-    fn subtitle_sync_listed(&self) -> Result<(), BackendError> {
-        match self.features.subtitle_sync {
-            true => Ok(()),
-            false => Err(BackendError::Unsupported(
-                spoolframe_protocol::features::SUBTITLE_SYNC.into(),
-            )),
-        }
-    }
-
-    /// Refuses a subtitle search call without the feature, unsent.
-    fn subtitle_search_listed(&self) -> Result<(), BackendError> {
-        match self.features.subtitle_search {
-            true => Ok(()),
-            false => Err(BackendError::Unsupported(
-                spoolframe_protocol::features::SUBTITLE_SEARCH.into(),
-            )),
         }
     }
 
@@ -3588,52 +3481,6 @@ impl FakeClient {
         }
     }
 
-    /// The server has no playlists (PX-40): an older one, without the
-    /// feature, and so without Liked and sharing, which need it.
-    pub fn without_playlists(self) -> Self {
-        let features = self.lock_playlists().features;
-        self.with_features(Features {
-            playlists: false,
-            ..features
-        })
-    }
-
-    /// The server has no downloads (PX-38): an older one, without the
-    /// feature. What was downloaded before still lists and plays.
-    pub fn without_downloads(self) -> Self {
-        let features = self.lock_playlists().features;
-        self.with_features(Features {
-            downloads: false,
-            music_downloads: false,
-            ..features
-        })
-    }
-
-    /// The server lists no `spoolframe:playlist-upcoming`: an older one,
-    /// which says nothing of what comes up and saves the play settings
-    /// only by playing.
-    pub fn without_playlist_upcoming(self) -> Self {
-        let features = self.lock_playlists().features;
-        self.with_features(Features {
-            playlist_upcoming: false,
-            ..features
-        })
-    }
-
-    /// The session has only these features, as when the server or the
-    /// app lists fewer: Liked, sharing and covers go with playlists, as
-    /// the SDK has it.
-    pub fn with_features(self, features: Features) -> Self {
-        self.lock_playlists().features = Features {
-            liked: features.liked && features.playlists,
-            playlist_sharing: features.playlist_sharing && features.playlists,
-            playlist_art: features.playlist_art && features.playlists,
-            playlist_upcoming: features.playlist_upcoming && features.playlists,
-            ..features
-        };
-        self
-    }
-
     /// The server's sync of `item`'s subtitle `track` (PX-03) ended as
     /// `sync`: everyone is told.
     pub fn finish_sync(&self, item: &MediaId, track: u32, sync: SubtitleSync) {
@@ -3845,15 +3692,6 @@ impl FakeClient {
             relays_edited: false,
         });
         Ok((invite, server))
-    }
-
-    /// Invite lookup is listed by the app and the server, as the SDK asks
-    /// before sending a lookup.
-    fn invite_lookup_listed(&self) -> Result<(), BackendError> {
-        match self.lock_playlists().features.invite_lookup {
-            true => Ok(()),
-            false => Err(BackendError::Unsupported("spoolframe:invite-lookup".into())),
-        }
     }
 
     /// Cabin saved, verified: the invite came from its admin.
@@ -4357,7 +4195,6 @@ impl Client for FakeClient {
                     "this invite has no code: it only finds the server".into(),
                 ));
             };
-            self.invite_lookup_listed()?;
             let spent = self.joined.lock().expect("fake state is never poisoned").1;
             Ok(InviteLookup {
                 server,
@@ -4374,7 +4211,6 @@ impl Client for FakeClient {
     ) -> BoxFuture<'a, Result<InviteLookup, BackendError>> {
         Box::pin(async move {
             let code = crate::invites::parse_code(typed)?;
-            self.invite_lookup_listed()?;
             let server = self.reach(key)?;
             let spent = self.joined.lock().expect("fake state is never poisoned").1;
             Ok(InviteLookup {
@@ -6263,15 +6099,6 @@ mod tests {
         }
 
         #[test]
-        fn without_invite_lookup_a_lookup_is_unsupported() {
-            let client = FakeClient::new(None).with_features(Features::default());
-            assert!(matches!(
-                ready(client.look_up_invite(&FakeClient::invite_link(Some(INVITE_CODE)))),
-                Err(BackendError::Unsupported(_))
-            ));
-        }
-
-        #[test]
         fn a_server_on_this_network_says_it_is_invite_only() {
             let client = FakeClient::new(None);
             let info = ready(client.lan_server_info(&home_media())).unwrap();
@@ -7737,25 +7564,6 @@ mod tests {
         let viewed = track_state(session.as_ref(), "41").last_viewed_at;
         assert!(viewed.is_some_and(|at| at >= before), "{viewed:?}");
     }
-
-    #[test]
-    fn without_play_history_nothing_is_listed_or_counted() {
-        let client = FakeClient::new(None).with_features(Features {
-            play_history: false,
-            ..Features::default()
-        });
-        let session = session_for(&client, "andrey");
-        assert_eq!(
-            (
-                ready(session.recently_played(None, 0, 50)),
-                track_state(session.as_ref(), "42").play_count
-            ),
-            (
-                Err(BackendError::Unsupported("spoolframe:play-history".into())),
-                0
-            )
-        );
-    }
 }
 
 /// Playlist covers (PX-53) on the fake server.
@@ -7892,26 +7700,6 @@ mod cover_tests {
         assert_eq!(
             ready(andrey.set_playlist_art(&id, b"not a picture".to_vec())),
             Err(BackendError::ImageUnreadable)
-        );
-    }
-
-    #[test]
-    fn without_the_feature_there_are_no_covers() {
-        let client = FakeClient::new(None).with_features(Features {
-            playlists: true,
-            ..Features::default()
-        });
-        let andrey = session_for(&client, "andrey");
-        let night = named(andrey.as_ref(), "Movie night");
-        assert_eq!(
-            (
-                night.artwork,
-                ready(andrey.set_playlist_art(&night.id, PNG.to_vec()))
-            ),
-            (
-                None,
-                Err(BackendError::Unsupported("spoolframe:playlist-art".into()))
-            )
         );
     }
 
@@ -8086,26 +7874,6 @@ mod subtitle_search_tests {
     }
 
     #[test]
-    fn without_the_feature_nothing_is_searched_and_no_track_says_where_it_came_from() {
-        let full = FakeClient::new(None);
-        let andrey = session_for(&full, "andrey");
-        let result = found(andrey.as_ref()).results[0].id.clone();
-        ready(andrey.download_subtitle(&alien(), &result)).unwrap();
-        // The same server, seen by an app that did not list the feature.
-        let client = FakeClient::new(None).with_features(Features {
-            playlists: true,
-            ..Features::default()
-        });
-        let off = session_for(&client, "andrey");
-        assert_eq!(
-            ready(off.search_subtitles(&alien(), None)),
-            Err(BackendError::Unsupported(
-                "spoolframe:subtitle-search".into()
-            ))
-        );
-    }
-
-    #[test]
     fn a_downloaded_track_plays_as_an_external_subtitle() {
         let (_dir, path) = file_with("subtitle-download", &[0; 4096]);
         let client = FakeClient::new(Some(path));
@@ -8260,25 +8028,6 @@ mod subtitle_sync_tests {
                     .map(|t| t.sync.clone())
             ),
             (Some(synced.clone()), Some(synced))
-        );
-    }
-
-    #[test]
-    fn without_the_feature_there_is_no_timing_and_nothing_is_sent() {
-        let client = FakeClient::new(None).with_features(Features {
-            playlists: true,
-            ..Features::default()
-        });
-        let session = andrey(&client);
-        assert_eq!(
-            (
-                timings(session.as_ref()),
-                ready(session.sync_subtitle(&alien(), 0)).err()
-            ),
-            (
-                vec![None, None, None],
-                Some(BackendError::Unsupported("spoolframe:subtitle-sync".into()))
-            )
         );
     }
 }

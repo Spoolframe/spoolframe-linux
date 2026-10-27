@@ -241,14 +241,10 @@ struct PlaylistContext {
     /// Its shuffle, repeat and skip watched; `None` until known (the
     /// preview's read says).
     modes: Option<PlaySettings>,
-    /// The modes the server has, as last sent or read; `None` until
-    /// known. What tells a save turning shuffle on from any other.
-    saved: Option<PlaySettings>,
     /// The stretch of the playlist Up next shows, from the entry playing,
-    /// on a server that does not say what comes up.
+    /// with no session to say what comes up.
     preview: Option<Preview>,
-    /// What the server says plays after its place, on a server that says
-    /// it (`spoolframe:playlist-upcoming`); `None` until read.
+    /// What the server says plays after its place; `None` until read.
     upcoming: Option<Vec<PlaylistEntry>>,
 }
 
@@ -680,36 +676,15 @@ async fn read_preview<const PAGE: u32, const AHEAD: usize>(
     Ok((preview, settings))
 }
 
-/// Where a save of the modes `now` plays from, the server having
-/// `saved` (`None`: not known). PlayPlaylist is the only call that saves
-/// them, and with shuffle on any entry given deals a new round with it
-/// first: so only shuffle turned on (off before, or not known) gives the
-/// entry `playing`, starting the round at the song heard. Any other save
-/// gives none, and the server keeps its round and resumes its place,
-/// which is the entry playing.
-fn save_from(saved: Option<PlaySettings>, now: PlaySettings, playing: EntryId) -> Option<EntryId> {
-    let turned_on = now.shuffle && !saved.is_some_and(|s| s.shuffle);
-    turned_on.then_some(playing)
-}
-
-/// Saves `settings` as how the playlist `playing` is played. Alone where
-/// the server can (`spoolframe:playlist-upcoming`): it keeps its place and
-/// its round, and turning shuffle on deals a new round from the place.
-/// Else by playing, from where [`save_from`] says, as before it could.
+/// Saves `settings` as how the playlist `playing` is played, alone: the
+/// server keeps its place and its round, and turning shuffle on deals a
+/// new round from the place.
 async fn save_modes(
     session: &dyn Session,
     playing: &Playing,
-    saved: Option<PlaySettings>,
     settings: PlaySettings,
 ) -> Result<(), BackendError> {
-    if session.has_playlist_upcoming() {
-        return session.set_playlist_settings(&playing.id, settings).await;
-    }
-    let from = save_from(saved, settings, playing.entry);
-    session
-        .play_playlist(&playing.id, from, settings)
-        .await
-        .map(drop)
+    session.set_playlist_settings(&playing.id, settings).await
 }
 
 /// How many entries a read of what comes up asks for: what Up next shows.
@@ -775,7 +750,7 @@ struct PlaylistAhead {
 /// `settings`, from `preview`; `None` while the preview it needs is not
 /// read, or does not hold the entry playing.
 ///
-/// For a server without `spoolframe:playlist-upcoming` (else see
+/// With no session to say what comes up (else see
 /// [`upcoming_ahead`]). Shuffled, it names no songs: the server plays a
 /// round of its own whose order it does not give, and the playlist's
 /// order would be a list of songs that do not play next. With Repeat One the
@@ -991,7 +966,6 @@ impl Playback {
         self.playlist.replace(Some(PlaylistContext {
             playing: from.playing,
             modes: from.settings,
-            saved: from.settings,
             preview: None,
             upcoming: None,
         }));
@@ -1071,7 +1045,6 @@ impl Playback {
                             return;
                         };
                         context.preview = Some(preview);
-                        context.saved.get_or_insert(settings);
                         context
                             .modes
                             .replace(context.modes.unwrap_or(settings))
@@ -1169,7 +1142,6 @@ impl Playback {
                 return;
             };
             context.upcoming = Some(upcoming);
-            context.saved.get_or_insert(settings);
             context
                 .modes
                 .replace(context.modes.unwrap_or(settings))
@@ -1212,11 +1184,9 @@ impl Playback {
         )
     }
 
-    /// Whether the server says what comes up in its playlists.
+    /// Whether there is a server to say what comes up in its playlists.
     fn has_upcoming(&self) -> bool {
-        self.session
-            .as_ref()
-            .is_some_and(|s| s.has_playlist_upcoming())
+        self.session.is_some()
     }
 
     pub fn play_playlist_entry(self: &Rc<Self>, entry: EntryId) {
@@ -1251,14 +1221,12 @@ impl Playback {
                 .playlist
                 .borrow()
                 .as_ref()
-                .map(|c| (c.playing.clone(), c.modes, c.saved));
+                .map(|c| (c.playing.clone(), c.modes));
             // Next asks the server's order; a pick and a save send the
             // modes, so wait for them to be known.
-            let (playing, settings, saved) = match (call, read) {
-                (Call::Next, Some((playing, modes, saved))) => {
-                    (playing, modes.unwrap_or_default(), saved)
-                }
-                (_, Some((playing, Some(modes), saved))) => (playing, modes, saved),
+            let (playing, settings) = match (call, read) {
+                (Call::Next, Some((playing, modes))) => (playing, modes.unwrap_or_default()),
+                (_, Some((playing, Some(modes)))) => (playing, modes),
                 _ => {
                     if call != Call::Save {
                         playback.asking_playlist.set(false);
@@ -1275,7 +1243,6 @@ impl Playback {
                 }
                 return;
             };
-            let id = playing.id.clone();
             drop(playback);
             let answer = relm4::spawn(async move {
                 match call {
@@ -1285,7 +1252,7 @@ impl Playback {
                             .play_playlist(&playing.id, Some(entry), settings)
                             .await
                     }
-                    Call::Save => save_modes(session.as_ref(), &playing, saved, settings)
+                    Call::Save => save_modes(session.as_ref(), &playing, settings)
                         .await
                         .map(|()| None),
                 }
@@ -1295,19 +1262,8 @@ impl Playback {
             let Some(playback) = weak.upgrade() else {
                 return;
             };
-            if call != Call::Next
-                && matches!(answer, Ok(Ok(_)))
-                && let Some(context) = playback.playlist.borrow_mut().as_mut()
-                && context.playing.id == id
-            {
-                context.saved = Some(settings);
-            }
             match (call, answer) {
-                // The entry it names is ignored: a save never changes
-                // what plays. Without an entry it is the one playing
-                // (resumed), or, the song having been heard to its end
-                // before, the next, where the server's place now is; the
-                // next Next asks after the entry playing all the same.
+                // A save never changes what plays.
                 (Call::Save, Ok(Ok(_))) => {}
                 (Call::Save, error) => {
                     tracing::warn!(?error, "cannot change playlist playback settings");
@@ -1614,11 +1570,8 @@ impl Playback {
 
     /// Saves the playlist's modes without restarting the current stream.
     ///
-    /// Where the server has `spoolframe:playlist-upcoming` they are saved
-    /// alone, keeping its place and round (see [`save_modes`]). An older
-    /// server saves them only by PlayPlaylist: from the entry playing
-    /// when shuffle is turned on (see [`save_from`]), else from its
-    /// place, which keeps its shuffled round. Either way the save goes in
+    /// They are saved alone, keeping the server's place and round (see
+    /// [`save_modes`]). The save goes in
     /// line with Next and picked entries ([`Self::playlist_calls`]) and
     /// reads the entry and the modes as it is sent, never before: sent
     /// beside a Next it could land after it and put the place back one
@@ -1796,11 +1749,11 @@ impl Playback {
         self.server_name.replace(name.to_owned());
     }
 
-    /// The subtitle menu's Search for subtitles… (PX-02), where the
-    /// server has it and a film or an episode plays: the panel over
-    /// `anchor`, and a track it downloads plays from here.
+    /// The subtitle menu's Search for subtitles… (PX-02), with a server
+    /// and while a film or an episode plays: the panel over `anchor`, and
+    /// a track it downloads plays from here.
     fn subtitle_search(&self) -> Option<crate::tracks::FindSubtitles> {
-        let session = self.session.clone().filter(|s| s.has_subtitle_search())?;
+        let session = self.session.clone()?;
         if !self.is_video() {
             return None;
         }
@@ -1829,12 +1782,10 @@ impl Playback {
         }))
     }
 
-    /// The subtitle menu's Timing (PX-03), where the server syncs
-    /// subtitles: for the chosen track while it is an external text one.
+    /// The subtitle menu's Timing (PX-03), with a server: for the chosen
+    /// track while it is an external text one.
     fn timing_menu(&self) -> Option<crate::subtitle_timing::TimingMenu> {
-        if !self.session.as_ref().is_some_and(|s| s.has_subtitle_sync()) {
-            return None;
-        }
+        self.session.as_ref()?;
         let me = self.me.clone();
         let current: Rc<dyn Fn() -> Option<(u32, SubtitleTiming)>> = {
             let me = me.clone();
@@ -3592,22 +3543,14 @@ mod tests {
         (all.id, entries, first.entry)
     }
 
-    /// A save of the modes as the playback sends it ([`save_modes`]), and
-    /// where [`save_from`] says it plays from, should it play.
-    fn save(
-        session: &dyn Session,
-        id: &str,
-        saved: PlaySettings,
-        now: PlaySettings,
-        playing: EntryId,
-    ) -> Option<EntryId> {
+    /// A save of the modes as the playback sends it ([`save_modes`]).
+    fn save(session: &dyn Session, id: &str, now: PlaySettings, playing: EntryId) {
         let playing = Playing {
             id: id.to_owned(),
             name: "All".into(),
             entry: playing,
         };
-        ready(save_modes(session, &playing, Some(saved), now)).unwrap();
-        save_from(Some(saved), now, playing.entry)
+        ready(save_modes(session, &playing, now)).unwrap();
     }
 
     /// The entries Next plays after `now`, at most `n`.
@@ -3658,7 +3601,7 @@ mod tests {
             shuffle: true,
             ..PlaySettings::default()
         };
-        save(session.as_ref(), &all, PlaySettings::default(), on, playing);
+        save(session.as_ref(), &all, on, playing);
         let place = ready(session.playlist(&all, 0, 1)).unwrap().place;
         let mut played = vec![playing];
         played.extend(next_n(session.as_ref(), &all, playing, 2 * entries.len()));
@@ -3683,13 +3626,7 @@ mod tests {
             repeat: spoolframe_linux_core::backend::Repeat::All,
             ..PlaySettings::default()
         };
-        save(
-            session.as_ref(),
-            &all,
-            PlaySettings::default(),
-            repeating,
-            playing,
-        );
+        save(session.as_ref(), &all, repeating, playing);
         let place = ready(session.playlist(&all, 0, 1)).unwrap().place;
         assert_eq!(place, Some(playing));
     }
@@ -3705,7 +3642,7 @@ mod tests {
             shuffle: true,
             ..PlaySettings::default()
         };
-        save(session.as_ref(), &all, PlaySettings::default(), on, playing);
+        save(session.as_ref(), &all, on, playing);
         let before = ready(read_upcoming(session.as_ref(), &all, Some(on)))
             .unwrap()
             .0;
@@ -3713,7 +3650,7 @@ mod tests {
             repeat: spoolframe_linux_core::backend::Repeat::All,
             ..on
         };
-        save(session.as_ref(), &all, on, repeating, playing);
+        save(session.as_ref(), &all, repeating, playing);
         let after = ready(read_upcoming(session.as_ref(), &all, Some(repeating)))
             .unwrap()
             .0;
@@ -3844,90 +3781,6 @@ mod tests {
                 assert_eq!(*sent.borrow(), ["next", "save", "read"]);
             })
             .unwrap();
-    }
-
-    /// The bug the user met: a change of Repeat while shuffling sent the
-    /// entry playing, the server dealt a new round from it, and songs
-    /// already heard came round again (and, the place landing mid-round,
-    /// the playlist ended early). On a server without
-    /// `spoolframe:playlist-upcoming`, which saves only by playing.
-    #[test]
-    fn without_upcoming_a_mode_saved_while_shuffling_keeps_the_round() {
-        let client = FakeClient::new(None).without_playlist_upcoming();
-        let session = client.session(&FakeClient::profile("andrey")).unwrap();
-        let (id, entries, first) = shuffling_all(session.as_ref());
-        let second = ready(session.next_in_playlist(&id, first))
-            .unwrap()
-            .unwrap()
-            .entry;
-        let shuffled = PlaySettings {
-            shuffle: true,
-            ..PlaySettings::default()
-        };
-        let repeating = PlaySettings {
-            repeat: spoolframe_linux_core::backend::Repeat::One,
-            ..shuffled
-        };
-        save(session.as_ref(), &id, shuffled, repeating, second);
-        save(session.as_ref(), &id, repeating, shuffled, second);
-        let mut played = vec![first, second];
-        let mut after = second;
-        while let Some(next) = ready(session.next_in_playlist(&id, after)).unwrap() {
-            assert!(played.len() <= entries.len(), "played {played:?}");
-            played.push(next.entry);
-            after = next.entry;
-        }
-        played.sort_unstable();
-        let mut all = entries.clone();
-        all.sort_unstable();
-        assert_eq!(played, all);
-    }
-
-    /// Off, on, off, on: each turn on deals one new round, from the entry
-    /// playing, and nothing else does (without
-    /// `spoolframe:playlist-upcoming`).
-    #[test]
-    fn without_upcoming_only_turning_shuffle_on_saves_from_the_entry_playing() {
-        let client = FakeClient::new(None).without_playlist_upcoming();
-        let session = client.session(&FakeClient::profile("andrey")).unwrap();
-        let list = ready(session.playlists()).unwrap().playlists;
-        let all = list.into_iter().find(|p| p.name == "All").unwrap();
-        let playing = ready(session.play_playlist(&all.id, None, PlaySettings::default()))
-            .unwrap()
-            .unwrap()
-            .entry;
-        let (off, on) = (
-            PlaySettings::default(),
-            PlaySettings {
-                shuffle: true,
-                ..PlaySettings::default()
-            },
-        );
-        let repeat_all = PlaySettings {
-            repeat: spoolframe_linux_core::backend::Repeat::All,
-            ..on
-        };
-        let steps = [(off, on), (on, repeat_all), (repeat_all, off), (off, on)];
-        let froms: Vec<_> = steps
-            .into_iter()
-            .map(|(saved, now)| save(session.as_ref(), &all.id, saved, now, playing))
-            .collect();
-        assert_eq!(froms, [Some(playing), None, None, Some(playing)]);
-    }
-
-    #[test]
-    fn a_save_with_the_servers_modes_unknown_and_shuffle_on_deals_from_the_entry_playing() {
-        let on = PlaySettings {
-            shuffle: true,
-            ..PlaySettings::default()
-        };
-        assert_eq!(
-            (
-                save_from(None, on, 7),
-                save_from(None, PlaySettings::default(), 7)
-            ),
-            (Some(7), None)
-        );
     }
 
     #[test]
@@ -4177,8 +4030,8 @@ mod tests {
         ahead.entries.iter().map(|e| e.entry).collect()
     }
 
-    /// A server without `spoolframe:playlist-upcoming` does not say the
-    /// round's order: the playlist's own would be a list of songs that do
+    /// Without what the server says comes up, the round's order is not
+    /// known: the playlist's own would be a list of songs that do
     /// not play next.
     #[test]
     fn up_next_while_shuffling_names_no_songs_and_says_why() {

@@ -151,10 +151,10 @@ pub fn ref_line(kind: PlaylistOwnerKind) -> &'static str {
     }
 }
 
-/// The playlists an item's page lists, if it lists any: none without the
-/// feature, and no section when none hold the item.
-pub fn shown_refs(has_playlists: bool, refs: &[PlaylistRef]) -> Option<&[PlaylistRef]> {
-    (has_playlists && !refs.is_empty()).then_some(refs)
+/// The playlists an item's page lists, if it lists any: no section when
+/// none hold the item.
+pub fn shown_refs(refs: &[PlaylistRef]) -> Option<&[PlaylistRef]> {
+    (!refs.is_empty()).then_some(refs)
 }
 
 /// What a row of an item page's Playlists does, by the playlist's id: a
@@ -583,9 +583,9 @@ pub struct PageActions {
     pub update: Rc<dyn Fn(PlaylistUpdate)>,
     pub delete: Rc<dyn Fn()>,
     /// Whom it can be shared with, for the editor's Add someone; none
-    /// where the server does not share by name.
+    /// with no server.
     pub people: Option<crate::share_picker::People>,
-    /// Its cover (PX-53); none where the server has no covers.
+    /// Its cover (PX-53); none with no server.
     pub cover: Option<CoverActions>,
 }
 
@@ -2061,29 +2061,6 @@ mod tests {
         );
     }
 
-    /// A server without sharing by name sends no owner's name: the row
-    /// says only that it is shared.
-    #[test]
-    fn without_names_a_shared_playlists_row_says_it_is_shared() {
-        let client =
-            FakeClient::new(None).with_features(spoolframe_linux_core::backend::Features {
-                playlists: true,
-                ..Default::default()
-            });
-        let session = andrey(&client);
-        let album = spoolframe_types::MediaId::new(
-            spoolframe_types::Namespace::Plex,
-            MediaKind::Album,
-            "31",
-        )
-        .unwrap();
-        let lines: Vec<_> = refs_of(session.as_ref(), &album)
-            .iter()
-            .map(ref_subtitle)
-            .collect();
-        assert_eq!(lines, ["Shared with you"]);
-    }
-
     fn refs_of(session: &dyn Session, id: &spoolframe_types::MediaId) -> Vec<PlaylistRef> {
         ready(session.item_detail(id)).unwrap().playlists
     }
@@ -2097,7 +2074,7 @@ mod tests {
     fn a_show_in_a_playlist_lists_it() {
         let client = FakeClient::new(None);
         let refs = refs_of(andrey(&client).as_ref(), &andor());
-        let shown: Vec<_> = shown_refs(true, &refs)
+        let shown: Vec<_> = shown_refs(&refs)
             .unwrap()
             .iter()
             .map(|p| p.name.as_str())
@@ -2110,14 +2087,7 @@ mod tests {
         let client = FakeClient::new(None);
         let mum = client.session(&FakeClient::profile("mum")).unwrap();
         let refs = refs_of(mum.as_ref(), &andor());
-        assert_eq!(shown_refs(true, &refs), None);
-    }
-
-    #[test]
-    fn without_the_feature_there_is_no_section() {
-        let client = FakeClient::new(None);
-        let refs = refs_of(andrey(&client).as_ref(), &andor());
-        assert_eq!(shown_refs(false, &refs), None);
+        assert_eq!(shown_refs(&refs), None);
     }
 
     #[test]

@@ -1626,14 +1626,6 @@ impl Session for SdkSession {
         Box::pin(self.call(|s| async move { s.can_leave_now().await }))
     }
 
-    fn has_playlists(&self) -> bool {
-        self.session.features().playlists
-    }
-
-    fn has_liked(&self) -> bool {
-        self.session.features().liked
-    }
-
     fn like<'a>(
         &'a self,
         items: &'a [MediaId],
@@ -1648,34 +1640,6 @@ impl Session for SdkSession {
     ) -> BoxFuture<'a, Result<PlaylistSummary, BackendError>> {
         let items = items.to_vec();
         Box::pin(self.call(move |s| async move { s.unlike(&items).await }))
-    }
-
-    fn has_last_viewed(&self) -> bool {
-        self.session.features().last_viewed
-    }
-
-    fn has_playlist_sharing(&self) -> bool {
-        self.session.features().playlist_sharing
-    }
-
-    fn has_play_history(&self) -> bool {
-        self.session.features().play_history
-    }
-
-    fn has_playlist_art(&self) -> bool {
-        self.session.features().playlist_art
-    }
-
-    fn has_playlist_upcoming(&self) -> bool {
-        self.session.features().playlist_upcoming
-    }
-
-    fn has_subtitle_sync(&self) -> bool {
-        self.session.features().subtitle_sync
-    }
-
-    fn has_subtitle_search(&self) -> bool {
-        self.session.features().subtitle_search
     }
 
     fn search_subtitles<'a>(
@@ -1886,10 +1850,6 @@ impl Session for SdkSession {
     ) -> BoxFuture<'a, Result<(), BackendError>> {
         let id = id.to_owned();
         Box::pin(self.call(move |s| async move { s.set_playlist_settings(&id, settings).await }))
-    }
-
-    fn has_downloads(&self) -> bool {
-        self.session.features().downloads
     }
 
     fn download_options<'a>(

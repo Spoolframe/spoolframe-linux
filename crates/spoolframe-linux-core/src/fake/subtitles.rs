@@ -367,7 +367,7 @@ impl Store {
         };
         Ok(SubtitleDownloaded {
             track: (before + at) as u32,
-            subtitle: track(&kept[at], asker, true),
+            subtitle: track(&kept[at], asker),
             account_remaining: Some(19),
             user_remaining: None,
         })
@@ -395,12 +395,11 @@ impl Store {
     }
 
     /// Item `id`'s downloaded tracks, after its own, in the order they
-    /// were downloaded; each says where it came from to a client that
-    /// listed subtitle search (`described`).
-    pub fn tracks(&self, id: &MediaId, asker: Asker<'_>, described: bool) -> Vec<SubtitleTrack> {
+    /// were downloaded; each says where it came from.
+    pub fn tracks(&self, id: &MediaId, asker: Asker<'_>) -> Vec<SubtitleTrack> {
         self.downloads
             .get(id)
-            .map(|kept| kept.iter().map(|d| track(d, asker, described)).collect())
+            .map(|kept| kept.iter().map(|d| track(d, asker)).collect())
             .unwrap_or_default()
     }
 
@@ -413,7 +412,7 @@ impl Store {
     }
 }
 
-fn track(download: &Downloaded, asker: Asker<'_>, described: bool) -> SubtitleTrack {
+fn track(download: &Downloaded, asker: Asker<'_>) -> SubtitleTrack {
     SubtitleTrack {
         language: Some(download.language.clone()),
         title: Some(SubtitleSource::name_of(&download.source).to_owned()),
@@ -425,7 +424,7 @@ fn track(download: &Downloaded, asker: Asker<'_>, described: bool) -> SubtitleTr
             false => SubtitleRole::Full,
         },
         timing: None,
-        download: described.then(|| SubtitleDownload {
+        download: Some(SubtitleDownload {
             id: download.id.clone(),
             source: download.source.clone(),
             release: download.release.clone(),

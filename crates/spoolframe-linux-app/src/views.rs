@@ -49,7 +49,7 @@ pub struct Cards {
 /// Opens "Add to playlist" for an item.
 pub type AddToPlaylist = Rc<dyn Fn(Item)>;
 
-/// "Add to playlist…" for `item`, where the server has playlists; a
+/// "Add to playlist…" for `item`, where the cards offer it; a
 /// season's says which season.
 pub fn add_entry(item: &Item, add: Option<&AddToPlaylist>) -> Option<MenuEntry> {
     let add = add?.clone();

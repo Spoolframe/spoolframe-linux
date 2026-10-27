@@ -1547,14 +1547,16 @@ mod tests {
         );
     }
 
+    /// `forced` is always sent since SDK 0.16; a value this build does
+    /// not know reads as Accept.
     #[test]
-    fn a_forced_preference_from_before_shows_as_no_preference() {
-        let before: spoolframe_types::SubtitlePreferences = serde_json::from_str(
-            r#"{"mode":"always","languages":[],"sdh":"accept","bitmap":"text"}"#,
+    fn a_forced_preference_this_build_does_not_know_shows_as_no_preference() {
+        let unknown: spoolframe_types::SubtitlePreferences = serde_json::from_str(
+            r#"{"mode":"always","languages":[],"sdh":"accept","bitmap":"text","forced":"later"}"#,
         )
         .unwrap();
         assert_eq!(
-            FORCED[shown_choice(&FORCED, &before.forced) as usize].1,
+            FORCED[shown_choice(&FORCED, &unknown.forced) as usize].1,
             "No preference"
         );
     }

@@ -16,10 +16,10 @@ use spoolframe_types::{ArtworkId, Item, MediaId};
 use tokio::sync::broadcast;
 
 use crate::backend::{
-    BackendError, Builtin, EntryId, Features, ItemKind, Kinds, PinNote, PinNoteReason,
-    PlaySettings, PlaylistChange, PlaylistEdit, PlaylistEvent, PlaylistList, PlaylistOwnerKind,
-    PlaylistRef, PlaylistShare, PlaylistSummary, PlaylistUpdate, Repeat, ShareCandidate,
-    ShareCandidatePage, Visibility,
+    BackendError, Builtin, EntryId, ItemKind, Kinds, PinNote, PinNoteReason, PlaySettings,
+    PlaylistChange, PlaylistEdit, PlaylistEvent, PlaylistList, PlaylistOwnerKind, PlaylistRef,
+    PlaylistShare, PlaylistSummary, PlaylistUpdate, Repeat, ShareCandidate, ShareCandidatePage,
+    Visibility,
 };
 
 pub use spoolframe_protocol::playlists::{MAX_ART_BYTES, MAX_ART_PIXELS};
@@ -98,9 +98,6 @@ struct Access {
 }
 
 pub(super) struct Store {
-    /// The features the session has: what the app and the fake server
-    /// both list. All of them unless a test turns some off.
-    pub features: Features,
     server: String,
     next_id: u64,
     next_entry: EntryId,
@@ -127,20 +124,6 @@ pub(super) struct Store {
 impl Store {
     pub fn new(server: &str) -> Self {
         Store {
-            features: Features {
-                playlists: true,
-                liked: true,
-                last_viewed: true,
-                playlist_sharing: true,
-                play_history: true,
-                playlist_art: true,
-                playlist_upcoming: true,
-                subtitle_sync: true,
-                subtitle_search: true,
-                downloads: true,
-                music_downloads: false,
-                invite_lookup: true,
-            },
             server: server.to_owned(),
             next_id: 1,
             next_entry: 1,
@@ -169,34 +152,14 @@ impl Store {
         });
     }
 
-    pub fn check(&self) -> Result<(), BackendError> {
-        if self.features.playlists {
-            Ok(())
-        } else {
-            Err(BackendError::Unsupported(
-                spoolframe_protocol::features::PLAYLISTS.into(),
-            ))
-        }
-    }
-
-    /// Refuses a like or unlike without the feature, unsent.
-    fn check_liked(&self) -> Result<(), BackendError> {
-        match self.features.liked {
-            true => Ok(()),
-            false => Err(BackendError::Unsupported(
-                spoolframe_protocol::features::LIKED.into(),
-            )),
-        }
-    }
-
     /// Makes `username`'s Liked (empty) and All the first time they are
-    /// seen, with the feature: the server has them for every user.
+    /// seen: the server has them for every user.
     pub fn builtins_for(&mut self, username: &str) {
         let has = self
             .playlists
             .iter()
             .any(|p| p.owner == username && p.builtin.is_some());
-        if has || !self.features.liked {
+        if has {
             return;
         }
         let tracks = Kinds {
@@ -229,11 +192,8 @@ impl Store {
             .expect("made with the user's builtins")
     }
 
-    /// The tracks in `username`'s Liked; none without the feature.
+    /// The tracks in `username`'s Liked.
     pub fn liked(&self, username: &str) -> HashSet<MediaId> {
-        if !self.features.liked {
-            return HashSet::new();
-        }
         self.playlists
             .iter()
             .filter(|p| p.owner == username && p.builtin == Some(Builtin::Liked))
@@ -249,7 +209,6 @@ impl Store {
         viewer: Viewer<'_>,
         expand: impl Fn(&MediaId) -> Result<Vec<Item>, BackendError>,
     ) -> Result<PlaylistSummary, BackendError> {
-        self.check_liked()?;
         let tracks = likeable(items, expand)?;
         let liked = self.liked(viewer.username);
         let mut fresh: Vec<MediaId> = Vec::new();
@@ -281,7 +240,6 @@ impl Store {
         viewer: Viewer<'_>,
         expand: impl Fn(&MediaId) -> Result<Vec<Item>, BackendError>,
     ) -> Result<PlaylistSummary, BackendError> {
-        self.check_liked()?;
         let tracks: HashSet<MediaId> = likeable(items, expand)?.into_iter().collect();
         let stored = self.liked_mut(viewer.username);
         let before = stored.entries.len();
@@ -380,30 +338,24 @@ impl Store {
 
     fn summary(&self, stored: &Stored, viewer: Viewer<'_>) -> Option<PlaylistSummary> {
         let access = Self::access(stored, viewer)?;
-        let named = self.features.playlist_sharing;
         let visibility = match &stored.visibility {
             // Listed only to whoever manages it.
             Visibility::Shared { .. } if !access.can_manage => Visibility::Shared { with: vec![] },
-            // With their names and kinds, for a client that has sharing
-            // by name.
-            Visibility::Shared { with } if named => Visibility::Shared {
+            // With their names and kinds.
+            Visibility::Shared { with } => Visibility::Shared {
                 with: with.iter().map(|share| self.named(share)).collect(),
             },
             other => other.clone(),
         };
-        let owner_name = named
-            .then(|| self.person(&user_id(&stored.owner)))
-            .flatten()
+        let owner_name = self
+            .person(&user_id(&stored.owner))
             .map(|p| p.display_name.clone());
         let pinned = self
             .pins
             .get(viewer.username)
             .and_then(|pins| pins.iter().position(|p| p == &stored.id))
             .map(|at| at as u32);
-        let (artwork, custom_art) = match self.features.playlist_art {
-            true => (Some(art_of(stored)), stored.cover.is_some()),
-            false => (None, false),
-        };
+        let (artwork, custom_art) = (Some(art_of(stored)), stored.cover.is_some());
         Some(PlaylistSummary {
             id: stored.id.clone(),
             name: stored.name.clone(),
@@ -447,11 +399,6 @@ impl Store {
         limit: u32,
         viewer: Viewer<'_>,
     ) -> Result<ShareCandidatePage, BackendError> {
-        if !self.features.playlist_sharing {
-            return Err(BackendError::Unsupported(
-                spoolframe_protocol::features::PLAYLIST_SHARING.into(),
-            ));
-        }
         let (summary, _) = self.seen(id, viewer)?;
         if !summary.can_manage {
             return Err(BackendError::PlaylistReadOnly);
@@ -495,7 +442,6 @@ impl Store {
         let mut playlists: Vec<PlaylistSummary> = self
             .playlists
             .iter()
-            .filter(|p| p.builtin.is_none() || self.features.liked)
             .filter_map(|p| self.summary(p, viewer))
             .collect();
         // Liked, then All, then the rest in the order they were made.
@@ -517,7 +463,6 @@ impl Store {
             .playlists
             .iter()
             .filter(|p| p.builtin != Some(Builtin::All))
-            .filter(|p| p.builtin.is_none() || self.features.liked)
             .filter(|p| p.entries.iter().any(|(_, item)| items.contains(item)))
             .filter_map(|p| self.summary(p, viewer))
             .map(|s| PlaylistRef {
@@ -548,7 +493,6 @@ impl Store {
         visibility: Visibility,
         viewer: Viewer<'_>,
     ) -> Result<PlaylistSummary, BackendError> {
-        self.check()?;
         if name.trim().is_empty() {
             return Err(BackendError::InvalidInput("a playlist needs a name".into()));
         }
@@ -611,15 +555,10 @@ impl Store {
         Ok(self.seen(id, viewer)?.0)
     }
 
-    /// Refuses a cover change without the feature, unsent; on a playlist
-    /// `viewer` does not see; or from anyone who may not edit it, and on
+    /// Refuses a cover change on a playlist `viewer` does not see; or
+    /// from anyone who may not edit it, and on
     /// Liked and All, `NotAllowed`.
     fn editable_art(&self, id: &str, viewer: Viewer<'_>) -> Result<(), BackendError> {
-        if !self.features.playlist_art {
-            return Err(BackendError::Unsupported(
-                spoolframe_protocol::features::PLAYLIST_ART.into(),
-            ));
-        }
         let (summary, stored) = self.seen(id, viewer)?;
         if !summary.can_edit || stored.builtin.is_some() {
             return Err(BackendError::NotAllowed);
@@ -644,7 +583,6 @@ impl Store {
         update: PlaylistUpdate,
         viewer: Viewer<'_>,
     ) -> Result<PlaylistSummary, BackendError> {
-        self.check()?;
         let (summary, _) = self.seen(id, viewer)?;
         if !summary.can_manage {
             return Err(BackendError::PlaylistReadOnly);
@@ -724,7 +662,6 @@ impl Store {
         viewer: Viewer<'_>,
         expand: impl Fn(&MediaId) -> Result<Vec<Item>, BackendError>,
     ) -> Result<u64, BackendError> {
-        self.check()?;
         let (summary, stored) = self.seen(id, viewer)?;
         if !summary.can_edit {
             return Err(BackendError::PlaylistReadOnly);
@@ -817,7 +754,6 @@ impl Store {
     }
 
     pub fn delete(&mut self, id: &str, viewer: Viewer<'_>) -> Result<(), BackendError> {
-        self.check()?;
         let (summary, stored) = self.seen(id, viewer)?;
         if !summary.can_manage {
             return Err(BackendError::PlaylistReadOnly);
@@ -841,7 +777,6 @@ impl Store {
     }
 
     pub fn pin(&mut self, id: &str, position: u32, viewer: Viewer<'_>) -> Result<(), BackendError> {
-        self.check()?;
         self.seen(id, viewer)?;
         let pins = self.pins.entry(viewer.username.to_owned()).or_default();
         pins.retain(|p| p != id);
@@ -852,7 +787,6 @@ impl Store {
     }
 
     pub fn unpin(&mut self, id: &str, viewer: Viewer<'_>) -> Result<(), BackendError> {
-        self.check()?;
         if let Some(pins) = self.pins.get_mut(viewer.username) {
             pins.retain(|p| p != id);
         }
@@ -861,7 +795,6 @@ impl Store {
     }
 
     pub fn dismiss_notes(&mut self, viewer: Viewer<'_>) -> Result<(), BackendError> {
-        self.check()?;
         self.notes.remove(viewer.username);
         self.tell(PlaylistChange::PinsChanged);
         Ok(())
@@ -883,7 +816,6 @@ impl Store {
         viewer: Viewer<'_>,
         watched: impl Fn(&MediaId) -> bool,
     ) -> Result<Option<(EntryId, MediaId)>, BackendError> {
-        self.check()?;
         self.seen(id, viewer)?;
         let key = (viewer.username.to_owned(), id.to_owned());
         self.choose(id, &key, settings, from);
@@ -959,7 +891,6 @@ impl Store {
         viewer: Viewer<'_>,
         watched: impl Fn(&MediaId) -> bool,
     ) -> Result<Option<(EntryId, MediaId)>, BackendError> {
-        self.check()?;
         self.seen(id, viewer)?;
         let key = (viewer.username.to_owned(), id.to_owned());
         let settings = self.settings.get(&key).copied().unwrap_or_default();
@@ -982,8 +913,6 @@ impl Store {
         viewer: Viewer<'_>,
         watched: impl Fn(&MediaId) -> bool,
     ) -> Result<Vec<(EntryId, MediaId)>, BackendError> {
-        self.check_upcoming()?;
-        self.check()?;
         self.seen(id, viewer)?;
         let key = (viewer.username.to_owned(), id.to_owned());
         let settings = self.settings.get(&key).copied().unwrap_or_default();
@@ -1013,23 +942,10 @@ impl Store {
         settings: PlaySettings,
         viewer: Viewer<'_>,
     ) -> Result<(), BackendError> {
-        self.check_upcoming()?;
-        self.check()?;
         self.seen(id, viewer)?;
         let key = (viewer.username.to_owned(), id.to_owned());
         self.choose(id, &key, settings, None);
         Ok(())
-    }
-
-    /// Refuses what comes up and settings saved alone without the
-    /// feature, unsent.
-    fn check_upcoming(&self) -> Result<(), BackendError> {
-        match self.features.playlist_upcoming {
-            true => Ok(()),
-            false => Err(BackendError::Unsupported(
-                spoolframe_protocol::features::PLAYLIST_UPCOMING.into(),
-            )),
-        }
     }
 
     /// What plays by `tries` in `order`: the first of its entries that

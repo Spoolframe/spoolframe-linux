@@ -1,7 +1,6 @@
 //! An item's history as its page says it: how often it was played and
-//! when last (PX-52, `spoolframe:play-history`), else when it was last
-//! viewed (`spoolframe:last-viewed`). A session without the features gets
-//! neither field, so nothing is said.
+//! when last (PX-52), else when it was last viewed. A state the server
+//! sent without them says nothing.
 
 use spoolframe_types::PlaybackState;
 

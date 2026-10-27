@@ -804,14 +804,6 @@ impl Session for CachedSession {
         self.inner.can_leave_now()
     }
 
-    fn has_playlists(&self) -> bool {
-        self.inner.has_playlists()
-    }
-
-    fn has_liked(&self) -> bool {
-        self.inner.has_liked()
-    }
-
     fn like<'a>(
         &'a self,
         items: &'a [MediaId],
@@ -826,14 +818,6 @@ impl Session for CachedSession {
         self.changing(move || self.inner.unlike(items))
     }
 
-    fn has_last_viewed(&self) -> bool {
-        self.inner.has_last_viewed()
-    }
-
-    fn has_playlist_sharing(&self) -> bool {
-        self.inner.has_playlist_sharing()
-    }
-
     fn share_candidates<'a>(
         &'a self,
         id: &'a str,
@@ -842,26 +826,6 @@ impl Session for CachedSession {
         limit: u32,
     ) -> BoxFuture<'a, Result<ShareCandidatePage, BackendError>> {
         self.inner.share_candidates(id, query, offset, limit)
-    }
-
-    fn has_play_history(&self) -> bool {
-        self.inner.has_play_history()
-    }
-
-    fn has_playlist_art(&self) -> bool {
-        self.inner.has_playlist_art()
-    }
-
-    fn has_playlist_upcoming(&self) -> bool {
-        self.inner.has_playlist_upcoming()
-    }
-
-    fn has_subtitle_sync(&self) -> bool {
-        self.inner.has_subtitle_sync()
-    }
-
-    fn has_subtitle_search(&self) -> bool {
-        self.inner.has_subtitle_search()
     }
 
     /// Not kept: the server keeps each search a day itself.
@@ -1047,10 +1011,6 @@ impl Session for CachedSession {
         settings: PlaySettings,
     ) -> BoxFuture<'a, Result<(), BackendError>> {
         self.changing(move || self.inner.set_playlist_settings(id, settings))
-    }
-
-    fn has_downloads(&self) -> bool {
-        self.inner.has_downloads()
     }
 
     /// Not kept: the options follow the user's tracks and the server's
