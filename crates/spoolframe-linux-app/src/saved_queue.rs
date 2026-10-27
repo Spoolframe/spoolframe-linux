@@ -28,6 +28,16 @@ struct Saved {
     playlist: Option<PlaylistResume>,
 }
 
+/// The profile's file in `dir`: `<dir>/<hash>.json`, named by a hash of
+/// the server and the username, as usernames need not fit a file name.
+pub fn profile_key(dir: &str, profile: &Profile) -> String {
+    let who = format!("{}/{}", profile.server.0, profile.username);
+    let hash = glib::compute_checksum_for_string(glib::ChecksumType::Sha256, &who)
+        .map(|sum| sum.to_string())
+        .unwrap_or_default();
+    format!("{dir}/{hash}.json")
+}
+
 pub struct SavedQueue {
     store: DataStore,
     key: String,
@@ -44,13 +54,9 @@ impl SavedQueue {
     }
 
     fn in_store(store: DataStore, profile: &Profile) -> Self {
-        let who = format!("{}/{}", profile.server.0, profile.username);
-        let hash = glib::compute_checksum_for_string(glib::ChecksumType::Sha256, &who)
-            .map(|sum| sum.to_string())
-            .unwrap_or_default();
         Self {
             store,
-            key: format!("queues/{hash}.json"),
+            key: profile_key("queues", profile),
         }
     }
 

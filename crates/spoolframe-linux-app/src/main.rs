@@ -54,6 +54,7 @@ mod reachability;
 mod recover_identity;
 mod remote_sign_in;
 mod sandbox;
+mod saved_choices;
 mod saved_queue;
 mod scrub;
 mod search;

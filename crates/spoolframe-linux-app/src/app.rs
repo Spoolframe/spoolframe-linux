@@ -3925,7 +3925,10 @@ impl App {
             username: profile.username.clone(),
         };
         self.show_downloads_of(holder, sender);
-        self.library_cache = Some(library::Cache::new(session.clone()));
+        self.library_cache = Some(library::Cache::new(
+            session.clone(),
+            crate::saved_choices::SavedChoices::for_profile(&profile),
+        ));
         self.session = Some(session);
         self.profile = Some(profile.clone());
         self.settings.set_server(&profile.server.0);

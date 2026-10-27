@@ -14,8 +14,9 @@
 //!
 //! A library can be sorted and filtered from the page's header ([`View`]),
 //! by what it says it offers. Sorted or filtered pages are fetched afresh
-//! and not kept; the choice itself is kept for the session, per library,
-//! and comes back when the library opens again.
+//! and not kept; the choice itself is saved per profile and library
+//! ([`SavedChoices`]), and comes back when the library opens again, after a
+//! restart too.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -30,6 +31,7 @@ use spoolframe_linux_core::backend::{
 use spoolframe_types::{Item, Library, LibraryId};
 
 use crate::library_browse::{self as browse, Body, Chip, Choice, First, Plan, Request, Value};
+use crate::saved_choices::SavedChoices;
 use crate::views::{self, Cards};
 
 /// The server's largest page.
@@ -132,14 +134,15 @@ impl Pages {
 }
 
 /// Each library's sort and filter, by its id.
-type Choices = Rc<RefCell<HashMap<String, Choice>>>;
+type Choices = Rc<RefCell<SavedChoices>>;
 
 /// The libraries of one session, as far as they have been fetched.
 pub struct Cache {
     session: Arc<dyn Session>,
     libraries: RefCell<HashMap<String, Rc<Pages>>>,
-    /// Kept for as long as the session, never saved: a library opens
-    /// sorted and filtered as it was left.
+    /// Loaded with the cache and saved on every change: a library opens
+    /// sorted and filtered as it was left, until the choice is changed or
+    /// cleared.
     choices: Choices,
     /// The library page showing, or shown last. Its menus hold it only
     /// weakly; the next library opened replaces it.
@@ -147,11 +150,13 @@ pub struct Cache {
 }
 
 impl Cache {
-    pub fn new(session: Arc<dyn Session>) -> Rc<Self> {
+    /// The cache of `session`'s libraries, opening them as `choices` has
+    /// them.
+    pub fn new(session: Arc<dyn Session>, choices: SavedChoices) -> Rc<Self> {
         Rc::new(Self {
             session,
             libraries: RefCell::new(HashMap::new()),
-            choices: Choices::default(),
+            choices: Rc::new(RefCell::new(choices)),
             shown: RefCell::new(None),
         })
     }
@@ -385,13 +390,13 @@ impl View {
         }
     }
 
-    /// Keeps `choice` for the library, shows it in the menus and the bar,
+    /// Saves `choice` for the library, shows it in the menus and the bar,
     /// and loads the grid for it from its first page.
     fn choose(self: &Rc<Self>, choice: Choice) {
         self.shared
             .choices
             .borrow_mut()
-            .insert(self.shared.library.id.to_string(), choice.clone());
+            .set(&self.shared.library.id.to_string(), choice.clone());
         self.choice.replace(choice);
         self.sync();
         self.load();
@@ -480,7 +485,8 @@ impl View {
     }
 
     /// The server or the library's list refuses the choice: the library
-    /// changed. Everything shows again, and the user is told why.
+    /// changed. Everything shows again, the saved choice is forgotten so
+    /// the next start does not ask again, and the user is told why.
     fn fall_back(self: &Rc<Self>, why: &str) {
         tracing::info!(why, "library sort and filter fell back");
         self.choose(Choice::default());
@@ -929,14 +935,19 @@ mod tests {
     /// The fake's library of `kind` opened in fresh slots, once its page
     /// shows; the cache, the view and the scroller.
     fn opened(kind: spoolframe_types::LibraryKind) -> (Rc<Cache>, Rc<View>, gtk::ScrolledWindow) {
+        let cache = cache(SavedChoices::default());
+        let (view, scroller) = open_in(&cache, kind);
+        (cache, view, scroller)
+    }
+
+    /// A cache over the fake's session, with `choices`.
+    fn cache(choices: SavedChoices) -> Rc<Cache> {
         gtk::init().unwrap();
         adw::init().unwrap();
         let session = FakeClient::new(None)
             .session(&FakeClient::profile("andrey"))
             .unwrap();
-        let cache = Cache::new(session);
-        let (view, scroller) = open_in(&cache, kind);
-        (cache, view, scroller)
+        Cache::new(session, choices)
     }
 
     /// The library of `kind` opened again from `cache`.
@@ -1001,6 +1012,33 @@ mod tests {
         );
     }
 
+    /// As after a restart: a new cache, its choices read from the file.
+    #[test]
+    #[ignore = "needs a display; run on its own"]
+    fn a_library_keeps_its_sort_in_the_next_session() {
+        let dir = spoolframe_linux_core::testing::TestDir::new_blocking(
+            "spoolframe-library-choices-next-session",
+        );
+        let saved = || {
+            SavedChoices::in_store(
+                spoolframe_linux_core::storage::DataStore::new(dir.path()),
+                &FakeClient::profile("andrey"),
+            )
+        };
+        let (view, _) = open_in(&cache(saved()), spoolframe_types::LibraryKind::Movies);
+        view.change(|c| {
+            c.sort = ItemSort {
+                key: SortKey::Added,
+                descending: true,
+            }
+        });
+        let (again, _) = open_in(&cache(saved()), spoolframe_types::LibraryKind::Movies);
+        assert_eq!(
+            again.widgets.sort.label().as_deref(),
+            Some("Date added, newest first")
+        );
+    }
+
     fn grid_length(scroller: &gtk::ScrolledWindow) -> u32 {
         scroller
             .child()
@@ -1059,26 +1097,29 @@ mod tests {
     }
 
     /// A choice the library no longer offers (the TV library has no
-    /// duration), as one kept from before it changed, falls back.
+    /// duration), as one saved from before it changed, falls back and is
+    /// forgotten.
     #[test]
     #[ignore = "needs a display; run on its own"]
     fn a_choice_the_library_refuses_falls_back_to_everything() {
         let (cache, view, _) = opened(spoolframe_types::LibraryKind::Shows);
         let id = view.shared.library.id.to_string();
-        view.choice.replace(Choice {
+        let refused = Choice {
             sort: ItemSort {
                 key: SortKey::Duration,
                 descending: true,
             },
             ..Choice::default()
-        });
+        };
+        cache.choices.borrow_mut().set(&id, refused.clone());
+        view.choice.replace(refused);
         view.load();
         assert_eq!(
             (
                 cache.choices.borrow().get(&id).cloned(),
                 view.widgets.sort.label()
             ),
-            (Some(Choice::default()), Some("Title, A to Z".into()))
+            (None, Some("Title, A to Z".into()))
         );
     }
 

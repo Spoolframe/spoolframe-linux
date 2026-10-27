@@ -18,7 +18,9 @@ use spoolframe_types::{Item, LibraryId};
 pub const FELL_BACK: &str = "This library's sort and filters changed; showing everything again";
 
 /// What the user chose for one library: its order and what it keeps.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Saved per profile ([`crate::saved_choices`]).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Choice {
     pub sort: ItemSort,
     pub filter: ItemFilter,
