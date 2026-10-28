@@ -1,7 +1,32 @@
 # Changelog
 
-## Unreleased
+## 0.6.2 — 2026-10-28
 
+Built with the Spoolframe SDK crates 0.16.1, for the server's 0.16.
+
+- Paired servers (federation), on a server that has the experimental
+  feature on: the sidebar groups libraries by server, each with its
+  name and a fold, an offline one last and greyed. A paired server's
+  library pages, Home row ("New on <server>"), search results and
+  posters say whose they are; an item page says who shares it, where it
+  plays from and where the place is kept, and a title on both servers
+  lists its copies to play from. A paired item plays straight from its
+  server, or through this one when it cannot be reached directly, and
+  its place is kept on this server. A portable account sees no paired
+  servers. Not yet: downloading a paired item, pairing and sharing as
+  an admin.
+- The app's id is app.spoolframe.relm4 (it was casa.coldsteel.Spoolframe):
+  the desktop file, icons, MPRIS and the Flatpak use it, and software
+  centres show it as the same app. Its sign-in secrets move to the new
+  id in the keyring by themselves, without a prompt.
+- The SDK crates come from crates.io.
+- The player's subtitle menu also lists the item's tracks that the
+  stream has none of, a subtitle downloaded before among them: picking
+  one starts the item again with it, as searching for it did.
+- A subtitle downloaded or chosen while a converted film plays shows,
+  where it said "Couldn't turn on subtitles".
+- The bar's volume, Audio and subtitles, Queue and Stop are no longer
+  dimmed: the volume's knob looked disabled.
 - Settings › Playback has Preferred quality in place of Quality limit:
   the quality playback starts at (Auto, a bitrate, or Original, the
   default), from the next item played, with no restart. An item page's
@@ -16,8 +41,9 @@
   resolutions or dynamic ranges, applied as they are ticked. An active
   filter shows as chips under the library's name, each removable, with
   Clear all and how many it keeps of all ("37 of 412"); one that keeps
-  nothing says so, with Clear filters. Each library keeps its choice
-  while its profile is signed in, until Spoolframe quits.
+  nothing says so, with Clear filters. Each library keeps its choice,
+  after Spoolframe restarts too: the first time it opens, a toast says
+  the choice was kept, with Clear all.
 - Downloads, on a server that has them: a film's or an episode's page
   gets Download, which asks for the version (Original or one of the
   server's profiles) and the tracks (all, or a choice), and shows the

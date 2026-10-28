@@ -36,7 +36,7 @@
     inherit src;
     strictDeps = true;
     pname = "spoolframe-linux";
-    version = "0.6.1";
+    version = "0.6.2";
     # glib: glib-compile-resources, which build.rs runs for the icons.
     # bindgenHook: libclang for fido-hid-rs's bindings.
     nativeBuildInputs = [pkg-config glib wrapGAppsHook4 rustPlatform.bindgenHook];

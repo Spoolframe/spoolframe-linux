@@ -9,7 +9,7 @@ members = [
 exclude = ["vendor"]
 
 [workspace.package]
-version = "0.6.1"
+version = "0.6.2"
 edition = "2024"
 authors = ["Andrey Cherkashin <andoriyu@gmail.com>"]
 # GPL, not the server's AGPL nor the protocol crates' MIT/Apache: the client
