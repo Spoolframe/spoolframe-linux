@@ -71,6 +71,10 @@ pub fn select_subtitle(
         .ok_or_else(|| glib::bool_error!("no subtitle stream {position}"))?;
     let id = PlayStreamInfoExt::stream_id(&stream);
     external.picking(Some(&id));
+    // On before the track is set: with subtitles off, as after an encode
+    // that had none, GstPlay refuses the track ("Failed to set subtitle
+    // track"), and a subtitle chosen mid-play did not show.
+    play.set_subtitle_track_enabled(true);
     if play
         .current_subtitle_track()
         .map(|t| PlayStreamInfoExt::stream_id(&t))
@@ -78,7 +82,6 @@ pub fn select_subtitle(
     {
         play.set_subtitle_track_id(Some(&id))?;
     }
-    play.set_subtitle_track_enabled(true);
     // Its cues were dropped while it was not shown: they are read again
     // from where playback is.
     if external.picked(Some(&id))

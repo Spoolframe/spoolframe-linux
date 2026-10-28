@@ -3887,6 +3887,38 @@ mod tests {
         pipeline.set_state(gst::State::Null).unwrap();
     }
 
+    /// Eight seconds of H.264 in Matroska with a text subtitle stream, one
+    /// cue throughout: what a conversion with `copy:srt` sends.
+    fn clip_with_subtitle(path: &Path) {
+        let pipeline = gst::parse::launch(&format!(
+            "videotestsrc num-buffers=240 ! video/x-raw,width=320,height=240,framerate=30/1 \
+             ! videoconvert ! x264enc ! h264parse ! matroskamux name=mux ! filesink location={} \
+             appsrc name=text format=time caps=text/x-raw,format=utf8 ! mux.subtitle_%u",
+            path.display()
+        ))
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        // appsrc by its action signals: no gstreamer-app crate for a test.
+        let text = pipeline.by_name("text").unwrap();
+        let bus = pipeline.bus().unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let mut cue = gst::Buffer::from_slice(b"the copied cue".to_vec());
+        {
+            let cue = cue.get_mut().unwrap();
+            cue.set_pts(gst::ClockTime::ZERO);
+            cue.set_duration(gst::ClockTime::from_seconds(8));
+        }
+        let _ = text.emit_by_name::<gst::FlowReturn>("push-buffer", &[&cue]);
+        let _ = text.emit_by_name::<gst::FlowReturn>("end-of-stream", &[]);
+        bus.timed_pop_filtered(
+            gst::ClockTime::from_seconds(30),
+            &[gst::MessageType::Eos, gst::MessageType::Error],
+        )
+        .expect("the clip is written");
+        pipeline.set_state(gst::State::Null).unwrap();
+    }
+
     /// Runs the main loop until `done` or `limit`.
     fn run_until(limit: Duration, done: impl Fn() -> bool) -> bool {
         let context = glib::MainContext::default();
@@ -5019,6 +5051,77 @@ mod tests {
             playback.is_playing(),
             played.get()
         );
+        playback.stop();
+    }
+
+    /// A subtitle chosen mid-play (one just downloaded) on a converted
+    /// playback starts it again with the subtitle copied into the output
+    /// (`copy:srt`), and the player shows that stream. It said "Couldn't
+    /// turn on subtitles" instead: GstPlay's media info from the last
+    /// encode, which had no subtitle, still arrived after the new one was
+    /// loaded, and the pick looked for the subtitle in it.
+    #[test]
+    #[ignore = "needs a display for gtk4paintablesink"]
+    fn a_subtitle_chosen_mid_play_shows_from_the_converted_output() {
+        gtk::init().unwrap();
+        init().unwrap();
+        let dir = TestDir::new_blocking("spoolframe-copied-subtitle");
+        let path = dir.join("clip.mkv");
+        clip_with_subtitle(&path);
+        let client = FakeClient::new(Some(path))
+            .converting(64 * 1024)
+            .copying_subtitle();
+        let profile = FakeClient::profile("andrey");
+        let session = client.session(&profile).unwrap();
+        let item = first_movie(&session);
+        // Without a subtitle, as the episode started.
+        let playback = Playback::start(Playlist {
+            session,
+            items: vec![item],
+            index: 0,
+            queued: Vec::new(),
+            from: None,
+            selection: Some(Selection::default()),
+            tracks: None,
+            album: None,
+            quality: Default::default(),
+            display: None,
+            from_playlist: None,
+        })
+        .unwrap();
+        let failed = Rc::new(RefCell::new(Vec::<String>::new()));
+        {
+            let failed = failed.clone();
+            playback.subscribe(move |change| {
+                if let Change::TrackFailed(message) = change {
+                    failed.borrow_mut().push(message.to_string());
+                }
+                true
+            });
+        }
+        assert!(
+            run_until(Duration::from_secs(20), || playback.position()
+                > Duration::from_secs(1)),
+            "the converted playback never played"
+        );
+        assert!(
+            !playback.plan().as_ref().is_some_and(subtitle_in_output),
+            "the first encode already had the subtitle"
+        );
+        playback.use_subtitle(0);
+        assert!(
+            run_until(Duration::from_secs(20), || playback
+                .plan()
+                .as_ref()
+                .is_some_and(subtitle_in_output)
+                && playback.is_playing()
+                && playback.subtitles_on.get()
+                || !failed.borrow().is_empty()),
+            "the subtitle never showed (plan {:?}, playing {})",
+            playback.plan(),
+            playback.is_playing()
+        );
+        assert_eq!(*failed.borrow(), Vec::<String>::new());
         playback.stop();
     }
 

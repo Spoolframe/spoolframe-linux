@@ -876,6 +876,9 @@ struct Serving {
     /// A converted playback's subtitle is read as text by the server
     /// (P2-07): not ready this many times, then there.
     reading_subtitle: Option<u32>,
+    /// A converted playback's chosen subtitle is copied into its output
+    /// as SRT, as the server copies a text one.
+    copying_subtitle: bool,
     /// The server's admin has not finished setup (P3-10): its catalog
     /// answers nothing yet.
     not_set_up: bool,
@@ -1487,9 +1490,36 @@ impl FakeSession {
         Ok(())
     }
 
+    /// What a converted playback's output does with its subtitle: read as
+    /// text (P2-07), copied in when one is chosen, or nothing.
+    fn converted_subtitle(&self, selection: Selection) -> Option<ConvertedSubtitle> {
+        if self.serving.reading_subtitle.is_some() {
+            return Some(ConvertedSubtitle {
+                index: 0,
+                action: SubtitleAction::Ocr {
+                    from: SubtitleFormat::Pgs,
+                    to: SubtitleFormat::Srt,
+                },
+            });
+        }
+        let index = selection
+            .subtitle
+            .filter(|_| self.serving.copying_subtitle)?;
+        Some(ConvertedSubtitle {
+            index,
+            action: SubtitleAction::Copy {
+                format: SubtitleFormat::Srt,
+            },
+        })
+    }
+
     /// What the fake converts to: HEVC it "cannot play" encoded to H.264,
     /// the audio copied.
-    fn converted_plan(item: &Item, selection: Selection, ocr: bool) -> PlaybackPlan {
+    fn converted_plan(
+        item: &Item,
+        selection: Selection,
+        subtitle: Option<ConvertedSubtitle>,
+    ) -> PlaybackPlan {
         let video = !matches!(item, Item::Track(_));
         PlaybackPlan::Converted {
             delivery: Delivery::Progressive,
@@ -1506,13 +1536,7 @@ impl FakeSession {
                     codec: AudioCodec::Aac,
                 },
             }),
-            subtitle: ocr.then_some(ConvertedSubtitle {
-                index: 0,
-                action: SubtitleAction::Ocr {
-                    from: SubtitleFormat::Pgs,
-                    to: SubtitleFormat::Srt,
-                },
-            }),
+            subtitle,
             reasons: vec!["video 0: hevc is not supported; encoded to h264".into()],
             // Progressive: no HLS variants (PX-21).
             ladder: Vec::new(),
@@ -1931,9 +1955,9 @@ impl Session for FakeSession {
             // exceeds it would be (P6-06).
             let capped = matches!(quality, crate::backend::PlaybackQuality::Bitrate(_));
             let (plan, size) = match self.serving.converting {
-                _ if capped => (Self::converted_plan(item, effective, false), 0),
+                _ if capped => (Self::converted_plan(item, effective, None), 0),
                 Some(_) => (
-                    Self::converted_plan(item, effective, self.serving.reading_subtitle.is_some()),
+                    Self::converted_plan(item, effective, self.converted_subtitle(effective)),
                     0,
                 ),
                 None => (Self::plan_for(item, &tracks, effective), size),
@@ -2128,7 +2152,7 @@ impl Session for FakeSession {
             let (_, size) = self.media_size()?;
             let (plan, size) = match quality {
                 crate::backend::PlaybackQuality::Bitrate(_) => {
-                    (Self::converted_plan(item, selection, false), 0)
+                    (Self::converted_plan(item, selection, None), 0)
                 }
                 _ => (Self::plan_for(item, &self.tracks_of(item), selection), size),
             };
@@ -2153,7 +2177,7 @@ impl Session for FakeSession {
             })?;
             let item = self.catalog.get(&id)?;
             Ok(crate::backend::PlaybackChange {
-                plan: Self::converted_plan(item, selection, false),
+                plan: Self::converted_plan(item, selection, None),
                 size: 0,
                 epoch,
             })
@@ -3884,6 +3908,7 @@ impl FakeClient {
                 converting: None,
                 markers: Vec::new(),
                 reading_subtitle: None,
+                copying_subtitle: false,
                 not_set_up: false,
                 web: true,
                 previews: PreviewsAnswer::None,
@@ -4446,6 +4471,14 @@ impl FakeClient {
     /// (P2-07), and not ready the first `waits` times it is asked for.
     pub fn reading_subtitle(mut self, waits: u32) -> Self {
         self.serving.reading_subtitle = Some(waits);
+        self
+    }
+
+    /// A converted playback with a subtitle chosen carries it in its
+    /// output, copied as SRT (`copy:srt`): the media file is the output,
+    /// so its own text stream is the one copied.
+    pub fn copying_subtitle(mut self) -> Self {
+        self.serving.copying_subtitle = true;
         self
     }
 
