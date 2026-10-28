@@ -20,7 +20,10 @@ const PROFILE_USER: &str = "profile-user";
 const PROFILE_NAME: &str = "profile-name";
 const RELAYS: &str = "relays";
 const STREAMING: &str = "streaming";
+/// The bitrate limit the Quality limit row kept, before Preferred
+/// quality replaced it: no longer read, and removed when that is saved.
 const MAX_BITRATE: &str = "max-bitrate";
+const QUALITY: &str = "quality";
 const SHOW_HDR: &str = "show-hdr";
 const PLAYBACK: &str = "playback";
 const SKIP_INTROS: &str = "skip-intros";
@@ -132,35 +135,33 @@ impl Settings {
         self.save();
     }
 
-    /// The most the server may send, in bits per second (P2-06); `None`,
-    /// the default, for no limit, as on a LAN. Read once at start-up: it is
-    /// part of what this device tells the server it can take.
-    pub fn max_bitrate(&self) -> Option<u64> {
+    /// The quality a playback starts at (P6-06), unless the item page or
+    /// the player chose another: Original, the file as it is, by default.
+    pub fn preferred_quality(&self) -> spoolframe_client_sdk::PlaybackQuality {
         self.file
-            .uint64(STREAMING, MAX_BITRATE)
+            .string(STREAMING, QUALITY)
             .ok()
-            .filter(|b| *b > 0)
+            .and_then(|q| crate::quality::from_setting(&q))
+            .unwrap_or(spoolframe_client_sdk::PlaybackQuality::Original)
+    }
+
+    pub fn set_preferred_quality(&mut self, quality: spoolframe_client_sdk::PlaybackQuality) {
+        self.file
+            .set_string(STREAMING, QUALITY, &crate::quality::to_setting(quality));
+        let _ = self.file.remove_key(STREAMING, MAX_BITRATE);
+        self.save();
     }
 
     /// Whether HDR films come as HDR, for GTK and the compositor to show on
     /// each monitor; on by default. Off, the server tone-maps them to SDR.
-    /// Read once at start-up, like the bitrate limit.
+    /// Read once at start-up: it is part of what this device tells the
+    /// server it can take.
     pub fn show_hdr(&self) -> bool {
         self.file.boolean(STREAMING, SHOW_HDR).unwrap_or(true)
     }
 
     pub fn set_show_hdr(&mut self, on: bool) {
         self.file.set_boolean(STREAMING, SHOW_HDR, on);
-        self.save();
-    }
-
-    pub fn set_max_bitrate(&mut self, bitrate: Option<u64>) {
-        match bitrate {
-            Some(bitrate) => self.file.set_uint64(STREAMING, MAX_BITRATE, bitrate),
-            None => {
-                let _ = self.file.remove_key(STREAMING, MAX_BITRATE);
-            }
-        }
         self.save();
     }
 
@@ -234,6 +235,29 @@ mod tests {
         };
         Settings::at(&path).set_download_profile(&alice);
         assert_eq!(Settings::at(&path).download_profile(), Some(alice));
+    }
+
+    /// Playback starts at Original until the user prefers another quality,
+    /// which is kept for the next start; saving it drops the bitrate limit
+    /// the old Quality limit row kept.
+    #[test]
+    fn playback_starts_at_original_until_another_quality_is_preferred() {
+        use spoolframe_client_sdk::PlaybackQuality;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.ini");
+        std::fs::write(&path, "[streaming]\nmax-bitrate=8000000\n").unwrap();
+        let mut settings = Settings::at(&path);
+        assert_eq!(settings.preferred_quality(), PlaybackQuality::Original);
+        settings.set_preferred_quality(PlaybackQuality::Bitrate(8_000_000));
+        assert_eq!(
+            (
+                Settings::at(&path).preferred_quality(),
+                std::fs::read_to_string(&path)
+                    .unwrap()
+                    .contains("max-bitrate")
+            ),
+            (PlaybackQuality::Bitrate(8_000_000), false)
+        );
     }
 
     /// Spoolframe's own look until the user picks another: the system's

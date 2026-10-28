@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Settings › Playback has Preferred quality in place of Quality limit:
+  the quality playback starts at (Auto, a bitrate, or Original, the
+  default), from the next item played, with no restart. An item page's
+  Quality picker starts at it, and the player's Quality menu still
+  changes the one playing. The bitrate limit is gone: the server is told
+  no limit, and a limit set before is forgotten.
 - A library can be sorted and filtered, by what its server offers for
   it: Sort, in the library's header, orders it by title, release date,
   date added, last played, rating, audience rating, duration or size,

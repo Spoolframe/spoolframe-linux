@@ -503,8 +503,8 @@ mod tests {
             theme: Theme::default(),
             set_theme: Rc::new(|_| {}),
             device: Device {
-                bitrate: None,
-                set_bitrate: Rc::new(|_| {}),
+                quality: Default::default(),
+                set_quality: Rc::new(|_| {}),
                 show_hdr: true,
                 set_show_hdr: off.clone(),
                 use_relays: true,

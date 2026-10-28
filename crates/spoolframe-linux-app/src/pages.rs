@@ -30,9 +30,10 @@ const CAST_SHOWN: usize = 6;
 
 /// Starts playback of the page's item, from a position or the start, with
 /// the tracks picked on the page, or with the server's choice (`None`).
-/// Plays from a position, with the tracks and the quality (P6-06) picked.
+/// Plays from a position, with the tracks and the quality (P6-06) picked;
+/// with no pickers, the preferred quality (`None`).
 pub type Play =
-    Rc<dyn Fn(Option<Duration>, Option<Selection>, spoolframe_client_sdk::PlaybackQuality)>;
+    Rc<dyn Fn(Option<Duration>, Option<Selection>, Option<spoolframe_client_sdk::PlaybackQuality>)>;
 
 /// Plays a list of tracks from one of them, as the context; shuffled
 /// (the queue's own shuffle, so the toggle shows it) when the flag says.
@@ -44,6 +45,8 @@ pub type EnqueueTracks = Rc<dyn Fn(Vec<Item>, Enqueue)>;
 /// What the details page of a movie or an episode can do.
 pub struct PlayableActions {
     pub play: Play,
+    /// The quality preferred in Settings: the Quality picker's start.
+    pub quality: spoolframe_client_sdk::PlaybackQuality,
     /// Marks the item watched (`true`) or unwatched.
     pub set_watched: Rc<dyn Fn(bool)>,
     /// Remembers tracks for the movie, or for an episode's whole series.
@@ -221,6 +224,7 @@ pub fn playable(
             series,
             &actions.forget,
             actions.subtitles.as_ref(),
+            actions.quality,
         )
     });
     let buttons = playback_buttons(&facts, &actions, pickers.clone());
@@ -552,6 +556,7 @@ impl TrackPickers {
         series: bool,
         forget: &Rc<dyn Fn()>,
         search: Option<&SubtitleActions>,
+        preferred: spoolframe_client_sdk::PlaybackQuality,
     ) -> Self {
         let start = chosen.map(|c| c.selection);
         let row = gtk::Box::builder().spacing(14).homogeneous(true).build();
@@ -587,7 +592,12 @@ impl TrackPickers {
             .into_iter()
             .map(|q| crate::quality::label(q, None))
             .collect();
-        let quality = picker(&row, "Quality", &qualities, 0);
+        let quality = picker(
+            &row,
+            "Quality",
+            &qualities,
+            crate::quality::index(preferred),
+        );
 
         // A movie says what its file is, beside the pickers, as designed.
         if !series && let Some(file) = format::file(tracks.container, tracks.video.as_ref()) {
@@ -896,12 +906,12 @@ fn play_button(
     );
     button.connect_clicked(move |_| {
         let Some(pickers) = &pickers else {
-            return play(from, None, Default::default());
+            return play(from, None, None);
         };
         if pickers.remember.is_active() {
             remember(pickers.selection());
         }
-        play(from, pickers.request(), pickers.quality());
+        play(from, pickers.request(), Some(pickers.quality()));
     });
     button
 }

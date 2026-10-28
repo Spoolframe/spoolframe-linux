@@ -101,8 +101,8 @@ pub fn capabilities() -> ClientCapabilities {
         // play (P2-06). Not HLS: GStreamer's HLS demuxer fetches with its
         // own HTTP client, which cannot reach the server over Iroh.
         delivery: vec![Delivery::Range, Delivery::Progressive],
-        // No limits on resolution or channels; the bitrate limit is the
-        // user's setting, added by the caller.
+        // No limits on resolution, channels or bitrate: how much a
+        // playback takes is its quality (P6-06), chosen per playback.
         ..ClientCapabilities::default()
     };
     // Raw PCM needs no decoder; every pipeline plays it.

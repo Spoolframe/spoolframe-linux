@@ -84,8 +84,9 @@ pub struct PlayRequest {
     pub album: Option<Album>,
     /// Shuffle on from the start (an album's Shuffle button).
     pub shuffle: bool,
-    /// The quality chosen on the item page (P6-06); Auto otherwise.
-    pub quality: spoolframe_client_sdk::PlaybackQuality,
+    /// The quality chosen on the item page (P6-06); `None` for the one
+    /// preferred in Settings.
+    pub quality: Option<spoolframe_client_sdk::PlaybackQuality>,
     /// The server's playlist it plays from (PX-40), with the settings it
     /// was started with; anything else played leaves it.
     pub playlist: Option<crate::saved_queue::PlaylistResume>,
@@ -111,8 +112,8 @@ impl PlayRequest {
         }
     }
 
-    /// At the quality the viewer chose before playing (P6-06).
-    fn at_quality(mut self, quality: spoolframe_client_sdk::PlaybackQuality) -> Self {
+    /// At the quality the viewer chose before playing (P6-06), if any.
+    fn at_quality(mut self, quality: Option<spoolframe_client_sdk::PlaybackQuality>) -> Self {
         self.quality = quality;
         self
     }
@@ -563,8 +564,8 @@ pub enum Msg {
     /// Settings on the page of the server in use (the account menu).
     OpenServerSettings,
     SetTheme(Theme),
-    /// The streaming bitrate limit (P2-06), for the next start.
-    SetMaxBitrate(Option<u64>),
+    /// The quality playback starts at (P6-06).
+    SetPreferredQuality(spoolframe_client_sdk::PlaybackQuality),
     /// Skip intros without asking (P2-10).
     SetSkipIntros(bool),
     SetShowHdr(bool),
@@ -2501,7 +2502,7 @@ impl Component for App {
                     selection,
                     tracks,
                     album,
-                    quality,
+                    quality: quality.unwrap_or_else(|| self.settings.preferred_quality()),
                     display: Some(crate::capabilities::display(self.settings.show_hdr())),
                     from_playlist: playlist,
                 }) {
@@ -2691,17 +2692,10 @@ impl Component for App {
                     },
                 );
             }
-            Msg::SetMaxBitrate(limit) => {
-                // The server learns it with the device's capabilities, at
-                // the next start.
-                self.settings.set_max_bitrate(limit);
-                toast_text(
-                    widgets,
-                    &format!(
-                        "Bitrate limit: {} · applies when Spoolframe next starts",
-                        preferences::bitrate_name(limit)
-                    ),
-                );
+            Msg::SetPreferredQuality(quality) => {
+                // For playbacks started from now on; the one playing keeps
+                // its own, which its Quality menu changes.
+                self.settings.set_preferred_quality(quality);
             }
         }
     }
@@ -3303,6 +3297,7 @@ impl Component for App {
                 let id = item.id().clone();
                 let actions = pages::PlayableActions {
                     play,
+                    quality: self.settings.preferred_quality(),
                     set_watched: {
                         let (sender, id) = (sender.clone(), id.clone());
                         Rc::new(move |watched| sender.input(Msg::SetWatched(id.clone(), watched)))
@@ -3829,9 +3824,9 @@ impl App {
             },
             app_relays: self.settings.use_relays(),
         };
-        let set_bitrate: preferences::SetBitrate = {
+        let set_quality: preferences::SetQuality = {
             let sender = sender.clone();
-            Rc::new(move |limit| sender.input(Msg::SetMaxBitrate(limit)))
+            Rc::new(move |quality| sender.input(Msg::SetPreferredQuality(quality)))
         };
         let set_skip_intros: preferences::SetSkipIntros = {
             let sender = sender.clone();
@@ -3861,8 +3856,8 @@ impl App {
                 servers,
                 signed,
                 device: preferences::Device {
-                    bitrate: self.settings.max_bitrate(),
-                    set_bitrate,
+                    quality: self.settings.preferred_quality(),
+                    set_quality,
                     show_hdr: self.settings.show_hdr(),
                     set_show_hdr,
                     use_relays: self.settings.use_relays(),
@@ -4760,7 +4755,8 @@ impl App {
             return;
         }
         let display = Some(crate::capabilities::display(self.settings.show_hdr()));
-        match Playback::restore(session, queue, at, playlist, display) {
+        let quality = self.settings.preferred_quality();
+        match Playback::restore(session, queue, at, playlist, display, quality) {
             Ok(playback) => {
                 self.attach_playback(&playback, widgets, sender);
                 self.playback = Some(playback);

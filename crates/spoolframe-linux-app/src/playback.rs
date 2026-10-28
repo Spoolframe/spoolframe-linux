@@ -1288,19 +1288,20 @@ impl Playback {
     }
 
     /// Brings back a queue saved at the last run (P1-23): the current item
-    /// prerolled at `at`, paused, waiting for Play.
+    /// prerolled at `at`, paused, waiting for Play, at `quality`.
     pub fn restore(
         session: Arc<dyn Session>,
         queue: Queue,
         at: Duration,
         playlist: Option<crate::saved_queue::PlaylistResume>,
         display: Option<spoolframe_types::DisplayCapabilities>,
+        quality: spoolframe_client_sdk::PlaybackQuality,
     ) -> anyhow::Result<Rc<Self>> {
         let start = Start {
             from: (!at.is_zero()).then_some(at),
             selection: None,
             tracks: None,
-            quality: Default::default(),
+            quality,
             display,
         };
         let playback = Self::build(Some(session), None, queue, start, false)?;
@@ -4716,6 +4717,7 @@ mod tests {
                 settings: Some(shuffled_repeating()),
             }),
             None,
+            Default::default(),
         )
         .unwrap();
         assert_eq!(
@@ -4866,8 +4868,15 @@ mod tests {
             let (queue, playlist) = serde_json::from_slice(&bytes).unwrap();
             let session = playback.session.clone().unwrap();
             playback.stop();
-            let restored =
-                Playback::restore(session, queue, Duration::ZERO, playlist, None).unwrap();
+            let restored = Playback::restore(
+                session,
+                queue,
+                Duration::ZERO,
+                playlist,
+                None,
+                Default::default(),
+            )
+            .unwrap();
             assert!(restored.has_next());
             assert_eq!(restored.playing_from().unwrap().id, night.id);
             assert_eq!(restored.up_next().queued.len(), 2);
@@ -5335,8 +5344,15 @@ mod tests {
         let session = client.session(&profile).unwrap();
         let item = first_movie(&session);
         let queue = Queue::new(vec![item], 0, None, Vec::new());
-        let playback =
-            Playback::restore(session, queue, Duration::from_secs(2), None, None).unwrap();
+        let playback = Playback::restore(
+            session,
+            queue,
+            Duration::from_secs(2),
+            None,
+            None,
+            Default::default(),
+        )
+        .unwrap();
         let played = Rc::new(Cell::new(Duration::ZERO));
         {
             let played = played.clone();

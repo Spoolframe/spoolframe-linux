@@ -404,8 +404,8 @@ fn bitmap_saved(original: BitmapPreference, selected: u32, ocr_offered: bool) ->
     }
 }
 
-/// Saves a new bitrate limit.
-pub type SetBitrate = Rc<dyn Fn(Option<u64>)>;
+/// Saves a new preferred quality.
+pub type SetQuality = Rc<dyn Fn(spoolframe_client_sdk::PlaybackQuality)>;
 
 /// Saves the user's track preferences on the server.
 pub type SetTracks = Rc<dyn Fn(TrackPreferences)>;
@@ -413,64 +413,31 @@ pub type SetTracks = Rc<dyn Fn(TrackPreferences)>;
 /// Turns skipping intros on or off.
 pub type SetSkipIntros = Rc<dyn Fn(bool)>;
 
-/// The bitrate limits offered, in bits per second; `None` is no limit.
-pub const BITRATE_LIMITS: [Option<u64>; 6] = [
-    None,
-    Some(40_000_000),
-    Some(20_000_000),
-    Some(8_000_000),
-    Some(4_000_000),
-    Some(2_000_000),
-];
-
-/// "Original quality", or a limit with what it carries: "8 Mbps · 1080p".
-pub fn bitrate_name(limit: Option<u64>) -> String {
-    match limit {
-        None => "Original quality".to_owned(),
-        Some(bits) => {
-            let fits = match bits {
-                b if b >= 40_000_000 => " · 4K",
-                b if b >= 8_000_000 => " · 1080p",
-                b if b >= 4_000_000 => " · 720p",
-                _ => " · 480p",
-            };
-            format!("{} Mbps{fits}", bits / 1_000_000)
-        }
-    }
-}
-
-/// The offered limit nearest `current` (a hand-edited setting may be
-/// none of them).
-fn nearest_limit(current: Option<u64>) -> usize {
-    match current {
-        None => 0,
-        Some(bits) => BITRATE_LIMITS
-            .iter()
-            .enumerate()
-            .skip(1)
-            .min_by_key(|(_, limit)| limit.unwrap_or(0).abs_diff(bits))
-            .map_or(0, |(i, _)| i),
-    }
-}
-
-/// The most the server may send (P2-06): over it, it encodes down. Off by
-/// default, as on a LAN.
-fn streaming(current: Option<u64>, set: SetBitrate) -> adw::PreferencesGroup {
-    let names: Vec<String> = BITRATE_LIMITS.iter().map(|l| bitrate_name(*l)).collect();
+/// The quality a playback starts at (P6-06), Original by default: the
+/// player's Quality menu offers the same choices, for the one playing.
+fn streaming(
+    current: spoolframe_client_sdk::PlaybackQuality,
+    set: SetQuality,
+) -> adw::PreferencesGroup {
+    let choices = crate::quality::choices();
+    let names: Vec<String> = choices
+        .iter()
+        .map(|q| crate::quality::label(*q, None))
+        .collect();
     let names: Vec<&str> = names.iter().map(String::as_str).collect();
     let row = adw::ComboRow::builder()
         .use_markup(false)
-        .title("Quality limit")
+        .title("Preferred quality")
         .subtitle(
-            "This computer only. The server converts anything above it. Applies when Spoolframe \
-             next starts.",
+            "What playback starts at on this computer. Auto suits the connection; the player \
+             can change it while playing.",
         )
         .model(&gtk::StringList::new(&names))
-        .selected(nearest_limit(current) as u32)
+        .selected(crate::quality::index(current) as u32)
         .build();
     row.connect_selected_notify(move |row| {
-        if let Some(limit) = BITRATE_LIMITS.get(row.selected() as usize) {
-            set(*limit);
+        if let Some(quality) = choices.get(row.selected() as usize) {
+            set(*quality);
         }
     });
     let group = adw::PreferencesGroup::builder().title("Streaming").build();
@@ -530,8 +497,8 @@ impl PlaybackRows {
 
 /// Settings kept on this device, as they are now and how to change them.
 pub struct Device {
-    pub bitrate: Option<u64>,
-    pub set_bitrate: SetBitrate,
+    pub quality: spoolframe_client_sdk::PlaybackQuality,
+    pub set_quality: SetQuality,
     pub show_hdr: bool,
     pub set_show_hdr: SetSkipIntros,
     pub use_relays: bool,
@@ -542,8 +509,8 @@ pub struct Device {
     pub set_show_diagnostics: SetSkipIntros,
 }
 
-/// Playback, on this computer for every server and profile: the quality
-/// limit and HDR, then what happens while playing. Audio and subtitle
+/// Playback, on this computer for every server and profile: the preferred
+/// quality and HDR, then what happens while playing. Audio and subtitle
 /// languages are the profile's, on each server's page.
 pub(crate) fn playback(device: &Device) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::builder()
@@ -551,7 +518,7 @@ pub(crate) fn playback(device: &Device) -> adw::PreferencesPage {
         .description("On this computer, for every server and profile.")
         .icon_name(crate::icons::PLAYBACK_PAGE)
         .build();
-    let streaming = streaming(device.bitrate, device.set_bitrate.clone());
+    let streaming = streaming(device.quality, device.set_quality.clone());
     let hdr = adw::SwitchRow::builder()
         .use_markup(false)
         .title("Show HDR")
@@ -1719,23 +1686,5 @@ mod tests {
             bitmap_saved(BitmapPreference::Text, 1, true),
             BitmapPreference::Pictures
         );
-    }
-
-    #[test]
-    fn no_setting_is_no_limit() {
-        assert_eq!(BITRATE_LIMITS[nearest_limit(None)], None);
-    }
-
-    #[test]
-    fn a_hand_edited_limit_shows_as_the_nearest_offered() {
-        assert_eq!(
-            BITRATE_LIMITS[nearest_limit(Some(9_000_000))],
-            Some(8_000_000)
-        );
-    }
-
-    #[test]
-    fn a_limit_is_named_with_what_it_carries() {
-        assert_eq!(bitrate_name(Some(8_000_000)), "8 Mbps · 1080p");
     }
 }

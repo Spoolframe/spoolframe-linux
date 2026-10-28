@@ -39,6 +39,29 @@ pub fn index(quality: PlaybackQuality) -> usize {
     choices().iter().position(|c| *c == quality).unwrap_or(0)
 }
 
+/// A choice as the settings file keeps it: `auto`, `original`, or the
+/// bitrate in bits per second.
+pub fn to_setting(quality: PlaybackQuality) -> String {
+    match quality {
+        PlaybackQuality::Auto => "auto".to_owned(),
+        PlaybackQuality::Original => "original".to_owned(),
+        PlaybackQuality::Bitrate(bits) => bits.to_string(),
+    }
+}
+
+/// A choice the settings file keeps; `None` for what is none of them.
+pub fn from_setting(text: &str) -> Option<PlaybackQuality> {
+    match text {
+        "auto" => Some(PlaybackQuality::Auto),
+        "original" => Some(PlaybackQuality::Original),
+        bits => bits
+            .parse()
+            .ok()
+            .filter(|b| *b > 0)
+            .map(PlaybackQuality::Bitrate),
+    }
+}
+
 /// The lines the server encodes to, when it encodes the video.
 pub fn encoded_height(plan: Option<&PlaybackPlan>) -> Option<u32> {
     match plan? {
@@ -81,6 +104,23 @@ mod tests {
         assert_eq!(index(PlaybackQuality::Bitrate(8_000_000)), 2);
         assert_eq!(index(PlaybackQuality::Bitrate(12_000_000)), 0);
         assert_eq!(index(PlaybackQuality::Original), 6);
+    }
+
+    #[test]
+    fn every_choice_is_read_back_as_it_was_kept() {
+        let read: Vec<_> = choices()
+            .into_iter()
+            .map(|q| from_setting(&to_setting(q)))
+            .collect();
+        assert_eq!(read, choices().into_iter().map(Some).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_kept_value_that_is_no_choice_is_none() {
+        assert_eq!(
+            [from_setting("best"), from_setting("0"), from_setting("")],
+            [None, None, None]
+        );
     }
 
     #[test]
