@@ -2,8 +2,14 @@
 
 ## 0.6.2 — 2026-10-28
 
-Built with the Spoolframe SDK crates 0.16.1, for the server's 0.16.
+Built with the Spoolframe SDK crates 0.16.3, for the server's 0.16.
 
+- A film the server converts no longer stalls into buffering over and
+  over: after running dry, playback waits for 10 seconds of the stream
+  (it was 4, and at 4K bitrates less than 2), and reads up to 256 MB
+  ahead (it was 128).
+- Devices that run the Android and Xbox apps are named and shown as
+  such, among a profile's devices and on an invite's origin.
 - Paired servers (federation), on a server that has the experimental
   feature on: the sidebar groups libraries by server, each with its
   name and a fold, an offline one last and greyed. A paired server's

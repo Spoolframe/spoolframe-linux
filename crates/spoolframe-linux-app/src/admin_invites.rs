@@ -109,6 +109,8 @@ pub fn made_where(by: &str, from: &InviteOrigin) -> String {
             Platform::Macos => "on a Mac".to_owned(),
             Platform::Tvos => "on an Apple TV".to_owned(),
             Platform::Linux => "on a Linux computer".to_owned(),
+            Platform::Android => "on an Android device".to_owned(),
+            Platform::Xbox => "on an Xbox".to_owned(),
             _ => "on another device".to_owned(),
         },
     };
@@ -1094,6 +1096,23 @@ mod tests {
             this_device: true,
         };
         assert_eq!(made_where("Andrey", &here), "by Andrey on this computer");
+    }
+
+    /// The SDK's 0.16.3 platforms are named, not "another device".
+    #[test]
+    fn an_invite_made_on_android_or_an_xbox_says_so() {
+        let on = |platform| InviteOrigin::Device {
+            name: None,
+            platform,
+            this_device: false,
+        };
+        assert_eq!(
+            [
+                made_where("Andrey", &on(Platform::Android)),
+                made_where("Andrey", &on(Platform::Xbox)),
+            ],
+            ["by Andrey on an Android device", "by Andrey on an Xbox"]
+        );
     }
 
     #[test]

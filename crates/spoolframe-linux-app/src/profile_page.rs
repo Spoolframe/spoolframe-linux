@@ -170,8 +170,9 @@ pub fn device_line(device: &DeviceInfo, now: i64) -> (String, String) {
 /// An icon for what a device runs.
 fn device_icon(platform: Option<Platform>) -> &'static str {
     match platform {
-        Some(Platform::Tvos) => crate::icons::SHOWS,
-        Some(Platform::Ios) => crate::icons::PHONE,
+        // A TV, and what plays on one.
+        Some(Platform::Tvos | Platform::Xbox) => crate::icons::SHOWS,
+        Some(Platform::Ios | Platform::Android) => crate::icons::PHONE,
         Some(Platform::Linux | Platform::Macos) => crate::icons::LAPTOP,
         _ => crate::icons::MONITOR,
     }
@@ -1871,6 +1872,19 @@ fn step_body(icon: &str, heading: &str, line: &str) -> gtk::Box {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An Android device shows as a phone, an Xbox as a TV, not as the
+    /// monitor an unknown device gets.
+    #[test]
+    fn android_and_xbox_devices_have_their_own_icons() {
+        assert_eq!(
+            [
+                device_icon(Some(Platform::Android)),
+                device_icon(Some(Platform::Xbox)),
+            ],
+            [crate::icons::PHONE, crate::icons::SHOWS]
+        );
+    }
 
     #[test]
     fn an_approval_without_an_answer_says_to_look_at_the_device() {
