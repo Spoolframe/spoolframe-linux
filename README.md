@@ -1,6 +1,13 @@
-# spoolframe-linux
+<p align="center">
+  <img src="crates/spoolframe-linux-app/data/icons/hicolor/scalable/apps/app.spoolframe.relm4.svg" alt="Spoolframe" width="128" height="128">
+</p>
 
-Spoolframe Linux client: Relm4, libadwaita, GStreamer.
+<h1 align="center">Spoolframe for Linux</h1>
+
+<p align="center">
+  The Spoolframe client for the Linux desktop: Relm4, libadwaita,
+  GStreamer.
+</p>
 
 ## Building
 
