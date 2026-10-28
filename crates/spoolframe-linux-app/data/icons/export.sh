@@ -5,7 +5,7 @@
 # a source; needs rsvg-convert (`nix shell nixpkgs#librsvg`).
 set -euo pipefail
 cd "$(dirname "$0")"
-app=casa.coldsteel.Spoolframe
+app=app.spoolframe.relm4
 for size in 16 22 24 32 48 64 128 256 512; do
   source=hicolor/scalable/apps/$app.svg
   [ "$size" -lt 40 ] && source=small.svg

@@ -21,7 +21,7 @@ fn version_names_the_binary_and_its_version() {
 /// takes it.
 #[test]
 fn the_desktop_entry_hands_invite_links_to_the_binary() {
-    let entry = include_str!("../../data/casa.coldsteel.Spoolframe.desktop");
+    let entry = include_str!("../../data/app.spoolframe.relm4.desktop");
     assert!(
         entry
             .lines()

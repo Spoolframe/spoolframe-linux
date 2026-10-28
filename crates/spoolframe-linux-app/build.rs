@@ -46,8 +46,8 @@ fn main() {
     xml.push_str("  </gresource>\n");
     writeln!(xml, "  <gresource prefix=\"{APPS}\">").unwrap();
     for name in [
-        "casa.coldsteel.Spoolframe.svg",
-        "casa.coldsteel.Spoolframe-symbolic.svg",
+        "app.spoolframe.relm4.svg",
+        "app.spoolframe.relm4-symbolic.svg",
     ] {
         writeln!(
             xml,

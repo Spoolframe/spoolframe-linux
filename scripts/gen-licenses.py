@@ -54,7 +54,7 @@ FLATPAK_DIR = os.path.join(ROOT, "scripts", "licenses", "flatpak")
 ICONS_DIR = os.path.join(ROOT, "crates", "spoolframe-linux-app", "icons")
 FONTS_DIR = os.path.join(ROOT, "crates", "spoolframe-linux-app", "fonts")
 CATPPUCCIN_LICENSE = os.path.join(ROOT, "scripts", "licenses", "catppuccin.LICENSE")
-MANIFEST = os.path.join(ROOT, "flatpak", "casa.coldsteel.Spoolframe.yml")
+MANIFEST = os.path.join(ROOT, "flatpak", "app.spoolframe.relm4.yml")
 
 APP = "spoolframe-linux-app"
 TARGETS = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]

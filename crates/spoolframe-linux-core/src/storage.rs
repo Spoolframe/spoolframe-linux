@@ -119,8 +119,14 @@ fn check_key(key: &str) -> Result<(), StorageError> {
 }
 
 /// The attribute every Spoolframe secret carries, so the client finds its
-/// own items and nothing else in the keyring. Also the schema's name.
-const APPLICATION: &str = "casa.coldsteel.Spoolframe";
+/// own items and nothing else in the keyring. Also the schema's name. It
+/// is the app's id.
+const APPLICATION: &str = "app.spoolframe.relm4";
+
+/// The app's id until 0.6.1, which the secrets from before carry. A key
+/// not found under [`APPLICATION`] is read under this one and moved: stored
+/// again under the new id, then deleted here (see [`keyring::lookup`]).
+const LEGACY_APPLICATION: &str = "casa.coldsteel.Spoolframe";
 
 /// What oo7 stored a `Vec<u8>` as, kept so an item reads the same to any
 /// other Secret Service client whichever library wrote it.
@@ -129,7 +135,16 @@ const CONTENT_TYPE: &std::ffi::CStr = c"application/octet-stream";
 /// The two attributes every secret is stored and found by, byte for byte
 /// those the client gave oo7: `application` and `key`.
 fn attributes(key: &str) -> HashMap<&str, &str> {
-    HashMap::from([("application", APPLICATION), ("key", key)])
+    attributes_of(APPLICATION, key)
+}
+
+/// The same attributes as the secrets from before the app's id changed.
+fn legacy_attributes(key: &str) -> HashMap<&str, &str> {
+    attributes_of(LEGACY_APPLICATION, key)
+}
+
+fn attributes_of<'a>(application: &'a str, key: &'a str) -> HashMap<&'a str, &'a str> {
+    HashMap::from([("application", application), ("key", key)])
 }
 
 /// The item's label, as the keyring's own app shows it.
@@ -214,15 +229,39 @@ mod keyring {
     /// keyring did with oo7: a search, which starts the Secret Service (or
     /// in a Flatpak asks the portal for the file's key).
     pub(super) fn reach() -> Result<(), glib::Error> {
-        let mine = HashMap::from([("application", APPLICATION)]);
         let flags = libsecret::SearchFlags::ALL | libsecret::SearchFlags::UNLOCK;
-        libsecret::password_search_sync(Some(&schema()), mine, flags, NO_CANCEL).map(drop)
+        // The items from before the app's id changed are unlocked too, so
+        // moving them later raises no prompt of its own.
+        for application in [APPLICATION, LEGACY_APPLICATION] {
+            let mine = HashMap::from([("application", application)]);
+            libsecret::password_search_sync(Some(&schema()), mine, flags, NO_CANCEL)?;
+        }
+        Ok(())
     }
 
+    /// `key`'s value: under the app's id, or else under its id from before,
+    /// which then moves to the new one. A move that fails is logged and the
+    /// value still read: it moves on the next lookup.
     pub(super) fn lookup(key: &str) -> Result<Option<Vec<u8>>, glib::Error> {
+        if let Some(value) = find(attributes(key))? {
+            return Ok(Some(value));
+        }
+        let Some(value) = find(legacy_attributes(key))? else {
+            return Ok(None);
+        };
+        match store(key, &value) {
+            Ok(()) => tracing::info!(key, "secret moved to the app's new id"),
+            Err(e) => {
+                tracing::warn!(key, error = %e, "secret read under the app's old id, not moved")
+            }
+        }
+        Ok(Some(value))
+    }
+
+    /// The newest item's secret among those with `attributes`.
+    fn find(attributes: HashMap<&str, &str>) -> Result<Option<Vec<u8>>, glib::Error> {
         let flags = libsecret::SearchFlags::ALL | libsecret::SearchFlags::UNLOCK;
-        let items =
-            libsecret::password_search_sync(Some(&schema()), attributes(key), flags, NO_CANCEL)?;
+        let items = libsecret::password_search_sync(Some(&schema()), attributes, flags, NO_CANCEL)?;
         let Some(item) = newest(items, |item| item.modified()) else {
             return Ok(None);
         };
@@ -262,12 +301,15 @@ mod keyring {
             libsecret::password_clear_sync(Some(&schema), attributes(key), NO_CANCEL)?;
             put()?;
         }
+        // An item under the old id would be read again once this one goes.
+        libsecret::password_clear_sync(Some(&schema), legacy_attributes(key), NO_CANCEL)?;
         Ok(())
     }
 
-    /// Deletes every item of `key`.
+    /// Deletes every item of `key`, under the app's id from before too.
     pub(super) fn clear(key: &str) -> Result<(), glib::Error> {
-        libsecret::password_clear_sync(Some(&schema()), attributes(key), NO_CANCEL)
+        libsecret::password_clear_sync(Some(&schema()), attributes(key), NO_CANCEL)?;
+        libsecret::password_clear_sync(Some(&schema()), legacy_attributes(key), NO_CANCEL)
     }
 }
 
@@ -420,15 +462,28 @@ mod tests {
         );
     }
 
-    /// The attributes oo7 stored the client's secrets under, exactly: one
-    /// more or one renamed and none of them is found.
+    /// The attributes oo7 stored the client's secrets under, exactly, with
+    /// the app's id: one more or one renamed and none of them is found.
     #[test]
     fn a_secret_is_found_by_application_and_key_alone() {
         assert_eq!(
             attributes("sessions/9e80325910d054d2"),
             HashMap::from([
-                ("application", "casa.coldsteel.Spoolframe"),
+                ("application", "app.spoolframe.relm4"),
                 ("key", "sessions/9e80325910d054d2"),
+            ])
+        );
+    }
+
+    /// A secret from before the app's id changed is looked for under the
+    /// old id, with the same key.
+    #[test]
+    fn a_secret_from_before_is_found_under_the_old_id() {
+        assert_eq!(
+            legacy_attributes("device-key"),
+            HashMap::from([
+                ("application", "casa.coldsteel.Spoolframe"),
+                ("key", "device-key"),
             ])
         );
     }

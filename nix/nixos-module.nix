@@ -59,6 +59,6 @@ in {
     hardware.graphics.enable = lib.mkDefault true;
     # An invite link opened in a browser or a file manager.
     xdg.mime.defaultApplications."x-scheme-handler/spoolframe" =
-      lib.mkDefault "casa.coldsteel.Spoolframe.desktop";
+      lib.mkDefault "app.spoolframe.relm4.desktop";
   };
 }

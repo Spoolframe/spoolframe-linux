@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>casa.coldsteel.Spoolframe</id>
+  <id>app.spoolframe.relm4</id>
   <name>Spoolframe</name>
   <summary>Watch and listen to your Spoolframe library</summary>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>GPL-3.0-or-later</project_license>
-  <developer id="casa.coldsteel">
+  <developer id="app.spoolframe">
     <name>Coldsteel</name>
   </developer>
   <description>
@@ -15,7 +15,11 @@
       you invite can use.
     </p>
   </description>
-  <launchable type="desktop-id">casa.coldsteel.Spoolframe.desktop</launchable>
+  <launchable type="desktop-id">app.spoolframe.relm4.desktop</launchable>
+  <!-- The app's id until 0.6.1; software centres show this as the same app. -->
+  <replaces>
+    <id>casa.coldsteel.Spoolframe</id>
+  </replaces>
   <url type="homepage">https://git.coldsteel.casa/Spoolframe/spoolframe-linux</url>
   <content_rating type="oars-1.1"/>
   <releases>

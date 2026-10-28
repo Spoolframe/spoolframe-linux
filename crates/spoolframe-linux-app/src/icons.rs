@@ -228,8 +228,8 @@ mod tests {
     fn the_app_icon_is_compiled_in() {
         gio::resources_register_include!("icons.gresource").unwrap();
         let missing: Vec<_> = [
-            "casa.coldsteel.Spoolframe.svg",
-            "casa.coldsteel.Spoolframe-symbolic.svg",
+            "app.spoolframe.relm4.svg",
+            "app.spoolframe.relm4-symbolic.svg",
         ]
         .into_iter()
         .filter(|name| {

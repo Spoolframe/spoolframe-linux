@@ -1,6 +1,6 @@
 # Flatpak
 
-`casa.coldsteel.Spoolframe.yml` builds the client as a Flatpak on the GNOME
+`app.spoolframe.relm4.yml` builds the client as a Flatpak on the GNOME
 runtime, for a bundle installed with `flatpak install`. On the GitHub
 mirror, the Flatpak workflow (`.github/workflows/flatpak.yaml`, run by
 hand) builds it the same way and publishes it as release `v<version>`, the
@@ -17,8 +17,8 @@ flatpak --user install flathub org.gnome.Sdk//51 org.gnome.Platform//51 \
   org.freedesktop.Sdk.Extension.llvm22//26.08
 
 flatpak-builder --user --force-clean --state-dir=target/flatpak-state \
-  --repo=target/flatpak-repo target/flatpak-build flatpak/casa.coldsteel.Spoolframe.yml
-flatpak build-bundle target/flatpak-repo target/spoolframe.flatpak casa.coldsteel.Spoolframe \
+  --repo=target/flatpak-repo target/flatpak-build flatpak/app.spoolframe.relm4.yml
+flatpak build-bundle target/flatpak-repo target/spoolframe.flatpak app.spoolframe.relm4 \
   --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo
 ```
 
@@ -30,7 +30,7 @@ appstreamcli flatpak-builder runs.
 
 Install it with `flatpak install --user target/spoolframe.flatpak`; the runtime
 comes from Flathub. Run it from the desktop or with
-`flatpak run casa.coldsteel.Spoolframe`.
+`flatpak run app.spoolframe.relm4`.
 
 ## When Cargo.lock changes
 

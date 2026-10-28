@@ -56,12 +56,12 @@ in
       inherit cargoArtifacts;
 
       cargoExtraArgs = "-p spoolframe-linux-app";
-      # The launcher and its icons: the app's id is casa.coldsteel.Spoolframe,
+      # The launcher and its icons: the app's id is app.spoolframe.relm4,
       # which MPRIS names as its desktop entry too.
       postInstall = ''
         data=crates/spoolframe-linux-app/data
-        install -Dm644 $data/casa.coldsteel.Spoolframe.desktop \
-          $out/share/applications/casa.coldsteel.Spoolframe.desktop
+        install -Dm644 $data/app.spoolframe.relm4.desktop \
+          $out/share/applications/app.spoolframe.relm4.desktop
         mkdir -p $out/share/icons
         cp -r $data/icons/hicolor $out/share/icons/
       '';

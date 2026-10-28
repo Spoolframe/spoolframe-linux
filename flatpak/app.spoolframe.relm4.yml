@@ -3,7 +3,7 @@
 #
 # The source is this repository. Crates come from cargo-sources.json, made
 # from Cargo.lock by flatpak-cargo-generator, as the build has no network.
-app-id: casa.coldsteel.Spoolframe
+app-id: app.spoolframe.relm4
 runtime: org.gnome.Platform
 # GNOME 49 is the first with GTK 4.20, which gst-plugin-gtk4's gtk_v4_20
 # feature needs; 51 is the current one.
@@ -70,10 +70,10 @@ modules:
     build-commands:
       - cd spoolframe-linux && cargo build --release --locked --offline -p spoolframe-linux-app
       - install -Dm755 spoolframe-linux/target/release/spoolframe-linux /app/bin/spoolframe-linux
-      - install -Dm644 spoolframe-linux/crates/spoolframe-linux-app/data/casa.coldsteel.Spoolframe.desktop
-        /app/share/applications/casa.coldsteel.Spoolframe.desktop
-      - install -Dm644 spoolframe-linux/flatpak/casa.coldsteel.Spoolframe.metainfo.xml
-        /app/share/metainfo/casa.coldsteel.Spoolframe.metainfo.xml
+      - install -Dm644 spoolframe-linux/crates/spoolframe-linux-app/data/app.spoolframe.relm4.desktop
+        /app/share/applications/app.spoolframe.relm4.desktop
+      - install -Dm644 spoolframe-linux/flatpak/app.spoolframe.relm4.metainfo.xml
+        /app/share/metainfo/app.spoolframe.relm4.metainfo.xml
       - mkdir -p /app/share/icons && cp -r spoolframe-linux/crates/spoolframe-linux-app/data/icons/hicolor
         /app/share/icons/
     sources:

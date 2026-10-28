@@ -99,7 +99,7 @@ static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
 
 /// The application ID: GNOME uses it for the desktop file, the settings
 /// and the single-instance check.
-const APP_ID: &str = "casa.coldsteel.Spoolframe";
+const APP_ID: &str = "app.spoolframe.relm4";
 
 /// Spoolframe Linux: Spoolframe Linux client: Relm4, libadwaita, GStreamer.
 #[derive(Parser)]

@@ -25,7 +25,7 @@ use crate::playback::{Change, Playback, Repeat};
 
 const IDENTITY: &str = "Spoolframe";
 /// The `.desktop` file's name, without the extension.
-const DESKTOP_ENTRY: &str = "casa.coldsteel.Spoolframe";
+const DESKTOP_ENTRY: &str = "app.spoolframe.relm4";
 /// Track ids are object paths under this.
 const TRACK_PATH: &str = "/casa/coldsteel/Spoolframe/item";
 /// A position further than this from where playback should be is a seek,
