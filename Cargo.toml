@@ -30,16 +30,15 @@ snmalloc-rs = { version = "0.7.5", default-features = false, features = ["build_
 spoolframe-linux-core = { path = "crates/spoolframe-linux-core" }
 
 # The client-facing media model. The permissive spoolframe crates come from
-# the Coldsteel cargo registry (named in .cargo/config.toml), where
-# Spoolframe/spoolframe-server publishes them; reads are anonymous. The
-# five move together: one version for all of them, the server's release.
-spoolframe-types = { version = "0.16.0", registry = "coldsteel" }
+# crates.io, where Spoolframe/spoolframe-server publishes them. The five
+# move together: one version for all of them, the server's release.
+spoolframe-types = "0.16.1"
 # The client protocol's types (home screen, playback plans and handles,
 # artwork sizes), which the SDK returns too.
-spoolframe-protocol = { version = "0.16.0", registry = "coldsteel" }
+spoolframe-protocol = "0.16.1"
 # The client side of the protocol: Iroh transport, saved servers, sessions.
-spoolframe-client-sdk = { version = "0.16.0", registry = "coldsteel", features = ["media-readers"] }
-spoolframe-policy = { version = "0.16.0", registry = "coldsteel" }
+spoolframe-client-sdk = { version = "0.16.1", features = ["media-readers"] }
+spoolframe-policy = "0.16.1"
 # The SDK's Storage trait is an async-trait one.
 async-trait = "0.1"
 
@@ -73,7 +72,7 @@ gst-plugin-gtk4 = { version = "0.15", features = ["gtk_v4_20", "dmabuf", "waylan
 qrcode = { version = "0.14", default-features = false }
 # A test's own directory under a random name, removed with it, so tests
 # running at once never share one (core's `testing` feature).
-spoolframe-test-dir = { version = "0.16.0", registry = "coldsteel" }
+spoolframe-test-dir = "0.16.1"
 # The play queue saved per profile (P1-23), as JSON beside the SDK's data.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -150,3 +149,7 @@ crypto-glue = { path = "vendor/crypto-glue" }
 webauthn-attestation-ca = { path = "vendor/webauthn-attestation-ca" }
 webauthn-authenticator-rs = { path = "vendor/webauthn-authenticator-rs" }
 webauthn-rs-core = { path = "vendor/webauthn-rs-core" }
+# QUIC's fix for playback on a lossy link (PX-62): a stream no longer drops
+# with "too many gaps in stream buffer". The server carries the same patch;
+# drop it once a noq-proto release has it.
+noq-proto = { git = "https://github.com/n0-computer/noq", rev = "3ff2822f9e6ef327501f75cd6bc0f7d0f3e9b76a" }

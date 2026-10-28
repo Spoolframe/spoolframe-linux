@@ -4134,9 +4134,8 @@ dependencies = [
 
 [[package]]
 name = "noq-proto"
-version = "1.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c01a35be3ed37558c8db69554419f24eff8a63599b54f711bbe3863ec727c47d"
+version = "1.5.0"
+source = "git+https://github.com/n0-computer/noq?rev=3ff2822f9e6ef327501f75cd6bc0f7d0f3e9b76a#3ff2822f9e6ef327501f75cd6bc0f7d0f3e9b76a"
 dependencies = [
  "aes-gcm",
  "aws-lc-rs",
@@ -5871,9 +5870,9 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-client-sdk"
-version = "0.16.0"
-source = "sparse+https://cargo.coldsteel.casa/api/v1/crates/"
-checksum = "18724a3b4c6b97188f83c3d98c3383d9ad655450af9b28f109068574a9246cc7"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dad6bc4378218376b4633007c735f437ac9ecb11e18909f402dcbd65e2641d29"
 dependencies = [
  "argon2",
  "async-trait",
@@ -5970,9 +5969,9 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-policy"
-version = "0.16.0"
-source = "sparse+https://cargo.coldsteel.casa/api/v1/crates/"
-checksum = "2ef00e7ebab1f7c80acb1594eb0ff14d549a293a70d5d1bb2d072093f992f30e"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e63aca3cfe7db854e1c111a4f132801c6da5b8ea6e3813f600258b8aeb3f271f"
 dependencies = [
  "serde",
  "spoolframe-protocol",
@@ -5981,9 +5980,9 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-protocol"
-version = "0.16.0"
-source = "sparse+https://cargo.coldsteel.casa/api/v1/crates/"
-checksum = "4e079c06ccd5535625a0a2165e70dbd2c0b1752ec07955290881d41a9b54d764"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e2d54180373087ff4efe3af1516c415b12a792c254a007291397bbb0187992c5"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -6001,9 +6000,9 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-test-dir"
-version = "0.16.0"
-source = "sparse+https://cargo.coldsteel.casa/api/v1/crates/"
-checksum = "60ac11027cbca69329f397eeb54f2ba1aecb2da04d03ab203c9f7232f5ebe508"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a7c96e18c0aa78809389e63c96fd91a561429dfd28ae4239c1de4d38f341d17"
 dependencies = [
  "tmpdir",
  "tokio",
@@ -6011,9 +6010,9 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-types"
-version = "0.16.0"
-source = "sparse+https://cargo.coldsteel.casa/api/v1/crates/"
-checksum = "367a9336af208ab53beb51c5b6107c7edd8ad30825f1e5eb8c6ffeb24667143b"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "79007e581a2c85a971b4111acc1fb55b3b96443777059173c8afc8a6d2dfaa18"
 dependencies = [
  "serde",
  "thiserror 2.0.21",

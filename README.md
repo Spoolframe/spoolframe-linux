@@ -4,10 +4,11 @@ Spoolframe Linux client: Relm4, libadwaita, GStreamer.
 
 ## Building
 
-The Spoolframe SDK crates (`spoolframe-types`, `-protocol`, `-client-sdk`,
-`-policy`, `-test-dir`) come from the Coldsteel cargo registry, named in
-`.cargo/config.toml`; reading it needs no account. Everything else comes
-from crates.io.
+Every crate comes from crates.io, the Spoolframe SDK crates
+(`spoolframe-types`, `-protocol`, `-client-sdk`, `-policy`, `-test-dir`)
+too. The one exception is noq-proto, from a git commit of
+github.com/n0-computer/noq that has its fix for playback on a lossy link
+(Cargo.toml's `[patch.crates-io]`).
 
 With Nix, the package (the app, its launcher and icons):
 

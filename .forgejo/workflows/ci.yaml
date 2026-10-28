@@ -148,8 +148,8 @@ jobs:
             target/lcov.info
           if-no-files-found: ignore
 
-  # Every flake output for x86_64-linux: the client package (crane, with the
-  # SDK crates fetched from the Coldsteel registry) and the dev shell.
+  # Every flake output for x86_64-linux: the client package (crane) and the
+  # dev shell.
   nix:
     name: "nix"
     runs-on: beefy

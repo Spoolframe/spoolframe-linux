@@ -1,6 +1,0 @@
-# The registry the Spoolframe SDK crates come from (spoolframe-types,
-# -protocol, -client-sdk, -policy, -test-dir: `registry = "coldsteel"` in
-# Cargo.toml). Spoolframe/spoolframe-server publishes them; reads need no
-# token.
-[registries.coldsteel]
-index = "sparse+https://cargo.coldsteel.casa/api/v1/crates/"

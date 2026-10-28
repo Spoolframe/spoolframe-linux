@@ -1,5 +1,11 @@
 [
     {
+        "type": "git",
+        "url": "https://github.com/n0-computer/noq",
+        "commit": "3ff2822f9e6ef327501f75cd6bc0f7d0f3e9b76a",
+        "dest": "flatpak-cargo/git/noq-3ff2822"
+    },
+    {
         "type": "archive",
         "archive-type": "tar-gzip",
         "url": "https://static.crates.io/crates/bytemuck/bytemuck-1.25.2.crate",
@@ -5033,19 +5039,6 @@
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/noq-proto/noq-proto-1.4.0.crate",
-        "sha256": "c01a35be3ed37558c8db69554419f24eff8a63599b54f711bbe3863ec727c47d",
-        "dest": "cargo/vendor/noq-proto-1.4.0"
-    },
-    {
-        "type": "inline",
-        "contents": "{\"package\": \"c01a35be3ed37558c8db69554419f24eff8a63599b54f711bbe3863ec727c47d\", \"files\": {}}",
-        "dest": "cargo/vendor/noq-proto-1.4.0",
-        "dest-filename": ".cargo-checksum.json"
-    },
-    {
-        "type": "archive",
-        "archive-type": "tar-gzip",
         "url": "https://static.crates.io/crates/noq-udp/noq-udp-1.4.0.crate",
         "sha256": "8d0160422832eea1cc11c34be04ee6d5a046452b0b46cfb14695d55a1f24c954",
         "dest": "cargo/vendor/noq-udp-1.4.0"
@@ -7199,71 +7192,6 @@
         "type": "inline",
         "contents": "{\"package\": \"7ef958a98b9d5da290cfc78946e9f3e61e1e62a18db0d92cac0b83cc161491a9\", \"files\": {}}",
         "dest": "cargo/vendor/spki-0.8.1",
-        "dest-filename": ".cargo-checksum.json"
-    },
-    {
-        "type": "archive",
-        "archive-type": "tar-gzip",
-        "url": "https://cargo.coldsteel.casa/api/v1/crates/dl/spoolframe-client-sdk/0.16.0/download",
-        "sha256": "18724a3b4c6b97188f83c3d98c3383d9ad655450af9b28f109068574a9246cc7",
-        "dest": "cargo/vendor/spoolframe-client-sdk-0.16.0"
-    },
-    {
-        "type": "inline",
-        "contents": "{\"package\": \"18724a3b4c6b97188f83c3d98c3383d9ad655450af9b28f109068574a9246cc7\", \"files\": {}}",
-        "dest": "cargo/vendor/spoolframe-client-sdk-0.16.0",
-        "dest-filename": ".cargo-checksum.json"
-    },
-    {
-        "type": "archive",
-        "archive-type": "tar-gzip",
-        "url": "https://cargo.coldsteel.casa/api/v1/crates/dl/spoolframe-policy/0.16.0/download",
-        "sha256": "2ef00e7ebab1f7c80acb1594eb0ff14d549a293a70d5d1bb2d072093f992f30e",
-        "dest": "cargo/vendor/spoolframe-policy-0.16.0"
-    },
-    {
-        "type": "inline",
-        "contents": "{\"package\": \"2ef00e7ebab1f7c80acb1594eb0ff14d549a293a70d5d1bb2d072093f992f30e\", \"files\": {}}",
-        "dest": "cargo/vendor/spoolframe-policy-0.16.0",
-        "dest-filename": ".cargo-checksum.json"
-    },
-    {
-        "type": "archive",
-        "archive-type": "tar-gzip",
-        "url": "https://cargo.coldsteel.casa/api/v1/crates/dl/spoolframe-protocol/0.16.0/download",
-        "sha256": "4e079c06ccd5535625a0a2165e70dbd2c0b1752ec07955290881d41a9b54d764",
-        "dest": "cargo/vendor/spoolframe-protocol-0.16.0"
-    },
-    {
-        "type": "inline",
-        "contents": "{\"package\": \"4e079c06ccd5535625a0a2165e70dbd2c0b1752ec07955290881d41a9b54d764\", \"files\": {}}",
-        "dest": "cargo/vendor/spoolframe-protocol-0.16.0",
-        "dest-filename": ".cargo-checksum.json"
-    },
-    {
-        "type": "archive",
-        "archive-type": "tar-gzip",
-        "url": "https://cargo.coldsteel.casa/api/v1/crates/dl/spoolframe-test-dir/0.16.0/download",
-        "sha256": "60ac11027cbca69329f397eeb54f2ba1aecb2da04d03ab203c9f7232f5ebe508",
-        "dest": "cargo/vendor/spoolframe-test-dir-0.16.0"
-    },
-    {
-        "type": "inline",
-        "contents": "{\"package\": \"60ac11027cbca69329f397eeb54f2ba1aecb2da04d03ab203c9f7232f5ebe508\", \"files\": {}}",
-        "dest": "cargo/vendor/spoolframe-test-dir-0.16.0",
-        "dest-filename": ".cargo-checksum.json"
-    },
-    {
-        "type": "archive",
-        "archive-type": "tar-gzip",
-        "url": "https://cargo.coldsteel.casa/api/v1/crates/dl/spoolframe-types/0.16.0/download",
-        "sha256": "367a9336af208ab53beb51c5b6107c7edd8ad30825f1e5eb8c6ffeb24667143b",
-        "dest": "cargo/vendor/spoolframe-types-0.16.0"
-    },
-    {
-        "type": "inline",
-        "contents": "{\"package\": \"367a9336af208ab53beb51c5b6107c7edd8ad30825f1e5eb8c6ffeb24667143b\", \"files\": {}}",
-        "dest": "cargo/vendor/spoolframe-types-0.16.0",
         "dest-filename": ".cargo-checksum.json"
     },
     {
@@ -9594,8 +9522,91 @@
         "dest-filename": ".cargo-checksum.json"
     },
     {
+        "type": "archive",
+        "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/spoolframe-client-sdk/spoolframe-client-sdk-0.16.1.crate",
+        "sha256": "dad6bc4378218376b4633007c735f437ac9ecb11e18909f402dcbd65e2641d29",
+        "dest": "cargo/vendor/spoolframe-client-sdk-0.16.1"
+    },
+    {
         "type": "inline",
-        "contents": "[source.vendored-sources]\ndirectory = \"cargo/vendor\"\n\n[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n[source.coldsteel-registry]\nregistry = \"sparse+https://cargo.coldsteel.casa/api/v1/crates/\"\nreplace-with = \"vendored-sources\"\n",
+        "contents": "{\"package\": \"dad6bc4378218376b4633007c735f437ac9ecb11e18909f402dcbd65e2641d29\", \"files\": {}}",
+        "dest": "cargo/vendor/spoolframe-client-sdk-0.16.1",
+        "dest-filename": ".cargo-checksum.json"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/spoolframe-policy/spoolframe-policy-0.16.1.crate",
+        "sha256": "e63aca3cfe7db854e1c111a4f132801c6da5b8ea6e3813f600258b8aeb3f271f",
+        "dest": "cargo/vendor/spoolframe-policy-0.16.1"
+    },
+    {
+        "type": "inline",
+        "contents": "{\"package\": \"e63aca3cfe7db854e1c111a4f132801c6da5b8ea6e3813f600258b8aeb3f271f\", \"files\": {}}",
+        "dest": "cargo/vendor/spoolframe-policy-0.16.1",
+        "dest-filename": ".cargo-checksum.json"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/spoolframe-protocol/spoolframe-protocol-0.16.1.crate",
+        "sha256": "e2d54180373087ff4efe3af1516c415b12a792c254a007291397bbb0187992c5",
+        "dest": "cargo/vendor/spoolframe-protocol-0.16.1"
+    },
+    {
+        "type": "inline",
+        "contents": "{\"package\": \"e2d54180373087ff4efe3af1516c415b12a792c254a007291397bbb0187992c5\", \"files\": {}}",
+        "dest": "cargo/vendor/spoolframe-protocol-0.16.1",
+        "dest-filename": ".cargo-checksum.json"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/spoolframe-test-dir/spoolframe-test-dir-0.16.1.crate",
+        "sha256": "7a7c96e18c0aa78809389e63c96fd91a561429dfd28ae4239c1de4d38f341d17",
+        "dest": "cargo/vendor/spoolframe-test-dir-0.16.1"
+    },
+    {
+        "type": "inline",
+        "contents": "{\"package\": \"7a7c96e18c0aa78809389e63c96fd91a561429dfd28ae4239c1de4d38f341d17\", \"files\": {}}",
+        "dest": "cargo/vendor/spoolframe-test-dir-0.16.1",
+        "dest-filename": ".cargo-checksum.json"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/spoolframe-types/spoolframe-types-0.16.1.crate",
+        "sha256": "79007e581a2c85a971b4111acc1fb55b3b96443777059173c8afc8a6d2dfaa18",
+        "dest": "cargo/vendor/spoolframe-types-0.16.1"
+    },
+    {
+        "type": "inline",
+        "contents": "{\"package\": \"79007e581a2c85a971b4111acc1fb55b3b96443777059173c8afc8a6d2dfaa18\", \"files\": {}}",
+        "dest": "cargo/vendor/spoolframe-types-0.16.1",
+        "dest-filename": ".cargo-checksum.json"
+    },
+    {
+        "type": "shell",
+        "commands": [
+            "cp -r --reflink=auto \"flatpak-cargo/git/noq-3ff2822/noq-proto\" \"cargo/vendor/noq-proto\""
+        ]
+    },
+    {
+        "type": "inline",
+        "contents": "# THIS FILE IS AUTOMATICALLY GENERATED BY CARGO\n#\n# When uploading crates to the registry Cargo will automatically\n# \"normalize\" Cargo.toml files for maximal compatibility\n# with all versions of Cargo and also rewrite `path` dependencies\n# to registry (e.g., crates.io) dependencies.\n#\n# If you are reading this file be aware that the original Cargo.toml\n# will likely look very different (and much more reasonable).\n# See Cargo.toml.orig for the original contents.\n\n[package]\nedition = \"2024\"\nrust-version = \"1.88\"\nname = \"noq-proto\"\nversion = \"1.5.0\"\nbuild = false\nworkspace = \"..\"\nautolib = false\nautobins = false\nautoexamples = false\nautotests = false\nautobenches = false\ndescription = \"State machine for the QUIC transport protocol\"\nreadme = false\nkeywords = [\"quic\"]\ncategories = [\n    \"network-programming\",\n    \"asynchronous\",\n]\nlicense = \"MIT OR Apache-2.0\"\nrepository = \"https://github.com/n0-computer/noq\"\n\n[package.metadata.docs.rs]\nfeatures = [\"__all_without_fips\"]\n\n[package.metadata.cargo_check_external_types]\nallowed_external_types = [\n    \"arbitrary::Arbitrary\",\n    \"criterion::Criterion\",\n    \"bytes::*\",\n    \"rustls\",\n    \"rustls::*\",\n    \"rustls_pki_types::*\",\n]\n\n[features]\n__all_without_fips = [\n    \"arbitrary\",\n    \"aws-lc-rs\",\n    \"rustls\",\n    \"ring\",\n    \"platform-verifier\",\n    \"rustls-log\",\n    \"qlog\",\n    \"bench\",\n    \"bloom\",\n    \"tracing-log\",\n]\n__rustls-post-quantum-test = []\narbitrary = [\"dep:arbitrary\"]\naws-lc-rs = [\n    \"dep:aws-lc-rs\",\n    \"aws-lc-rs?/aws-lc-sys\",\n    \"aws-lc-rs?/prebuilt-nasm\",\n    \"rustls?/aws-lc-rs\",\n]\naws-lc-rs-fips = [\n    \"aws-lc-rs\",\n    \"aws-lc-rs?/fips\",\n]\nbench = [\"dep:criterion\"]\nbloom = [\"dep:fastbloom\"]\ndefault = [\n    \"rustls\",\n    \"ring\",\n    \"tracing-log\",\n    \"bloom\",\n]\nplatform-verifier = [\"dep:rustls-platform-verifier\"]\nqlog = [\"dep:qlog\"]\nring = [\n    \"dep:ring\",\n    \"rustls?/ring\",\n]\nrustls = [\n    \"dep:rustls\",\n    \"dep:aes-gcm\",\n]\nrustls-aws-lc-rs = [\n    \"rustls\",\n    \"aws-lc-rs\",\n]\nrustls-log = [\"rustls?/logging\"]\nrustls-ring = [\n    \"rustls\",\n    \"ring\",\n]\ntracing-log = [\"tracing/log\"]\n\n[lib]\nname = \"noq_proto\"\npath = \"src/lib.rs\"\n\n[[bench]]\nname = \"send_buffer\"\npath = \"benches/send_buffer.rs\"\nharness = false\nrequired-features = [\"bench\"]\n\n[dependencies]\nrand_pcg = \"0.10\"\n\n[dependencies.aes-gcm]\nversion = \"0.10.3\"\nfeatures = [\"aes\"]\noptional = true\ndefault-features = false\n\n[dependencies.arbitrary]\nversion = \"1.0.1\"\nfeatures = [\"derive\"]\noptional = true\n\n[dependencies.aws-lc-rs]\nversion = \"1.9\"\noptional = true\ndefault-features = false\n\n[dependencies.bytes]\nversion = \"1\"\n\n[dependencies.criterion]\nversion = \"0.7\"\nfeatures = [\"async_tokio\"]\noptional = true\ndefault-features = false\n\n[dependencies.derive_more]\nversion = \"2.1.0\"\nfeatures = [\n    \"debug\",\n    \"deref\",\n    \"deref_mut\",\n    \"display\",\n    \"from\",\n    \"add\",\n    \"add_assign\",\n]\n\n[dependencies.enum-assoc]\nversion = \"1.3.0\"\n\n[dependencies.fastbloom]\nversion = \"0.17\"\noptional = true\ndefault-features = false\n\n[dependencies.identity-hash]\nversion = \"0.1.0\"\n\n[dependencies.lru-slab]\nversion = \"0.1.2\"\n\n[dependencies.qlog]\nversion = \"0.2.0\"\noptional = true\npackage = \"n0-qlog\"\n\n[dependencies.rand]\nversion = \"0.10\"\n\n[dependencies.ring]\nversion = \"0.17\"\noptional = true\n\n[dependencies.rustc-hash]\nversion = \"2\"\n\n[dependencies.rustls]\nversion = \"0.23.46\"\nfeatures = [\"std\"]\noptional = true\ndefault-features = false\n\n[dependencies.rustls-platform-verifier]\nversion = \"0.7\"\noptional = true\n\n[dependencies.slab]\nversion = \"0.4.9\"\n\n[dependencies.sorted-index-buffer]\nversion = \"0.2.0\"\n\n[dependencies.thiserror]\nversion = \"2.0.3\"\n\n[dependencies.tinyvec]\nversion = \"1.10\"\nfeatures = [\n    \"alloc\",\n    \"alloc\",\n]\n\n[dependencies.tracing]\nversion = \"0.1.10\"\nfeatures = [\"std\"]\ndefault-features = false\n\n[dev-dependencies]\ntestresult = \"0.4.1\"\n\n[dev-dependencies.assert_matches]\nversion = \"1.1\"\n\n[dev-dependencies.hex-literal]\nversion = \"0.4\"\n\n[dev-dependencies.proptest]\nversion = \"1.9.0\"\nfeatures = [\"std\"]\ndefault-features = false\n\n[dev-dependencies.rcgen]\nversion = \"0.14\"\n\n[dev-dependencies.test-strategy]\nversion = \"0.4.3\"\n\n[dev-dependencies.tracing-subscriber]\nversion = \"0.3.1\"\nfeatures = [\n    \"env-filter\",\n    \"fmt\",\n    \"ansi\",\n    \"time\",\n    \"local-time\",\n]\ndefault-features = false\n\n[dev-dependencies.wasm-bindgen-test]\nversion = \"0.3.45\"\n\n[target.'cfg(all(target_family = \"wasm\", target_os = \"unknown\"))'.dependencies.getrandom]\nversion = \"0.4\"\nfeatures = [\"wasm_js\"]\ndefault-features = false\n\n[target.'cfg(all(target_family = \"wasm\", target_os = \"unknown\"))'.dependencies.ring]\nversion = \"0.17\"\nfeatures = [\"wasm32_unknown_unknown_js\"]\noptional = true\n\n[target.'cfg(all(target_family = \"wasm\", target_os = \"unknown\"))'.dependencies.rustls-pki-types]\nversion = \"1.7\"\nfeatures = [\"web\"]\n\n[target.'cfg(all(target_family = \"wasm\", target_os = \"unknown\"))'.dependencies.web-time]\nversion = \"1\"\n\n[target.'cfg(all(target_family = \"wasm\", target_os = \"unknown\"))'.dev-dependencies.getrandom_0_3]\nversion = \"0.3\"\nfeatures = [\"wasm_js\"]\npackage = \"getrandom\"\n\n[lints.clippy]\nmanual_let_else = \"warn\"\nor_fun_call = \"warn\"\nuse_self = \"warn\"\n\n[lints.rust]\nelided_lifetimes_in_paths = \"warn\"\nunnameable_types = \"warn\"\nunreachable_pub = \"warn\"\n\n[lints.rust.unexpected_cfgs]\nlevel = \"warn\"\npriority = 0\ncheck-cfg = [\"cfg(fuzzing)\"]\n",
+        "dest": "cargo/vendor/noq-proto",
+        "dest-filename": "Cargo.toml"
+    },
+    {
+        "type": "inline",
+        "contents": "{\"package\": null, \"files\": {}}",
+        "dest": "cargo/vendor/noq-proto",
+        "dest-filename": ".cargo-checksum.json"
+    },
+    {
+        "type": "inline",
+        "contents": "[source.vendored-sources]\ndirectory = \"cargo/vendor\"\n\n[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n[source.\"https://github.com/n0-computer/noq\"]\ngit = \"https://github.com/n0-computer/noq\"\nrev = \"3ff2822f9e6ef327501f75cd6bc0f7d0f3e9b76a\"\nreplace-with = \"vendored-sources\"\n",
         "dest": "cargo",
         "dest-filename": "config"
     }

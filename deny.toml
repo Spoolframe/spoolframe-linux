@@ -66,12 +66,14 @@ ignore = [
 [bans]
 multiple-versions = "allow"
 
-# crates.io, and the Coldsteel registry the SDK crates come from
-# (.cargo/config.toml). No git sources.
+# crates.io, the SDK crates' too. The one git source is noq-proto's fix for
+# playback on a lossy link (PX-62, Cargo.toml's [patch.crates-io]).
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = [
   "https://github.com/rust-lang/crates.io-index",
-  "sparse+https://cargo.coldsteel.casa/api/v1/crates/",
+]
+allow-git = [
+  "https://github.com/n0-computer/noq",
 ]

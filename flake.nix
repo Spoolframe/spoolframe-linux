@@ -31,18 +31,10 @@
       ];
 
       perSystem = {pkgs, ...}: let
-        # The SDK crates come from the Coldsteel registry (.cargo/config.toml),
-        # everything else from crates.io. The download URL is the registry's
-        # config.json `dl`, written out here: registryFromSparse would fetch
-        # config.json at evaluation time (import from derivation).
-        craneBase = inputs.crane.mkLib pkgs;
-        craneLib = craneBase.appendCrateRegistries [
-          (craneBase.registryFromDownloadUrl {
-            indexUrl = "https://cargo.coldsteel.casa/api/v1/crates/";
-            registryPrefix = "sparse+";
-            dl = "https://cargo.coldsteel.casa:443/api/v1/crates/dl";
-          })
-        ];
+        # Every crate comes from crates.io, the SDK's too, except noq-proto
+        # from its git commit (Cargo.toml's [patch.crates-io]), which crane
+        # fetches by the commit in Cargo.lock.
+        craneLib = inputs.crane.mkLib pkgs;
         spoolframe-linux = pkgs.callPackage ./nix/package.nix {
           inherit craneLib;
           src = let

@@ -1,8 +1,7 @@
 # spoolframe-linux — Spoolframe Linux client: Relm4, libadwaita, GStreamer.
 #
 # Built with crane. flake.nix passes `src` (the Rust sources, the fonts and
-# the launcher data) and a craneLib that knows the Coldsteel registry the
-# SDK crates come from.
+# the launcher data) and its craneLib.
 {
   craneLib,
   src,

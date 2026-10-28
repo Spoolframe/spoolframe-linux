@@ -58,7 +58,6 @@ MANIFEST = os.path.join(ROOT, "flatpak", "casa.coldsteel.Spoolframe.yml")
 
 APP = "spoolframe-linux-app"
 TARGETS = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
-SDK_REGISTRY = "cargo.coldsteel.casa"
 
 # The Flatpak manifest's modules: license and the license file, copied
 # from the module's release archive (the URL and sha256 in the manifest).
@@ -356,9 +355,11 @@ def generate():
         by_key[key] = package
     edges = linked_graph()
 
+    # The SDK's crates are the spoolframe-* ones from crates.io; this
+    # workspace's own (spoolframe-linux-*) have no source.
     def is_sdk(key):
         package = by_key[key]
-        return key[0].startswith("spoolframe-") and SDK_REGISTRY in (package["source"] or "")
+        return key[0].startswith("spoolframe-") and (package["source"] or "").startswith("registry+")
 
     sdk, todo = set(), [k for k in edges if is_sdk(k)]
     while todo:
