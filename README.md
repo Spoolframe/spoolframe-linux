@@ -17,6 +17,29 @@ nix build
 ./result/bin/spoolframe-linux --version
 ```
 
+Every push to master builds the package for x86_64-linux and puts it in
+the public `spoolframe` Cachix cache, so with the cache `nix build`
+downloads it instead of compiling it. With Cachix:
+
+```bash
+cachix use spoolframe
+```
+
+Or without it, in `nix.conf` (on NixOS, `nix.settings`), as a trusted
+user or root:
+
+```
+extra-substituters = https://spoolframe.cachix.org
+extra-trusted-public-keys = spoolframe.cachix.org-1:pc6sZmax6H90UErhCpOgUSoGzm0aoGDfDyWbjGtqUVs=
+```
+
+```nix
+nix.settings = {
+  extra-substituters = ["https://spoolframe.cachix.org"];
+  extra-trusted-public-keys = ["spoolframe.cachix.org-1:pc6sZmax6H90UErhCpOgUSoGzm0aoGDfDyWbjGtqUVs="];
+};
+```
+
 In the dev shell, which has the Rust toolchain, GTK 4, libadwaita and
 GStreamer:
 
