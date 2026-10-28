@@ -268,6 +268,11 @@ pub enum BackendError {
     /// in the SDK's words: the directory is full, not writable, or not set.
     #[error("downloads: {0}")]
     Downloads(String),
+    /// A paired server's item (P8-04) whose server is offline to the
+    /// user's own: it is browsed from what the user's server keeps, and
+    /// plays once that server is back.
+    #[error("its server is offline; it plays when that server is back")]
+    OriginOffline,
     #[error("{0}")]
     Other(String),
 }
@@ -491,6 +496,14 @@ pub use spoolframe_protocol::downloads::{
     DownloadSource, DownloadState, DownloadTracks, FileTracks, LeftOutSubtitle, OriginalDownload,
 };
 
+/// Federation (P8, experimental): a paired server's libraries, Home row
+/// and search hits, in the SDK's, the protocol's and the types' own
+/// shapes. A paired server's items have `fed:` ids; what plays them, and
+/// how ([`RemoteMode`]), is the backend's.
+pub use spoolframe_client_sdk::{LibrariesChanged, RemoteMode};
+pub use spoolframe_protocol::{Copies, SearchHit, ServerRow, TitleCopy};
+pub use spoolframe_types::LibraryServer;
+
 /// The most a subtitle may be moved either way (PX-03): ten minutes, ms.
 pub const MAX_SUBTITLE_OFFSET_MS: i64 = 10 * 60 * 1000;
 
@@ -523,6 +536,10 @@ pub struct ItemDetail {
     pub liked: Option<Liked>,
     /// An album's tracks among `children` that are liked.
     pub liked_children: Vec<MediaId>,
+    /// Federation (P8-05): the paired server the item is from, its
+    /// title's copies on other servers, and the copy that plays. `None`
+    /// without federation, or from a server that does not send them.
+    pub copies: Option<Copies>,
 }
 
 /// What an invite link says (P6-01), read without a word to the server:
@@ -1041,6 +1058,11 @@ pub trait Client: Send + Sync {
     /// its progress, its watch, or its removal. Made before subscribing,
     /// they are not seen: list the downloads first.
     fn download_events(&self) -> tokio::sync::broadcast::Receiver<DownloadEvent>;
+
+    /// A server's libraries changed (P8-02): a paired server came online
+    /// or went offline, or shared or stopped sharing a library. List them
+    /// again ([`Session::libraries`]).
+    fn libraries_events(&self) -> tokio::sync::broadcast::Receiver<LibrariesChanged>;
 }
 
 /// One signed-in user's view of a server: the catalog, their watch state
@@ -1726,6 +1748,42 @@ pub trait Session: Send + Sync {
     /// download of theirs there: what became of each item. One the server
     /// has newer takes the server's state on the download.
     fn sync_download_watch(&self) -> BoxFuture<'_, Result<Vec<SyncedWatch>, BackendError>>;
+
+    /// Whether the server turned federation (P8) on for this session: its
+    /// paired servers' libraries, Home rows and search hits. On does not
+    /// mean there is anything: a portable account (a guest with a portable
+    /// identity) sees nothing federated, and `NotFound` for a `fed:` id.
+    fn federation(&self) -> bool;
+
+    /// [`Session::search`] over this server and what its paired servers
+    /// share (P8-05): a title on several servers once, with where it is
+    /// from, its other copies and the copy that plays. Without federation,
+    /// this server's own items, each a hit of its own.
+    fn search_hits<'a>(
+        &'a self,
+        request: &'a SearchRequest,
+    ) -> BoxFuture<'a, Result<SearchResults<SearchHit>, BackendError>>;
+
+    /// Plays the title `title` (any copy's id) from paired server `from`,
+    /// or from this server with `None` (P8-05), for every copy of it, while
+    /// that server has one. [`BackendError::InvalidInput`] for a title on
+    /// one server only.
+    fn set_play_from<'a>(
+        &'a self,
+        title: &'a MediaId,
+        from: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<(), BackendError>>;
+
+    /// How a playback started here plays (P8-04): from a paired server
+    /// directly, or through this server; `None` for this server's own
+    /// item, or a handle that is not playing. Asks nothing.
+    ///
+    /// A `fed:` item's [`Session::start_playback`] plays it from its
+    /// server when this device reaches it in a few seconds, else through
+    /// this one; [`BackendError::OriginOffline`] when that server is
+    /// offline. The playback's reads, seeks and stop go to whichever plays
+    /// it, and its progress to this server, by the `fed:` id.
+    fn remote_mode(&self, handle: &PlaybackHandle) -> Option<RemoteMode>;
 }
 
 #[cfg(test)]

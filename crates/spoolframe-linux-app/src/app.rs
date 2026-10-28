@@ -5,6 +5,7 @@
 //! stack's root is the page the sidebar picks; a card pushes its item's page
 //! on top, with a Back button and swipe-back.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -13,6 +14,7 @@ use std::time::Duration;
 use adw::prelude::*;
 use gtk::glib;
 use relm4::{Component, ComponentParts, ComponentSender};
+use spoolframe_linux_core::backend::Copies;
 use spoolframe_linux_core::backend::{
     BackendError, ChosenTracks, Client, ConnectionState, EntryId, HomeScreen, Invite, InviteLookup,
     ItemDetail, Kinds, LanServerInfo, Liked, Person, PlaySettings, PlaylistEdit, PlaylistEvent,
@@ -526,6 +528,12 @@ pub enum Msg {
     CatalogLagged,
     /// Playlist changes were missed: read everything shown again.
     PlaylistsLagged,
+    /// A server's libraries changed (P8-02): a paired server came or went,
+    /// or shared or stopped sharing a library. Listed again, with Home.
+    LibrariesChanged,
+    /// The title (any copy's id) plays from this paired server, or from
+    /// this one (`None`), from now on (P8-05).
+    PlayFrom(MediaId, Option<String>),
     /// The playlist with this id played to its end.
     PlaylistFinished(String),
     /// A person a search found: their items.
@@ -667,14 +675,15 @@ pub enum Loaded {
     Home(Result<(HomeScreen, Vec<Album>), BackendError>),
     Person(Box<Person>, Result<(Vec<Item>, u32), BackendError>),
     /// A movie or episode, what it belongs to (an episode's show), and its
-    /// tracks for the pickers.
+    /// tracks for the pickers; the playlists holding it, and where it is
+    /// from with its title's copies (P8-05).
     Playable(
         Item,
         Option<String>,
         Result<MediaTracks, BackendError>,
         Option<ChosenTracks>,
         Option<Box<Item>>,
-        Vec<PlaylistRef>,
+        (Vec<PlaylistRef>, Option<Box<Copies>>),
     ),
     /// A show, its seasons with their episodes, and the season to open on
     /// ("Go to season"), if one was asked for.
@@ -874,8 +883,8 @@ impl Component for App {
             },
         });
         sidebar.fill(
-            sidebar::rows(0, sidebar::Playlists::Off, true),
-            &[],
+            sidebar::rows(&[], &Default::default(), sidebar::Playlists::Off, true),
+            (&[], ""),
             &[],
             &pinned_actions,
             None,
@@ -1228,6 +1237,7 @@ impl Component for App {
                 open_person: None,
                 add_to_playlist: None,
                 hearts: None,
+                servers: Default::default(),
             }),
             connection_watch: None,
             sign_out_watch: None,
@@ -1278,6 +1288,7 @@ impl Component for App {
         // Downloads are this computer's, not a session's: heard from the
         // start, whoever signs in, and listed once heard so none is missed.
         model.watch_downloads(&sender);
+        model.watch_libraries(&sender);
         model.list_downloads(&sender);
         model.load_servers(&sender);
         // Invite links the desktop opened before the window was up.
@@ -1866,6 +1877,15 @@ impl Component for App {
             }
             Msg::Select(Row::Pinned(id)) => self.open_playlist(id, PlaylistPlace::Library, &sender),
             Msg::Select(Row::NothingPinned) => {}
+            // A server's heading folds or unfolds its libraries (P8).
+            Msg::Select(Row::Server(key)) => {
+                widgets
+                    .sidebar
+                    .folds
+                    .borrow_mut()
+                    .toggle(&key, &self.libraries);
+                self.fill_sidebar(widgets);
+            }
             Msg::Select(Row::Library(index)) => {
                 let Some(library) = self.libraries.get(index).cloned() else {
                     return;
@@ -1878,7 +1898,10 @@ impl Component for App {
                 plain_header(widgets);
                 self.library = Some(library.clone());
                 widgets.stack.pop_to_page(&widgets.root_page);
-                widgets.root_page.set_title(&library.title);
+                // A paired server's: "Bob's Media › Movies" (Browse).
+                widgets
+                    .root_page
+                    .set_title(&crate::federation::library_title(&library));
                 show_content(widgets);
                 clear(&widgets.content);
                 // Pulsing blank posters until the first page arrives, so
@@ -2397,6 +2420,19 @@ impl Component for App {
                 if self.shown_playlist_id(widgets).as_ref() == Some(&id) {
                     self.reload_playlist(id, &sender);
                 }
+            }
+            Msg::PlayFrom(title, from) => {
+                let Some(session) = self.session.clone() else {
+                    return;
+                };
+                self.command(&sender, async move {
+                    Loaded::Saved(session.set_play_from(&title, from.as_deref()).await)
+                });
+            }
+            Msg::LibrariesChanged => {
+                self.clear_catalog();
+                self.load_libraries(&sender);
+                self.load_home(&sender);
             }
             Msg::PlaylistsLagged => {
                 self.clear_catalog();
@@ -3117,6 +3153,13 @@ impl Component for App {
                 None => toast(widgets, &e),
             },
             Loaded::Libraries(Ok(libraries)) => {
+                // A library a paired server stopped sharing says so, and
+                // that the places in it stay (States 2).
+                let home = self.cards.servers.home();
+                for gone in crate::federation::unshared(&self.libraries, &libraries) {
+                    toast_text(widgets, &crate::federation::unshared_text(&gone, &home));
+                }
+                self.cards.servers.learn(&libraries);
                 // Fetched ahead, so opening one rarely waits.
                 if let Some(cache) = &self.library_cache {
                     for library in &libraries {
@@ -3143,7 +3186,15 @@ impl Component for App {
                     rows.push(views::row(
                         "Continue watching",
                         home.continue_watching.iter().map(|i| {
-                            views::continue_card(i, cards, views::Shelf::ContinueWatching)
+                            let card =
+                                views::continue_card(i, cards, views::Shelf::ContinueWatching);
+                            // A library no longer shared (P8-02): shown, its
+                            // place kept, but not played.
+                            if home.unavailable.contains(i.id()) {
+                                card.set_sensitive(false);
+                                card.set_tooltip_text(Some("No longer shared with you"));
+                            }
+                            card
                         }),
                     ));
                 }
@@ -3153,6 +3204,20 @@ impl Component for App {
                         home.next_up
                             .iter()
                             .map(|i| views::continue_card(i, cards, views::Shelf::NextUp)),
+                    ));
+                }
+                // Each paired server's row (P8-02, Home), its badge by the
+                // heading; one turned off, or with nothing, is left out.
+                for row in home
+                    .servers
+                    .iter()
+                    .filter(|r| r.shown && !r.items.is_empty())
+                {
+                    let badge = crate::federation_view::badge(&row.server, false);
+                    rows.push(views::row_with(
+                        &format!("New on {}", row.server.name),
+                        Some(badge.upcast_ref()),
+                        row.items.iter().map(|i| views::poster_card(i, cards)),
                     ));
                 }
                 // Albums, as the board has the row: a track card would
@@ -3188,7 +3253,7 @@ impl Component for App {
                 ),
             ),
             Loaded::Person(person, Err(e)) => push_error(widgets, &person.name, &e, None),
-            Loaded::Playable(item, context, tracks, chosen, next, refs) => {
+            Loaded::Playable(item, context, tracks, chosen, next, (refs, copies)) => {
                 // An episode's page is titled with its season, as designed.
                 let title = match &item {
                     Item::Episode(e) => views::season_name(e.season),
@@ -3199,14 +3264,41 @@ impl Component for App {
                 let tracks = tracks
                     .inspect_err(|e| tracing::warn!(error = %e, "no track list"))
                     .ok();
+                // What plays (P8-05): the item, or the copy picked for its
+                // title; a pick on the page changes it at once.
+                let playing = Rc::new(RefCell::new(crate::federation::playing_copy(
+                    &item,
+                    copies.as_deref(),
+                )));
                 let play: pages::Play = {
-                    let (sender, item, tracks) = (sender.clone(), item.clone(), tracks.clone());
+                    let (sender, playing, tracks) =
+                        (sender.clone(), playing.clone(), tracks.clone());
                     Rc::new(move |from, selection, quality| {
+                        let item = playing.borrow().clone();
                         sender.input(Msg::Play(Box::new(
-                            PlayRequest::one(item.clone(), from, selection, tracks.clone())
+                            PlayRequest::one(item, from, selection, tracks.clone())
                                 .at_quality(quality),
                         )))
                     })
+                };
+                let server = self.cards.servers.of(item.id());
+                let notes =
+                    self.item_notes(&item, server.as_ref(), copies.as_deref(), &playing, &sender);
+                // An offline server's copy is browsed, not played (States
+                // 1); with another copy picked, that one plays.
+                let playable = self
+                    .cards
+                    .servers
+                    .of(playing.borrow().id())
+                    .is_none_or(|s| s.online);
+                // A paired item's place is said by the notes; its context
+                // is where it is shared from (Item).
+                let context = match (&item, &server) {
+                    (Item::Movie(_), Some(server)) => Some(crate::federation::shared_by(
+                        &server.name,
+                        crate::federation::library_of(&item, &self.libraries),
+                    )),
+                    _ => context,
                 };
                 let id = item.id().clone();
                 let actions = pages::PlayableActions {
@@ -3228,8 +3320,9 @@ impl Component for App {
                     subtitles: self.subtitle_actions(&item, &sender),
                 };
                 // Download is offered with a server (PX-38); downloads
-                // already made show on the Downloads page either way.
-                let download = self.session.is_some().then(|| {
+                // already made show on the Downloads page either way. Not
+                // for a paired server's item: the boards offer none.
+                let download = (self.session.is_some() && server.is_none()).then(|| {
                     let open: Rc<dyn Fn()> = {
                         let (sender, item) = (sender.clone(), item.clone());
                         Rc::new(move || {
@@ -3251,6 +3344,8 @@ impl Component for App {
                         next: next.as_deref(),
                         playlists: self.playlist_rows(&refs, &sender).as_ref(),
                         download: download.as_deref(),
+                        notes: notes.as_ref().map(|n| n.upcast_ref()),
+                        playable,
                     },
                     cards,
                 );
@@ -3921,6 +4016,14 @@ impl App {
                     Rc::new(move |id| ask.input(Msg::AskHeart(id))),
                 )
             }),
+            // This server's paired ones (P8), as its libraries name them.
+            servers: {
+                let servers = Rc::new(crate::federation::Servers::default());
+                if let Some(server) = &self.server {
+                    servers.set_home(&server.name);
+                }
+                servers
+            },
         });
         // Its downloads are the ones shown now (PX-60): picked, switched
         // to, or opened at start.
@@ -3994,6 +4097,20 @@ impl App {
                 }
             }
         }));
+    }
+
+    /// Hears a server's libraries change (P8-02), for as long as the app
+    /// runs: the paired servers' come with the server's own, and change
+    /// as those servers come and go. Missed changes list them again too.
+    fn watch_libraries(&self, sender: &ComponentSender<Self>) {
+        let mut events = self.client.libraries_events();
+        let sender = sender.clone();
+        glib::spawn_future_local(async move {
+            use tokio::sync::broadcast::error::RecvError;
+            while let Ok(_) | Err(RecvError::Lagged(_)) = events.recv().await {
+                sender.input(Msg::LibrariesChanged);
+            }
+        });
     }
 
     /// Hears this computer's downloads change (PX-38), for as long as the
@@ -4284,10 +4401,12 @@ impl App {
             (Some(_), None) => sidebar::Playlists::Loading,
             (Some(_), Some(list)) => sidebar::Playlists::Listed(list),
         };
+        let folds = widgets.sidebar.folds.borrow().clone();
+        let home = self.cards.servers.home();
         widgets.sidebar.fill(
             // Downloads are this computer's: their row is always there.
-            sidebar::rows(self.libraries.len(), state, true),
-            &self.libraries,
+            sidebar::rows(&self.libraries, &folds, state, true),
+            (&self.libraries, &home),
             listed.unwrap_or_default(),
             &self.pinned_actions,
             self.cards.art.as_ref(),
@@ -4353,6 +4472,52 @@ impl App {
             "Playlists",
             playlists::section(list, &actions, self.cards.art.as_ref(), browse),
         );
+    }
+
+    /// A movie's or an episode's federation notes (P8, Item and States):
+    /// how a paired server's item plays, where the place is kept, and its
+    /// title's copies to play from. A pick plays from that copy at once,
+    /// and the server remembers it for the title.
+    fn item_notes(
+        &self,
+        item: &Item,
+        server: Option<&spoolframe_linux_core::backend::LibraryServer>,
+        copies: Option<&Copies>,
+        playing: &Rc<RefCell<Item>>,
+        sender: &ComponentSender<Self>,
+    ) -> Option<gtk::Box> {
+        let choices = copies
+            .map(|c| crate::federation::choices(item.id(), c))
+            .unwrap_or_default();
+        let pick: Rc<dyn Fn(Option<String>)> = {
+            let (sender, item, playing) = (sender.clone(), item.clone(), playing.clone());
+            let choices = choices.clone();
+            Rc::new(move |from| {
+                let Some(choice) = choices
+                    .iter()
+                    .find(|c| c.server.as_ref().map(|s| &s.server_id) == from.as_ref())
+                else {
+                    return;
+                };
+                let picked = Copies {
+                    origin: None,
+                    also_on: Vec::new(),
+                    play_from: choice.id.clone(),
+                };
+                playing.replace(crate::federation::playing_copy(&item, Some(&picked)));
+                sender.input(Msg::PlayFrom(item.id().clone(), from));
+            })
+        };
+        let home = self.cards.servers.home();
+        let facts = views::Facts::of(item);
+        crate::federation_view::item_notes(crate::federation_view::ItemNotes {
+            server,
+            home: &home,
+            position: facts.position(),
+            title: &facts.title,
+            choices,
+            pick,
+        })
     }
 
     /// An item page's Playlists: those holding it, if any and the server
@@ -4524,6 +4689,7 @@ impl App {
         sender: &ComponentSender<Self>,
     ) {
         playback.set_server_name(&self.server_name());
+        playback.set_servers(self.cards.servers.clone());
         playback.set_skip_intros(self.settings.skip_intros());
         // A queued item that cannot play is passed over with a word, not
         // a stop (P1-23).
@@ -4655,6 +4821,14 @@ impl App {
     /// Stops what plays, closing the full player and the bar.
     fn stop_playback(&mut self, widgets: &mut AppWidgets) {
         if let Some(playback) = self.playback.take() {
+            // A paired server's item (P8-03, States 5): its place is this
+            // server's, and resumes anywhere.
+            if let (Some((_, _, home)), Some(item)) = (playback.remote_path(), playback.current())
+                && playback.position() > Duration::ZERO
+            {
+                let title = views::Facts::of(&item).title;
+                toast_text(widgets, &crate::federation::kept_toast(&title, &home));
+            }
             // A download plays alone: the queue from before waits for the
             // next playback.
             if !playback.is_local() {
@@ -5181,6 +5355,7 @@ impl App {
                         playlists,
                         liked,
                         liked_children,
+                        ..
                     }) => (full, Ok(children), playlists, liked.map(|_| liked_children)),
                     Ok(detail) => (
                         album,
@@ -5389,10 +5564,13 @@ async fn tracks_of(session: &dyn Session, item: Item) -> Result<Vec<AlbumTracks>
 
 /// `item` as the server has it now, with its watch state; the copy given
 /// when the server cannot say.
-async fn fresh(session: &dyn Session, item: Item) -> (Item, Vec<PlaylistRef>) {
+async fn fresh(
+    session: &dyn Session,
+    item: Item,
+) -> (Item, (Vec<PlaylistRef>, Option<Box<Copies>>)) {
     match session.item_detail(item.id()).await {
-        Ok(detail) => (detail.item, detail.playlists),
-        Err(_) => (item, Vec::new()),
+        Ok(detail) => (detail.item, (detail.playlists, detail.copies.map(Box::new))),
+        Err(_) => (item, (Vec::new(), None)),
     }
 }
 
@@ -6203,7 +6381,7 @@ mod tests {
                 Err(error.clone()),
                 None,
                 None,
-                Vec::new(),
+                (Vec::new(), None),
             );
             assert_eq!(loaded.session_error(), Some(&error));
         }

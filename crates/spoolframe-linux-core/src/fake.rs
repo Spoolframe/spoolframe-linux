@@ -55,12 +55,14 @@ use crate::backend::{ItemFilter, ItemFilterValues, ItemSort};
 
 mod browse;
 mod downloads;
+mod federation;
 mod playlists;
 mod subtitles;
 
 use crate::backend::{SubtitleDownloaded, SubtitleSearch, SubtitleSync, SubtitleTiming};
 
 pub use downloads::{FILE_SIZE as DOWNLOAD_FILE_SIZE, SPACE_AVAILABLE as DOWNLOAD_SPACE};
+pub use federation::{BOBS_MEDIA, DAVES_DEN};
 pub use playlists::PAGE_LIMIT as PLAYLIST_PAGE_LIMIT;
 pub use subtitles::{QUOTA_RESETS_AT, Sites};
 
@@ -211,6 +213,8 @@ struct Catalog {
     /// What a sort and a filter read of each top-level item beyond its
     /// own fields (SDK 0.16).
     facts: HashMap<MediaId, browse::Facts>,
+    /// The paired servers and what they share (P8), with federation.
+    fed: federation::Paired,
 }
 
 impl Catalog {
@@ -223,6 +227,7 @@ impl Catalog {
             recently_added: Vec::new(),
             people: Vec::new(),
             facts: HashMap::new(),
+            fed: federation::Paired::default(),
         };
 
         let mut alien = movie("1", "Alien", 1979, 117);
@@ -735,6 +740,8 @@ pub struct FakeSession {
     subtitles: Arc<Mutex<subtitles::Store>>,
     /// This device's downloads (PX-38), which outlive the server.
     downloads: Arc<Mutex<downloads::Store>>,
+    /// Federation (P8): the paired servers' state, the server's.
+    federation: Arc<Mutex<federation::Store>>,
 }
 
 /// What this device keeps saved, shared by the client and its sessions.
@@ -916,6 +923,8 @@ struct Stores {
     subtitles: Arc<Mutex<subtitles::Store>>,
     /// This device's downloads (PX-38).
     downloads: Arc<Mutex<downloads::Store>>,
+    /// Federation (P8): the paired servers' state.
+    federation: Arc<Mutex<federation::Store>>,
 }
 
 impl FakeSession {
@@ -934,6 +943,7 @@ impl FakeSession {
             playlists,
             subtitles,
             downloads,
+            federation,
         } = stores;
         // Alice has a PIN, asked for here, so the fake opens her locked.
         let pin = match username {
@@ -969,6 +979,7 @@ impl FakeSession {
             playlists,
             subtitles,
             downloads,
+            federation,
         };
         {
             let mut watch = session.watch();
@@ -1022,6 +1033,67 @@ impl FakeSession {
         self.watch.lock().expect("fake state is never poisoned")
     }
 
+    fn lock_federation(&self) -> std::sync::MutexGuard<'_, federation::Store> {
+        self.federation
+            .lock()
+            .expect("fake state is never poisoned")
+    }
+
+    /// Whether this session sees paired servers' items (P8): with
+    /// federation on, and not as a portable account, which since 0.16.1
+    /// sees nothing federated.
+    fn sees_paired(&self) -> bool {
+        self.lock_federation().on && self.username != FAKE_GUEST
+    }
+
+    /// Whether `library` is listed: this server's own, or a paired
+    /// server's it still shares, to a session that sees them.
+    fn sees_library(&self, library: &Library) -> bool {
+        library.server.is_none()
+            || (self.sees_paired() && !self.lock_federation().unshared.contains(&library.id))
+    }
+
+    /// Whether `id` is found: this server's own, or a paired server's in
+    /// a library it still shares, to a session that sees them.
+    fn sees(&self, id: &MediaId) -> bool {
+        if id.namespace() != Namespace::Federated {
+            return true;
+        }
+        let shared = match self.catalog.fed.library_of.get(id) {
+            Some(library) => !self.lock_federation().unshared.contains(library),
+            None => true,
+        };
+        self.sees_paired() && shared
+    }
+
+    /// The catalog's `id`, as this session finds it.
+    fn seen(&self, id: &MediaId) -> Result<&Item, BackendError> {
+        if !self.sees(id) {
+            return Err(BackendError::NotFound(id.to_string()));
+        }
+        self.catalog.get(id)
+    }
+
+    /// `library` and its items, as this session finds it.
+    fn library(&self, library: &LibraryId) -> Result<&(Library, Vec<MediaId>), BackendError> {
+        self.catalog
+            .libraries
+            .iter()
+            .find(|(l, _)| &l.id == library && self.sees_library(l))
+            .ok_or_else(|| BackendError::NotFound(library.to_string()))
+    }
+
+    /// A paired server's item, unplayable while its server is offline to
+    /// this one (P8-04).
+    fn reachable(&self, id: &MediaId) -> Result<(), BackendError> {
+        match id.origin() {
+            Some(origin) if self.lock_federation().offline.contains(origin) => {
+                Err(BackendError::OriginOffline)
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// The item with this user's playback state filled in.
     fn with_state(&self, item: &Item, watch: &WatchState) -> Item {
         let mut item = item.clone();
@@ -1068,12 +1140,7 @@ impl FakeSession {
         library: &LibraryId,
     ) -> Result<(LibraryKind, Vec<browse::Browsed>), BackendError> {
         use spoolframe_types::WatchedState;
-        let (library, ids) = self
-            .catalog
-            .libraries
-            .iter()
-            .find(|(l, _)| &l.id == library)
-            .ok_or_else(|| BackendError::NotFound(library.to_string()))?;
+        let (library, ids) = self.library(library)?;
         let watch = self.watch();
         let browsed = ids
             .iter()
@@ -1191,12 +1258,54 @@ impl FakeSession {
         let shown = |id: &MediaId| !hidden.contains(id);
         let continue_ids: Vec<MediaId> = continue_ids.into_iter().filter(|id| shown(id)).collect();
         let next_up: Vec<MediaId> = next_up.into_iter().filter(|id| shown(id)).collect();
+        // Federation (P8-02): what a library no longer shared held stays
+        // in the rows, marked unavailable; each paired server has its row.
+        let paired = self.sees_paired();
+        let unavailable = continue_ids
+            .iter()
+            .chain(&next_up)
+            .filter(|id| paired && id.namespace() == Namespace::Federated && !self.sees(id))
+            .cloned()
+            .collect();
+        let servers = match paired {
+            false => Vec::new(),
+            true => {
+                let store = self.lock_federation();
+                let rows: Vec<(spoolframe_types::LibraryServer, Vec<MediaId>)> = self
+                    .catalog
+                    .fed
+                    .servers
+                    .iter()
+                    .map(|server| {
+                        let recent = self.catalog.fed.recent.get(&server.server_id);
+                        (store.now(server), recent.cloned().unwrap_or_default())
+                    })
+                    .collect();
+                drop(store);
+                rows.into_iter()
+                    .map(|(server, recent)| {
+                        let shared: Vec<MediaId> =
+                            recent.into_iter().filter(|id| self.sees(id)).collect();
+                        crate::backend::ServerRow {
+                            server,
+                            shown: true,
+                            items: self.items_with_state(&shared),
+                        }
+                    })
+                    .collect()
+            }
+        };
+        // A portable account sees nothing federated, its rows included.
+        let continue_ids: Vec<MediaId> = continue_ids
+            .into_iter()
+            .filter(|id| paired || id.namespace() != Namespace::Federated)
+            .collect();
         HomeScreen {
             continue_watching: self.items_with_state(&continue_ids),
             next_up: self.items_with_state(&next_up),
             recently_added: self.items_with_state(&self.catalog.recently_added),
-            unavailable: Vec::new(),
-            servers: Vec::new(),
+            unavailable,
+            servers,
         }
     }
 
@@ -1549,11 +1658,21 @@ impl Session for FakeSession {
     fn libraries(&self) -> BoxFuture<'_, Result<Vec<Library>, BackendError>> {
         Box::pin(async move {
             self.catalog()?;
-            Ok(self
+            // A paired server's (P8-02), with whether it is online now.
+            let store = self.lock_federation();
+            let listed: Vec<Library> = self
                 .catalog
                 .libraries
                 .iter()
-                .map(|(l, _)| l.clone())
+                .map(|(l, _)| Library {
+                    server: l.server.as_ref().map(|s| store.now(s)),
+                    ..l.clone()
+                })
+                .collect();
+            drop(store);
+            Ok(listed
+                .into_iter()
+                .filter(|l| self.sees_library(l))
                 .collect())
         })
     }
@@ -1566,12 +1685,7 @@ impl Session for FakeSession {
     ) -> BoxFuture<'a, Result<(Vec<Item>, u32), BackendError>> {
         Box::pin(async move {
             self.catalog()?;
-            let (_, ids) = self
-                .catalog
-                .libraries
-                .iter()
-                .find(|(l, _)| &l.id == library)
-                .ok_or_else(|| BackendError::NotFound(library.to_string()))?;
+            let (_, ids) = self.library(library)?;
             let page: Vec<MediaId> = ids
                 .iter()
                 .skip(offset as usize)
@@ -1627,7 +1741,7 @@ impl Session for FakeSession {
     ) -> BoxFuture<'a, Result<(Item, Vec<Item>), BackendError>> {
         Box::pin(async move {
             self.catalog()?;
-            let item = self.catalog.get(id)?;
+            let item = self.seen(id)?;
             let item = self.with_state(item, &self.watch());
             let children = self.catalog.children.get(id).cloned().unwrap_or_default();
             Ok((item, self.items_with_state(&children)))
@@ -1670,12 +1784,19 @@ impl Session for FakeSession {
                 .collect();
             held.insert(id.clone());
             let playlists = store.holding(&held, self.viewer());
+            drop(store);
+            // Where it is from and its title's other copies (P8-05), to a
+            // session that sees paired servers.
+            let copies = self
+                .sees_paired()
+                .then(|| self.catalog.copies(id, &self.lock_federation()));
             Ok(ItemDetail {
                 item,
                 children,
                 playlists,
                 liked: heart,
                 liked_children,
+                copies,
             })
         })
     }
@@ -1687,9 +1808,16 @@ impl Session for FakeSession {
         Box::pin(async move {
             self.catalog()?;
             let mut results = search::run(&self.catalog, request);
-            // As the server answers: with this user's watch state.
+            // As the server answers: with this user's watch state, and
+            // only what this session sees (P8).
             let stated = |items: &[Item]| {
-                self.items_with_state(&items.iter().map(|i| i.id().clone()).collect::<Vec<_>>())
+                self.items_with_state(
+                    &items
+                        .iter()
+                        .map(|i| i.id().clone())
+                        .filter(|id| self.sees(id))
+                        .collect::<Vec<_>>(),
+                )
             };
             results.top = match results.top {
                 Some(TopResult::Item(top)) => stated(&[top]).pop().map(TopResult::Item),
@@ -1728,7 +1856,7 @@ impl Session for FakeSession {
     }
 
     fn tracks<'a>(&'a self, id: &'a MediaId) -> BoxFuture<'a, Result<MediaTracks, BackendError>> {
-        Box::pin(async move { Ok(self.tracks_of(self.catalog.get(id)?)) })
+        Box::pin(async move { Ok(self.tracks_of(self.seen(id)?)) })
     }
 
     fn playback_plan<'a>(
@@ -1737,7 +1865,7 @@ impl Session for FakeSession {
         selection: Option<Selection>,
     ) -> BoxFuture<'a, Result<(PlaybackPlan, Option<ChosenTracks>), BackendError>> {
         Box::pin(async move {
-            let item = self.catalog.get(id)?;
+            let item = self.seen(id)?;
             let tracks = self.tracks_of(item);
             let chosen = selection.is_none().then(|| self.choose(item, &tracks));
             let effective = selection
@@ -1760,7 +1888,8 @@ impl Session for FakeSession {
                 .lock()
                 .expect("fake state is never poisoned")
                 .push(options.display);
-            let item = self.catalog.get(id)?;
+            let item = self.seen(id)?;
+            self.reachable(id)?;
             let tracks = self.tracks_of(item);
             let (_, size) = self.media_size()?;
             let chosen = selection.is_none().then(|| self.choose(item, &tracks));
@@ -1788,6 +1917,16 @@ impl Session for FakeSession {
                         counted: false,
                     },
                 );
+            // A paired server's item (P8-04) plays from it when this
+            // device reaches it, else through this server.
+            if id.namespace() == Namespace::Federated {
+                let mut store = self.lock_federation();
+                let mode = match store.direct {
+                    true => crate::backend::RemoteMode::Direct,
+                    false => crate::backend::RemoteMode::Proxied,
+                };
+                store.modes.insert(handle.clone(), mode);
+            }
             // A chosen bitrate converts the fake's file, as one that
             // exceeds it would be (P6-06).
             let capped = matches!(quality, crate::backend::PlaybackQuality::Bitrate(_));
@@ -1880,6 +2019,7 @@ impl Session for FakeSession {
                 .lock()
                 .expect("fake state is never poisoned")
                 .remove(handle);
+            self.lock_federation().modes.remove(handle);
             Ok(())
         })
     }
@@ -3125,6 +3265,90 @@ impl Session for FakeSession {
         })
     }
 
+    fn federation(&self) -> bool {
+        self.lock_federation().on
+    }
+
+    /// As the server answers a client that names federation (P8-05): a
+    /// title on two servers is one hit, Home Media's copy, when both are
+    /// found in its group; without federation, plain hits of its own.
+    fn search_hits<'a>(
+        &'a self,
+        request: &'a SearchRequest,
+    ) -> BoxFuture<'a, Result<SearchResults<crate::backend::SearchHit>, BackendError>> {
+        Box::pin(async move {
+            let results = self.search(request).await?;
+            let on = self.sees_paired();
+            let store = self.lock_federation();
+            let hit = |item: Item| {
+                let copies = match on {
+                    true => self.catalog.copies(item.id(), &store),
+                    false => crate::backend::Copies {
+                        origin: None,
+                        also_on: Vec::new(),
+                        play_from: item.id().clone(),
+                    },
+                };
+                crate::backend::SearchHit::new(item, copies)
+            };
+            let mut hits = results.map(hit);
+            // The paired copy goes where Home Media's is found: the top
+            // match, or any group.
+            let top = hits.top.iter().filter_map(|t| match t {
+                TopResult::Item(hit) => Some(hit.item.id().clone()),
+                TopResult::Person(_) => None,
+            });
+            let found: Vec<MediaId> = top
+                .chain(
+                    hits.groups
+                        .iter()
+                        .flat_map(|g| g.items.iter().map(|h| h.item.id().clone())),
+                )
+                .collect();
+            for group in &mut hits.groups {
+                group.items.retain(|h| {
+                    h.origin.is_none()
+                        || !h
+                            .also_on
+                            .iter()
+                            .any(|c| c.server.is_none() && found.contains(&c.id))
+                });
+            }
+            Ok(hits)
+        })
+    }
+
+    fn set_play_from<'a>(
+        &'a self,
+        title: &'a MediaId,
+        from: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async move {
+            self.catalog()?;
+            if !self.lock_federation().on {
+                return Err(BackendError::Unsupported("federation".into()));
+            }
+            self.seen(title)?;
+            let copies = self.catalog.copies_of(title);
+            if copies.len() < 2 {
+                return Err(BackendError::InvalidInput(format!(
+                    "{title} has one copy: there is nothing to play it from but its own"
+                )));
+            }
+            if !copies.iter().any(|c| c.origin() == from) {
+                return Err(BackendError::NotFound(from.unwrap_or("this server").into()));
+            }
+            self.lock_federation()
+                .play_from
+                .insert(copies[0].clone(), from.map(str::to_owned));
+            Ok(())
+        })
+    }
+
+    fn remote_mode(&self, handle: &PlaybackHandle) -> Option<crate::backend::RemoteMode> {
+        self.lock_federation().modes.get(handle).copied()
+    }
+
     fn begin_passkey_registration(&self) -> BoxFuture<'_, Result<PasskeyCreation, BackendError>> {
         Box::pin(async move {
             self.guard()?;
@@ -3540,6 +3764,8 @@ pub struct FakeClient {
     /// This device's downloads (PX-38): not the server's, so they stay
     /// when it goes away.
     downloads: Arc<Mutex<downloads::Store>>,
+    /// Federation (P8): the paired servers' state, the server's.
+    federation: Arc<Mutex<federation::Store>>,
 }
 
 /// How the fake answers a sign-in a phone approves.
@@ -3762,6 +3988,7 @@ impl FakeClient {
             playlists: Arc::new(Mutex::new(seeded_playlists())),
             subtitles: Arc::new(Mutex::new(subtitles::Store::new(&home_media().0))),
             downloads: Arc::new(Mutex::new(downloads::Store::new())),
+            federation: Arc::new(Mutex::new(federation::Store::new())),
         }
     }
 
@@ -3823,6 +4050,48 @@ impl FakeClient {
 
     fn lock_downloads(&self) -> std::sync::MutexGuard<'_, downloads::Store> {
         self.downloads.lock().expect("fake state is never poisoned")
+    }
+
+    /// Federation (P8) on: Home Media is paired with Bob's Media, online,
+    /// and Dave's Den, offline, and lists their libraries with its own.
+    /// Before any session is made.
+    pub fn with_federation(mut self) -> Self {
+        self.catalog = Arc::new(Catalog::federated());
+        self.lock_federation().on = true;
+        self
+    }
+
+    /// This device cannot reach a paired server itself (P8-04): its items
+    /// play through Home Media.
+    pub fn without_direct_path(self) -> Self {
+        self.lock_federation().direct = false;
+        self
+    }
+
+    /// Paired server `server_id` went offline to Home Media, or came back
+    /// (P8-02); told on `libraries_events`.
+    pub fn set_paired_online(&self, server_id: &str, online: bool) {
+        let mut store = self.lock_federation();
+        match online {
+            true => store.offline.remove(server_id),
+            false => store.offline.insert(server_id.to_owned()),
+        };
+        store.changed(&home_media().0);
+    }
+
+    /// A paired server stopped sharing `library` (P8-02): it is no longer
+    /// listed, its items are not found, and those in Home's rows are
+    /// unavailable. Told on `libraries_events`.
+    pub fn stop_sharing(&self, library: &LibraryId) {
+        let mut store = self.lock_federation();
+        store.unshared.insert(library.clone());
+        store.changed(&home_media().0);
+    }
+
+    fn lock_federation(&self) -> std::sync::MutexGuard<'_, federation::Store> {
+        self.federation
+            .lock()
+            .expect("fake state is never poisoned")
     }
 
     /// `item`'s file can no longer be read (a drive offline): it stays in
@@ -4061,6 +4330,7 @@ impl FakeClient {
                             playlists: self.playlists.clone(),
                             subtitles: self.subtitles.clone(),
                             downloads: self.downloads.clone(),
+                            federation: self.federation.clone(),
                         },
                     ),
                 ))
@@ -5136,6 +5406,12 @@ impl Client for FakeClient {
 
     fn download_events(&self) -> tokio::sync::broadcast::Receiver<DownloadEvent> {
         self.lock_downloads().subscribe()
+    }
+
+    fn libraries_events(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::backend::LibrariesChanged> {
+        self.lock_federation().subscribe()
     }
 }
 

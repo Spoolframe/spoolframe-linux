@@ -82,6 +82,12 @@ pub struct Under<'a> {
     /// Its Download action (PX-38): a button beside Resume, and the
     /// download's state under them. None with no server.
     pub download: Option<&'a crate::downloads::ItemDownload>,
+    /// Federation's notes (P8, Item and States): how a paired item plays,
+    /// where the place is kept, and its title's Play from list.
+    pub notes: Option<&'a gtk::Widget>,
+    /// Whether the copy that plays can play now: not while its paired
+    /// server is offline (States 1).
+    pub playable: bool,
 }
 
 /// What an album's page does with its tracks.
@@ -129,6 +135,8 @@ pub fn playable(
         next,
         playlists,
         download,
+        notes,
+        playable,
     } = under;
     let facts = Facts::of(item);
     let (title, summary, cast) = match item {
@@ -216,6 +224,14 @@ pub fn playable(
         )
     });
     let buttons = playback_buttons(&facts, &actions, pickers.clone());
+    // An offline server's item is browsed, not played (States 1).
+    if !playable {
+        let mut child = buttons.first_child();
+        while let Some(button) = child {
+            child = button.next_sibling();
+            button.set_sensitive(false);
+        }
+    }
     if let Some(download) = download {
         buttons.append(&download.button);
     }
@@ -230,6 +246,9 @@ pub fn playable(
     info.append(&buttons);
     if let Some(download) = download {
         info.append(&download.status);
+    }
+    if let Some(notes) = notes {
+        info.append(notes);
     }
     if let Some(pickers) = &pickers {
         info.append(&pickers.column);
@@ -273,6 +292,8 @@ pub fn playable(
         &[ArtworkKind::Poster],
         ArtworkSize::Medium,
     );
+    // A paired server's item has its badge (P8, Item).
+    crate::federation_view::badge_tile(&poster, cards.servers.of(item.id()).as_ref());
     poster.set_halign(gtk::Align::Start);
     poster.set_valign(gtk::Align::Start);
     poster.set_margin_start(48);

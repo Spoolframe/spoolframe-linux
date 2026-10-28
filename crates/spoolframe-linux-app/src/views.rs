@@ -44,6 +44,9 @@ pub struct Cards {
     pub add_to_playlist: Option<AddToPlaylist>,
     /// Hearts on tracks and albums (PX-43); none without Liked.
     pub hearts: Option<Rc<crate::hearts::Hearts>>,
+    /// The servers a card names (P8): a paired server's item has its
+    /// badge, and its Continue watching card says where it plays.
+    pub servers: Rc<crate::federation::Servers>,
 }
 
 /// Opens "Add to playlist" for an item.
@@ -104,6 +107,15 @@ pub(crate) const TILE_HUES: [&str; 8] = [
 /// in the heading. The wheel over the row scrolls the row (see
 /// [`wheel_scrolls_row`]); elsewhere it scrolls the page.
 pub fn row(title: &str, cards: impl IntoIterator<Item = gtk::Widget>) -> gtk::Box {
+    row_with(title, None, cards)
+}
+
+/// [`row`] with `badge` after its heading: a paired server's (P8, Home).
+pub fn row_with(
+    title: &str,
+    badge: Option<&gtk::Widget>,
+    cards: impl IntoIterator<Item = gtk::Widget>,
+) -> gtk::Box {
     // Cards keep their own width: a caption's hexpand would otherwise
     // stretch a lone card across the row.
     let cards_box = gtk::Box::builder()
@@ -126,7 +138,17 @@ pub fn row(title: &str, cards: impl IntoIterator<Item = gtk::Widget>) -> gtk::Bo
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     // In line with the cards, which sit inside the row's side room.
     header.set_margin_start(LIFT_SIDE);
-    header.append(&heading(title));
+    let heading = heading(title);
+    if let Some(badge) = badge {
+        // The badge sits by the heading; the buttons stay at the end.
+        heading.set_hexpand(false);
+        badge.set_hexpand(true);
+        badge.set_halign(gtk::Align::Start);
+        header.append(&heading);
+        header.append(badge);
+    } else {
+        header.append(&heading);
+    }
     header.append(&back);
     header.append(&forward);
 
@@ -306,15 +328,20 @@ pub fn continue_card(item: &Item, cards: &Cards, shelf: Shelf) -> gtk::Widget {
     let below = gtk::Box::new(gtk::Orientation::Vertical, 2);
     let first = caption_label(&facts.caption(), &["card-caption"]);
     let line = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let left = facts
+    let remaining = facts
         .length
         .zip(facts.position())
-        .map(|(length, position)| {
-            gtk::Label::builder()
-                .label(format::remaining(length, position))
-                .css_classes(["dim-label", "small-text"])
-                .build()
-        });
+        .map(|(length, position)| format::remaining(length, position));
+    // A paired server's item (Home, States 5): its badge, and a line of its
+    // own for where it plays and where the place is kept.
+    let server = cards.servers.of(item.id());
+    crate::federation_view::badge_tile(&tile, server.as_ref());
+    let left = remaining.as_ref().filter(|_| server.is_none()).map(|left| {
+        gtk::Label::builder()
+            .label(left)
+            .css_classes(["dim-label", "small-text"])
+            .build()
+    });
     match facts.episode_line() {
         Some(episode) => {
             below.append(&first);
@@ -331,6 +358,11 @@ pub fn continue_card(item: &Item, cards: &Cards, shelf: Shelf) -> gtk::Widget {
         line.append(left);
     }
     below.append(&line);
+    if let Some(server) = &server {
+        let home = cards.servers.home();
+        let text = crate::federation::continue_line(remaining.as_deref(), &server.name, &home);
+        below.append(&caption_label(&text, &["small-text", "server-line"]));
+    }
     let card = card(item, &tile, &below, LANDSCAPE.0, &cards.open);
     card.add_css_class("continue-card");
     if let (Some(set_watched), Some(hide)) = (&cards.set_watched, &cards.hide) {
@@ -399,6 +431,11 @@ fn poster(item: &Item, cards: &Cards, detail: bool) -> gtk::Widget {
             .tooltip_text("Watched")
             .build();
         tile.add_overlay(&badge);
+    }
+    // A paired server's badge wherever its item shows among others (States
+    // 3); a library's grid is all one server's, its page says which.
+    if detail {
+        crate::federation_view::badge_tile(&tile, cards.servers.of(item.id()).as_ref());
     }
 
     let caption = gtk::Box::new(gtk::Orientation::Vertical, 2);

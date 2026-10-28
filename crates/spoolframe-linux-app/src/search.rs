@@ -18,6 +18,7 @@ use std::time::Duration;
 use adw::prelude::*;
 use gtk::glib;
 use serde::{Deserialize, Serialize};
+use spoolframe_linux_core::backend::Copies;
 use spoolframe_linux_core::backend::{
     ArtworkSize, BackendError, Person, PersonRole, Profile, SearchCounts, SearchGroup, SearchKind,
     SearchRequest, SearchResults, SearchScope, Session, TopResult,
@@ -116,6 +117,8 @@ struct State {
     opened_from: Option<String>,
     /// The last answer, for the counts and the empty state.
     last: Option<SearchResults>,
+    /// Where each of its items is from, and its title's other copies (P8).
+    copies: std::collections::HashMap<spoolframe_types::MediaId, Copies>,
     recent: Vec<Recent>,
     /// Chips being set by the screen, not the user.
     setting_chips: bool,
@@ -129,6 +132,7 @@ impl Default for State {
             query: String::new(),
             opened_from: None,
             last: None,
+            copies: Default::default(),
             recent: Vec::new(),
             setting_chips: false,
             year: None,
@@ -346,6 +350,7 @@ impl SearchPage {
                     add_to_playlist: needs.cards.add_to_playlist.clone(),
                     open_person: needs.cards.open_person.clone(),
                     hearts: needs.cards.hearts.clone(),
+                    servers: needs.cards.servers.clone(),
                 })
             };
             Self {
@@ -538,7 +543,9 @@ impl SearchPage {
             count.set_visible(false);
         }
         let session = self.needs.session.clone();
-        let asked = relm4::spawn(async move { session.search(&request).await });
+        // Hits (P8-05): a title on several servers once, with its copies;
+        // without federation, each of this server's items a hit of its own.
+        let asked = relm4::spawn(async move { session.search_hits(&request).await });
         let weak = Rc::downgrade(self);
         self.load.replace(Some(glib::spawn_future_local(async move {
             let Ok(answer) = asked.await else { return };
@@ -547,7 +554,11 @@ impl SearchPage {
             page.searching.set_visible(false);
             page.searching.set_spinning(false);
             match answer {
-                Ok(results) => page.show(results),
+                Ok(hits) => {
+                    let (results, copies) = crate::federation::split_hits(hits);
+                    page.state.borrow_mut().copies = copies;
+                    page.show(results)
+                }
                 // Not a failed search: the app goes back to "Who's watching".
                 Err(BackendError::SignInRequired) => (page.needs.signed_out)(),
                 Err(e) => page.failed(&e),
@@ -602,6 +613,18 @@ impl SearchPage {
         query: &str,
     ) {
         clear(&self.results);
+        // Which servers were searched (P8, Search), with a paired one.
+        let servers = &self.cards.servers;
+        if let Some(note) = crate::federation::search_note(&servers.home(), &servers.online()) {
+            self.results.append(
+                &gtk::Label::builder()
+                    .label(note)
+                    .xalign(0.0)
+                    .wrap(true)
+                    .css_classes(["dim-label", "search-servers-note"])
+                    .build(),
+            );
+        }
         if let Some(kind) = kind {
             let count = results.groups.first().map_or(0, |g| {
                 g.total
@@ -678,6 +701,8 @@ impl SearchPage {
         let tile = views::tile(item.id(), &facts.title, shape, size);
         self.cards
             .art(&tile, facts.artwork, kinds, ArtworkSize::Small);
+        crate::federation_view::badge_tile(&tile, self.cards.servers.of(item.id()).as_ref());
+        let copies = self.state.borrow().copies.get(item.id()).cloned();
         let text = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(6)
@@ -691,6 +716,9 @@ impl SearchPage {
         if let Some(sub) = top_detail(item, &facts) {
             text.append(&caption(&sub, &["dim-label"]));
         }
+        if let Some(line) = self.hit_line(item) {
+            text.append(&caption(&line, &["dim-label", "caption"]));
+        }
         let actions = gtk::Box::builder().spacing(8).margin_top(6).build();
         if matches!(item, Item::Movie(_) | Item::Episode(_) | Item::Track(_)) {
             let play = gtk::Button::builder()
@@ -702,11 +730,13 @@ impl SearchPage {
                 )
                 .css_classes(["small-button", "suggested-action"])
                 .build();
-            let (weak, item) = (Rc::downgrade(self), item.clone());
+            // The copy picked for the title plays (P8-05).
+            let played = crate::federation::playing_copy(item, copies.as_ref());
+            let weak = Rc::downgrade(self);
             play.connect_clicked(move |_| {
                 if let Some(page) = weak.upgrade() {
                     page.remember();
-                    (page.needs.play)(item.clone());
+                    (page.needs.play)(played.clone());
                 }
             });
             actions.append(&play);
@@ -966,6 +996,7 @@ impl SearchPage {
         let tile = views::tile(item.id(), &facts.title, shape, size);
         self.cards
             .art(&tile, facts.artwork, kinds, ArtworkSize::Small);
+        crate::federation_view::badge_tile(&tile, self.cards.servers.of(item.id()).as_ref());
         let below = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(2)
@@ -978,7 +1009,17 @@ impl SearchPage {
         if let Some(sub) = sub {
             below.append(&views::caption_label(&sub, &["dim-label", "caption"]));
         }
+        if let Some(line) = self.hit_line(item) {
+            below.append(&views::caption_label(&line, &["dim-label", "caption"]));
+        }
         views::card(item, &tile, &below, size.0, &self.cards.open)
+    }
+
+    /// "on Home Media · also on Bob's Media", for a title on several
+    /// servers (P8, Search).
+    fn hit_line(&self, item: &Item) -> Option<String> {
+        let state = self.state.borrow();
+        crate::federation::hit_line(state.copies.get(item.id())?, &self.cards.servers.home())
     }
 
     /// A person: their initials in a circle (people have no artwork), what
@@ -1040,7 +1081,16 @@ impl SearchPage {
                 .activatable(true)
                 .build();
             row.set_title(&facts.title);
-            row.set_subtitle(&facts.detail.clone().unwrap_or_default());
+            // Where it is from (P8, Search): a paired server's badge, or
+            // the servers a title on several is on.
+            let detail = facts.detail.clone().unwrap_or_default();
+            match self.hit_line(item) {
+                Some(line) => row.set_subtitle(&format!("{detail} · {line}")),
+                None => row.set_subtitle(&detail),
+            }
+            if let Some(server) = self.cards.servers.of(item.id()) {
+                row.add_suffix(&crate::federation_view::badge(&server, false));
+            }
             if let Some(length) = facts.length {
                 row.add_suffix(
                     &gtk::Label::builder()
@@ -1634,6 +1684,7 @@ mod tests {
                 open_person: None,
                 add_to_playlist: None,
                 hearts: None,
+                servers: Default::default(),
             }),
             play: Rc::new(|_| {}),
             open_person: Rc::new(|_| {}),

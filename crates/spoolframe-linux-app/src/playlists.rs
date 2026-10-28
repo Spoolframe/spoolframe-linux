@@ -1526,6 +1526,7 @@ mod tests {
             open_person: None,
             add_to_playlist: None,
             hearts: None,
+            servers: Default::default(),
         });
         let removed = Rc::new(Cell::new(false));
         let row = entry_row(

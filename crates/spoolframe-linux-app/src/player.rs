@@ -171,12 +171,32 @@ pub fn page(playback: &Rc<Playback>, actions: Actions) -> adw::NavigationPage {
             let (Some(view), Some(playback)) = (view.upgrade(), weak_playback.upgrade()) else {
                 return glib::ControlFlow::Break;
             };
-            // A download plays with no link to show.
+            // A download plays with no link to show. A paired server's
+            // item says where it plays from (P8-04, States 6), and, through
+            // this server, why.
             let session = playback.session();
-            view.controls.show_link(
-                session
+            let remote = playback.remote_path();
+            let line = match (&remote, &session) {
+                (Some((mode, server, home)), Some(s)) => {
+                    let path = crate::federation::path_line(*mode, server, home);
+                    Some(match s.link_rate() {
+                        Some(rate) => format!("{path} · {}", format::bitrate(rate)),
+                        None => path,
+                    })
+                }
+                _ => session
                     .as_ref()
                     .and_then(|s| format::link_line(s.connection_path(), s.link_rate())),
+            };
+            view.controls.show_link(line);
+            view.controls.link.set_tooltip_text(
+                remote
+                    .as_ref()
+                    .filter(|(mode, ..)| {
+                        *mode == spoolframe_linux_core::backend::RemoteMode::Proxied
+                    })
+                    .map(|(_, server, home)| crate::federation::proxied_note(server, home))
+                    .as_deref(),
             );
             if let Some(status) = playback.reader_status() {
                 view.controls.show_buffered(status.ready);
@@ -189,13 +209,14 @@ pub fn page(playback: &Rc<Playback>, actions: Actions) -> adw::NavigationPage {
                 view.diagnostics.show_video(playback.video_sink());
                 view.diagnostics
                     .show_range(playback.video_sink(), playback.plan().as_ref());
-                view.diagnostics.set(
-                    "connection",
-                    &session.as_ref().map_or_else(
-                        || "This computer".to_owned(),
-                        |s| format::connection_path(s.connection_path()),
-                    ),
-                );
+                let connection = match (&remote, &session) {
+                    (Some((mode, server, home)), _) => {
+                        crate::federation::path_detail(*mode, server, home)
+                    }
+                    (None, Some(s)) => format::connection_path(s.connection_path()),
+                    (None, None) => "This computer".to_owned(),
+                };
+                view.diagnostics.set("connection", &connection);
             }
             glib::ControlFlow::Continue
         });

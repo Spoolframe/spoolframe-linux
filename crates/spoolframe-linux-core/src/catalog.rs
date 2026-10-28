@@ -1065,6 +1065,31 @@ impl Session for CachedSession {
     fn sync_download_watch(&self) -> BoxFuture<'_, Result<Vec<SyncedWatch>, BackendError>> {
         self.changing(move || self.inner.sync_download_watch())
     }
+
+    fn federation(&self) -> bool {
+        self.inner.federation()
+    }
+
+    /// Not kept, as [`Session::search`] is not.
+    fn search_hits<'a>(
+        &'a self,
+        request: &'a SearchRequest,
+    ) -> BoxFuture<'a, Result<SearchResults<SearchHit>, BackendError>> {
+        self.inner.search_hits(request)
+    }
+
+    /// A change: every kept item's copy that plays may be another now.
+    fn set_play_from<'a>(
+        &'a self,
+        title: &'a MediaId,
+        from: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        self.changing(move || self.inner.set_play_from(title, from))
+    }
+
+    fn remote_mode(&self, handle: &PlaybackHandle) -> Option<RemoteMode> {
+        self.inner.remote_mode(handle)
+    }
 }
 
 #[cfg(test)]
@@ -1593,6 +1618,16 @@ mod tests {
             kept_after(|s| ready(s.hide_from_continue(&alien())).unwrap()),
             0
         );
+    }
+
+    /// Every kept item's copy that plays may be another after it (P8-05);
+    /// refused or not, as any change.
+    #[test]
+    fn choosing_where_a_title_plays_from_clears_the_session() {
+        let kept = kept_after(|s| {
+            let _ = ready(s.set_play_from(&alien(), None));
+        });
+        assert_eq!(kept, 0);
     }
 
     #[test]

@@ -1945,3 +1945,89 @@ label.accent {
   border-radius: 32px;
   padding: 12px 20px;
 }
+
+/* Federation (P8), as the LinuxFed boards have it: this server's colour
+   is the accent, a paired server's peach, an offline one grey. */
+.server-dot {
+  min-width: 8px;
+  min-height: 8px;
+  border-radius: 4px;
+  background-color: var(--accent-orange);
+}
+
+.server-dot.home {
+  background-color: var(--accent-color);
+}
+
+.server-dot.offline {
+  background-color: alpha(currentColor, 0.45);
+}
+
+/* A paired server's name in a pill: by a library's title, a Home row's
+   heading, a search row; on a poster's corner, over its art. */
+.server-badge {
+  padding: 2px 8px 2px 6px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--accent-orange);
+  background-color: alpha(var(--accent-orange), 0.16);
+}
+
+.server-badge.on-tile {
+  padding: 3px 8px 3px 6px;
+  font-size: 10px;
+  background-color: alpha(var(--window-bg-color), 0.85);
+}
+
+.server-badge.offline {
+  color: alpha(currentColor, 0.6);
+  background-color: alpha(currentColor, 0.1);
+}
+
+/* A paired item's Continue watching line: where it plays, where the
+   place is kept. */
+.server-line {
+  color: var(--accent-orange);
+  font-weight: 600;
+}
+
+/* A paired item's notes on its page (Item, States). */
+.fed-note {
+  padding: 14px 16px;
+  border-radius: 12px;
+  background-color: var(--card-bg-color);
+}
+
+.fed-notes {
+  margin-top: 4px;
+}
+
+/* A server's heading in the sidebar, over its libraries, set in. */
+.app-sidebar > row.server-heading {
+  min-height: 30px;
+  padding: 10px 12px 4px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.app-sidebar > row.server-heading.offline {
+  opacity: 0.55;
+}
+
+.app-sidebar > row.in-server {
+  padding-left: 26px;
+  font-size: 13px;
+}
+
+.app-sidebar > row.in-server image {
+  color: var(--accent-color);
+}
+
+.app-sidebar > row.in-server.paired image {
+  color: var(--accent-orange);
+}
+
+.search-servers-note {
+  margin-bottom: 4px;
+}

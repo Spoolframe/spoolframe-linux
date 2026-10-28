@@ -11,6 +11,8 @@ mod dialog;
 mod download_dialog;
 mod downloads;
 mod external_subtitle;
+mod federation;
+mod federation_view;
 mod file_helper;
 mod fonts;
 mod hearts;
@@ -221,12 +223,19 @@ const CLOSE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// How the SDK opens, from the user's settings: with or without relays
 /// (P6-03), which it cannot change while it runs, and with its downloads
 /// (PX-38) in a directory under the app's data, the one place the sandbox
-/// lets it write to. No experimental feature is asked for: this app uses
-/// neither HTTP playback nor federation.
+/// lets it write to. It asks for federation (P8), experimental: a paired
+/// server's libraries, Home row, search hits and playback. A server with
+/// federation off does not turn it on, and the app is then as it was
+/// without it (each session says, `Session::federation`). HTTP playback is
+/// not asked for: this app plays over Iroh only.
 fn client_options(settings: &settings::Settings) -> sdk::ClientOptions {
     sdk::ClientOptions {
         relays: settings.use_relays(),
         downloads_dir: downloads_dir(),
+        experimental: sdk::Experimental {
+            federation: true,
+            ..sdk::Experimental::default()
+        },
         ..sdk::ClientOptions::default()
     }
 }
@@ -311,15 +320,18 @@ mod tests {
         );
     }
 
-    /// Every regular feature is base protocol since SDK 0.16; the two
-    /// experimental ones (HTTP playback, federation) are not asked for.
+    /// Every regular feature is base protocol since SDK 0.16; of the two
+    /// experimental ones, federation is asked for, HTTP playback is not.
     #[test]
-    fn the_sdk_opens_asking_for_no_experimental_feature() {
+    fn the_sdk_opens_asking_for_federation_and_not_http_playback() {
         let dir = tempfile::tempdir().unwrap();
         let settings = settings::Settings::at(&dir.path().join("settings.ini"));
         assert_eq!(
             client_options(&settings).experimental,
-            sdk::Experimental::default()
+            sdk::Experimental {
+                http_playback: false,
+                federation: true,
+            }
         );
     }
 }

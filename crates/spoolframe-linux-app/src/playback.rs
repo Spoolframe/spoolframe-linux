@@ -391,6 +391,8 @@ pub struct Playback {
     progress_calls: Serial,
     /// The server's name, as Search for subtitles says it (PX-02).
     server_name: RefCell<String>,
+    /// The servers a paired item plays from (P8-04), by name.
+    servers: RefCell<Option<Rc<crate::federation::Servers>>>,
 }
 
 /// What belongs to the item playing now, and lives exactly as long as it
@@ -1347,6 +1349,7 @@ impl Playback {
             saving_modes: Cell::new(false),
             progress_calls: Serial::default(),
             server_name: RefCell::new("the server".to_owned()),
+            servers: RefCell::new(None),
         });
         connect(playback.pipeline.adapter(), &playback);
         {
@@ -1747,6 +1750,28 @@ impl Playback {
     /// The server's name, for what the player says of it.
     pub fn set_server_name(&self, name: &str) {
         self.server_name.replace(name.to_owned());
+    }
+
+    /// The servers by name, for what the player says of a paired item.
+    pub fn set_servers(&self, servers: Rc<crate::federation::Servers>) {
+        self.servers.replace(Some(servers));
+    }
+
+    /// How a paired server's item plays now (P8-04): from that server, or
+    /// through this one, with that server's name and this one's. `None`
+    /// for this server's own item, or nothing playing.
+    pub fn remote_path(
+        &self,
+    ) -> Option<(spoolframe_linux_core::backend::RemoteMode, String, String)> {
+        let session = self.session.as_ref()?;
+        let handle = self.now()?.managed.borrow().as_ref()?.snapshot().handle;
+        let mode = session.remote_mode(&handle)?;
+        let servers = self.servers.borrow().clone()?;
+        let server = self
+            .current()
+            .and_then(|item| servers.of(item.id()))
+            .map_or_else(|| "its server".to_owned(), |s| s.name);
+        Some((mode, server, servers.home()))
     }
 
     /// The subtitle menu's Search for subtitles… (PX-02), with a server

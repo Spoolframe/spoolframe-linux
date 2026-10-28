@@ -236,6 +236,7 @@ pub fn backend_error(error: sdk::SdkError) -> BackendError {
         E::NoSubtitleSource => BackendError::NoSubtitleSource,
         E::DownloadNotReady => BackendError::DownloadNotReady,
         E::Downloads(why) => BackendError::Downloads(why),
+        E::OriginOffline => BackendError::OriginOffline,
         E::UnknownServer(id) => BackendError::NotFound(id),
         E::UnknownIdentity(_) | E::Credential(_) | E::NotThisDevice | E::DeviceKeyRevoked => {
             BackendError::NotPaired
@@ -390,6 +391,21 @@ impl sdk::Storage for SdkStorage {
 /// taken out.
 type Sessions = Arc<Mutex<HashMap<(ServerKey, String), sdk::Session>>>;
 
+/// A paired server's item playing (P8-04), by its handle: the playback's
+/// reads, seeks and stop go to the session that plays it (the paired
+/// server's, direct; the user's own, proxied), and its progress to the
+/// user's own server, by the `fed:` id. Kept by the client, since a
+/// session's adapter is made anew for each `Client::session`; the
+/// `RemotePlayback` holds the paired server's relays for as long as the
+/// play lives.
+type Routes = Arc<Mutex<HashMap<PlaybackHandle, Route>>>;
+
+struct Route {
+    playing: sdk::RemotePlayback,
+    /// The item's `fed:` id, which its progress is reported by.
+    id: MediaId,
+}
+
 /// Runs `call` on the SDK's runtime and maps its error. A task that
 /// panicked or was cancelled is an error too, never a hang.
 async fn on_runtime<T, F>(handle: &Handle, call: F) -> Result<T, BackendError>
@@ -431,6 +447,7 @@ pub struct SdkClient {
     sign_outs: Mutex<HashMap<ServerKey, watch::Sender<u64>>>,
     servers_changed: watch::Sender<()>,
     identities: crate::identity::Identities,
+    routes: Routes,
 }
 
 impl SdkClient {
@@ -478,6 +495,7 @@ impl SdkClient {
             states: Mutex::new(HashMap::new()),
             sign_outs: Mutex::new(HashMap::new()),
             servers_changed,
+            routes: Arc::default(),
         }
     }
 
@@ -1023,6 +1041,7 @@ impl Client for SdkClient {
             handle: self.handle.clone(),
             sessions: self.sessions.clone(),
             key,
+            routes: self.routes.clone(),
         }))
     }
 
@@ -1194,6 +1213,12 @@ impl Client for SdkClient {
         }))
     }
 
+    fn libraries_events(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::backend::LibrariesChanged> {
+        self.client.libraries_events()
+    }
+
     fn download_events(&self) -> tokio::sync::broadcast::Receiver<DownloadEvent> {
         self.client.download_events()
     }
@@ -1205,9 +1230,35 @@ pub struct SdkSession {
     handle: Handle,
     sessions: Sessions,
     key: (ServerKey, String),
+    routes: Routes,
 }
 
 impl SdkSession {
+    /// The session a playback's calls go to: the one playing a paired
+    /// server's item (P8-04), else this one.
+    fn routed(&self, handle: &PlaybackHandle) -> Option<sdk::Session> {
+        self.routes
+            .lock()
+            .expect("never poisoned")
+            .get(handle)
+            .map(|route| route.playing.session.clone())
+    }
+
+    /// [`SdkSession::call`] on the session playing `handle`. A paired
+    /// server's session that is gone does not forget this one: it is
+    /// that server's, for one item.
+    async fn call_on<T, F, Fut>(&self, handle: &PlaybackHandle, call: F) -> Result<T, BackendError>
+    where
+        T: Send + 'static,
+        F: FnOnce(sdk::Session) -> Fut,
+        Fut: Future<Output = Result<T, sdk::SdkError>> + Send + 'static,
+    {
+        match self.routed(handle) {
+            Some(session) => on_runtime(&self.handle, call(session)).await,
+            None => self.call(call).await,
+        }
+    }
+
     /// Runs a call on the session; if the session turns out to be gone,
     /// forgets it, so "Who's watching" no longer offers it.
     async fn call<T, F, Fut>(&self, call: F) -> Result<T, BackendError>
@@ -1303,6 +1354,7 @@ impl Session for SdkSession {
                 playlists: detail.playlists,
                 liked: detail.liked,
                 liked_children: detail.liked_children,
+                copies: detail.copies,
             })
         }))
     }
@@ -1353,9 +1405,29 @@ impl Session for SdkSession {
         options: sdk::PlaybackOptions,
     ) -> BoxFuture<'a, Result<PlaybackStart, BackendError>> {
         let id = id.clone();
-        Box::pin(
-            self.call(move |s| async move { s.start_playback_with(&id, selection, options).await }),
-        )
+        // A paired server's item (P8-04): the SDK dials that server once,
+        // briefly, and plays through this one when it is not reached.
+        let remote = id.namespace() == spoolframe_types::Namespace::Federated && self.federation();
+        if !remote {
+            return Box::pin(self.call(move |s| async move {
+                s.start_playback_with(&id, selection, options).await
+            }));
+        }
+        Box::pin(async move {
+            let asked = id.clone();
+            let playing =
+                self.call(move |s| async move {
+                    s.start_remote_playback(&asked, selection, options).await
+                })
+                .await?;
+            tracing::info!(%id, mode = ?playing.mode, "a paired server's item plays");
+            let start = playing.playback.clone();
+            self.routes
+                .lock()
+                .expect("never poisoned")
+                .insert(start.handle.clone(), Route { playing, id });
+            Ok(start)
+        })
     }
 
     fn change_quality<'a>(
@@ -1364,8 +1436,9 @@ impl Session for SdkSession {
         quality: sdk::PlaybackQuality,
         position: Duration,
     ) -> BoxFuture<'a, Result<sdk::PlaybackChange, BackendError>> {
-        let handle = handle.clone();
-        Box::pin(self.call(move |s| async move {
+        let asked = handle.clone();
+        Box::pin(self.call_on(handle, move |s| async move {
+            let handle = asked;
             s.change_quality(&handle, quality, Default::default(), position)
                 .await
         }))
@@ -1378,10 +1451,10 @@ impl Session for SdkSession {
         offset: u64,
         length: u64,
     ) -> BoxFuture<'a, Result<Chunk, BackendError>> {
-        let handle = handle.clone();
-        Box::pin(
-            self.call(move |s| async move { s.read_chunk(&handle, epoch, offset, length).await }),
-        )
+        let asked = handle.clone();
+        Box::pin(self.call_on(handle, move |s| async move {
+            s.read_chunk(&asked, epoch, offset, length).await
+        }))
     }
 
     fn seek_playback<'a>(
@@ -1389,16 +1462,28 @@ impl Session for SdkSession {
         handle: &'a PlaybackHandle,
         position: Duration,
     ) -> BoxFuture<'a, Result<u32, BackendError>> {
-        let handle = handle.clone();
-        Box::pin(self.call(move |s| async move { s.seek_playback(&handle, position).await }))
+        let asked = handle.clone();
+        Box::pin(self.call_on(handle, move |s| async move {
+            s.seek_playback(&asked, position).await
+        }))
     }
 
     fn stop_playback<'a>(
         &'a self,
         handle: &'a PlaybackHandle,
     ) -> BoxFuture<'a, Result<(), BackendError>> {
-        let handle = handle.clone();
-        Box::pin(self.call(move |s| async move { s.stop_playback(&handle).await }))
+        let asked = handle.clone();
+        Box::pin(async move {
+            let stopped = self
+                .call_on(
+                    handle,
+                    move |s| async move { s.stop_playback(&asked).await },
+                )
+                .await;
+            // Stopped or not, the play is over here: its relays go too.
+            self.routes.lock().expect("never poisoned").remove(handle);
+            stopped
+        })
     }
 
     fn read<'a>(
@@ -1407,17 +1492,19 @@ impl Session for SdkSession {
         offset: u64,
         length: u64,
     ) -> BoxFuture<'a, Result<Vec<u8>, BackendError>> {
-        let handle = handle.clone();
-        Box::pin(self.call(move |s| async move { s.read(&handle, offset, length).await }))
+        let asked = handle.clone();
+        Box::pin(self.call_on(handle, move |s| async move {
+            s.read(&asked, offset, length).await
+        }))
     }
 
     fn read_subtitle<'a>(
         &'a self,
         handle: &'a PlaybackHandle,
     ) -> BoxFuture<'a, Result<(SubtitleFormat, Vec<u8>), BackendError>> {
-        let handle = handle.clone();
-        Box::pin(self.call(move |s| async move {
-            let subtitle = s.read_subtitle(&handle).await?;
+        let asked = handle.clone();
+        Box::pin(self.call_on(handle, move |s| async move {
+            let subtitle = s.read_subtitle(&asked).await?;
             Ok((subtitle.format, subtitle.bytes))
         }))
     }
@@ -1449,9 +1536,9 @@ impl Session for SdkSession {
         link_bitrate: u64,
         position: Duration,
     ) -> BoxFuture<'a, Result<sdk::PlaybackChange, BackendError>> {
-        let handle = handle.clone();
-        Box::pin(self.call(move |s| async move {
-            s.limit_playback(&handle, link_bitrate, Default::default(), position)
+        let asked = handle.clone();
+        Box::pin(self.call_on(handle, move |s| async move {
+            s.limit_playback(&asked, link_bitrate, Default::default(), position)
                 .await
         }))
     }
@@ -1466,8 +1553,22 @@ impl Session for SdkSession {
         handle: &'a PlaybackHandle,
         position: Duration,
     ) -> BoxFuture<'a, Result<(), BackendError>> {
+        // A paired server's item: the user's own server keeps their place
+        // (P8-03), by the `fed:` id, however it plays; that server keeps
+        // nothing of it.
+        let fed = self
+            .routes
+            .lock()
+            .expect("never poisoned")
+            .get(handle)
+            .map(|route| route.id.clone());
         let handle = handle.clone();
-        Box::pin(self.call(move |s| async move { s.update_progress(&handle, position).await }))
+        Box::pin(self.call(move |s| async move {
+            match fed {
+                Some(id) => s.update_watch_progress(&id, position).await,
+                None => s.update_progress(&handle, position).await,
+            }
+        }))
     }
 
     fn mark_watched<'a>(&'a self, id: &'a MediaId) -> BoxFuture<'a, Result<(), BackendError>> {
@@ -1894,6 +1995,49 @@ impl Session for SdkSession {
     ) -> BoxFuture<'a, Result<LocalDownload, BackendError>> {
         let (id, downloads) = (id.clone(), self.client.downloads());
         Box::pin(self.call(move |s| async move { downloads.start(&s, &id, source, tracks).await }))
+    }
+
+    fn federation(&self) -> bool {
+        self.session.experimental().federation
+    }
+
+    fn search_hits<'a>(
+        &'a self,
+        request: &'a SearchRequest,
+    ) -> BoxFuture<'a, Result<SearchResults<crate::backend::SearchHit>, BackendError>> {
+        let request = request.clone();
+        // The SDK refuses hits without federation, sending nothing: then
+        // this server's own items, each its own hit.
+        let federated = self.federation();
+        Box::pin(self.call(move |s| async move {
+            if federated {
+                return s.search_hits(request).await;
+            }
+            let results = s.search(request).await?;
+            Ok(results.map(|item| crate::backend::SearchHit {
+                play_from: item.id().clone(),
+                origin: None,
+                also_on: Vec::new(),
+                item,
+            }))
+        }))
+    }
+
+    fn set_play_from<'a>(
+        &'a self,
+        title: &'a MediaId,
+        from: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        let (title, from) = (title.clone(), from.map(str::to_owned));
+        Box::pin(self.call(move |s| async move { s.set_play_from(&title, from.as_deref()).await }))
+    }
+
+    fn remote_mode(&self, handle: &PlaybackHandle) -> Option<crate::backend::RemoteMode> {
+        self.routes
+            .lock()
+            .expect("never poisoned")
+            .get(handle)
+            .map(|route| route.playing.mode)
     }
 
     fn sync_download_watch(&self) -> BoxFuture<'_, Result<Vec<SyncedWatch>, BackendError>> {

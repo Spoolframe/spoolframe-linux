@@ -813,6 +813,11 @@ impl Widgets {
                 .css_classes(["title-1"])
                 .build(),
         );
+        // A paired server's library (P8, Browse): its server's badge by
+        // the name.
+        if let Some(server) = &shared.library.server {
+            title.append(&crate::federation_view::badge(server, false));
+        }
         let counted = gtk::Box::builder().valign(gtk::Align::Baseline).build();
         counted.append(&count.0);
         counted.append(&count.1);
@@ -1350,6 +1355,7 @@ mod tests {
             open_person: None,
             add_to_playlist: None,
             hearts: None,
+            servers: Default::default(),
         });
         let scroller = gtk::ScrolledWindow::new();
         let slots = Slots {
