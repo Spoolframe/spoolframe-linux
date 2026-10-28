@@ -1,0 +1,39 @@
+# Builds the Nix package (.#default) for x86_64-linux and pushes what it
+# builds to the public Cachix cache `spoolframe` (spoolframe.cachix.org), on
+# the GitHub mirror. Runs on every push to master, by hand, and from the
+# Flatpak workflow for the commit it releases.
+#
+# The runners cannot reach the Coldsteel caches, so there are no extra
+# substituters: what is not on cache.nixos.org or spoolframe.cachix.org is
+# built here, and pushed.
+name: Nix
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+  workflow_call:
+    secrets:
+      CACHIX_AUTH_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      # The runner's preinstalled toolchains take room a Rust build needs.
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache /usr/local/share/boost /usr/share/swift
+      - uses: actions/checkout@v7.0.1
+      - uses: cachix/install-nix-action@v31.11.3
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      # Pushes every path the job builds.
+      - uses: cachix/cachix-action@v17
+        with:
+          name: spoolframe
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - run: nix build .#default --print-build-logs

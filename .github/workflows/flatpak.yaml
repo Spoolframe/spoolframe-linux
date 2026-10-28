@@ -5,7 +5,9 @@
 # The build is flatpak/README.md's, in Flathub's GNOME 51 image, which has
 # flatpak-builder and the Flathub remote: the bundle needs the runtime from
 # Flathub, and the build itself no network, as every crate is listed in
-# cargo-sources.json.
+# cargo-sources.json. The release also waits for the Nix package of the same
+# commit to be built and in the Cachix cache (nix.yaml): a release from a
+# commit that is not master's tip is cached too.
 name: Flatpak
 
 on:
@@ -79,8 +81,15 @@ jobs:
           repository-url: https://dl.flathub.org/repo/flathub.flatpakrepo
           upload-artifact: true
 
+  nix:
+    needs: version
+    if: needs.version.outputs.published == 'false'
+    uses: ./.github/workflows/nix.yaml
+    secrets:
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
   release:
-    needs: [version, build]
+    needs: [version, build, nix]
     if: needs.version.outputs.published == 'false'
     runs-on: ubuntu-24.04
     permissions:
