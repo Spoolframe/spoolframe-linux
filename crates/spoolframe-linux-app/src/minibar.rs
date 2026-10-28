@@ -186,7 +186,7 @@ impl MiniBar {
             .icon_name(crate::icons::CLOSE)
             .tooltip_text("Stop")
             .valign(gtk::Align::Center)
-            .css_classes(["flat", "dim-label", "mini-button"])
+            .css_classes(["flat", "mini-button"])
             .build();
         stop_button.connect_clicked(move |_| stop());
         // Music's queue is on Now Playing.
@@ -195,7 +195,7 @@ impl MiniBar {
             .tooltip_text("Queue")
             .valign(gtk::Align::Center)
             .visible(false)
-            .css_classes(["flat", "dim-label", "mini-button"])
+            .css_classes(["flat", "mini-button"])
             .build();
         {
             let expand = expand_for_queue.clone();
@@ -207,7 +207,7 @@ impl MiniBar {
             .icon_name(crate::icons::TRACKS)
             .tooltip_text("Audio and subtitles")
             .valign(gtk::Align::Center)
-            .css_classes(["flat", "dim-label", "mini-button"])
+            .css_classes(["flat", "mini-button"])
             .visible(false)
             .build();
         let end = gtk::Box::builder()
@@ -215,7 +215,8 @@ impl MiniBar {
             .halign(gtk::Align::End)
             .valign(gtk::Align::Center)
             .build();
-        volume.row.add_css_class("dim-label");
+        // At full strength, as the transport is: dimmed (`dim-label` is an
+        // opacity), the volume's knob and fill looked disabled.
         end.append(&volume.row);
         end.append(&tracks);
         end.append(&queue_button);
@@ -619,6 +620,31 @@ fn pan_offset(elapsed: f64, range: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The volume, tracks, queue and stop controls are drawn at full
+    /// strength, as the transport is: dimmed, the volume's knob and fill
+    /// looked disabled.
+    #[test]
+    #[ignore = "needs a GTK display"]
+    fn the_controls_at_the_end_are_not_dimmed() {
+        adw::init().unwrap();
+        let bar = MiniBar::new(Rc::new(|| {}), Rc::new(|| {}));
+        let controls: [gtk::Widget; 4] = [
+            bar.volume.row.clone().upcast(),
+            bar.tracks.clone().upcast(),
+            bar.queue.clone().upcast(),
+            bar.stop.clone().upcast(),
+        ];
+        let dimmed: Vec<String> = controls
+            .iter()
+            .filter(|control| {
+                std::iter::successors(Some((*control).clone()), |w| w.parent())
+                    .any(|w| w.has_css_class("dim-label"))
+            })
+            .map(|control| control.type_().name().to_owned())
+            .collect();
+        assert_eq!(dimmed, Vec::<String>::new());
+    }
 
     #[test]
     #[ignore = "needs a GTK display"]
