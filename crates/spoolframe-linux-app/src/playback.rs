@@ -1743,8 +1743,41 @@ impl Playback {
             crate::tracks::SubtitleExtras {
                 find: self.subtitle_search(),
                 timing: self.timing_menu(),
+                elsewhere: self.subtitles_elsewhere(),
             },
         )
+    }
+
+    /// The item's subtitle tracks this playback has no stream of (see
+    /// [`subtitles_not_in_stream`]), with a server to start it again
+    /// with one: a download plays its own file's tracks.
+    fn subtitles_elsewhere(&self) -> Option<crate::tracks::ServerSubtitles> {
+        if self.is_local() {
+            return None;
+        }
+        let current = self.now()?;
+        let plan = current.plan.borrow().clone()?;
+        let tracks = current.track_list.borrow();
+        let tracks = tracks.as_ref()?;
+        let named: Vec<(u32, String)> = subtitles_not_in_stream(tracks, &plan)
+            .into_iter()
+            .map(|n| {
+                let track = &tracks.subtitles[n as usize];
+                (n, spoolframe_linux_core::format::subtitle_track(track))
+            })
+            .collect();
+        if named.is_empty() {
+            return None;
+        }
+        let me = self.me.clone();
+        Some(crate::tracks::ServerSubtitles {
+            tracks: named,
+            pick: Rc::new(move |track| {
+                if let Some(this) = me.upgrade() {
+                    this.use_subtitle(track);
+                }
+            }),
+        })
     }
 
     /// The server's name, for what the player says of it.
@@ -3233,6 +3266,24 @@ fn subtitle_in_output(plan: &PlaybackPlan) -> bool {
     )
 }
 
+/// The item's subtitle tracks the playback under `plan` has no stream of,
+/// by their place in `tracks`: the menu offers them, and picking one
+/// starts the item again with it, as a downloaded one does. A direct play
+/// has the file's own tracks as streams, and the external one it was
+/// started with; a converted output has only the one it carries.
+fn subtitles_not_in_stream(tracks: &MediaTracks, plan: &PlaybackPlan) -> Vec<u32> {
+    let carried = match plan {
+        PlaybackPlan::Direct { subtitle, .. } => subtitle.as_ref().map(|s| s.index),
+        PlaybackPlan::Converted { subtitle, .. } => subtitle.map(|s| s.index),
+        _ => None,
+    };
+    let converted = matches!(plan, PlaybackPlan::Converted { .. });
+    (0..tracks.subtitles.len() as u32)
+        .filter(|&n| Some(n) != carried)
+        .filter(|&n| converted || tracks.subtitles[n as usize].external)
+        .collect()
+}
+
 /// Whose a GstPlay error is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Blame {
@@ -3831,6 +3882,80 @@ mod tests {
             ladder: Vec::new(),
             source_codec: None,
         }
+    }
+
+    /// An item's subtitles: one in the file, then `downloaded` external
+    /// ones, as a track someone downloaded is.
+    fn tracks_with(downloaded: usize) -> MediaTracks {
+        let track = |external| spoolframe_types::SubtitleTrack {
+            language: Some("eng".into()),
+            title: None,
+            forced: false,
+            default: false,
+            external,
+            role: Default::default(),
+            timing: None,
+            download: None,
+        };
+        MediaTracks {
+            subtitles: std::iter::once(track(false))
+                .chain(std::iter::repeat_n(track(true), downloaded))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn direct_with(subtitle: Option<u32>) -> PlaybackPlan {
+        PlaybackPlan::Direct {
+            container: spoolframe_types::Container::Matroska,
+            video: None,
+            audio: None,
+            subtitle: subtitle.map(|index| PlannedSubtitle {
+                index,
+                format: SubtitleFormat::Srt,
+                delivery: SubtitleDelivery::External,
+            }),
+            source_codec: None,
+        }
+    }
+
+    /// A conversion started without a subtitle carries none: the menu
+    /// offers every track the item has, downloaded ones too.
+    #[test]
+    fn a_conversion_without_a_subtitle_offers_every_track() {
+        let plan = PlaybackPlan::Converted {
+            delivery: Delivery::Progressive,
+            container: spoolframe_types::Container::Matroska,
+            video: None,
+            audio: None,
+            subtitle: None,
+            reasons: Vec::new(),
+            ladder: Vec::new(),
+            source_codec: None,
+        };
+        assert_eq!(subtitles_not_in_stream(&tracks_with(2), &plan), [0, 1, 2]);
+    }
+
+    /// The track a conversion carries is in its stream; the others are not.
+    #[test]
+    fn a_conversion_offers_the_tracks_it_does_not_carry() {
+        let plan = converted_with(SubtitleAction::Copy {
+            format: SubtitleFormat::Srt,
+        });
+        assert_eq!(subtitles_not_in_stream(&tracks_with(2), &plan), [1, 2]);
+    }
+
+    /// A direct play has the file's own tracks; the downloaded ones are
+    /// offered, but not the one it was started with.
+    #[test]
+    fn a_direct_play_offers_the_downloaded_tracks_it_was_not_started_with() {
+        assert_eq!(
+            (
+                subtitles_not_in_stream(&tracks_with(2), &direct_with(None)),
+                subtitles_not_in_stream(&tracks_with(2), &direct_with(Some(1))),
+            ),
+            (vec![1, 2], vec![2])
+        );
     }
 
     /// A subtitle the plan burns into the picture is neither fetched nor
@@ -5054,25 +5179,14 @@ mod tests {
         playback.stop();
     }
 
-    /// A subtitle chosen mid-play (one just downloaded) on a converted
-    /// playback starts it again with the subtitle copied into the output
-    /// (`copy:srt`), and the player shows that stream. It said "Couldn't
-    /// turn on subtitles" instead: GstPlay's media info from the last
-    /// encode, which had no subtitle, still arrived after the new one was
-    /// loaded, and the pick looked for the subtitle in it.
-    #[test]
-    #[ignore = "needs a display for gtk4paintablesink"]
-    fn a_subtitle_chosen_mid_play_shows_from_the_converted_output() {
-        gtk::init().unwrap();
-        init().unwrap();
-        let dir = TestDir::new_blocking("spoolframe-copied-subtitle");
-        let path = dir.join("clip.mkv");
-        clip_with_subtitle(&path);
-        let client = FakeClient::new(Some(path))
-            .converting(64 * 1024)
-            .copying_subtitle();
-        let profile = FakeClient::profile("andrey");
-        let session = client.session(&profile).unwrap();
+    /// The fake's first movie converted with no subtitle, as the episode
+    /// started, on a server that copies a chosen one into the output; and
+    /// the track failures it tells of. Played past its first second.
+    fn converted_without_a_subtitle(
+        client: &FakeClient,
+        profile: &Profile,
+    ) -> (Rc<Playback>, Rc<RefCell<Vec<String>>>) {
+        let session = client.session(profile).unwrap();
         let item = first_movie(&session);
         // Without a subtitle, as the episode started.
         let playback = Playback::start(Playlist {
@@ -5108,20 +5222,105 @@ mod tests {
             !playback.plan().as_ref().is_some_and(subtitle_in_output),
             "the first encode already had the subtitle"
         );
+        (playback, failed)
+    }
+
+    /// Whether `playback` shows the subtitle its output now carries.
+    fn shows_the_copied_subtitle(playback: &Playback) -> bool {
+        playback.plan().as_ref().is_some_and(subtitle_in_output)
+            && playback.is_playing()
+            && playback.subtitles_on.get()
+    }
+
+    /// A subtitle chosen mid-play (one just downloaded) on a converted
+    /// playback starts it again with the subtitle copied into the output
+    /// (`copy:srt`), and the player shows that stream. It said "Couldn't
+    /// turn on subtitles" instead: the first encode had none, so subtitles
+    /// were off, and GstPlay refused the new encode's track until they
+    /// were turned on.
+    #[test]
+    #[ignore = "needs a display for gtk4paintablesink"]
+    fn a_subtitle_chosen_mid_play_shows_from_the_converted_output() {
+        gtk::init().unwrap();
+        init().unwrap();
+        let dir = TestDir::new_blocking("spoolframe-copied-subtitle");
+        let path = dir.join("clip.mkv");
+        clip_with_subtitle(&path);
+        let client = FakeClient::new(Some(path))
+            .converting(64 * 1024)
+            .copying_subtitle();
+        let profile = FakeClient::profile("andrey");
+        let (playback, failed) = converted_without_a_subtitle(&client, &profile);
         playback.use_subtitle(0);
         assert!(
-            run_until(Duration::from_secs(20), || playback
-                .plan()
-                .as_ref()
-                .is_some_and(subtitle_in_output)
-                && playback.is_playing()
-                && playback.subtitles_on.get()
-                || !failed.borrow().is_empty()),
+            run_until(Duration::from_secs(20), || shows_the_copied_subtitle(
+                &playback
+            ) || !failed.borrow().is_empty()),
             "the subtitle never showed (plan {:?}, playing {})",
             playback.plan(),
             playback.is_playing()
         );
         assert_eq!(*failed.borrow(), Vec::<String>::new());
+        playback.stop();
+    }
+
+    /// A playback started without a subtitle offers the item's other
+    /// tracks in its menu, a downloaded one among them, though its stream
+    /// has none of them; picking one starts it again with that track,
+    /// which shows. The menu listed only the stream's own, so a track
+    /// downloaded before could be had only by searching for it again.
+    #[test]
+    #[ignore = "needs a display for gtk4paintablesink"]
+    fn the_menu_offers_a_track_the_stream_lacks_and_shows_it() {
+        use gtk::prelude::*;
+        gtk::init().unwrap();
+        init().unwrap();
+        let dir = TestDir::new_blocking("spoolframe-menu-track");
+        let path = dir.join("clip.mkv");
+        clip_with_subtitle(&path);
+        let client = FakeClient::new(Some(path))
+            .converting(64 * 1024)
+            .copying_subtitle();
+        let profile = FakeClient::profile("andrey");
+        let (playback, failed) = converted_without_a_subtitle(&client, &profile);
+        let info = playback.now().unwrap().media_info.borrow().clone().unwrap();
+        let offered = playback.subtitles_elsewhere().map(|e| e.tracks);
+        assert!(
+            offered.as_ref().is_some_and(|t| !t.is_empty()),
+            "the menu offers no track the stream lacks ({offered:?})"
+        );
+        let menu = playback.track_menu(&info);
+        // Hung from a button, as the player's is.
+        let button = gtk::MenuButton::new();
+        button.set_popover(Some(&menu));
+        // The menu's lists: audio, subtitles, quality.
+        let mut lists = Vec::new();
+        let mut stack = vec![menu.clone().upcast::<gtk::Widget>()];
+        while let Some(widget) = stack.pop() {
+            if widget.has_css_class("pick-list") {
+                lists.push(widget.clone().downcast::<gtk::ListBox>().unwrap());
+            }
+            let mut child = widget.last_child();
+            while let Some(c) = child {
+                child = c.prev_sibling();
+                stack.push(c);
+            }
+        }
+        let subtitles = &lists[1];
+        // Off, the stream's own, then the first track it lacks.
+        let row = 1 + info.subtitle_streams().len() as i32;
+        subtitles.row_at_index(row).unwrap().emit_activate();
+        assert!(
+            run_until(Duration::from_secs(20), || shows_the_copied_subtitle(
+                &playback
+            ) || !failed.borrow().is_empty()),
+            "the picked track never showed (plan {:?}, playing {})",
+            playback.plan(),
+            playback.is_playing()
+        );
+        assert_eq!(*failed.borrow(), Vec::<String>::new());
+        button.set_popover(None::<&gtk::Popover>);
+        drop((lists, button, menu));
         playback.stop();
     }
 

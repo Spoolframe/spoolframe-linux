@@ -116,6 +116,17 @@ pub struct SubtitleExtras {
     pub find: Option<FindSubtitles>,
     /// The chosen external text subtitle's timing (PX-03), under it.
     pub timing: Option<crate::subtitle_timing::TimingMenu>,
+    /// The server's tracks the stream has none of, after its own.
+    pub elsewhere: Option<ServerSubtitles>,
+}
+
+/// The item's subtitle tracks that only the server has for this playback:
+/// a downloaded one, or one a conversion did not carry. Picking one starts
+/// the item again with it, as Search for subtitles does.
+pub struct ServerSubtitles {
+    /// Each track's place in the item's subtitles, and its name.
+    pub tracks: Vec<(u32, String)>,
+    pub pick: Rc<dyn Fn(u32)>,
 }
 
 pub struct QualityMenu {
@@ -130,7 +141,11 @@ pub fn menu(
     failed: Rc<dyn Fn(&str)>,
     quality: Option<QualityMenu>,
     external: ExternalSubtitle,
-    SubtitleExtras { find, timing }: SubtitleExtras,
+    SubtitleExtras {
+        find,
+        timing,
+        elsewhere,
+    }: SubtitleExtras,
 ) -> gtk::Popover {
     let column = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -159,11 +174,18 @@ pub fn menu(
     column.append(&heading("Audio"));
     column.append(&audio.list);
 
+    // Off, the streams, then the server's tracks the streams lack.
+    let streams = info.subtitle_streams().len();
     let subtitle_names: Vec<String> = std::iter::once("Off".to_owned())
         .chain(
             info.subtitle_streams()
                 .iter()
                 .map(|s| stream_label(s.language().as_deref(), s.codec().as_deref(), None)),
+        )
+        .chain(
+            elsewhere
+                .iter()
+                .flat_map(|e| e.tracks.iter().map(|(_, name)| name.clone())),
         )
         .collect();
     let subtitles = PickList::new(&subtitle_names);
@@ -256,10 +278,23 @@ pub fn menu(
             subtitles_on.clone(),
             failed.clone(),
         );
-        subtitles.list.connect_row_activated(move |_, row| {
+        subtitles.list.connect_row_activated(move |list, row| {
             let Some(play) = play.upgrade() else { return };
-            // Row 0 is "Off"; the streams follow.
+            // Row 0 is "Off"; the streams follow, then the server's tracks.
             let position = (row.index() as usize).checked_sub(1);
+            if let Some(elsewhere) = &elsewhere
+                && let Some(&(track, _)) = position
+                    .and_then(|p| p.checked_sub(streams))
+                    .and_then(|n| elsewhere.tracks.get(n))
+            {
+                marks.mark(Some(row.index() as usize));
+                // The item starts again, with a new menu.
+                if let Some(popover) = list.ancestor(gtk::Popover::static_type()) {
+                    popover.downcast_ref::<gtk::Popover>().unwrap().popdown();
+                }
+                (elsewhere.pick)(track);
+                return;
+            }
             match select_subtitle(&play, &info, position, &external) {
                 Ok(()) => {
                     on.set(position.is_some());
