@@ -18,8 +18,8 @@ use std::time::SystemTime;
 use adw::prelude::*;
 use gtk::glib;
 use spoolframe_linux_core::backend::{
-    AddressNetwork, BackendError, BoxFuture, DeviceAddress, DeviceInfo, DeviceSignInRequest,
-    PinProof, PinState, Platform, PlexLink, Session,
+    BackendError, BoxFuture, DeviceAddress, DeviceInfo, DeviceSignInRequest, PinProof, PinState,
+    Platform, PlexLink, Session,
 };
 use spoolframe_protocol::device_sign_in;
 
@@ -183,46 +183,28 @@ fn device_icon(platform: Option<Platform>) -> &'static str {
 /// finding 27): a home network or the server's own machine plainly, the
 /// internet as a warning (`true`), since a code someone sent you is theirs.
 /// None when the server does not say.
+/// The SDK's `address_class` decides which: a kind of network a newer
+/// server names is warned of as the internet.
 fn asked_from(device: &str, from: Option<&DeviceAddress>) -> Option<(String, bool)> {
+    use spoolframe_client_sdk::AddressClass;
     let from = from?;
-    Some(match from.network {
-        AddressNetwork::Loopback => (format!("{device} asked from this computer"), false),
+    let class = spoolframe_client_sdk::address_class(from);
+    let said = match class {
+        AddressClass::Loopback => format!("{device} asked from this computer"),
         // A device in the server's own /64 counts as local, though its
         // address is public: say so.
-        AddressNetwork::Local if public_ipv6(&from.address) => (
-            format!(
-                "{device} asked from {}, on your network (public IPv6)",
-                from.address
-            ),
-            false,
+        AddressClass::LocalPublicV6 => format!(
+            "{device} asked from {}, on your network (public IPv6)",
+            from.address
         ),
-        AddressNetwork::Local => (format!("{device} asked from {}", from.address), false),
-        // Unknown: a kind a newer server names; warned of as the internet.
-        AddressNetwork::Internet | AddressNetwork::Unknown => (
-            format!(
-                "{device} asked from {}. This device is on the internet, not on your network. \
-                 Approve only a device you can see. A code someone sent you is theirs.",
-                from.address
-            ),
-            true,
+        AddressClass::Local => format!("{device} asked from {}", from.address),
+        AddressClass::Internet => format!(
+            "{device} asked from {}. This device is on the internet, not on your network. \
+             Approve only a device you can see. A code someone sent you is theirs.",
+            from.address
         ),
-    })
-}
-
-/// A global unicast IPv6 address: not unique-local (fc00::/7), not
-/// link-local (fe80::/10), not IPv4-mapped, and not loopback, unspecified
-/// or multicast.
-fn public_ipv6(address: &str) -> bool {
-    let Ok(ip) = address.parse::<std::net::Ipv6Addr>() else {
-        return false;
     };
-    let first = ip.segments()[0];
-    !(first & 0xfe00 == 0xfc00
-        || first & 0xffc0 == 0xfe80
-        || ip.to_ipv4_mapped().is_some()
-        || ip.is_loopback()
-        || ip.is_unspecified()
-        || ip.is_multicast())
+    Some((said, class.warns()))
 }
 
 /// A device's trust, as the pill beside it says.
@@ -1872,6 +1854,8 @@ fn step_body(icon: &str, heading: &str, line: &str) -> gtk::Box {
 
 #[cfg(test)]
 mod tests {
+    use spoolframe_linux_core::backend::AddressNetwork;
+
     use super::*;
 
     /// An Android device shows as a phone, an Xbox as a TV, not as the

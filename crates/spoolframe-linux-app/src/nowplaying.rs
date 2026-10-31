@@ -821,14 +821,15 @@ impl Transport {
     pub fn show_modes(&self, shuffle: bool, repeat: Repeat) {
         self.syncing.set(true);
         self.shuffle.set_active(shuffle);
-        self.repeat.set_active(repeat != Repeat::Off);
+        self.repeat
+            .set_active(!matches!(repeat, Repeat::Off | Repeat::Unknown));
         self.syncing.set(false);
         let tip = match repeat {
-            Repeat::Off => "Repeat",
+            Repeat::Off | Repeat::Unknown => "Repeat",
             Repeat::All => "Repeating the queue",
             Repeat::One => "Repeating this track",
         };
-        self.repeat.set_icon_name(repeat.icon());
+        self.repeat.set_icon_name(crate::queue::repeat_icon(repeat));
         self.repeat.set_tooltip_text(Some(tip));
     }
 }

@@ -1,24 +1,29 @@
-//! Text the UI shows for media values.
+//! Text the UI shows for media values: the SDK's parts
+//! (`spoolframe_client_sdk::describe`), in this app's words.
 
 use std::time::Duration;
+
+use spoolframe_client_sdk::describe::{
+    self, Channels, HoursMinutes, TrackLabel, TrackOrigin, TrackRole,
+};
 
 /// How much of an item is left, as "1 h 20 min left" or "18 min left".
 /// Rounds up, so an item is never shown as having "0 min" left before its
 /// end.
 pub fn remaining(length: Duration, position: Duration) -> String {
-    let secs = length.saturating_sub(position).as_secs();
-    let minutes = secs.div_ceil(60);
-    match (minutes / 60, minutes % 60) {
-        (0, m) => format!("{m} min left"),
-        (h, 0) => format!("{h} h left"),
-        (h, m) => format!("{h} h {m} min left"),
-    }
+    format!(
+        "{} left",
+        hours_minutes(describe::remaining(length, position))
+    )
 }
 
 /// An item's length, as "1 h 57 min", "2 h" or "50 min".
 pub fn length(length: Duration) -> String {
-    let minutes = length.as_secs().div_ceil(60);
-    match (minutes / 60, minutes % 60) {
+    hours_minutes(HoursMinutes::of(length))
+}
+
+fn hours_minutes(span: HoursMinutes) -> String {
+    match (span.hours, span.minutes) {
         (0, m) => format!("{m} min"),
         (h, 0) => format!("{h} h"),
         (h, m) => format!("{h} h {m} min"),
@@ -41,68 +46,31 @@ pub fn timestamp(position: Duration) -> String {
 /// PX-02), for the common ones; the code itself, upper-cased, for the
 /// rest.
 pub fn language(code: &str) -> String {
-    match code.to_ascii_lowercase().as_str() {
-        "pt-br" => return "Portuguese (Brazil)".to_owned(),
-        "zh-tw" => return "Chinese (Taiwan)".to_owned(),
-        _ => {}
-    }
-    let primary = code.split(['-', '_']).next().unwrap_or(code);
-    let name = match primary.to_ascii_lowercase().as_str() {
-        "en" => "English",
-        "fr" => "French",
-        "de" => "German",
-        "es" => "Spanish",
-        "it" => "Italian",
-        "pt" => "Portuguese",
-        "ru" => "Russian",
-        "uk" => "Ukrainian",
-        "pl" => "Polish",
-        "nl" => "Dutch",
-        "sv" => "Swedish",
-        "no" | "nb" => "Norwegian",
-        "da" => "Danish",
-        "fi" => "Finnish",
-        "ja" => "Japanese",
-        "ko" => "Korean",
-        "zh" => "Chinese",
-        _ => return language_639_2(code),
-    };
-    name.to_owned()
+    language_name(&describe::language(code))
 }
 
-fn language_639_2(code: &str) -> String {
-    let name = match code {
-        "eng" => "English",
-        "fre" | "fra" => "French",
-        "ger" | "deu" => "German",
-        "spa" => "Spanish",
-        "ita" => "Italian",
-        "por" => "Portuguese",
-        "rus" => "Russian",
-        "ukr" => "Ukrainian",
-        "pol" => "Polish",
-        "dut" | "nld" => "Dutch",
-        "swe" => "Swedish",
-        "nor" => "Norwegian",
-        "dan" => "Danish",
-        "fin" => "Finnish",
-        "jpn" => "Japanese",
-        "kor" => "Korean",
-        "chi" | "zho" => "Chinese",
-        "und" => "Unknown language",
-        other => return other.to_uppercase(),
+fn language_name(language: &describe::Language) -> String {
+    if language.undetermined {
+        return "Unknown language".to_owned();
+    }
+    let Some(name) = &language.english else {
+        return language.code.to_uppercase();
     };
-    name.to_owned()
+    match (language.iso639_1.as_deref(), language.region.as_deref()) {
+        (Some("pt"), Some("BR")) => format!("{name} (Brazil)"),
+        (Some("zh"), Some("TW")) => format!("{name} (Taiwan)"),
+        _ => name.clone(),
+    }
 }
 
 /// An audio layout: "stereo", "5.1", "3 channels".
 pub fn channels(n: u32) -> String {
-    match n {
-        1 => "mono".to_owned(),
-        2 => "stereo".to_owned(),
-        6 => "5.1".to_owned(),
-        8 => "7.1".to_owned(),
-        n => format!("{n} channels"),
+    match Channels::of(n) {
+        Channels::Mono => "mono".to_owned(),
+        Channels::Stereo => "stereo".to_owned(),
+        Channels::Surround51 => "5.1".to_owned(),
+        Channels::Surround71 => "7.1".to_owned(),
+        Channels::Other(n) => format!("{n} channels"),
     }
 }
 
@@ -113,69 +81,57 @@ pub fn bitrate(bits: u64) -> String {
 
 /// An audio track as a picker shows it: "English · Commentary · stereo".
 /// The role is named unless it is the main sound; a title that only
-/// repeats the role is left out.
+/// repeats the language or the role is left out.
 pub fn audio_track(track: &spoolframe_types::AudioTrack) -> String {
-    use spoolframe_types::AudioRole;
-    let role = match track.role {
-        AudioRole::Main => None,
-        AudioRole::AudioDescription => Some("Audio description"),
-        AudioRole::Commentary => Some("Commentary"),
-        AudioRole::Other => None,
-    };
-    let parts: Vec<String> = [
-        track.language.as_deref().map(language),
-        role.map(str::to_owned),
-        track
-            .title
-            .clone()
-            .filter(|t| role.is_none_or(|r| !t.eq_ignore_ascii_case(r))),
-        track.channels.map(channels),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-    if parts.is_empty() {
-        "Audio".to_owned()
-    } else {
-        parts.join(" · ")
-    }
+    track_label(&describe::audio_track(track), "Audio")
 }
 
 /// A subtitle track as a picker shows it: "English · SDH", "English ·
 /// Forced · external file".
 pub fn subtitle_track(track: &spoolframe_types::SubtitleTrack) -> String {
-    use spoolframe_types::SubtitleRole;
-    let role = match track.role {
-        SubtitleRole::Sdh => Some("SDH"),
-        SubtitleRole::Forced => Some("Forced"),
-        SubtitleRole::Commentary => Some("Commentary"),
-        SubtitleRole::Full => None,
+    track_label(&describe::subtitle_track(track), "Subtitles")
+}
+
+/// `label`'s parts joined, or `none` when it has none.
+fn track_label(label: &TrackLabel, none: &str) -> String {
+    let role = label.role.map(|role| match role {
+        TrackRole::AudioDescription => "Audio description",
+        TrackRole::Commentary => "Commentary",
+        TrackRole::Sdh => "SDH",
+        TrackRole::Forced => "Forced",
+    });
+    // Forced by its flag alone, it says so once all the same.
+    let forced = (label.forced && label.role != Some(TrackRole::Forced)).then_some("Forced");
+    let origin = match &label.origin {
+        TrackOrigin::InFile => None,
+        TrackOrigin::ExternalFile => Some("external file".to_owned()),
+        TrackOrigin::Searched { site } => Some(format!("Searched ({site})")),
     };
     let parts: Vec<String> = [
-        track.language.as_deref().map(language),
+        label.language.as_ref().map(language_name),
         role.map(str::to_owned),
-        track
-            .title
-            .clone()
-            // A downloaded one's title is its site's name, said below.
-            .filter(|_| track.download.is_none())
-            .filter(|t| role.is_none_or(|r| !t.eq_ignore_ascii_case(r))),
-        // A downloaded one (PX-02) is titled by its site.
-        track.download.as_ref().map(|d| {
-            format!(
-                "Searched ({})",
-                spoolframe_types::SubtitleSource::name_of(&d.source)
-            )
-        }),
-        (track.external && track.download.is_none()).then(|| "external file".to_owned()),
+        forced.map(str::to_owned),
+        label.title.clone(),
+        label.channels.map(|c| channels(channel_count(c))),
+        origin,
     ]
     .into_iter()
     .flatten()
     .collect();
     if parts.is_empty() {
-        "Subtitles".to_owned()
+        none.to_owned()
     } else {
         parts.join(" · ")
+    }
+}
+
+fn channel_count(channels: Channels) -> u32 {
+    match channels {
+        Channels::Mono => 1,
+        Channels::Stereo => 2,
+        Channels::Surround51 => 6,
+        Channels::Surround71 => 8,
+        Channels::Other(n) => n,
     }
 }
 
@@ -223,14 +179,16 @@ pub fn progress(length: Duration, position: Duration) -> f64 {
 }
 
 /// A file as stored, "MKV · HEVC 2160p HDR10", from the server's probe;
-/// `None` when it probed nothing. The picture's class goes by its width,
-/// so a 2.40:1 4K film (3840 by 1600) is 2160p.
+/// `None` when it probed nothing. The picture's class goes by its width
+/// or its height, whichever says more, so a 2.40:1 4K film (3840 by 1600)
+/// is 2160p.
 pub fn file(
     container: Option<spoolframe_types::Container>,
     video: Option<&spoolframe_types::VideoTrack>,
 ) -> Option<String> {
-    use spoolframe_types::{Container, HdrFormat, VideoCodec};
-    let container = container.and_then(|c| match c {
+    use spoolframe_types::{Container, HdrFormat, Resolution, VideoCodec};
+    let class = describe::picture(container, video)?;
+    let container = class.container.and_then(|c| match c {
         Container::Matroska => Some("MKV"),
         Container::Mp4 => Some("MP4"),
         Container::MpegTs => Some("TS"),
@@ -241,33 +199,33 @@ pub fn file(
         Container::Unknown => None,
     });
     let picture = video.map(|v| {
-        let codec = match v.codec {
-            VideoCodec::H264 => "H.264",
-            VideoCodec::Hevc => "HEVC",
-            VideoCodec::Av1 => "AV1",
-            VideoCodec::Vp9 => "VP9",
-            VideoCodec::Vp8 => "VP8",
-            VideoCodec::Mpeg2 => "MPEG-2",
-            VideoCodec::Mpeg4 => "MPEG-4",
-            VideoCodec::Vc1 => "VC-1",
-            VideoCodec::Unknown => "",
-        };
-        let class = match v.width {
-            w if w >= 3200 => "2160p".to_owned(),
-            w if w >= 1800 => "1080p".to_owned(),
-            w if w >= 1200 => "720p".to_owned(),
+        let codec = class.codec.and_then(|c| match c {
+            VideoCodec::H264 => Some("H.264"),
+            VideoCodec::Hevc => Some("HEVC"),
+            VideoCodec::Av1 => Some("AV1"),
+            VideoCodec::Vp9 => Some("VP9"),
+            VideoCodec::Vp8 => Some("VP8"),
+            VideoCodec::Mpeg2 => Some("MPEG-2"),
+            VideoCodec::Mpeg4 => Some("MPEG-4"),
+            VideoCodec::Vc1 => Some("VC-1"),
+            VideoCodec::Unknown => None,
+        });
+        // Below 720p the lines themselves say more than "SD".
+        let resolution = match class.resolution {
+            Some(Resolution::Uhd) => "2160p".to_owned(),
+            Some(Resolution::FullHd) => "1080p".to_owned(),
+            Some(Resolution::Hd) => "720p".to_owned(),
             _ => format!("{}p", v.height),
         };
-        let hdr = v.hdr.map(|h| match h {
+        let hdr = class.hdr.map(|h| match h {
             HdrFormat::Hdr10 => "HDR10",
             HdrFormat::Hlg => "HLG",
             HdrFormat::DolbyVision => "Dolby Vision",
             HdrFormat::Unknown => "HDR",
         });
-        [Some(codec), Some(class.as_str()), hdr]
+        [codec, Some(resolution.as_str()), hdr]
             .into_iter()
             .flatten()
-            .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
             .join(" ")
     });
@@ -286,7 +244,8 @@ pub fn audio_format(
     sample_rate: Option<u32>,
 ) -> Option<String> {
     use spoolframe_types::AudioCodec;
-    let name = match codec? {
+    let format = describe::audio_format(codec, bit_depth, sample_rate)?;
+    let name = match format.codec {
         AudioCodec::Aac => "AAC",
         AudioCodec::Ac3 => "AC-3",
         AudioCodec::Eac3 => "E-AC-3",
@@ -300,21 +259,16 @@ pub fn audio_format(
         AudioCodec::Pcm => "PCM",
         AudioCodec::Unknown => return None,
     };
-    let lossless = matches!(
-        codec?,
-        AudioCodec::Flac | AudioCodec::Alac | AudioCodec::Pcm
-    );
-    Some(match (lossless, bit_depth, sample_rate) {
-        (true, Some(depth), Some(rate)) => {
-            let khz = rate as f64 / 1000.0;
+    Some(match format.bit_depth.zip(format.sample_rate) {
+        Some((depth, rate)) => {
             let khz = if rate % 1000 == 0 {
                 format!("{}", rate / 1000)
             } else {
-                format!("{khz:.1}")
+                format!("{:.1}", rate as f64 / 1000.0)
             };
             format!("{name} {depth}/{khz}")
         }
-        _ => name.to_owned(),
+        None => name.to_owned(),
     })
 }
 
@@ -330,13 +284,12 @@ pub fn seasons(n: u32) -> String {
 /// "Direct · LAN", "Direct · internet", "Relayed" (P6-06's word); `None`
 /// while it is not connected.
 pub fn path_chip(path: crate::backend::ConnectionPath) -> Option<&'static str> {
-    use crate::backend::ConnectionPath;
-    match path {
-        ConnectionPath::Lan { .. } => Some("Direct · LAN"),
-        ConnectionPath::Direct { .. } => Some("Direct · internet"),
-        ConnectionPath::Relay => Some("Relayed"),
-        ConnectionPath::Unknown => None,
-    }
+    use describe::PathChip;
+    Some(match describe::path_chip(path)? {
+        PathChip::Lan => "Direct · LAN",
+        PathChip::Internet => "Direct · internet",
+        PathChip::Relayed => "Relayed",
+    })
 }
 
 /// The path and how fast the link has carried media lately, for the
@@ -454,6 +407,22 @@ mod tests {
     }
 
     #[test]
+    fn a_narrow_film_is_classed_by_its_lines() {
+        assert_eq!(
+            file(None, Some(&picture(1440, 1080, None))).as_deref(),
+            Some("HEVC 1080p")
+        );
+    }
+
+    #[test]
+    fn an_sd_file_says_its_lines() {
+        assert_eq!(
+            file(None, Some(&picture(720, 576, None))).as_deref(),
+            Some("HEVC 576p")
+        );
+    }
+
+    #[test]
     fn a_wide_film_is_classed_by_its_width() {
         assert_eq!(
             file(None, Some(&picture(3840, 1600, None))).as_deref(),
@@ -552,6 +521,21 @@ mod tests {
             role: spoolframe_types::AudioRole::Commentary,
         };
         assert_eq!(audio_track(&track), "English · Commentary · stereo");
+    }
+
+    #[test]
+    fn a_subtitle_forced_by_its_flag_alone_says_so() {
+        let track = spoolframe_types::SubtitleTrack {
+            language: Some("eng".into()),
+            title: None,
+            forced: true,
+            default: false,
+            external: false,
+            role: spoolframe_types::SubtitleRole::Full,
+            timing: None,
+            download: None,
+        };
+        assert_eq!(subtitle_track(&track), "English · Forced");
     }
 
     #[test]

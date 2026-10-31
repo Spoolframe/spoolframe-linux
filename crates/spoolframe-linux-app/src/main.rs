@@ -202,6 +202,8 @@ fn main() -> Result<()> {
         artwork_cache: artwork_cache.clone(),
     });
     playback::shutdown();
+    // The queue saved last is written before the client closes.
+    saved_queue::shutdown();
     // The downloads stop where they got to, for the next start (PX-38),
     // and the connections close.
     if within(&runtime, CLOSE_WAIT, sdk.close()).is_err() {
@@ -248,6 +250,9 @@ mod within_tests {
     }
 }
 
+/// The most catalog reads the SDK keeps, over every profile this run.
+const CATALOG_CAPACITY: usize = 3000;
+
 /// How the SDK opens, from the user's settings: with or without relays
 /// (P6-03), which it cannot change while it runs, and with its downloads
 /// (PX-38) in a directory under the app's data, the one place the sandbox
@@ -257,11 +262,17 @@ mod within_tests {
 /// without it (each session says, `Session::federation`). It asks for
 /// smart crop (PX-64), experimental: where the faces in a backdrop are, so
 /// a wide hero keeps their heads. HTTP playback is not asked for: this app
-/// plays over Iroh only.
+/// plays over Iroh only. The system's language goes with it, so a viewer
+/// with no saved track preferences hears a film in it. The SDK keeps the
+/// catalog's reads ([`CATALOG_CAPACITY`]) and says when one shown changed.
 fn client_options(settings: &settings::Settings) -> sdk::ClientOptions {
     sdk::ClientOptions {
+        catalog_cache: Some(sdk::CacheConfig {
+            capacity: CATALOG_CAPACITY,
+        }),
         relays: settings.use_relays(),
         downloads_dir: downloads_dir(),
+        language: language_of(&gtk::glib::language_names()),
         experimental: sdk::Experimental {
             federation: true,
             smart_crop: true,
@@ -269,6 +280,17 @@ fn client_options(settings: &settings::Settings) -> sdk::ClientOptions {
         },
         ..sdk::ClientOptions::default()
     }
+}
+
+/// The first of the system's locale names (most preferred first, as GLib
+/// lists them) that names a language, as BCP 47 wants it: `en_US.UTF-8`
+/// is `en-US`. `C` and `POSIX` name none.
+fn language_of(names: &[impl AsRef<str>]) -> Option<String> {
+    names.iter().find_map(|name| {
+        let name = name.as_ref();
+        let bare = name.split(['.', '@']).next().unwrap_or(name);
+        (!bare.is_empty() && bare != "C" && bare != "POSIX").then(|| bare.replace('_', "-"))
+    })
 }
 
 /// Where the downloads are kept (PX-38): under the app's data, where the
@@ -340,6 +362,19 @@ mod tests {
     /// experimental ones, federation and smart crop are asked for, HTTP
     /// playback is not.
     #[test]
+    fn the_language_is_the_systems_first_as_bcp_47() {
+        assert_eq!(
+            language_of(&["pt_BR.UTF-8", "pt_BR", "pt", "C"]).as_deref(),
+            Some("pt-BR")
+        );
+    }
+
+    #[test]
+    fn a_c_or_posix_locale_names_no_language() {
+        assert_eq!(language_of(&["C.UTF-8", "C", "POSIX"]), None);
+    }
+
+    #[test]
     fn the_sdk_opens_asking_for_federation_and_smart_crop_not_http_playback() {
         let dir = tempfile::tempdir().unwrap();
         let settings = settings::Settings::at(&dir.path().join("settings.ini"));
@@ -350,6 +385,16 @@ mod tests {
                 federation: true,
                 smart_crop: true,
             }
+        );
+    }
+
+    #[test]
+    fn the_sdk_keeps_the_catalog_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = settings::Settings::at(&dir.path().join("settings.ini"));
+        assert_eq!(
+            client_options(&settings).catalog_cache,
+            Some(sdk::CacheConfig { capacity: 3000 })
         );
     }
 }

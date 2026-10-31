@@ -33,13 +33,13 @@ spoolframe-linux-core = { path = "crates/spoolframe-linux-core" }
 # crates.io, where Spoolframe/spoolframe-server publishes them. The five
 # move together: one version for all of them, the server's release. A
 # prerelease is pinned with `=`: a caret requirement never matches one.
-spoolframe-types = { version = "=0.17.0-beta.4.g47450d4", registry = "coldsteel" }
+spoolframe-types = { version = "=0.17.0-beta.6.g5ef5a07", registry = "coldsteel" }
 # The client protocol's types (home screen, playback plans and handles,
 # artwork sizes), which the SDK returns too.
-spoolframe-protocol = { version = "=0.17.0-beta.4.g47450d4", registry = "coldsteel" }
+spoolframe-protocol = { version = "=0.17.0-beta.6.g5ef5a07", registry = "coldsteel" }
 # The client side of the protocol: Iroh transport, saved servers, sessions.
-spoolframe-client-sdk = { version = "=0.17.0-beta.4.g47450d4", registry = "coldsteel", features = ["media-readers"] }
-spoolframe-policy = { version = "=0.17.0-beta.4.g47450d4", registry = "coldsteel" }
+spoolframe-client-sdk = { version = "=0.17.0-beta.6.g5ef5a07", registry = "coldsteel", features = ["media-readers"] }
+spoolframe-policy = { version = "=0.17.0-beta.6.g5ef5a07", registry = "coldsteel" }
 # The SDK's Storage trait is an async-trait one.
 async-trait = "0.1"
 

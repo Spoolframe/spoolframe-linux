@@ -10,18 +10,17 @@
 //! from elsewhere, asks.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use gtk::glib;
 use gtk::prelude::*;
+use spoolframe_client_sdk::{LikeCache, Pending};
 use spoolframe_linux_core::backend::Liked;
-use spoolframe_linux_core::playlists::{album_heart, heart_likes};
 use spoolframe_types::MediaId;
 
-/// Sends a like (`true`) or an un-like of `items`; on a refusal the app
-/// gives `before` back to [`Hearts::learn`].
-pub type Send = Rc<dyn Fn(Vec<MediaId>, bool, Vec<(MediaId, bool)>)>;
+/// Sends the tap on `items` (a like when [`Pending::likes`]); on a
+/// refusal the app gives it back to [`Hearts::refused`].
+pub type Send = Rc<dyn Fn(Vec<MediaId>, Pending)>;
 
 /// Asks the server for a track's heart, which comes back by
 /// [`Hearts::learn`].
@@ -36,10 +35,10 @@ struct Shown {
     tracks: Rc<RefCell<Vec<MediaId>>>,
 }
 
-/// The hearts of a session: what is known of each track, and the hearts
-/// shown for them.
+/// The hearts of a session: what is known of each track (the SDK's
+/// cache), and the hearts shown for them.
 pub struct Hearts {
-    known: RefCell<HashMap<MediaId, bool>>,
+    known: LikeCache,
     shown: RefCell<Vec<Shown>>,
     send: Send,
     ask: Ask,
@@ -48,7 +47,7 @@ pub struct Hearts {
 impl Hearts {
     pub fn new(send: Send, ask: Ask) -> Rc<Self> {
         Rc::new(Hearts {
-            known: RefCell::default(),
+            known: LikeCache::default(),
             shown: RefCell::default(),
             send,
             ask,
@@ -58,17 +57,23 @@ impl Hearts {
     /// What the server says of these tracks now; every heart showing one
     /// of them is drawn again.
     pub fn learn(&self, hearts: impl IntoIterator<Item = (MediaId, bool)>) {
-        let changed: HashSet<MediaId> = {
-            let mut known = self.known.borrow_mut();
-            hearts
-                .into_iter()
-                .filter(|(id, liked)| known.insert(id.clone(), *liked) != Some(*liked))
-                .map(|(id, _)| id)
-                .collect()
-        };
-        if !changed.is_empty() {
-            self.redraw(|tracks| tracks.iter().any(|t| changed.contains(t)));
+        let changed: Vec<(MediaId, bool)> = hearts
+            .into_iter()
+            .filter(|(id, liked)| self.known.liked(id) != Some(*liked))
+            .collect();
+        if changed.is_empty() {
+            return;
         }
+        let ids: Vec<MediaId> = changed.iter().map(|(id, _)| id.clone()).collect();
+        self.known.learn(changed);
+        self.redraw(|tracks| tracks.iter().any(|t| ids.contains(t)));
+    }
+
+    /// The server refused a tap: its hearts go back as they were.
+    pub fn refused(&self, tap: Pending) {
+        tap.rollback(&self.known);
+        // Which tracks it held is the SDK's: every heart is drawn again.
+        self.redraw(|_| true);
     }
 
     /// A track row's heart.
@@ -108,7 +113,7 @@ impl Hearts {
             *tracks.borrow_mut() = track.iter().cloned().collect();
             *sends.borrow_mut() = track.clone();
             if let Some(track) = &track
-                && !hearts.known.borrow().contains_key(track)
+                && hearts.known.liked(track).is_none()
             {
                 (hearts.ask)(track.clone());
             }
@@ -146,29 +151,16 @@ impl Hearts {
                 return;
             };
             let tracks = tracks.borrow().clone();
-            let likes = heart_likes(hearts.state(&tracks));
-            let before: Vec<(MediaId, bool)> = {
-                let known = hearts.known.borrow();
-                tracks
-                    .iter()
-                    .map(|t| (t.clone(), known.get(t).copied().unwrap_or(false)))
-                    .collect()
-            };
-            hearts.learn(tracks.iter().map(|t| (t.clone(), likes)));
-            (hearts.send)(vec![item], likes, before);
+            let tap = hearts.known.toggle(&tracks);
+            hearts.redraw(|shown| shown.iter().any(|t| tracks.contains(t)));
+            (hearts.send)(vec![item], tap);
         });
     }
 
     /// The heart for `tracks`, by what is known: a track not heard of
     /// counts as not liked.
     fn state(&self, tracks: &[MediaId]) -> Liked {
-        let known = self.known.borrow();
-        let liked: HashSet<MediaId> = tracks
-            .iter()
-            .filter(|t| known.get(*t).copied().unwrap_or(false))
-            .cloned()
-            .collect();
-        album_heart(tracks, &liked)
+        self.known.heart(tracks)
     }
 
     fn redraw(&self, affected: impl Fn(&[MediaId]) -> bool) {
@@ -207,5 +199,46 @@ fn draw(button: &gtk::Button, liked: Liked) {
         button.remove_css_class("liked");
     } else {
         button.add_css_class("liked");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spoolframe_types::{MediaKind, Namespace};
+
+    fn track(key: &str) -> MediaId {
+        MediaId::new(Namespace::Plex, MediaKind::Track, key).unwrap()
+    }
+
+    /// A tap fills every heart of the track at once; the server's refusal
+    /// empties them all again.
+    #[test]
+    #[ignore = "needs a display; run on its own"]
+    fn a_refused_like_puts_every_heart_of_the_track_back() {
+        gtk::init().unwrap();
+        let sent: Rc<RefCell<Option<Pending>>> = Rc::default();
+        let hearts = {
+            let sent = sent.clone();
+            Hearts::new(
+                Rc::new(move |_, tap| *sent.borrow_mut() = Some(tap)),
+                Rc::new(|_| {}),
+            )
+        };
+        let one = track("1");
+        let (row, album) = (
+            hearts.track(&one),
+            hearts.album(&track("album"), vec![one.clone()]),
+        );
+        row.emit_clicked();
+        assert!(
+            row.has_css_class("liked") && album.has_css_class("liked"),
+            "the tap is not shown on both hearts"
+        );
+        hearts.refused(sent.take().expect("the tap is sent"));
+        assert!(
+            !row.has_css_class("liked") && !album.has_css_class("liked"),
+            "the refusal did not empty both hearts"
+        );
     }
 }

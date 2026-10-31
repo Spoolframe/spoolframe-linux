@@ -1407,10 +1407,12 @@ impl FakeSession {
             .lock()
             .expect("fake state is never poisoned");
         let overrides = self.lock_overrides();
+        // The fake hears no device's language: a saved "device" is left out.
         tracks::choose(
             media,
             &preferences,
             overrides.get(&Self::override_key(item)),
+            None,
         )
     }
 
@@ -2991,11 +2993,14 @@ impl Session for FakeSession {
     ) -> BoxFuture<'a, Result<PlaylistPage, BackendError>> {
         Box::pin(async move {
             self.guard()?;
+            // The watch state first, as every other call taking both does:
+            // the other order deadlocked against a playlist's next or
+            // upcoming read on the runtime.
+            let watch = self.watch();
             let store = self.lock_playlists();
             let viewer = self.viewer();
             let (playlist, stored) = store.seen(id, viewer)?;
             let liked = store.liked(&self.username);
-            let watch = self.watch();
             // An item gone from the library drops out.
             let entries: Vec<_> = stored
                 .entries
@@ -3374,6 +3379,11 @@ impl Session for FakeSession {
 
     fn remote_mode(&self, handle: &PlaybackHandle) -> Option<crate::backend::RemoteMode> {
         self.lock_federation().modes.get(handle).copied()
+    }
+
+    /// None: the fake keeps no catalog; the SDK's cache is tested there.
+    fn catalog_changes(&self) -> crate::backend::CatalogChanges {
+        crate::backend::CatalogChanges::new(futures::stream::empty())
     }
 
     fn begin_passkey_registration(&self) -> BoxFuture<'_, Result<PasskeyCreation, BackendError>> {
@@ -3773,6 +3783,8 @@ pub struct FakeClient {
     connections: Mutex<HashMap<ServerKey, watch::Sender<ConnectionState>>>,
     /// The fake has no LAN: its list changes only when an address is added.
     servers_changed: Arc<watch::Sender<()>>,
+    /// Watch state changed on another device: the fake has no other.
+    watch_events: tokio::sync::broadcast::Sender<crate::backend::WatchEvent>,
     /// Accounts made on Cabin from an invite (P6-01), and whether
     /// [`INVITE_CODE`]'s one use is spent.
     joined: Mutex<(Vec<String>, bool)>,
@@ -3783,6 +3795,11 @@ pub struct FakeClient {
     phone_sign_ins: Mutex<PhoneSignIns>,
     /// Bumped by [`FakeClient::sign_out_elsewhere`].
     sign_outs: watch::Sender<u64>,
+    /// What [`FakeClient::tell_profile`] tells.
+    profile_events: tokio::sync::broadcast::Sender<crate::backend::ProfileEvent>,
+    /// Every profile's values ([`Client::profile_store`]), by the SDK's
+    /// key: `profile/<hash>/<name>`.
+    profile_values: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     passkeys: Arc<Mutex<FakeAuth>>,
     /// Every user's playlists (PX-40), as the server keeps them.
     playlists: Arc<Mutex<playlists::Store>>,
@@ -4009,7 +4026,10 @@ impl FakeClient {
             failed_sign_ins: Mutex::new((0, None)),
             connections: Mutex::new(HashMap::new()),
             sign_outs: watch::Sender::new(0),
+            profile_events: tokio::sync::broadcast::channel(16).0,
+            profile_values: Arc::default(),
             servers_changed: Arc::new(watch::Sender::new(())),
+            watch_events: tokio::sync::broadcast::channel(16).0,
             joined: Mutex::default(),
             playlists: Arc::new(Mutex::new(seeded_playlists())),
             subtitles: Arc::new(Mutex::new(subtitles::Store::new(&home_media().0))),
@@ -4157,6 +4177,12 @@ impl FakeClient {
             self.fake_session(profile).pin_state().revoked = true;
         }
         self.sign_outs.send_modify(|n| *n += 1);
+    }
+
+    /// A profile changes as a server or the SDK would tell it: only the
+    /// event, nothing of the fake's state changes with it.
+    pub fn tell_profile(&self, event: crate::backend::ProfileEvent) {
+        let _ = self.profile_events.send(event);
     }
 
     /// An admin resets `username`'s password to [`FAKE_ONE_TIME_PASSWORD`]:
@@ -5129,12 +5155,7 @@ impl Client for FakeClient {
                     }
                 })
                 .collect();
-            // The remembered ones folded in, as the SDK backend does.
-            Ok(crate::sdk::with_trust(
-                listed,
-                self.remembered(server),
-                server,
-            ))
+            Ok(with_trust(listed, self.remembered(server), server))
         })
     }
 
@@ -5348,6 +5369,10 @@ impl Client for FakeClient {
         self.lock_playlists().subscribe()
     }
 
+    fn watch_events(&self) -> tokio::sync::broadcast::Receiver<crate::backend::WatchEvent> {
+        self.watch_events.subscribe()
+    }
+
     fn subtitle_timing_events(
         &self,
     ) -> tokio::sync::broadcast::Receiver<crate::backend::SubtitleTimingEvent> {
@@ -5444,6 +5469,108 @@ impl Client for FakeClient {
     ) -> tokio::sync::broadcast::Receiver<crate::backend::LibrariesChanged> {
         self.lock_federation().subscribe()
     }
+
+    fn profile_events(&self) -> tokio::sync::broadcast::Receiver<crate::backend::ProfileEvent> {
+        self.profile_events.subscribe()
+    }
+
+    fn profile_store(
+        &self,
+        server: &ServerKey,
+        username: &str,
+    ) -> Arc<dyn crate::backend::ProfileStore> {
+        Arc::new(FakeProfileStore {
+            values: self.profile_values.clone(),
+            hash: spoolframe_client_sdk::profile_hash(&server.0, username),
+        })
+    }
+}
+
+/// One profile's values, in memory, as the SDK keeps them.
+struct FakeProfileStore {
+    values: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    hash: String,
+}
+
+impl FakeProfileStore {
+    fn key(&self, name: &str) -> String {
+        format!("profile/{}/{name}", self.hash)
+    }
+}
+
+impl crate::backend::ProfileStore for FakeProfileStore {
+    fn get<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<Option<Vec<u8>>, BackendError>> {
+        let value = self
+            .values
+            .lock()
+            .expect("fake state is never poisoned")
+            .get(&self.key(name))
+            .cloned();
+        Box::pin(std::future::ready(Ok(value)))
+    }
+
+    fn set<'a>(
+        &'a self,
+        name: &'a str,
+        value: Option<Vec<u8>>,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        let mut values = self.values.lock().expect("fake state is never poisoned");
+        match value {
+            Some(value) => values.insert(self.key(name), value),
+            None => values.remove(&self.key(name)),
+        };
+        Box::pin(std::future::ready(Ok(())))
+    }
+}
+
+/// `profiles` with the remembered ones of `trusted` (P4-01) folded in by
+/// username, as the SDK's "Who's watching" lists them
+/// ([`crate::sdk::listed_profile`]): a session keeps opening with it (its
+/// trust kept only to open at start); an ended one opens by resuming; one
+/// only remembered is added. Signed in first, then remembered, then the
+/// rest.
+fn with_trust(
+    mut profiles: Vec<Profile>,
+    trusted: Vec<TrustedProfile>,
+    server: &ServerKey,
+) -> Vec<Profile> {
+    for remembered in trusted {
+        let mut trust = crate::backend::Trust {
+            user_id: remembered.user_id,
+            pin_required: remembered.pin_required,
+            auto_login: remembered.auto_login,
+            by_passkey: false,
+        };
+        match profiles
+            .iter_mut()
+            .find(|p| p.username == remembered.username)
+        {
+            Some(profile) if profile.sign_in == ProfileSignIn::Automatic => {
+                profile.trust = trust.auto_login.then_some(trust);
+            }
+            Some(profile) => {
+                trust.by_passkey = profile.sign_in == ProfileSignIn::Passkey;
+                profile.sign_in = ProfileSignIn::Resume;
+                profile.locked = remembered.pin_required;
+                profile.trust = Some(trust);
+            }
+            None => profiles.push(Profile {
+                server: server.clone(),
+                username: remembered.username,
+                display_name: remembered.display_name,
+                locked: remembered.pin_required,
+                sign_in: ProfileSignIn::Resume,
+                trust: Some(trust),
+            }),
+        }
+    }
+    profiles.sort_by_key(|p| match p.sign_in {
+        ProfileSignIn::Automatic => 0,
+        ProfileSignIn::Resume => 1,
+        ProfileSignIn::Portable(_) => 2,
+        ProfileSignIn::Password | ProfileSignIn::Passkey => 3,
+    });
+    profiles
 }
 
 /// The playlists the fake server starts with (PX-40), as the boards show

@@ -372,7 +372,7 @@ fn tracks_line(download: &LocalDownload) -> String {
     if download.chosen == DownloadTracks::All {
         return "all tracks".to_owned();
     }
-    let file = spoolframe_linux_core::downloads::file_tracks(download);
+    let file = download.file_tracks();
     match file.audio.len() + file.subtitles.len() {
         1 => "1 track".to_owned(),
         n => format!("{n} tracks"),

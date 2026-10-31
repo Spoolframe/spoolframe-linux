@@ -45,6 +45,7 @@ pub enum StorageError {
 }
 
 /// Values stored as files, one per key, in a directory.
+#[derive(Clone)]
 pub struct DataStore {
     dir: PathBuf,
 }

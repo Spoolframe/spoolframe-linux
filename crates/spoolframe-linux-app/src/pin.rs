@@ -19,9 +19,9 @@ use adw::prelude::*;
 use gtk::glib;
 use spoolframe_linux_core::backend::Profile;
 
-/// The fewest and most digits a PIN has.
-pub const MIN: usize = 4;
-pub const MAX: usize = 8;
+/// The fewest and most digits a PIN has, as the SDK counts them.
+pub const MIN: usize = spoolframe_client_sdk::PIN_MIN_DIGITS as usize;
+pub const MAX: usize = spoolframe_client_sdk::PIN_MAX_DIGITS as usize;
 
 /// The digits typed so far.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]

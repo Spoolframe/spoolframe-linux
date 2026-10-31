@@ -168,6 +168,12 @@ impl Cache {
         })
     }
 
+    /// The profile's saved choices, read once the cache was made: a
+    /// library opened before has them from now on.
+    pub fn choices_read(&self, saved: SavedChoices) {
+        self.choices.borrow_mut().read(saved);
+    }
+
     /// Fetches `library`'s first page in the background, if it has not
     /// been fetched yet.
     pub fn prefetch(self: &Rc<Self>, library: Library) {
@@ -217,9 +223,9 @@ impl Cache {
         Ok(pages)
     }
 
-    /// The catalog's re-read of `library`'s page at `offset` came back
+    /// The SDK's re-read of `library`'s plain page at `offset` came back
     /// different: that page is fetched again, if it was fetched before,
-    /// and gets the new value the catalog keeps.
+    /// and gets the new value the SDK keeps.
     pub fn changed(&self, library: &LibraryId, offset: u32) {
         let pages = self.libraries.borrow().get(&library.to_string()).cloned();
         let Some(pages) = pages else { return };
@@ -1401,18 +1407,16 @@ mod tests {
         assert_eq!(again.widgets.sort_label.label(), "Added · Newest");
     }
 
-    /// As after a restart: a new cache, its choices read from the file.
+    /// As after a restart: a new cache, its choices read from the store.
     #[test]
     #[ignore = "needs a display; run on its own"]
     fn a_library_keeps_its_sort_in_the_next_session() {
-        let dir = spoolframe_linux_core::testing::TestDir::new_blocking(
-            "spoolframe-library-choices-next-session",
-        );
+        use spoolframe_linux_core::backend::Client as _;
+        let (client, andrey) = (FakeClient::new(None), FakeClient::profile("andrey"));
         let saved = || {
-            SavedChoices::in_store(
-                spoolframe_linux_core::storage::DataStore::new(dir.path()),
-                &FakeClient::profile("andrey"),
-            )
+            let store = client.profile_store(&andrey.server, &andrey.username);
+            spoolframe_linux_core::testing::runtime()
+                .block_on(SavedChoices::in_store(store, None, &andrey))
         };
         let (view, _) = open_in(&cache(saved()), LibraryKind::Movies);
         view.change(|c| {
@@ -1421,6 +1425,7 @@ mod tests {
                 descending: true,
             }
         });
+        crate::saved_queue::written();
         let (again, _) = open_in(&cache(saved()), LibraryKind::Movies);
         assert_eq!(again.widgets.sort_label.label(), "Added · Newest");
     }

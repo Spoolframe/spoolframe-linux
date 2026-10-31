@@ -212,6 +212,9 @@ pub fn backend_error(error: sdk::SdkError) -> BackendError {
         E::LastAdmin => BackendError::LastAdmin,
         E::PasswordChangeRequired => BackendError::PasswordChangeRequired,
         E::Unsupported { feature } => BackendError::Unsupported(feature),
+        // An older server: what needs the request is hidden, as for a
+        // feature it lacks.
+        E::NotOnServer { request } => BackendError::Unsupported(request),
         E::PlaylistReadOnly => BackendError::PlaylistReadOnly,
         E::KindNotAllowed { kind } => BackendError::KindNotAllowed(kind),
         E::PlaylistConflict { revision } => BackendError::PlaylistConflict { revision },
@@ -302,43 +305,73 @@ fn profile(session: &sdk::Session) -> Profile {
     }
 }
 
-/// `profiles` with the remembered ones of `trusted` (P4-01) folded in by
-/// username: one with a session keeps opening with it; one without opens
-/// by resuming; one only remembered is added.
-pub fn with_trust(
-    mut profiles: Vec<Profile>,
-    trusted: Vec<TrustedProfile>,
+/// A profile on "Who's watching" as the app shows it, `by_passkey` when
+/// its last sign-in here was a passkey. A trusted one opens by resuming,
+/// a portable one with its identity, an ended one signs in again the way
+/// it last did; only a session the server opens at start carries its
+/// trust, for [`Profile::trust`]'s auto login.
+pub fn listed_profile(
     server: &ServerKey,
-) -> Vec<Profile> {
-    for remembered in trusted {
-        let mut trust = Trust {
-            user_id: remembered.user_id,
-            pin_required: remembered.pin_required,
-            auto_login: remembered.auto_login,
-            by_passkey: false,
-        };
-        match profiles
-            .iter_mut()
-            .find(|p| p.username == remembered.username)
-        {
-            Some(profile) => {
-                trust.by_passkey = profile.sign_in == ProfileSignIn::Passkey;
-                if profile.sign_in != ProfileSignIn::Automatic {
-                    profile.sign_in = ProfileSignIn::Resume;
-                }
-                profile.trust = Some(trust);
-            }
-            None => profiles.push(Profile {
-                server: server.clone(),
-                username: remembered.username,
-                display_name: remembered.display_name,
-                locked: false,
-                sign_in: ProfileSignIn::Resume,
-                trust: Some(trust),
-            }),
+    watching: sdk::WatchingProfile,
+    by_passkey: bool,
+) -> Profile {
+    let trust = |user_id: String| Trust {
+        user_id,
+        pin_required: watching.pin_required,
+        auto_login: watching.auto_login,
+        by_passkey,
+    };
+    let (sign_in, trust) = match &watching.opens {
+        sdk::ProfileOpens::Session(session) => (
+            ProfileSignIn::Automatic,
+            watching
+                .auto_login
+                .then(|| trust(session.user().user_id.clone())),
+        ),
+        sdk::ProfileOpens::Trusted { user_id } => {
+            (ProfileSignIn::Resume, Some(trust(user_id.clone())))
         }
+        sdk::ProfileOpens::Portable { identity } => (ProfileSignIn::Portable(*identity), None),
+        sdk::ProfileOpens::SignIn {
+            method: Some(sdk::SignInMethod::Passkey),
+        } => (ProfileSignIn::Passkey, None),
+        sdk::ProfileOpens::SignIn { .. } => (ProfileSignIn::Password, None),
+    };
+    Profile {
+        server: server.clone(),
+        username: watching.username,
+        display_name: watching.display_name,
+        locked: watching.locked,
+        sign_in,
+        trust,
     }
-    profiles
+}
+
+/// [`sdk::ProfileStore`], called on the SDK's runtime.
+struct SdkProfileStore {
+    store: sdk::ProfileStore,
+    handle: Handle,
+}
+
+impl crate::backend::ProfileStore for SdkProfileStore {
+    fn get<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<Option<Vec<u8>>, BackendError>> {
+        let (store, name) = (self.store.clone(), name.to_owned());
+        Box::pin(on_runtime(
+            &self.handle,
+            async move { store.get(&name).await },
+        ))
+    }
+
+    fn set<'a>(
+        &'a self,
+        name: &'a str,
+        value: Option<Vec<u8>>,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        let (store, name) = (self.store.clone(), name.to_owned());
+        Box::pin(on_runtime(&self.handle, async move {
+            store.set(&name, value).await
+        }))
+    }
 }
 
 /// The app's storage as the SDK's: four pass-throughs.
@@ -831,49 +864,41 @@ impl Client for SdkClient {
         Box::pin(async move {
             let client = self.client.clone();
             let id = key.0.clone();
-            let (sessions, saved, trusted) = on_runtime(&self.handle, async move {
-                let sessions = client.profiles(&id).await?;
-                let saved = client.saved_profiles(&id).await?;
-                // Asked of the server; without an answer the picker still
-                // shows what the device keeps.
-                let trusted = client.trusted_profiles(&id).await.unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, "cannot list the remembered profiles");
-                    Vec::new()
-                });
-                Ok::<_, sdk::SdkError>((sessions, saved, trusted))
+            let (watching, passkeys) = on_runtime(&self.handle, async move {
+                let watching = client.whos_watching(&id).await?;
+                // "Remembered · passkey": the SDK's trusted profile does not
+                // say how it last signed in; the saved sign-in does.
+                let passkeys: Vec<String> = client
+                    .saved_profiles(&id)
+                    .await?
+                    .into_iter()
+                    .filter(|s| s.method == Some(sdk::SignInMethod::Passkey))
+                    .map(|s| s.username)
+                    .collect();
+                Ok::<_, sdk::SdkError>((watching, passkeys))
             })
             .await?;
+            // Only what is saved here, and none of it opens: as when the
+            // sessions could not be asked.
+            if watching.offline {
+                return Err(BackendError::Unreachable("The server".into()));
+            }
             // Sessions the SDK no longer has were ended; drop them here too.
             self.sessions
                 .lock()
                 .expect("never poisoned")
                 .retain(|(server, _), _| server != key);
-            let mut profiles: Vec<Profile> = sessions.iter().map(|s| self.remember(s)).collect();
-            // Every profile kept here and not among the sessions is offered
-            // to sign in again: ended ones, and one signed in since
-            // `profiles` answered. All count as kept (C7).
-            for saved in saved {
-                if !profiles.iter().any(|p| p.username == saved.username) {
-                    // Offered the way they last signed in, as far as it
-                    // can be offered again here.
-                    let sign_in = match (saved.method, saved.portable) {
-                        (Some(sdk::SignInMethod::Passkey), _) => ProfileSignIn::Passkey,
-                        (Some(sdk::SignInMethod::Portable), Some(identity)) => {
-                            ProfileSignIn::Portable(identity)
-                        }
-                        _ => ProfileSignIn::Password,
-                    };
-                    profiles.push(Profile {
-                        server: key.clone(),
-                        username: saved.username,
-                        display_name: saved.display_name,
-                        locked: false,
-                        sign_in,
-                        trust: None,
-                    });
-                }
-            }
-            Ok(with_trust(profiles, trusted, key))
+            Ok(watching
+                .profiles
+                .into_iter()
+                .map(|watching| {
+                    if let sdk::ProfileOpens::Session(session) = &watching.opens {
+                        self.remember(session);
+                    }
+                    let by_passkey = passkeys.contains(&watching.username);
+                    listed_profile(key, watching, by_passkey)
+                })
+                .collect())
         })
     }
 
@@ -1095,6 +1120,10 @@ impl Client for SdkClient {
         self.client.subtitle_timing_events()
     }
 
+    fn watch_events(&self) -> tokio::sync::broadcast::Receiver<crate::backend::WatchEvent> {
+        self.client.watch_events()
+    }
+
     fn set_download_profile(&self, server: &str, user_id: &str) {
         self.client.downloads().set_profile(server, user_id);
     }
@@ -1207,6 +1236,21 @@ impl Client for SdkClient {
         &self,
     ) -> tokio::sync::broadcast::Receiver<crate::backend::LibrariesChanged> {
         self.client.libraries_events()
+    }
+
+    fn profile_events(&self) -> tokio::sync::broadcast::Receiver<crate::backend::ProfileEvent> {
+        self.client.profile_events()
+    }
+
+    fn profile_store(
+        &self,
+        server: &ServerKey,
+        username: &str,
+    ) -> Arc<dyn crate::backend::ProfileStore> {
+        Arc::new(SdkProfileStore {
+            store: self.client.profile_store(&server.0, username),
+            handle: self.handle.clone(),
+        })
     }
 
     fn download_events(&self) -> tokio::sync::broadcast::Receiver<DownloadEvent> {
@@ -1523,6 +1567,26 @@ impl Session for SdkSession {
 
     fn smart_crop(&self) -> bool {
         self.session.experimental().smart_crop
+    }
+
+    /// The server's own answer when it has `NextEpisodes`: in order,
+    /// specials first, as the walk without it goes.
+    fn next_episode<'a>(
+        &'a self,
+        episode: &'a spoolframe_types::Episode,
+    ) -> BoxFuture<'a, Result<Option<Item>, BackendError>> {
+        Box::pin(async move {
+            if !self.session.has_feature(sdk::Feature::NextEpisodes) {
+                return crate::next_episode::walk(self, episode).await;
+            }
+            let id = episode.id.clone();
+            self.call(move |s| async move {
+                s.feature::<sdk::gate::NextEpisodes>()?
+                    .next_episode(&id, sdk::NextMode::InOrder, true)
+                    .await
+            })
+            .await
+        })
     }
 
     fn web_url(&self) -> Option<String> {
@@ -2053,6 +2117,14 @@ impl Session for SdkSession {
             .map(|route| route.playing.mode)
     }
 
+    fn catalog_changes(&self) -> crate::backend::CatalogChanges {
+        let changes = self.session.catalog_changes();
+        crate::backend::CatalogChanges::new(futures::stream::unfold(
+            changes,
+            |mut changes| async move { changes.recv().await.map(|change| (change.key, changes)) },
+        ))
+    }
+
     fn sync_download_watch(&self) -> BoxFuture<'_, Result<Vec<SyncedWatch>, BackendError>> {
         let downloads = self.client.downloads();
         Box::pin(self.call(move |s| async move { downloads.sync_watch(&s).await }))
@@ -2258,27 +2330,70 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_remembered_profile_last_in_by_passkey_still_says_passkey() {
-        let server = ServerKey("home".into());
-        let saved = Profile {
-            server: server.clone(),
+    fn watching(opens: sdk::ProfileOpens) -> sdk::WatchingProfile {
+        sdk::WatchingProfile {
             username: "sam".into(),
             display_name: "Sam".into(),
+            opens,
             locked: false,
-            sign_in: ProfileSignIn::Passkey,
-            trust: None,
-        };
-        let remembered = TrustedProfile {
-            user_id: "u-sam".into(),
-            username: "sam".into(),
-            display_name: "Sam".into(),
             pin_required: false,
             pin_digits: None,
             auto_login: false,
+            last: false,
+        }
+    }
+
+    #[test]
+    fn a_remembered_profile_last_in_by_passkey_still_says_passkey() {
+        let trusted = watching(sdk::ProfileOpens::Trusted {
+            user_id: "u-sam".into(),
+        });
+        let listed = listed_profile(&ServerKey("home".into()), trusted, true);
+        assert!(listed.trust.is_some_and(|t| t.by_passkey));
+    }
+
+    #[test]
+    fn a_remembered_profile_resumes_as_its_user() {
+        let trusted = watching(sdk::ProfileOpens::Trusted {
+            user_id: "u-sam".into(),
+        });
+        let listed = listed_profile(&ServerKey("home".into()), trusted, false);
+        assert_eq!(
+            (listed.sign_in, listed.trust.map(|t| t.user_id)),
+            (ProfileSignIn::Resume, Some("u-sam".to_owned()))
+        );
+    }
+
+    #[test]
+    fn an_ended_sign_in_by_passkey_offers_a_passkey_again() {
+        let ended = watching(sdk::ProfileOpens::SignIn {
+            method: Some(sdk::SignInMethod::Passkey),
+        });
+        assert_eq!(
+            listed_profile(&ServerKey("home".into()), ended, false).sign_in,
+            ProfileSignIn::Passkey
+        );
+    }
+
+    #[test]
+    fn an_ended_sign_in_with_no_method_asks_for_the_password() {
+        let ended = watching(sdk::ProfileOpens::SignIn { method: None });
+        assert_eq!(
+            listed_profile(&ServerKey("home".into()), ended, false).sign_in,
+            ProfileSignIn::Password
+        );
+    }
+
+    #[test]
+    fn a_remembered_profile_the_server_opens_at_start_says_so() {
+        let auto = sdk::WatchingProfile {
+            auto_login: true,
+            ..watching(sdk::ProfileOpens::Trusted {
+                user_id: "u-sam".into(),
+            })
         };
-        let merged = with_trust(vec![saved], vec![remembered], &server);
-        assert!(merged[0].trust.as_ref().is_some_and(|t| t.by_passkey));
+        let listed = listed_profile(&ServerKey("home".into()), auto, false);
+        assert!(listed.trust.is_some_and(|t| t.auto_login));
     }
 
     #[test]
@@ -2348,6 +2463,9 @@ mod tests {
                     kind: ItemKind::Movie
                 },
                 sdk::SdkError::PlaylistConflict { revision: 9 },
+                sdk::SdkError::NotOnServer {
+                    request: "UpcomingInPlaylist".into(),
+                },
             ]
             .map(backend_error),
             [
@@ -2355,6 +2473,7 @@ mod tests {
                 BackendError::PlaylistReadOnly,
                 BackendError::KindNotAllowed(ItemKind::Movie),
                 BackendError::PlaylistConflict { revision: 9 },
+                BackendError::Unsupported("UpcomingInPlaylist".into()),
             ]
         );
     }

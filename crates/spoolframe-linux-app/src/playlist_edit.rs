@@ -344,7 +344,7 @@ pub fn panel(
                         update(PlaylistUpdate {
                             visibility: Some(playlists::share_change(
                                 &now,
-                                &ShareChange::Add(user, can_edit),
+                                &ShareChange::Add { user, can_edit },
                             )),
                             ..PlaylistUpdate::default()
                         })
@@ -450,7 +450,10 @@ fn share_row(
     {
         let (update, now, user) = (actions.update.clone(), visibility.clone(), user.to_owned());
         access.connect_selected_notify(move |access| {
-            let change = ShareChange::CanEdit(user.clone(), access.selected() == 1);
+            let change = ShareChange::CanEdit {
+                user: user.clone(),
+                can_edit: access.selected() == 1,
+            };
             update(PlaylistUpdate {
                 visibility: Some(playlists::share_change(&now, &change)),
                 ..PlaylistUpdate::default()
@@ -470,7 +473,7 @@ fn share_row(
             update(PlaylistUpdate {
                 visibility: Some(playlists::share_change(
                     &now,
-                    &ShareChange::StopSharing(user.clone()),
+                    &ShareChange::StopSharing { user: user.clone() },
                 )),
                 ..PlaylistUpdate::default()
             });

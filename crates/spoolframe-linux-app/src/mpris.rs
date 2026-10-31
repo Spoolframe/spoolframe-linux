@@ -825,7 +825,7 @@ fn length_of(length: Duration) -> Option<Time> {
 
 fn loop_status(repeat: Repeat) -> LoopStatus {
     match repeat {
-        Repeat::Off => LoopStatus::None,
+        Repeat::Off | Repeat::Unknown => LoopStatus::None,
         Repeat::All => LoopStatus::Playlist,
         Repeat::One => LoopStatus::Track,
     }

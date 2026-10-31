@@ -15,8 +15,7 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::{gdk, glib};
-use spoolframe_linux_core::backend::PlaylistSummary;
-use spoolframe_linux_core::playlists;
+use spoolframe_linux_core::backend::{PlaylistList, PlaylistSummary};
 use spoolframe_types::{Library, LibraryKind};
 
 use crate::federation::{self, Group};
@@ -54,7 +53,7 @@ pub enum Playlists<'a> {
     Off,
     /// Not listed yet: the Playlists row, and Pinned once they are.
     Loading,
-    Listed(&'a [PlaylistSummary]),
+    Listed(&'a PlaylistList),
 }
 
 /// Which server groups the user folded or unfolded (P8), by group key;
@@ -105,7 +104,7 @@ pub fn rows(
     match playlists {
         Playlists::Off | Playlists::Loading => {}
         Playlists::Listed(list) => {
-            let pinned = playlists::pinned(list);
+            let pinned = list.pinned();
             if pinned.is_empty() {
                 rows.push(Row::NothingPinned);
             }
@@ -501,9 +500,9 @@ mod tests {
         ]
     }
 
-    fn listed(client: &FakeClient) -> Vec<PlaylistSummary> {
+    fn listed(client: &FakeClient) -> PlaylistList {
         let session = client.session(&FakeClient::profile("andrey")).unwrap();
-        ready(session.playlists()).unwrap().playlists
+        ready(session.playlists()).unwrap()
     }
 
     #[test]
@@ -518,7 +517,13 @@ mod tests {
     fn playlists_follow_the_libraries_with_the_pinned_ones_under_them() {
         let client = FakeClient::new(None);
         let list = listed(&client);
-        let heists = list.iter().find(|p| p.pinned.is_some()).unwrap().id.clone();
+        let heists = list
+            .playlists
+            .iter()
+            .find(|p| p.pinned.is_some())
+            .unwrap()
+            .id
+            .clone();
         assert_eq!(
             rows(&own(1), &Folds::default(), Playlists::Listed(&list), false),
             [
@@ -536,13 +541,21 @@ mod tests {
         let client = FakeClient::new(None);
         let session = client.session(&FakeClient::profile("andrey")).unwrap();
         let list = listed(&client);
-        let night = list.iter().find(|p| p.name == "Movie night").unwrap();
+        let night = list
+            .playlists
+            .iter()
+            .find(|p| p.name == "Movie night")
+            .unwrap();
         ready(session.pin_playlist(&night.id, 0)).unwrap();
         let list = listed(&client);
         let pinned: Vec<_> = rows(&[], &Folds::default(), Playlists::Listed(&list), false)
             .into_iter()
             .filter_map(|row| match row {
-                Row::Pinned(id) => list.iter().find(|p| p.id == id).map(|p| p.name.clone()),
+                Row::Pinned(id) => list
+                    .playlists
+                    .iter()
+                    .find(|p| p.id == id)
+                    .map(|p| p.name.clone()),
                 _ => None,
             })
             .collect();
@@ -552,7 +565,7 @@ mod tests {
     #[test]
     fn nothing_pinned_shows_the_hint_in_its_place() {
         let mut list = listed(&FakeClient::new(None));
-        for playlist in &mut list {
+        for playlist in &mut list.playlists {
             playlist.pinned = None;
         }
         assert_eq!(

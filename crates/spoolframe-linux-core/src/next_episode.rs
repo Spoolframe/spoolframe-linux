@@ -2,14 +2,18 @@
 //! it: the next of its season, else the first of the next season that
 //! has any. The player's Next Episode (P2-10) plays it when the episode
 //! was started on its own, from Continue watching or a search.
+//!
+//! A server with `NextEpisodes` answers this itself
+//! ([`Session::next_episode`]); this walk is for one without.
 
 use spoolframe_types::{Episode, Item};
 
 use crate::backend::{BackendError, Session};
 
-/// The episode after `episode` in its show; `None` after the last.
-pub async fn next_episode(
-    session: &dyn Session,
+/// The episode after `episode` in its show, by walking its seasons;
+/// `None` after the last.
+pub async fn walk<S: Session + ?Sized>(
+    session: &S,
     episode: &Episode,
 ) -> Result<Option<Item>, BackendError> {
     let mut episodes = episodes_of(session, &episode.season_id)
@@ -34,8 +38,8 @@ pub async fn next_episode(
 
 /// A season's episodes, in order; anything else among its children is
 /// left out.
-async fn episodes_of(
-    session: &dyn Session,
+async fn episodes_of<S: Session + ?Sized>(
+    session: &S,
     season: &spoolframe_types::MediaId,
 ) -> Result<impl Iterator<Item = Item>, BackendError> {
     let (_, children) = session.item(season).await?;
@@ -81,7 +85,7 @@ mod tests {
     }
 
     async fn next_of(session: &dyn Session, episode: &Episode) -> Option<(u32, u32)> {
-        match next_episode(session, episode).await.unwrap() {
+        match session.next_episode(episode).await.unwrap() {
             Some(Item::Episode(e)) => Some((e.season, e.episode)),
             _ => None,
         }

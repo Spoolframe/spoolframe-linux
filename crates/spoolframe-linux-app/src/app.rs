@@ -19,14 +19,13 @@ use spoolframe_linux_core::backend::{
     BackendError, ChosenTracks, Client, ConnectionState, EntryId, HomeScreen, Invite, InviteLookup,
     ItemDetail, Kinds, LanServerInfo, Liked, Person, PlaySettings, PlaylistEdit, PlaylistEvent,
     PlaylistList, PlaylistNext, PlaylistPage, PlaylistRef, PlaylistSummary, PlaylistUpdate,
-    Profile, ProfileSignIn, SearchScope, Selection, Server, ServerKey, Session,
-    TrackPreferencesInfo, Visibility,
+    Profile, ProfileChange, ProfileEvent, ProfileSignIn, SearchScope, Selection, Server, ServerKey,
+    Session, TrackPreferencesInfo, Visibility,
 };
 use spoolframe_linux_core::backend::{
     DownloadEvent, DownloadOptionsInfo, DownloadSource, DownloadSpace, DownloadTracks,
     LocalDownload,
 };
-use spoolframe_linux_core::next_episode::next_episode;
 use spoolframe_linux_core::playlists::{self as playlist_rules, PinNotesShown};
 use spoolframe_linux_core::theme::Theme;
 use spoolframe_types::{
@@ -52,7 +51,7 @@ use crate::{
     library, nowplaying, pages, pin, player, playlists, preferences, sidebar, start, views,
 };
 use spoolframe_linux_core::artcache::ArtworkCache;
-use spoolframe_linux_core::catalog::{self, CachedSession, Catalog, Scope};
+use spoolframe_linux_core::backend::CatalogKey;
 
 /// A password or PIN in a message. Msg derives Debug, and Relm4 records
 /// each message in a tracing span: this keeps them out of logs.
@@ -189,7 +188,7 @@ pub struct App {
     now_playing: tokio::sync::watch::Sender<Option<MediaId>>,
     /// The playlists the user sees (PX-40), once listed; never on a server
     /// without them.
-    playlists: Option<Vec<PlaylistSummary>>,
+    playlists: Option<PlaylistList>,
     playlist_browser: std::cell::RefCell<Option<playlists::PlaylistBrowser>>,
     /// Pin notes shown already, so a list read again shows none twice.
     pin_notes: PinNotesShown,
@@ -206,9 +205,8 @@ pub struct App {
     pinned_actions: Rc<PinnedActions>,
     /// The item "Add to playlist" was asked for while the list loads.
     pending_add: Option<Box<Item>>,
-    /// Catalog reads kept for every profile this run, shown at once and
-    /// re-read behind (stale-while-revalidate).
-    catalog: Arc<Catalog>,
+    /// Hears the SDK's changes to the catalog reads of the profile in use.
+    catalog_watch: Option<glib::JoinHandle<()>>,
     /// The item whose page is loading, as it was opened: what a redraw of
     /// the page opens again.
     opening_item: Option<Item>,
@@ -307,7 +305,7 @@ pub enum PlaylistPlay {
 }
 
 /// The most entries the server sends at once.
-const PLAYLIST_PAGE: u32 = playlist_rules::PAGE;
+use spoolframe_client_sdk::PLAYLIST_PAGE;
 
 /// The tag of a playlist's page on the stack.
 const PLAYLIST_TAG: &str = "playlist";
@@ -529,14 +527,15 @@ pub enum Msg {
     Closing(crate::closing::Answer),
     PlaylistChanged(Box<PlaylistEvent>),
     /// A kept catalog read came back different from what was shown.
-    CatalogChanged(Box<catalog::Change>),
-    /// Catalog changes were missed: read again what is shown.
-    CatalogLagged,
+    CatalogChanged(Box<CatalogKey>),
     /// Playlist changes were missed: read everything shown again.
     PlaylistsLagged,
     /// A server's libraries changed (P8-02): a paired server came or went,
     /// or shared or stopped sharing a library. Listed again, with Home.
     LibrariesChanged,
+    /// Watch state changed on another of the user's devices, as a server
+    /// told; missed ones count as a change to everything shown.
+    WatchedElsewhere(Option<String>),
     /// The title (any copy's id) plays from this paired server, or from
     /// this one (`None`), from now on (P8-05).
     PlayFrom(MediaId, Option<String>),
@@ -553,7 +552,7 @@ pub enum Msg {
     SetWatched(MediaId, bool),
     /// Likes (`true`) or un-likes tracks or albums (PX-43); the hearts as
     /// they were before the tap, for a refusal.
-    Like(Vec<MediaId>, bool, Vec<(MediaId, bool)>),
+    Like(Vec<MediaId>, spoolframe_client_sdk::Pending),
     /// Asks for a track's heart, for the bar.
     AskHeart(MediaId),
     /// Remember these tracks for the item (an episode: its series).
@@ -579,6 +578,9 @@ pub enum Msg {
     /// The session ended under the screen (signed out elsewhere, or its
     /// password changed): back to "Who's watching".
     SessionEnded,
+    /// A signed-in user's profile changed, as the SDK told; `None` when
+    /// changes were missed.
+    ProfileChanged(Option<Box<ProfileEvent>>),
     /// Settings › a server stopped remembering this computer, which
     /// ended the session here (P4-01).
     StoppedRemembering,
@@ -708,12 +710,11 @@ pub enum Loaded {
         Vec<PlaylistRef>,
         Option<Vec<MediaId>>,
     ),
-    /// A like (`true`) or un-like answered, with the hearts as they were
-    /// before it, to put back on a refusal.
+    /// A like or un-like answered, with the tap it was, to put back on a
+    /// refusal.
     Liked(
-        bool,
         Result<PlaylistSummary, BackendError>,
-        Vec<(MediaId, bool)>,
+        spoolframe_client_sdk::Pending,
     ),
     /// A track's heart the bar asked for.
     Heart(MediaId, Result<Option<Liked>, BackendError>),
@@ -760,6 +761,10 @@ pub enum Loaded {
     DownloadStarted(Result<Box<LocalDownload>, BackendError>),
     /// A playlist deleted, by name.
     PlaylistDeleted(String, Result<(), BackendError>),
+    /// The profile's libraries' sort and filter, read from its store.
+    LibraryChoices(Box<crate::saved_choices::SavedChoices>),
+    /// The profile's queue from the last run, read from its store.
+    SavedQueue(Option<Box<crate::saved_queue::Restored>>),
     PinChanged(Result<(), BackendError>),
     /// What the server picked to play first from playlist (id, name), and
     /// the settings it was asked to play with.
@@ -813,7 +818,7 @@ impl Loaded {
             | Loaded::Show(_, Err(e), _, _)
             | Loaded::Artist(_, Err(e), _)
             | Loaded::Album(_, Err(e), _, _)
-            | Loaded::Liked(_, Err(e), _)
+            | Loaded::Liked(Err(e), _)
             | Loaded::Heart(_, Err(e))
             | Loaded::WatchChanged(Err(e))
             | Loaded::Hidden(_, _, _, Err(e))
@@ -1263,12 +1268,7 @@ impl Component for App {
             shown_playlist: None,
             pinned_actions,
             pending_add: None,
-            catalog: Catalog::new(
-                Arc::new(catalog::SystemClock),
-                Arc::new(|reread| {
-                    relm4::spawn(reread);
-                }),
-            ),
+            catalog_watch: None,
             opening_item: None,
             shown_item: None,
             redrawing: None,
@@ -1285,11 +1285,12 @@ impl Component for App {
             hold: None,
             window: root.downgrade(),
         };
-        model.watch_catalog(&sender);
         // Downloads are this computer's, not a session's: heard from the
         // start, whoever signs in, and listed once heard so none is missed.
         model.watch_downloads(&sender);
         model.watch_libraries(&sender);
+        model.watch_profiles(&sender);
+        model.watch_watch_state(&sender);
         model.list_downloads(&sender);
         model.load_servers(&sender);
         // Invite links the desktop opened before the window was up.
@@ -1958,7 +1959,7 @@ impl Component for App {
                 let name = self
                     .playlists
                     .iter()
-                    .flatten()
+                    .flat_map(|list| &list.playlists)
                     .find(|p| p.id == id)
                     .map(|p| p.name.clone())
                     .or_else(|| {
@@ -2016,10 +2017,10 @@ impl Component for App {
                     return;
                 };
                 // Shown at once; the server's list follows.
-                let position = playlist_rules::new_pin_position(list);
+                let position = list.new_pin_position();
                 if pin {
-                    playlist_rules::with_pin_at(list, &id, position);
-                } else if let Some(playlist) = list.iter_mut().find(|p| p.id == id) {
+                    playlist_rules::with_pin_at(&mut list.playlists, &id, position);
+                } else if let Some(playlist) = list.playlists.iter_mut().find(|p| p.id == id) {
                     playlist.pinned = None;
                 }
                 self.fill_sidebar(widgets);
@@ -2036,12 +2037,11 @@ impl Component for App {
                 else {
                     return;
                 };
-                let Some((id, position)) =
-                    playlist_rules::pin_drop(&playlist_rules::pinned(list), from, to)
+                let Some((id, position)) = playlist_rules::pin_drop(&list.pinned(), from, to)
                 else {
                     return;
                 };
-                playlist_rules::with_pin_at(list, &id, position);
+                playlist_rules::with_pin_at(&mut list.playlists, &id, position);
                 self.fill_sidebar(widgets);
                 self.command(&sender, async move {
                     Loaded::PinChanged(session.pin_playlist(&id, position).await)
@@ -2387,8 +2387,6 @@ impl Component for App {
                 });
             }
             Msg::PlaylistChanged(event) => {
-                // Changed elsewhere, or here: what is kept may be older.
-                self.clear_catalog();
                 let Some(server) = &self.server else { return };
                 // The playlist playing: what comes up in it may have moved.
                 if event.server == server.key.0
@@ -2422,7 +2420,6 @@ impl Component for App {
                 }
             }
             Msg::PlaylistFinished(id) => {
-                self.clear_catalog();
                 if self.shown_playlist_id(widgets).as_ref() == Some(&id) {
                     self.reload_playlist(id, &sender);
                 }
@@ -2436,12 +2433,26 @@ impl Component for App {
                 });
             }
             Msg::LibrariesChanged => {
-                self.clear_catalog();
                 self.load_libraries(&sender);
                 self.load_home(&sender);
             }
+            Msg::WatchedElsewhere(server) => {
+                let Some(shown_server) = &self.server else {
+                    return;
+                };
+                if server.is_some_and(|server| server != shown_server.key.0) {
+                    return;
+                }
+                // The SDK forgot what it kept of them before telling.
+                for refresh in refresh_for_watch(&self.shown(widgets)) {
+                    match refresh {
+                        Refresh::Home => self.load_home(&sender),
+                        Refresh::Item => self.redraw_item(&sender),
+                        _ => {}
+                    }
+                }
+            }
             Msg::PlaylistsLagged => {
-                self.clear_catalog();
                 if let Some(playback) = &self.playback
                     && let Some(playing) = playback.playing_from()
                 {
@@ -2452,16 +2463,7 @@ impl Component for App {
                     self.reload_playlist(id, &sender);
                 }
             }
-            Msg::CatalogChanged(change) => self.catalog_changed(*change, widgets, &sender),
-            Msg::CatalogLagged => {
-                if self.on_home(widgets) {
-                    self.load_home(&sender);
-                }
-                self.load_playlists(&sender);
-                if let Some(id) = self.shown_playlist_id(widgets) {
-                    self.reload_playlist(id, &sender);
-                }
-            }
+            Msg::CatalogChanged(key) => self.catalog_changed(&key, widgets, &sender),
             Msg::OpenPerson(person) => {
                 let Some(session) = self.session.clone() else {
                     return;
@@ -2477,9 +2479,7 @@ impl Component for App {
                 // with or without the server (PX-38).
                 if let Some(download) = self.downloaded(&request).cloned() {
                     let from = crate::downloads::start_from(&download.watch, request.from);
-                    let selection = request
-                        .selection
-                        .map(|s| spoolframe_linux_core::downloads::file_selection(&download, s));
+                    let selection = request.selection.map(|s| download.file_selection(s));
                     return self.play_local(&download, from, selection, widgets, &sender);
                 }
                 let Some(session) = self.session.clone() else {
@@ -2569,16 +2569,16 @@ impl Component for App {
             Msg::EnqueueTracks(items, album, at) => {
                 self.enqueue(vec![(items, album)], at, widgets, &sender)
             }
-            Msg::Like(items, likes, before) => {
+            Msg::Like(items, tap) => {
                 let Some(session) = self.session.clone() else {
                     return;
                 };
                 self.command(&sender, async move {
-                    let done = match likes {
+                    let done = match tap.likes {
                         true => session.like(&items).await,
                         false => session.unlike(&items).await,
                     };
-                    Loaded::Liked(likes, done, before)
+                    Loaded::Liked(done, tap)
                 });
             }
             Msg::AskHeart(id) => {
@@ -2661,6 +2661,39 @@ impl Component for App {
             }
             Msg::SetShowDiagnostics(on) => self.settings.set_show_diagnostics(on),
             Msg::SessionEnded => self.signed_out(widgets, &sender),
+            Msg::ProfileChanged(event) => {
+                // The profile in use, while its session is: once left or
+                // locked, a second word of the same change does nothing.
+                let shown = self
+                    .session
+                    .as_ref()
+                    .zip(self.profile.as_ref())
+                    .map(|(session, profile)| (profile.server.0.clone(), session.user_id()));
+                let listed = self
+                    .server
+                    .as_ref()
+                    .filter(|_| {
+                        self.unlocking.is_none()
+                            && widgets.screens.visible_child_name().as_deref() == Some("profiles")
+                    })
+                    .map(|server| server.key.0.as_str());
+                let shown = shown.as_ref().map(|(s, u)| (s.as_str(), u.as_str()));
+                match profile_action(event.as_deref(), shown, listed) {
+                    ProfileAction::Nothing => {}
+                    ProfileAction::Leave => self.signed_out(widgets, &sender),
+                    ProfileAction::Lock => self.locked_mid_session(widgets, &sender),
+                    ProfileAction::ChangePassword => {
+                        if let Some(profile) = self.profile.clone() {
+                            self.password_change_mid_session(profile, &sender, root);
+                        }
+                    }
+                    ProfileAction::ListProfiles => {
+                        if let Some(server) = self.server.clone() {
+                            self.load_profiles(server, &sender);
+                        }
+                    }
+                }
+            }
             Msg::StoppedRemembering => {
                 self.invalidate_session();
                 self.stop_playback(widgets);
@@ -2746,7 +2779,7 @@ impl Component for App {
                 _ => self.profile.clone(),
             };
             if let Some(profile) = profile {
-                return self.must_change_password(profile, None, &sender, root);
+                return self.password_change_mid_session(profile, &sender, root);
             }
         }
         if loaded.sign_in_required() {
@@ -3011,6 +3044,15 @@ impl Component for App {
                 }
             }
             Loaded::Resumed(_, Err(e)) => toast(widgets, &e),
+            Loaded::LibraryChoices(choices) => {
+                if let Some(cache) = &self.library_cache {
+                    cache.choices_read(*choices);
+                }
+            }
+            Loaded::SavedQueue(Some(restored)) => {
+                self.restore_queue_read(*restored, widgets, &sender)
+            }
+            Loaded::SavedQueue(None) => {}
             Loaded::Profiles(server, Ok(profiles)) => {
                 let choose: start::Choose<Profile> = {
                     let sender = sender.clone();
@@ -3493,7 +3535,8 @@ impl Component for App {
             Loaded::Playlists(Ok(list)) => {
                 // Once per note: the server keeps it until a device says
                 // it was shown.
-                if let Some(text) = self.pin_notes.fresh(&list.pin_notes)
+                if let Some(text) =
+                    playlist_rules::pin_note_text(&self.pin_notes.fresh(&list.pin_notes))
                     && let Some(session) = self.playlist_session()
                 {
                     toast_text(widgets, &text);
@@ -3511,7 +3554,7 @@ impl Component for App {
                 {
                     browser.update(&list.playlists);
                 }
-                self.playlists = Some(list.playlists);
+                self.playlists = Some(list);
                 self.fill_sidebar(widgets);
                 if self.root == Root::Playlists {
                     self.show_playlists(widgets, &sender);
@@ -3762,12 +3805,16 @@ impl Component for App {
             Loaded::PlaylistStarted(_, _, Err(e)) => toast(widgets, &e),
             // Liked changed: its page, if shown, and the list hear of it
             // by the playlist event that follows.
-            Loaded::Liked(_, Ok(_), _) => {}
-            Loaded::Liked(likes, Err(e), before) => {
+            Loaded::Liked(Ok(_), _) => {}
+            Loaded::Liked(Err(e), tap) => {
+                let what = if tap.likes {
+                    "Not liked"
+                } else {
+                    "Still liked"
+                };
                 if let Some(hearts) = &cards.hearts {
-                    hearts.learn(before);
+                    hearts.refused(tap);
                 }
-                let what = if likes { "Not liked" } else { "Still liked" };
                 toast_text(widgets, &format!("{what}: {e}"));
             }
             Loaded::Heart(id, Ok(liked)) => {
@@ -3899,6 +3946,18 @@ impl App {
 
     /// Opens the library as `profile`: its own session on the same
     /// connection, a fresh sidebar and Home.
+    /// The session in use may do nothing until its password is changed:
+    /// what it was asked for is dropped, so the dialog opens once.
+    fn password_change_mid_session(
+        &mut self,
+        profile: Profile,
+        sender: &ComponentSender<Self>,
+        root: &adw::ApplicationWindow,
+    ) {
+        self.invalidate_session();
+        self.must_change_password(profile, None, sender, root);
+    }
+
     /// "Choose a new password" over everything; then the profile opens,
     /// or Sign out signs it out.
     fn must_change_password(
@@ -3970,11 +4029,7 @@ impl App {
         sender: &ComponentSender<Self>,
     ) {
         let session: Arc<dyn Session> = match self.client.session(&profile) {
-            Ok(session) => Arc::new(CachedSession::new(
-                session,
-                self.catalog.clone(),
-                Scope::of(&profile),
-            )),
+            Ok(session) => session,
             Err(e) => return toast(widgets, &e),
         };
         self.shown_item = None;
@@ -4012,9 +4067,7 @@ impl App {
             hearts: Some({
                 let (like, ask) = (sender.clone(), sender.clone());
                 crate::hearts::Hearts::new(
-                    Rc::new(move |items, likes, before| {
-                        like.input(Msg::Like(items, likes, before))
-                    }),
+                    Rc::new(move |items, tap| like.input(Msg::Like(items, tap))),
                     Rc::new(move |id| ask.input(Msg::AskHeart(id))),
                 )
             }),
@@ -4035,10 +4088,13 @@ impl App {
             username: profile.username.clone(),
         };
         self.show_downloads_of(holder, sender);
-        self.library_cache = Some(library::Cache::new(
-            session.clone(),
-            crate::saved_choices::SavedChoices::for_profile(&profile),
-        ));
+        // Read from the profile's store; until then, libraries open plain.
+        self.library_cache = Some(library::Cache::new(session.clone(), Default::default()));
+        let choices =
+            crate::saved_choices::SavedChoices::for_profile(self.client.as_ref(), &profile);
+        self.command(sender, async move {
+            Loaded::LibraryChoices(Box::new(choices.await))
+        });
         self.session = Some(session);
         self.profile = Some(profile.clone());
         self.settings.set_server(&profile.server.0);
@@ -4046,6 +4102,7 @@ impl App {
         widgets.profile_name.set_label(&profile.display_name);
         self.watch_connection(&profile.server, sender);
         self.watch_playlists(sender);
+        self.watch_catalog(sender);
         self.watch_subtitle_timing(sender);
         self.libraries.clear();
         self.playlists = None;
@@ -4066,8 +4123,11 @@ impl App {
         self.offline = false;
         // The queue was the last profile's; this one's comes back paused.
         self.queued.clear();
-        self.saved_queue = SavedQueue::for_profile(&profile).map(Rc::new);
-        self.restore_queue(widgets, sender);
+        self.saved_queue = Some(Rc::new(SavedQueue::for_profile(
+            self.client.as_ref(),
+            &profile,
+        )));
+        self.restore_queue(sender);
         widgets.stack.pop_to_page(&widgets.root_page);
         widgets.window_stack.pop_to_page(&widgets.library_page);
         clear(&widgets.content);
@@ -4111,6 +4171,40 @@ impl App {
             use tokio::sync::broadcast::error::RecvError;
             while let Ok(_) | Err(RecvError::Lagged(_)) = events.recv().await {
                 sender.input(Msg::LibrariesChanged);
+            }
+        });
+    }
+
+    /// Hears profiles change (removed, a PIN, a session ended, a new
+    /// password needed), for as long as the app runs.
+    fn watch_profiles(&self, sender: &ComponentSender<Self>) {
+        let mut events = self.client.profile_events();
+        let sender = sender.clone();
+        glib::spawn_future_local(async move {
+            use tokio::sync::broadcast::error::RecvError;
+            loop {
+                match events.recv().await {
+                    Ok(event) => sender.input(Msg::ProfileChanged(Some(Box::new(event)))),
+                    Err(RecvError::Lagged(_)) => sender.input(Msg::ProfileChanged(None)),
+                    Err(RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+
+    /// Hears watch state change on the user's other devices, for as long
+    /// as the app runs.
+    fn watch_watch_state(&self, sender: &ComponentSender<Self>) {
+        let mut events = self.client.watch_events();
+        let sender = sender.clone();
+        glib::spawn_future_local(async move {
+            use tokio::sync::broadcast::error::RecvError;
+            loop {
+                match events.recv().await {
+                    Ok(event) => sender.input(Msg::WatchedElsewhere(Some(event.server))),
+                    Err(RecvError::Lagged(_)) => sender.input(Msg::WatchedElsewhere(None)),
+                    Err(RecvError::Closed) => break,
+                }
             }
         });
     }
@@ -4421,7 +4515,7 @@ impl App {
 
     /// The sidebar for the libraries and playlists known now.
     fn fill_sidebar(&self, widgets: &AppWidgets) {
-        let listed = self.playlists.as_deref();
+        let listed = self.playlists.as_ref();
         let state = match (self.playlist_session(), listed) {
             (None, _) => sidebar::Playlists::Off,
             (Some(_), None) => sidebar::Playlists::Loading,
@@ -4433,7 +4527,7 @@ impl App {
             // Downloads are this computer's: their row is always there.
             sidebar::rows(&self.libraries, &folds, state, true),
             (&self.libraries, &home),
-            listed.unwrap_or_default(),
+            listed.map_or(&[], |list| list.playlists.as_slice()),
             &self.pinned_actions,
             self.cards.art.as_ref(),
         );
@@ -4477,7 +4571,7 @@ impl App {
             },
         });
         if browse {
-            let browser = playlists::browse(list, &actions, self.cards.art.as_ref());
+            let browser = playlists::browse(&list.playlists, &actions, self.cards.art.as_ref());
             let body = &browser.widget;
             body.set_margin_start(28);
             body.set_margin_end(28);
@@ -4633,7 +4727,7 @@ impl App {
         root: &adw::ApplicationWindow,
     ) {
         let Some(list) = &self.playlists else { return };
-        let rows = playlists::add_rows(list, item.id().kind());
+        let rows = playlists::add_rows(&list.playlists, item.id().kind());
         let add: Rc<dyn Fn(String, String)> = {
             let (sender, item) = (sender.clone(), item.clone());
             Rc::new(move |id, name| sender.input(Msg::AddItemTo(id, name, Box::new(item.clone()))))
@@ -4773,16 +4867,29 @@ impl App {
         widgets.mpris.attach(playback, self.cards.art.clone());
     }
 
+    /// Reads the profile's queue from the last run, for [`Self::restore_queue_read`].
+    fn restore_queue(&self, sender: &ComponentSender<Self>) {
+        let Some(saved) = &self.saved_queue else {
+            return;
+        };
+        let load = saved.load();
+        self.command(sender, async move {
+            Loaded::SavedQueue(load.await.map(Box::new))
+        });
+    }
+
     /// Brings back the profile's queue from the last run, paused in the
-    /// bar.
-    fn restore_queue(&mut self, widgets: &AppWidgets, sender: &ComponentSender<Self>) {
-        let (Some(session), Some(saved)) = (self.session.clone(), self.saved_queue.clone()) else {
+    /// bar, unless something plays already.
+    fn restore_queue_read(
+        &mut self,
+        (queue, at, playlist): crate::saved_queue::Restored,
+        widgets: &AppWidgets,
+        sender: &ComponentSender<Self>,
+    ) {
+        let Some(session) = self.session.clone() else {
             return;
         };
-        let Some((queue, at, playlist)) = saved.load() else {
-            return;
-        };
-        if queue.current().is_none() {
+        if queue.current().is_none() || self.playback.is_some() {
             return;
         }
         let display = Some(crate::capabilities::display(self.settings.show_hdr()));
@@ -4881,56 +4988,32 @@ impl App {
             && widgets.window_stack.visible_page().as_ref() == Some(&widgets.library_page)
     }
 
-    /// Forgets the catalog reads kept for the profile in use, for changes
-    /// made elsewhere; changes made here clear it themselves (CachedSession).
-    fn clear_catalog(&self) {
-        if let Some(profile) = &self.profile {
-            self.catalog.clear(&Scope::of(profile));
+    /// Hears the SDK's catalog changes for the session in use, replacing
+    /// the watch on the last one.
+    fn watch_catalog(&mut self, sender: &ComponentSender<Self>) {
+        if let Some(watch) = self.catalog_watch.take() {
+            watch.abort();
         }
-    }
-
-    /// Hears the catalog's changes for as long as the app runs.
-    fn watch_catalog(&self, sender: &ComponentSender<Self>) {
-        let mut changes = self.catalog.changes();
+        let Some(session) = &self.session else { return };
+        let mut changes = session.catalog_changes();
         let sender = sender.clone();
-        glib::spawn_future_local(async move {
-            use tokio::sync::broadcast::error::RecvError;
-            loop {
-                match changes.recv().await {
-                    Ok(change) => sender.input(Msg::CatalogChanged(Box::new(change))),
-                    Err(RecvError::Lagged(_)) => sender.input(Msg::CatalogLagged),
-                    Err(RecvError::Closed) => break,
-                }
+        self.catalog_watch = Some(glib::spawn_future_local(async move {
+            while let Some(key) = changes.recv().await {
+                sender.input(Msg::CatalogChanged(Box::new(key)));
             }
-        });
+        }));
     }
 
     /// A kept read came back different: the page showing it reads it
-    /// again ([`refresh_for`]), and gets the value just kept, so no other
-    /// re-read follows.
+    /// again ([`refresh_for`]), and gets the value the SDK just kept, so
+    /// no other re-read follows.
     fn catalog_changed(
         &mut self,
-        change: catalog::Change,
+        key: &CatalogKey,
         widgets: &AppWidgets,
         sender: &ComponentSender<Self>,
     ) {
-        if self.profile.as_ref().map(Scope::of) != Some(change.scope) {
-            return;
-        }
-        let item_on_top = self.shown_item.as_ref().filter(|shown| {
-            self.opening.is_none()
-                && shown
-                    .page
-                    .upgrade()
-                    .is_some_and(|page| widgets.window_stack.visible_page().as_ref() == Some(&page))
-        });
-        let playlist = self.shown_playlist_id(widgets);
-        let shown = Shown {
-            home: self.on_home(widgets),
-            playlist: playlist.as_deref(),
-            item: item_on_top.map(|shown| shown.reads.as_slice()),
-        };
-        match refresh_for(&change.read, &shown) {
+        match refresh_for(key, &self.shown(widgets)) {
             None => {}
             Some(Refresh::Home) => self.load_home(sender),
             Some(Refresh::Libraries) => self.load_libraries(sender),
@@ -4942,6 +5025,22 @@ impl App {
             Some(Refresh::Item) => self.redraw_item(sender),
             Some(Refresh::Playlists) => self.load_playlists(sender),
             Some(Refresh::Playlist(id)) => self.reload_playlist(id, sender),
+        }
+    }
+
+    /// What shows now, for [`refresh_for`].
+    fn shown(&self, widgets: &AppWidgets) -> Shown {
+        let item_on_top = self.shown_item.as_ref().filter(|shown| {
+            self.opening.is_none()
+                && shown
+                    .page
+                    .upgrade()
+                    .is_some_and(|page| widgets.window_stack.visible_page().as_ref() == Some(&page))
+        });
+        Shown {
+            home: self.on_home(widgets),
+            playlist: self.shown_playlist_id(widgets),
+            item: item_on_top.map(|shown| shown.reads.clone()),
         }
     }
 
@@ -5216,6 +5315,9 @@ impl App {
         if let Some(watch) = self.playlist_watch.take() {
             watch.abort();
         }
+        if let Some(watch) = self.catalog_watch.take() {
+            watch.abort();
+        }
         if let Some(watch) = self.timing_watch.take() {
             watch.abort();
         }
@@ -5326,7 +5428,7 @@ impl App {
                         backend.item(&show),
                         backend.tracks(&id),
                         server_choice(backend.as_ref(), &id),
-                        next_episode(backend.as_ref(), &episode),
+                        backend.next_episode(&episode),
                     );
                     // "Next episode" is a convenience: none if it cannot be had.
                     let next = next.ok().flatten().map(Box::new);
@@ -5509,13 +5611,13 @@ async fn show_with_seasons(
 /// server has playlists (PX-40), those the user sees that hold it. An
 /// older server is asked as before and holds it in none.
 /// What shows now, for [`refresh_for`].
-struct Shown<'a> {
+struct Shown {
     /// Home, with nothing over it.
     home: bool,
     /// The playlist whose page is on its stack.
-    playlist: Option<&'a str>,
+    playlist: Option<String>,
     /// What the item page on top read, unless another page is loading.
-    item: Option<&'a [MediaId]>,
+    item: Option<Vec<MediaId>>,
 }
 
 /// What reads again when a kept catalog read changes.
@@ -5530,26 +5632,42 @@ enum Refresh {
     Playlist(String),
 }
 
-/// What reads again for a change to `read`, given what `shown`: only what
-/// shows it. The libraries and a library's fetched pages are kept by the
-/// sidebar and the grids, shown or not.
-fn refresh_for(read: &catalog::Read, shown: &Shown) -> Option<Refresh> {
-    use catalog::Read;
-    match read {
-        Read::Home => shown.home.then_some(Refresh::Home),
-        Read::Libraries => Some(Refresh::Libraries),
-        Read::Items {
-            library, offset, ..
-        } => Some(Refresh::LibraryPage(library.clone(), *offset)),
-        Read::Item(id) | Read::ItemDetail(id) => shown
+/// What reads again for a change to `key`, given what `shown`: only what
+/// shows it. The libraries and a library's fetched plain pages are kept by
+/// the sidebar and the grids, shown or not; a sorted or filtered page is
+/// read again when its grid is opened.
+fn refresh_for(key: &CatalogKey, shown: &Shown) -> Option<Refresh> {
+    match key {
+        CatalogKey::Home => shown.home.then_some(Refresh::Home),
+        CatalogKey::Libraries => Some(Refresh::Libraries),
+        CatalogKey::Items {
+            library,
+            offset,
+            order,
+            ..
+        } => order
+            .is_empty()
+            .then(|| Refresh::LibraryPage(library.clone(), *offset)),
+        CatalogKey::Item(id) => shown
             .item
+            .as_ref()
             .is_some_and(|reads| reads.contains(id))
             .then_some(Refresh::Item),
-        Read::Playlists => Some(Refresh::Playlists),
-        Read::Playlist { id, .. } => {
-            (shown.playlist == Some(id.as_str())).then(|| Refresh::Playlist(id.clone()))
+        CatalogKey::Playlists => Some(Refresh::Playlists),
+        CatalogKey::Playlist { id, .. } => {
+            (shown.playlist.as_ref() == Some(id)).then(|| Refresh::Playlist(id.clone()))
         }
     }
+}
+
+/// What reads again when watch state changed on another device: Home and
+/// the item page on top, whatever items it named. A season's or show's
+/// id stands for its episodes, which no page's reads list, and these
+/// changes are rare.
+fn refresh_for_watch(shown: &Shown) -> Vec<Refresh> {
+    let home = shown.home.then_some(Refresh::Home);
+    let item = shown.item.is_some().then_some(Refresh::Item);
+    home.into_iter().chain(item).collect()
 }
 
 /// The Filters pane at the right of `content`, as the boards have it:
@@ -6139,6 +6257,54 @@ pub mod opened {
     }
 }
 
+/// What a profile change does in the app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProfileAction {
+    Nothing,
+    /// Back to "Who's watching", as when a call found the session gone.
+    Leave,
+    /// The PIN pad, as when a call found the profile locked.
+    Lock,
+    /// "Choose a new password".
+    ChangePassword,
+    /// List "Who's watching" again.
+    ListProfiles,
+}
+
+/// What `event` (`None`: some were missed) does, with `shown` the profile
+/// in use (server key, user id) and `listed` the server whose "Who's
+/// watching" is on screen. A PIN cleared asks nothing of the profile in
+/// use; any other profile's change shows on "Who's watching".
+fn profile_action(
+    event: Option<&ProfileEvent>,
+    shown: Option<(&str, &str)>,
+    listed: Option<&str>,
+) -> ProfileAction {
+    let Some(event) = event else {
+        return match listed {
+            Some(_) => ProfileAction::ListProfiles,
+            None => ProfileAction::Nothing,
+        };
+    };
+    if shown.is_some_and(|(server, user)| event.is_of(server, user)) {
+        match event.change {
+            ProfileChange::Removed { .. } | ProfileChange::SessionEnded { .. } => {
+                return ProfileAction::Leave;
+            }
+            ProfileChange::PinChanged { required: true, .. } => return ProfileAction::Lock,
+            ProfileChange::PasswordChangeRequired { .. } => return ProfileAction::ChangePassword,
+            ProfileChange::PinChanged {
+                required: false, ..
+            } => {}
+        }
+    }
+    if listed == Some(event.server.as_str()) {
+        ProfileAction::ListProfiles
+    } else {
+        ProfileAction::Nothing
+    }
+}
+
 /// What the invite dialog's buttons send.
 fn invite_actions(sender: &ComponentSender<App>) -> crate::invite::Actions {
     let send = |make: fn(String) -> Msg| -> Rc<dyn Fn(String)> {
@@ -6240,6 +6406,114 @@ fn server_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn profile_event(server: &str, change: ProfileChange) -> ProfileEvent {
+        ProfileEvent {
+            server: server.into(),
+            change,
+        }
+    }
+
+    #[test]
+    fn the_profile_in_use_removed_leaves_it() {
+        let removed = profile_event("s1", ProfileChange::Removed { user: "u1".into() });
+        assert_eq!(
+            profile_action(Some(&removed), Some(("s1", "u1")), None),
+            ProfileAction::Leave
+        );
+    }
+
+    #[test]
+    fn the_profile_in_use_s_session_ended_leaves_it() {
+        let ended = profile_event(
+            "s1",
+            ProfileChange::SessionEnded {
+                user: "u1".into(),
+                reason: spoolframe_linux_core::backend::SessionEndReason::SignedOut,
+            },
+        );
+        assert_eq!(
+            profile_action(Some(&ended), Some(("s1", "u1")), None),
+            ProfileAction::Leave
+        );
+    }
+
+    #[test]
+    fn a_pin_set_on_the_profile_in_use_locks_it() {
+        let set = profile_event(
+            "s1",
+            ProfileChange::PinChanged {
+                user: "u1".into(),
+                required: true,
+            },
+        );
+        assert_eq!(
+            profile_action(Some(&set), Some(("s1", "u1")), None),
+            ProfileAction::Lock
+        );
+    }
+
+    #[test]
+    fn a_pin_cleared_on_the_profile_in_use_asks_nothing_of_it() {
+        let cleared = profile_event(
+            "s1",
+            ProfileChange::PinChanged {
+                user: "u1".into(),
+                required: false,
+            },
+        );
+        assert_eq!(
+            profile_action(Some(&cleared), Some(("s1", "u1")), None),
+            ProfileAction::Nothing
+        );
+    }
+
+    #[test]
+    fn a_new_password_needed_in_use_asks_for_it() {
+        let needed = profile_event(
+            "s1",
+            ProfileChange::PasswordChangeRequired { user: "u1".into() },
+        );
+        assert_eq!(
+            profile_action(Some(&needed), Some(("s1", "u1")), None),
+            ProfileAction::ChangePassword
+        );
+    }
+
+    #[test]
+    fn another_user_s_change_lists_who_s_watching_again() {
+        let removed = profile_event("s1", ProfileChange::Removed { user: "u2".into() });
+        assert_eq!(
+            profile_action(Some(&removed), Some(("s1", "u1")), Some("s1")),
+            ProfileAction::ListProfiles
+        );
+    }
+
+    #[test]
+    fn the_same_user_id_on_another_server_is_not_the_profile_in_use() {
+        let removed = profile_event("s2", ProfileChange::Removed { user: "u1".into() });
+        assert_eq!(
+            profile_action(Some(&removed), Some(("s1", "u1")), None),
+            ProfileAction::Nothing
+        );
+    }
+
+    #[test]
+    fn another_server_s_change_leaves_who_s_watching_as_it_is() {
+        let removed = profile_event("s2", ProfileChange::Removed { user: "u2".into() });
+        assert_eq!(
+            profile_action(Some(&removed), None, Some("s1")),
+            ProfileAction::Nothing
+        );
+    }
+
+    #[test]
+    fn missed_changes_list_who_s_watching_again() {
+        assert_eq!(
+            profile_action(None, None, Some("s1")),
+            ProfileAction::ListProfiles
+        );
+    }
 
     #[test]
     fn an_identity_with_no_access_is_told_it_has_none() {
@@ -6475,7 +6749,7 @@ mod tests {
         assert_eq!(home_recent_albums(client), ["Low Tide"]);
     }
 
-    fn nothing_shown() -> Shown<'static> {
+    fn nothing_shown() -> Shown {
         Shown {
             home: false,
             playlist: None,
@@ -6498,46 +6772,56 @@ mod tests {
             home: true,
             ..nothing_shown()
         };
-        assert_eq!(
-            refresh_for(&catalog::Read::Home, &shown),
-            Some(Refresh::Home)
-        );
+        assert_eq!(refresh_for(&CatalogKey::Home, &shown), Some(Refresh::Home));
     }
 
     #[test]
     fn a_change_to_home_under_another_page_waits() {
-        assert_eq!(refresh_for(&catalog::Read::Home, &nothing_shown()), None);
+        assert_eq!(refresh_for(&CatalogKey::Home, &nothing_shown()), None);
     }
 
     #[test]
     fn a_change_to_what_the_item_page_read_draws_it_again() {
-        let reads = [movie("1")];
         let shown = Shown {
-            item: Some(&reads),
+            item: Some(vec![movie("1")]),
             ..nothing_shown()
         };
-        let read = catalog::Read::ItemDetail(movie("1"));
+        let read = CatalogKey::Item(movie("1"));
         assert_eq!(refresh_for(&read, &shown), Some(Refresh::Item));
     }
 
     #[test]
     fn a_change_to_another_item_leaves_the_page() {
-        let reads = [movie("1")];
         let shown = Shown {
-            item: Some(&reads),
+            item: Some(vec![movie("1")]),
             ..nothing_shown()
         };
-        let read = catalog::Read::Item(movie("2"));
+        let read = CatalogKey::Item(movie("2"));
         assert_eq!(refresh_for(&read, &shown), None);
+    }
+
+    #[test]
+    fn watch_state_changed_elsewhere_reads_home_and_the_item_page_again() {
+        let shown = Shown {
+            home: true,
+            item: Some(vec![movie("1")]),
+            ..nothing_shown()
+        };
+        assert_eq!(refresh_for_watch(&shown), [Refresh::Home, Refresh::Item]);
+    }
+
+    #[test]
+    fn watch_state_changed_elsewhere_reads_nothing_under_other_pages() {
+        assert_eq!(refresh_for_watch(&nothing_shown()), []);
     }
 
     #[test]
     fn a_change_to_the_shown_playlist_reads_it_again() {
         let shown = Shown {
-            playlist: Some("p1"),
+            playlist: Some("p1".into()),
             ..nothing_shown()
         };
-        let read = catalog::Read::Playlist {
+        let read = CatalogKey::Playlist {
             id: "p1".into(),
             offset: 0,
             limit: 200,
@@ -6551,15 +6835,43 @@ mod tests {
     #[test]
     fn a_change_to_a_playlist_not_shown_reads_nothing() {
         let shown = Shown {
-            playlist: Some("p1"),
+            playlist: Some("p1".into()),
             ..nothing_shown()
         };
-        let read = catalog::Read::Playlist {
+        let read = CatalogKey::Playlist {
             id: "p2".into(),
             offset: 0,
             limit: 200,
         };
         assert_eq!(refresh_for(&read, &shown), None);
+    }
+
+    fn page_of_movies(order: &str) -> CatalogKey {
+        CatalogKey::Items {
+            library: LibraryId::new(spoolframe_types::Namespace::Plex, "movies").unwrap(),
+            offset: 100,
+            limit: 100,
+            order: order.into(),
+        }
+    }
+
+    #[test]
+    fn a_change_to_a_plain_library_page_fetches_it_again() {
+        assert_eq!(
+            refresh_for(&page_of_movies(""), &nothing_shown()),
+            Some(Refresh::LibraryPage(
+                LibraryId::new(spoolframe_types::Namespace::Plex, "movies").unwrap(),
+                100
+            ))
+        );
+    }
+
+    /// The grids keep plain pages only: a sorted page at that offset
+    /// holds other items.
+    #[test]
+    fn a_change_to_a_sorted_library_page_fetches_no_plain_page() {
+        let sorted = page_of_movies(r#"[{"key":"added","descending":true},null]"#);
+        assert_eq!(refresh_for(&sorted, &nothing_shown()), None);
     }
 
     /// Started in a quarter of an ultrawide, where the pane collapses,

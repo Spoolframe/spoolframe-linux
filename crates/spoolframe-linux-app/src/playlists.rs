@@ -12,8 +12,8 @@ use adw::prelude::*;
 use gtk::glib;
 use spoolframe_linux_core::backend::{
     ArtworkSize, BackendError, Builtin, EntryId, Kinds, MAX_ART_BYTES, MAX_ART_PIXELS,
-    PlaySettings, PlaylistEdit, PlaylistEntry, PlaylistOwnerKind, PlaylistPage, PlaylistRef,
-    PlaylistSummary, PlaylistUpdate, Repeat, Visibility,
+    PlaySettings, PlaylistEdit, PlaylistEntry, PlaylistList, PlaylistOwnerKind, PlaylistPage,
+    PlaylistRef, PlaylistSummary, PlaylistUpdate, Repeat, Visibility,
 };
 use spoolframe_linux_core::playlists::{self, Offer};
 use spoolframe_types::{ArtworkId, ArtworkKind, Item, MediaKind};
@@ -225,12 +225,12 @@ pub struct ListActions {
 /// My playlists, Shared with me and Server-wide, each a row of cards; a
 /// group with none is left out.
 pub fn section(
-    list: &[PlaylistSummary],
+    list: &PlaylistList,
     actions: &Rc<ListActions>,
     art: Option<&Rc<crate::artwork::Art>>,
     browse: Rc<dyn Fn()>,
 ) -> Vec<gtk::Box> {
-    let groups = playlists::sections(list);
+    let groups = list.sections();
     let rows: Vec<gtk::Box> = [
         ("Music", groups.builtin),
         ("My playlists", groups.mine),
@@ -239,7 +239,7 @@ pub fn section(
     ]
     .into_iter()
     .filter(|(_, group)| !group.is_empty())
-    .map(|(title, group)| views::row(title, group.into_iter().map(|p| card(p, actions, art))))
+    .map(|(title, group)| views::row(title, group.iter().map(|p| card(p, actions, art))))
     .collect();
     if !rows.is_empty() {
         // The section's own, over whichever groups there are: someone
@@ -530,7 +530,7 @@ pub fn play_label(page: &PlaylistPage) -> String {
 /// Play from start's entry: the first that can play. `None` with a place
 /// not kept, where the main button already plays from the top.
 pub fn from_start(page: &PlaylistPage) -> Option<EntryId> {
-    playlists::up_next(page)?;
+    playlists::continue_entry(page)?;
     page.entries
         .iter()
         .find(|e| !e.unavailable)
@@ -538,14 +538,14 @@ pub fn from_start(page: &PlaylistPage) -> Option<EntryId> {
 }
 
 /// What the Repeat button says and shows for a playlist's `repeat`.
+/// A kind this build does not know shows as off.
 fn repeat_label(repeat: Repeat) -> (&'static str, &'static str) {
-    let repeat = crate::queue::Repeat::from(repeat);
     let text = match repeat {
-        crate::queue::Repeat::All => "Repeat all",
-        crate::queue::Repeat::One => "Repeat one",
-        crate::queue::Repeat::Off => "Repeat",
+        Repeat::All => "Repeat all",
+        Repeat::One => "Repeat one",
+        Repeat::Off | Repeat::Unknown => "Repeat",
     };
-    (text, repeat.icon())
+    (text, crate::queue::repeat_icon(repeat))
 }
 
 /// The line under the name: its counts and whose it is.
@@ -776,7 +776,7 @@ impl PlaylistView {
             up_next: if playlists::music_only(page.playlist.kinds) {
                 None
             } else {
-                playlists::up_next(page)
+                playlists::continue_entry(page)
             },
             cards,
             editing,
@@ -1005,7 +1005,7 @@ fn header(
             let (text, icon) = repeat_label(repeat);
             content.set_label(text);
             content.set_icon_name(icon);
-            if crate::queue::Repeat::from(repeat) == crate::queue::Repeat::Off {
+            if matches!(repeat, Repeat::Off | Repeat::Unknown) {
                 button.remove_css_class("on");
             } else {
                 button.add_css_class("on");
@@ -1018,7 +1018,7 @@ fn header(
         let show_repeat = show_repeat.clone();
         repeat.connect_clicked(move |_| {
             let now = change_settings(&settings, &*changed, |now| PlaySettings {
-                repeat: crate::queue::Repeat::from(now.repeat).next().into(),
+                repeat: crate::queue::next_repeat(now.repeat),
                 ..now
             });
             show_repeat(now.repeat);
@@ -1146,7 +1146,7 @@ fn entry_row(
         row.add_suffix(&hearts.track(&track.id));
     }
     if let Some(note) = playlists::entry_note(entry, up_next) {
-        let note = label(&note, &["small-text"]);
+        let note = label(&playlists::note_text(note), &["small-text"]);
         if Some(entry.entry) == up_next {
             note.add_css_class("accent");
         } else {
@@ -1221,19 +1221,21 @@ pub struct AddRow {
 pub fn add_rows(list: &[PlaylistSummary], kind: MediaKind) -> Vec<AddRow> {
     playlists::add_targets(list, kind)
         .into_iter()
-        .map(|(playlist, offer)| AddRow {
-            id: playlist.id.clone(),
-            name: playlist.name.clone(),
-            builtin: playlist.builtin,
-            artwork: playlist.artwork.clone(),
-            line: offer.reason().map(str::to_owned).unwrap_or_else(|| {
-                format!(
-                    "{} · {}",
-                    playlists::kinds_line(playlist.kinds),
-                    playlists::owner_line(playlist)
-                )
-            }),
-            adds: offer == Offer::Adds,
+        .map(|target| AddRow {
+            line: playlists::offer_reason(target.offer)
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    format!(
+                        "{} · {}",
+                        playlists::kinds_line(target.playlist.kinds),
+                        playlists::owner_line(&target.playlist)
+                    )
+                }),
+            adds: target.offer == Offer::Adds,
+            id: target.playlist.id,
+            name: target.playlist.name,
+            builtin: target.playlist.builtin,
+            artwork: target.playlist.artwork,
         })
         .collect()
 }
@@ -1472,14 +1474,14 @@ pub fn new_playlist_dialog(
             tracks: tracks.is_active(),
         };
         match playlists::new_playlist(&name.text(), kinds, server_wide.is_active()) {
-            Ok((name, kinds, visibility)) => {
+            Ok(made) => {
                 if let Some(dialog) = closing.upgrade() {
                     dialog.close();
                 }
-                create(name, kinds, visibility);
+                create(made.name, made.kinds, made.visibility);
             }
             Err(why) => {
-                refusal.set_label(why);
+                refusal.set_label(playlists::new_playlist_refusal(why));
                 refusal.set_visible(true);
             }
         }
@@ -1811,13 +1813,9 @@ mod tests {
     fn browse_all_is_offered_without_playlists_of_ones_own() {
         gtk::init().unwrap();
         let client = FakeClient::new(None);
-        let list: Vec<_> = ready(andrey(&client).playlists())
-            .unwrap()
-            .playlists
-            .into_iter()
-            .filter(|p| p.builtin.is_some())
-            .collect();
-        assert!(!list.is_empty());
+        let mut list = ready(andrey(&client).playlists()).unwrap();
+        list.playlists.retain(|p| p.builtin.is_some());
+        assert!(!list.playlists.is_empty());
         let browsed = Rc::new(Cell::new(false));
         let actions = Rc::new(ListActions {
             open: Rc::new(|_| {}),

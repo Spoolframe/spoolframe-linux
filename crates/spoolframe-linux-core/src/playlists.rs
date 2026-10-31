@@ -1,8 +1,9 @@
-//! Playlists (PX-40) as the screens show them, without GTK: the
-//! Playlists section's groups, Pinned in its order, which playlists "Add
-//! to playlist" offers for an item, the lines under a playlist's name and
-//! its entries, the edit a drag makes, and what an event asks to read
-//! again. The server keeps everything; this only reads its answers.
+//! Playlists (PX-40) as the screens show them, without GTK: the lines
+//! under a playlist's name and its entries, what a greyed "Add to
+//! playlist" row says, and what an event asks to read again. The rules
+//! (groups, Pinned, offers, a drag's edit, Continue, sharing) are the
+//! SDK's [`spoolframe_client_sdk::playlists::view`]; this words them.
+//! The server keeps everything; this only reads its answers.
 //!
 //! Playlist summaries carry no counts (only a playlist's own page does),
 //! so lines from a summary say whose it is and what it holds, never how
@@ -11,16 +12,20 @@
 use std::ops::ControlFlow;
 use std::time::Duration;
 
-use spoolframe_types::{Item, MediaId, MediaKind};
+use spoolframe_types::{Item, MediaId};
 
 use crate::backend::{
-    BackendError, Builtin, EntryId, Kinds, Liked, PlaylistChange, PlaylistEdit, PlaylistEntry,
-    PlaylistEvent, PlaylistNext, PlaylistOwnerKind, PlaylistPage, PlaylistShare, PlaylistSummary,
-    Session, ShareCandidate, UserKind, Visibility,
+    BackendError, Builtin, EntryId, Kinds, PlaylistChange, PlaylistEdit, PlaylistEvent,
+    PlaylistNext, PlaylistOwnerKind, PlaylistPage, PlaylistShare, PlaylistSummary, Session,
+    ShareCandidate, UserKind, Visibility,
 };
 
-/// The most entries a page of a playlist holds.
-pub const PAGE: u32 = 200;
+pub use spoolframe_client_sdk::PLAYLIST_PAGE as PAGE;
+pub use spoolframe_client_sdk::playlists::view::{
+    EditorControls, EntryNote, NewPlaylist, NewPlaylistError, Offer, PageCounts, PinNotesShown,
+    ShareChange, add_targets, continue_entry, editor_controls, entry_note, kinds_for, move_edit,
+    new_playlist, page_counts, pin_drop, share_change, with_pin_at,
+};
 
 /// A playlist's name, or what is typed to search them, as a search
 /// compares it: lowercase, without the spaces around it.
@@ -51,49 +56,6 @@ pub fn play_settings(
         settings.skip_watched = false;
     }
     settings
-}
-
-/// The Playlists section's groups, each in the server's order.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct Sections<'a> {
-    /// Liked and All (PX-43), first, under Music: the server lists them
-    /// first, Liked before All.
-    pub builtin: Vec<&'a PlaylistSummary>,
-    pub mine: Vec<&'a PlaylistSummary>,
-    pub shared_with_me: Vec<&'a PlaylistSummary>,
-    pub server_wide: Vec<&'a PlaylistSummary>,
-}
-
-/// `list` apart by whose each is. A kind from a newer server goes with
-/// the shared ones: someone else's, seen by this user.
-pub fn sections(list: &[PlaylistSummary]) -> Sections<'_> {
-    let mut sections = Sections::default();
-    for playlist in list {
-        if playlist.builtin.is_some() {
-            sections.builtin.push(playlist);
-            continue;
-        }
-        match playlist.owner_kind {
-            PlaylistOwnerKind::Mine => sections.mine.push(playlist),
-            PlaylistOwnerKind::ServerWide => sections.server_wide.push(playlist),
-            PlaylistOwnerKind::SharedWithMe | PlaylistOwnerKind::Unknown => {
-                sections.shared_with_me.push(playlist)
-            }
-        }
-    }
-    sections
-}
-
-/// The user's Pinned, in their order.
-pub fn pinned(list: &[PlaylistSummary]) -> Vec<&PlaylistSummary> {
-    let mut pinned: Vec<_> = list.iter().filter(|p| p.pinned.is_some()).collect();
-    pinned.sort_by_key(|p| p.pinned);
-    pinned
-}
-
-/// Where a pin newly made goes: last.
-pub fn new_pin_position(list: &[PlaylistSummary]) -> u32 {
-    list.iter().filter(|p| p.pinned.is_some()).count() as u32
 }
 
 /// Whose a playlist is, as its card and row say under its name.
@@ -148,69 +110,15 @@ pub fn kinds_line(kinds: Kinds) -> String {
         .unwrap_or_default()
 }
 
-/// How "Add to playlist" offers a playlist that takes the item's kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Offer {
-    /// One click adds.
-    Adds,
-    /// Shared with the user to read: listed greyed.
-    ReadOnly,
-    /// Server-wide, and the user is no admin: listed greyed.
-    AdminsEdit,
-    /// Liked (PX-43): a track gets in by its heart, never by an add.
-    UseHeart,
-    /// All: it holds every track already.
-    HasEverything,
-}
-
-impl Offer {
-    /// Why a greyed one cannot take it; `None` for one that can.
-    pub fn reason(self) -> Option<&'static str> {
-        match self {
-            Offer::Adds => None,
-            Offer::ReadOnly => Some("Read only"),
-            Offer::AdminsEdit => Some("Server-wide · admins edit"),
-            Offer::UseHeart => Some("Use the heart instead"),
-            Offer::HasEverything => Some("Built in · every track already"),
-        }
-    }
-}
-
-/// The playlists "Add to playlist" lists for an item of `kind`: only those
-/// whose kinds take it (a film never sees a music playlist), the ones the
-/// user can add to first, each group in the server's order.
-pub fn add_targets(list: &[PlaylistSummary], kind: MediaKind) -> Vec<(&PlaylistSummary, Offer)> {
-    let mut targets: Vec<_> = list
-        .iter()
-        .filter(|p| p.kinds.allows(kind))
-        .map(|p| {
-            let offer = match (p.builtin, p.can_edit, p.owner_kind) {
-                (Some(Builtin::Liked), _, _) => Offer::UseHeart,
-                (Some(_), _, _) => Offer::HasEverything,
-                (None, true, _) => Offer::Adds,
-                (None, false, PlaylistOwnerKind::ServerWide) => Offer::AdminsEdit,
-                (None, false, _) => Offer::ReadOnly,
-            };
-            (p, offer)
-        })
-        .collect();
-    targets.sort_by_key(|(_, offer)| *offer != Offer::Adds);
-    targets
-}
-
-/// Whether a tap on a heart showing `liked` likes (true) or un-likes: a
-/// full heart un-likes, a half one likes the rest, an empty one likes.
-pub fn heart_likes(liked: Liked) -> bool {
-    !matches!(liked, Liked::All)
-}
-
-/// An album's heart from which of its `tracks` are `liked`: full when
-/// every one is, half when some are.
-pub fn album_heart(tracks: &[MediaId], liked: &std::collections::HashSet<MediaId>) -> Liked {
-    match tracks.iter().filter(|t| liked.contains(*t)).count() {
-        0 => Liked::None,
-        n if n == tracks.len() => Liked::All,
-        _ => Liked::Some,
+/// Why a greyed "Add to playlist" row cannot take the item; `None` for
+/// one that can.
+pub fn offer_reason(offer: Offer) -> Option<&'static str> {
+    match offer {
+        Offer::Adds => None,
+        Offer::ReadOnly => Some("Read only"),
+        Offer::AdminsEdit => Some("Server-wide · admins edit"),
+        Offer::UseHeart => Some("Use the heart instead"),
+        Offer::HasEverything => Some("Built in · every track already"),
     }
 }
 
@@ -218,32 +126,33 @@ pub fn album_heart(tracks: &[MediaId], liked: &std::collections::HashSet<MediaId
 /// episodes", "18 episodes · 17 playable". By kind only when the page has
 /// every entry; a longer playlist says how many items.
 pub fn count_line(page: &PlaylistPage) -> String {
-    if page.total == 0 {
-        return "Empty".to_owned();
-    }
-    let counts = if page.offset == 0 && page.entries.len() as u32 == page.total {
-        let count = |kind: MediaKind| {
-            page.entries
-                .iter()
-                .filter(|e| e.item.id().kind() == kind)
-                .count()
-        };
-        [
-            (count(MediaKind::Movie), "film", "films"),
-            (count(MediaKind::Episode), "episode", "episodes"),
-            (count(MediaKind::Track), "track", "tracks"),
-        ]
-        .into_iter()
-        .filter(|(n, _, _)| *n > 0)
-        .map(|(n, one, many)| plural(n, one, many))
-        .collect::<Vec<_>>()
-        .join(", ")
-    } else {
-        plural(page.total as usize, "item", "items")
+    let (counts, playable) = match page_counts(page) {
+        PageCounts::Empty => return "Empty".to_owned(),
+        PageCounts::ByKind {
+            films,
+            episodes,
+            tracks,
+            playable,
+        } => (
+            [
+                (films, "film", "films"),
+                (episodes, "episode", "episodes"),
+                (tracks, "track", "tracks"),
+            ]
+            .into_iter()
+            .filter(|(n, _, _)| *n > 0)
+            .map(|(n, one, many)| plural(n, one, many))
+            .collect::<Vec<_>>()
+            .join(", "),
+            playable,
+        ),
+        PageCounts::Items { total, playable } => {
+            (plural(total as usize, "item", "items"), playable)
+        }
     };
-    match page.playable < page.total {
-        true => format!("{counts} · {} playable", page.playable),
-        false => counts,
+    match playable {
+        Some(playable) => format!("{counts} · {playable} playable"),
+        None => counts,
     }
 }
 
@@ -254,25 +163,9 @@ fn plural(n: usize, one: &str, many: &str) -> String {
     }
 }
 
-/// The entry Continue starts at, of those on the page: the user's place,
-/// or the next playable one once the place's item is watched or cannot be
-/// read. `None` without a place, when Continue is Play from the top.
-pub fn up_next(page: &PlaylistPage) -> Option<EntryId> {
-    let place = page.place?;
-    let at = page.entries.iter().position(|e| e.entry == place)?;
-    let here = &page.entries[at];
-    if !here.unavailable && !watched(&here.item) {
-        return Some(place);
-    }
-    page.entries[at + 1..]
-        .iter()
-        .find(|e| !e.unavailable)
-        .map(|e| e.entry)
-}
-
 /// What Continue says it plays: "S4 · E6 Halloween IV", or a title.
 pub fn continue_label(page: &PlaylistPage) -> Option<String> {
-    let next = up_next(page)?;
+    let next = continue_entry(page)?;
     let entry = page.entries.iter().find(|e| e.entry == next)?;
     Some(match &entry.item {
         Item::Episode(e) => format!("S{} · E{} {}", e.season, e.episode, e.title),
@@ -280,18 +173,14 @@ pub fn continue_label(page: &PlaylistPage) -> Option<String> {
     })
 }
 
-/// The line under an entry: Unavailable, Up next, Watched, or its length.
-pub fn entry_note(entry: &PlaylistEntry, up_next: Option<EntryId>) -> Option<String> {
-    if entry.unavailable {
-        return Some("Unavailable · the file can’t be read; skipped".to_owned());
+/// The line under an entry, from [`entry_note`].
+pub fn note_text(note: EntryNote) -> String {
+    match note {
+        EntryNote::Unavailable => "Unavailable · the file can’t be read; skipped".to_owned(),
+        EntryNote::UpNext => "Up next · Continue starts here".to_owned(),
+        EntryNote::Watched => "Watched".to_owned(),
+        EntryNote::Length(length) => crate::format::length(length),
     }
-    if Some(entry.entry) == up_next {
-        return Some("Up next · Continue starts here".to_owned());
-    }
-    if watched(&entry.item) {
-        return Some("Watched".to_owned());
-    }
-    length(&entry.item).map(crate::format::length)
 }
 
 /// Where an entry's item is from: "Andor · S1 · E3", "The Night Shift ·
@@ -333,35 +222,6 @@ pub fn watched(item: &Item) -> bool {
         Item::Track(t) => t.playback.watched,
         _ => false,
     }
-}
-
-fn length(item: &Item) -> Option<Duration> {
-    match item {
-        Item::Movie(m) => m.duration,
-        Item::Episode(e) => e.duration,
-        Item::Track(t) => t.duration,
-        _ => None,
-    }
-}
-
-/// The edit that moves the entry at `from` in `entries` (as shown) so it
-/// ends at `to`: before whatever is then after it, or to the end. `None`
-/// when it stays where it is.
-pub fn move_edit(entries: &[EntryId], from: usize, to: usize) -> Option<PlaylistEdit> {
-    if from >= entries.len() {
-        return None;
-    }
-    let mut order = entries.to_vec();
-    let entry = order.remove(from);
-    let to = to.min(order.len());
-    if to == from {
-        return None;
-    }
-    order.insert(to, entry);
-    Some(PlaylistEdit::Move {
-        entry,
-        before: order.get(to + 1).copied(),
-    })
 }
 
 /// `edits` on the revision shown; when someone changed the same entries
@@ -434,72 +294,12 @@ pub fn pin_note_text(notes: &[crate::backend::PinNote]) -> Option<String> {
     (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
-/// The pin notes shown this session: the server keeps a note until some
-/// device dismisses it, so a list read again before the dismissal lands
-/// carries it once more, and it is not shown twice.
-#[derive(Debug, Default)]
-pub struct PinNotesShown(std::collections::HashSet<String>);
-
-impl PinNotesShown {
-    /// The text of the notes in `notes` not shown yet, now counted as
-    /// shown; `None` when there are none.
-    pub fn fresh(&mut self, notes: &[crate::backend::PinNote]) -> Option<String> {
-        let fresh: Vec<_> = notes
-            .iter()
-            .filter(|note| self.0.insert(note.playlist_id.clone()))
-            .cloned()
-            .collect();
-        pin_note_text(&fresh)
+/// What "New playlist" says it still needs.
+pub fn new_playlist_refusal(error: NewPlaylistError) -> &'static str {
+    match error {
+        NewPlaylistError::NoName => "Give the playlist a name.",
+        NewPlaylistError::NoKind => "Tick at least one kind it holds.",
     }
-}
-
-/// The pin a drag within Pinned makes: the playlist at `from` (in
-/// [`pinned`]'s order) dropped on the row at `to` takes that row's place.
-/// Its id and the position to pin it at; `None` when it stays.
-pub fn pin_drop(pinned: &[&PlaylistSummary], from: usize, to: usize) -> Option<(String, u32)> {
-    let playlist = pinned.get(from)?;
-    let to = to.min(pinned.len() - 1);
-    (to != from).then(|| (playlist.id.clone(), to as u32))
-}
-
-/// `list` with playlist `id` pinned at `position`, as the server will
-/// have it: shown at once, before its answer. Positions are made 0, 1, …
-/// in the new order.
-pub fn with_pin_at(list: &mut [PlaylistSummary], id: &str, position: u32) {
-    let mut order: Vec<String> = pinned(list)
-        .into_iter()
-        .filter(|p| p.id != id)
-        .map(|p| p.id.clone())
-        .collect();
-    let at = (position as usize).min(order.len());
-    order.insert(at, id.to_owned());
-    for playlist in list.iter_mut() {
-        playlist.pinned = order
-            .iter()
-            .position(|pinned| *pinned == playlist.id)
-            .map(|at| at as u32);
-    }
-}
-
-/// What "New playlist" sends, from what its dialog has: a trimmed name,
-/// at least one kind, and who sees it.
-pub fn new_playlist(
-    name: &str,
-    kinds: Kinds,
-    server_wide: bool,
-) -> Result<(String, Kinds, Visibility), &'static str> {
-    let name = name.trim();
-    if name.is_empty() {
-        return Err("Give the playlist a name.");
-    }
-    if !(kinds.movies || kinds.episodes || kinds.tracks) {
-        return Err("Tick at least one kind it holds.");
-    }
-    let visibility = match server_wide {
-        true => Visibility::ServerWide,
-        false => Visibility::Personal,
-    };
-    Ok((name.to_owned(), kinds, visibility))
 }
 
 /// Adds `item` to the end of playlist `id` (a season its episodes, an
@@ -635,92 +435,6 @@ pub fn add_refusal(error: &BackendError, item: &Item, playlist: &str) -> String 
     }
 }
 
-/// The kinds a playlist made from an item's "New playlist…" starts with:
-/// those that take the item.
-pub fn kinds_for(kind: MediaKind) -> Kinds {
-    Kinds {
-        movies: kind == MediaKind::Movie,
-        episodes: matches!(
-            kind,
-            MediaKind::Episode | MediaKind::Season | MediaKind::Show
-        ),
-        tracks: matches!(
-            kind,
-            MediaKind::Track | MediaKind::Album | MediaKind::Artist
-        ),
-    }
-}
-
-/// What the editor shows of a playlist: Edit itself, the entries' handles
-/// and Remove, and the side panel (name, kinds, sharing, Delete).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EditorControls {
-    pub edit: bool,
-    pub panel: bool,
-    /// Server-wide among the sharing choices: an admin's.
-    pub server_wide: bool,
-}
-
-pub fn editor_controls(playlist: &PlaylistSummary, admin: bool) -> EditorControls {
-    EditorControls {
-        edit: playlist.can_edit || playlist.can_manage,
-        panel: playlist.can_manage,
-        server_wide: playlist.can_manage && admin,
-    }
-}
-
-/// A change made in the editor's Sharing.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ShareChange {
-    Personal,
-    ServerWide,
-    /// Whether this user may edit the entries.
-    CanEdit(String, bool),
-    StopSharing(String),
-    /// Someone picked to share with, read only or able to edit; someone
-    /// it is shared with already keeps their place, with this access.
-    Add(String, bool),
-}
-
-/// Who sees the playlist after `change`, from `now`. Shared with nobody
-/// is Personal.
-pub fn share_change(now: &Visibility, change: &ShareChange) -> Visibility {
-    let shares = |now: &Visibility| match now {
-        Visibility::Shared { with } => with.clone(),
-        _ => Vec::new(),
-    };
-    let with: Vec<PlaylistShare> = match change {
-        ShareChange::Personal => return Visibility::Personal,
-        ShareChange::ServerWide => return Visibility::ServerWide,
-        ShareChange::CanEdit(user, can_edit) => shares(now)
-            .into_iter()
-            .map(|share| match share.user_id == *user {
-                true => PlaylistShare {
-                    can_edit: *can_edit,
-                    ..share
-                },
-                false => share,
-            })
-            .collect(),
-        ShareChange::StopSharing(user) => shares(now)
-            .into_iter()
-            .filter(|share| share.user_id != *user)
-            .collect(),
-        ShareChange::Add(user, can_edit) => {
-            let mut with = shares(now);
-            match with.iter_mut().find(|share| share.user_id == *user) {
-                Some(share) => share.can_edit = *can_edit,
-                None => with.push(PlaylistShare::new(user.clone(), *can_edit)),
-            }
-            with
-        }
-    };
-    match with.is_empty() {
-        true => Visibility::Personal,
-        false => Visibility::Shared { with },
-    }
-}
-
 /// Who someone a playlist is shared with is shown as: their name where
 /// the server says it (sharing by name), else their user id.
 pub fn share_name(share: &PlaylistShare) -> &str {
@@ -814,7 +528,9 @@ mod tests {
     use spoolframe_types::{MediaId, MediaKind, Namespace};
 
     use super::*;
-    use crate::backend::{Client, PinNoteReason, PlaySettings, PlaylistUpdate, Repeat};
+    use crate::backend::{
+        Client, Liked, PinNoteReason, PlaySettings, PlaylistList, PlaylistUpdate, Repeat,
+    };
     use crate::fake::FakeClient;
 
     #[test]
@@ -867,7 +583,7 @@ mod tests {
         list.iter().find(|p| p.name == name).unwrap()
     }
 
-    fn names(list: &[&PlaylistSummary]) -> Vec<String> {
+    fn names(list: &[PlaylistSummary]) -> Vec<String> {
         list.iter().map(|p| p.name.clone()).collect()
     }
 
@@ -880,27 +596,6 @@ mod tests {
 
     fn page(session: &dyn Session, id: &str) -> PlaylistPage {
         ready(session.playlist(id, 0, 200)).unwrap()
-    }
-
-    #[test]
-    fn the_section_groups_playlists_by_whose_they_are() {
-        let client = FakeClient::new(None);
-        let list = ready(session(&client, "andrey").playlists())
-            .unwrap()
-            .playlists;
-        let groups = sections(&list);
-        assert_eq!(
-            (
-                names(&groups.mine),
-                names(&groups.shared_with_me),
-                names(&groups.server_wide)
-            ),
-            (
-                vec!["Andor: the heists".to_owned(), "Movie night".to_owned()],
-                vec!["Road trip".to_owned()],
-                vec!["New this month".to_owned()],
-            )
-        );
     }
 
     #[test]
@@ -965,21 +660,6 @@ mod tests {
     }
 
     #[test]
-    fn pinned_follows_the_users_order_and_a_new_pin_goes_last() {
-        let client = FakeClient::new(None);
-        let andrey = session(&client, "andrey");
-        let list = ready(andrey.playlists()).unwrap().playlists;
-        let night = named(&list, "Movie night").id.clone();
-        ready(andrey.pin_playlist(&night, new_pin_position(&list))).unwrap();
-        let list = ready(andrey.playlists()).unwrap().playlists;
-        assert_eq!(names(&pinned(&list)), ["Andor: the heists", "Movie night"]);
-        // Dragged to the top.
-        ready(andrey.pin_playlist(&night, 0)).unwrap();
-        let list = ready(andrey.playlists()).unwrap().playlists;
-        assert_eq!(names(&pinned(&list)), ["Movie night", "Andor: the heists"]);
-    }
-
-    #[test]
     fn pins_are_the_users_on_every_device() {
         let client = FakeClient::new(None);
         let night = {
@@ -998,25 +678,6 @@ mod tests {
     }
 
     #[test]
-    fn a_film_is_offered_no_episode_or_music_playlist() {
-        let client = FakeClient::new(None);
-        let list = ready(session(&client, "andrey").playlists())
-            .unwrap()
-            .playlists;
-        let offered: Vec<_> = add_targets(&list, MediaKind::Movie)
-            .into_iter()
-            .map(|(p, offer)| (p.name.as_str(), offer))
-            .collect();
-        assert_eq!(
-            offered,
-            [
-                ("Movie night", Offer::Adds),
-                ("New this month", Offer::Adds)
-            ]
-        );
-    }
-
-    #[test]
     fn read_only_and_server_wide_ones_are_offered_greyed_last() {
         let client = FakeClient::new(None);
         let list = ready(session(&client, "alice").playlists())
@@ -1024,16 +685,22 @@ mod tests {
             .playlists;
         let offered: Vec<_> = add_targets(&list, MediaKind::Season)
             .into_iter()
-            .map(|(p, offer)| (p.name.as_str(), offer.reason()))
+            .map(|t| (t.playlist.name, offer_reason(t.offer)))
             .collect();
-        assert_eq!(offered, [("Andor: the heists", Some("Read only"))]);
+        assert_eq!(
+            offered,
+            [("Andor: the heists".to_owned(), Some("Read only"))]
+        );
         let films: Vec<_> = add_targets(&list, MediaKind::Movie)
             .into_iter()
-            .map(|(p, offer)| (p.name.as_str(), offer.reason()))
+            .map(|t| (t.playlist.name, offer_reason(t.offer)))
             .collect();
         assert_eq!(
             films,
-            [("New this month", Some("Server-wide · admins edit"))]
+            [(
+                "New this month".to_owned(),
+                Some("Server-wide · admins edit")
+            )]
         );
     }
 
@@ -1140,8 +807,8 @@ mod tests {
         client.make_unavailable(&media(MediaKind::Episode, "64"));
         let shown = page(andrey.as_ref(), &heists);
         assert_eq!(
-            entry_note(&shown.entries[0], up_next(&shown)).as_deref(),
-            Some("Unavailable · the file can’t be read; skipped")
+            entry_note(&shown.entries[0], continue_entry(&shown)).map(note_text),
+            Some("Unavailable · the file can’t be read; skipped".to_owned())
         );
         let first = ready(andrey.play_playlist(&heists, None, PlaySettings::default()))
             .unwrap()
@@ -1167,6 +834,21 @@ mod tests {
         assert_eq!(
             continue_label(&page(andrey.as_ref(), &heists)).as_deref(),
             Some("S1 · E4 Aldhani")
+        );
+    }
+
+    #[test]
+    fn continue_passes_entries_watched_after_the_place_too() {
+        let client = FakeClient::new(None);
+        let (andrey, heists, _) = heists(&client);
+        let first = ready(andrey.play_playlist(&heists, None, PlaySettings::default()))
+            .unwrap()
+            .unwrap();
+        ready(andrey.mark_watched(first.item.id())).unwrap();
+        ready(andrey.mark_watched(&media(MediaKind::Episode, "65"))).unwrap();
+        assert_eq!(
+            continue_label(&page(andrey.as_ref(), &heists)).as_deref(),
+            Some("S2 · E2 Sagrona Teema")
         );
     }
 
@@ -1749,33 +1431,6 @@ mod tests {
     }
 
     #[test]
-    fn a_drag_moves_the_entry_before_the_one_then_after_it() {
-        assert_eq!(
-            [
-                move_edit(&[1, 2, 3, 4], 0, 2),
-                move_edit(&[1, 2, 3, 4], 3, 0),
-                move_edit(&[1, 2, 3, 4], 1, 3),
-                move_edit(&[1, 2, 3, 4], 2, 2),
-            ],
-            [
-                Some(PlaylistEdit::Move {
-                    entry: 1,
-                    before: Some(4)
-                }),
-                Some(PlaylistEdit::Move {
-                    entry: 4,
-                    before: Some(1)
-                }),
-                Some(PlaylistEdit::Move {
-                    entry: 2,
-                    before: None
-                }),
-                None,
-            ]
-        );
-    }
-
-    #[test]
     fn a_second_editors_add_is_redone_on_the_new_revision() {
         let client = FakeClient::new(None);
         let (andrey, alice) = (session(&client, "andrey"), session(&client, "alice"));
@@ -1887,10 +1542,7 @@ mod tests {
         .unwrap();
         let seen = ready(alice.playlists()).unwrap();
         assert_eq!(
-            (
-                pinned(&seen.playlists).len(),
-                pin_note_text(&seen.pin_notes)
-            ),
+            (seen.pinned().len(), pin_note_text(&seen.pin_notes)),
             (
                 0,
                 Some("Andor: the heists is no longer shared with you, so it left Pinned.".into())
@@ -1974,12 +1626,12 @@ mod tests {
     }
 
     /// Andrey with Movie night pinned after the heists, and the list.
-    fn two_pinned(client: &FakeClient) -> (Arc<dyn Session>, Vec<PlaylistSummary>) {
+    fn two_pinned(client: &FakeClient) -> (Arc<dyn Session>, PlaylistList) {
         let andrey = session(client, "andrey");
-        let list = ready(andrey.playlists()).unwrap().playlists;
-        let night = named(&list, "Movie night").id.clone();
-        ready(andrey.pin_playlist(&night, new_pin_position(&list))).unwrap();
-        let list = ready(andrey.playlists()).unwrap().playlists;
+        let list = ready(andrey.playlists()).unwrap();
+        let night = named(&list.playlists, "Movie night").id.clone();
+        ready(andrey.pin_playlist(&night, list.new_pin_position())).unwrap();
+        let list = ready(andrey.playlists()).unwrap();
         (andrey, list)
     }
 
@@ -1987,32 +1639,17 @@ mod tests {
     fn a_pin_dropped_on_the_first_row_goes_first_here_and_on_the_server() {
         let client = FakeClient::new(None);
         let (andrey, mut list) = two_pinned(&client);
-        let (id, position) = pin_drop(&pinned(&list), 1, 0).unwrap();
-        with_pin_at(&mut list, &id, position);
+        let (id, position) = pin_drop(&list.pinned(), 1, 0).unwrap();
+        with_pin_at(&mut list.playlists, &id, position);
         ready(andrey.pin_playlist(&id, position)).unwrap();
-        let server = ready(andrey.playlists()).unwrap().playlists;
+        let server = ready(andrey.playlists()).unwrap();
         assert_eq!(
-            (names(&pinned(&list)), names(&pinned(&server))),
+            (names(&list.pinned()), names(&server.pinned())),
             (
                 vec!["Movie night".to_owned(), "Andor: the heists".to_owned()],
                 vec!["Movie night".to_owned(), "Andor: the heists".to_owned()],
             )
         );
-    }
-
-    #[test]
-    fn a_pin_dropped_on_itself_sends_nothing() {
-        let client = FakeClient::new(None);
-        let (_, list) = two_pinned(&client);
-        assert_eq!(pin_drop(&pinned(&list), 1, 1), None);
-    }
-
-    #[test]
-    fn a_pin_dropped_past_the_last_row_goes_last() {
-        let client = FakeClient::new(None);
-        let (_, list) = two_pinned(&client);
-        let heists = named(&list, "Andor: the heists").id.clone();
-        assert_eq!(pin_drop(&pinned(&list), 0, 7), Some((heists, 1)));
     }
 
     /// Alice pinned the heists, and Andrey stopped sharing it.
@@ -2033,28 +1670,12 @@ mod tests {
     }
 
     #[test]
-    fn a_pin_note_is_shown_once_though_the_list_is_read_again() {
-        let client = FakeClient::new(None);
-        let alice = alice_lost_a_pin(&client);
-        let mut shown = PinNotesShown::default();
-        let first = ready(alice.playlists()).unwrap().pin_notes;
-        let again = ready(alice.playlists()).unwrap().pin_notes;
-        assert_eq!(
-            (shown.fresh(&first), shown.fresh(&again)),
-            (
-                Some("Andor: the heists is no longer shared with you, so it left Pinned.".into()),
-                None
-            )
-        );
-    }
-
-    #[test]
     fn a_dismissed_pin_note_is_gone_from_the_next_list() {
         let client = FakeClient::new(None);
         let alice = alice_lost_a_pin(&client);
         let mut shown = PinNotesShown::default();
         let notes = ready(alice.playlists()).unwrap().pin_notes;
-        if shown.fresh(&notes).is_some() {
+        if !shown.fresh(&notes).is_empty() {
             ready(alice.dismiss_pin_notes()).unwrap();
         }
         assert!(ready(alice.playlists()).unwrap().pin_notes.is_empty());
@@ -2125,28 +1746,6 @@ mod tests {
     }
 
     #[test]
-    fn a_new_playlist_from_an_item_takes_its_kind() {
-        assert_eq!(
-            [
-                kinds_for(MediaKind::Season),
-                kinds_for(MediaKind::Album),
-                kinds_for(MediaKind::Movie)
-            ],
-            [
-                episodes(),
-                Kinds {
-                    tracks: true,
-                    ..Kinds::default()
-                },
-                Kinds {
-                    movies: true,
-                    ..Kinds::default()
-                },
-            ]
-        );
-    }
-
-    #[test]
     fn the_editor_shows_what_each_user_may_change() {
         let client = FakeClient::new(None);
         let andrey = ready(session(&client, "andrey").playlists())
@@ -2192,30 +1791,6 @@ mod tests {
     }
 
     #[test]
-    fn a_share_can_be_made_an_editor_or_stopped() {
-        let now = shares(&[("local:a", false), ("local:b", true)]);
-        assert_eq!(
-            (
-                share_change(&now, &ShareChange::CanEdit("local:a".into(), true)),
-                share_change(&now, &ShareChange::StopSharing("local:b".into())),
-            ),
-            (
-                shares(&[("local:a", true), ("local:b", true)]),
-                shares(&[("local:a", false)]),
-            )
-        );
-    }
-
-    #[test]
-    fn stopping_the_last_share_makes_it_personal() {
-        let now = shares(&[("local:a", false)]);
-        assert_eq!(
-            share_change(&now, &ShareChange::StopSharing("local:a".into())),
-            Visibility::Personal
-        );
-    }
-
-    #[test]
     fn personal_and_server_wide_drop_the_shares() {
         let now = shares(&[("local:a", false)]);
         assert_eq!(
@@ -2232,14 +1807,18 @@ mod tests {
         let kinds = episodes();
         assert_eq!(
             (
-                new_playlist("  ", kinds, false),
-                new_playlist("Heists", Kinds::default(), false),
-                new_playlist(" Heists ", kinds, true),
+                new_playlist("  ", kinds, false).map_err(new_playlist_refusal),
+                new_playlist("Heists", Kinds::default(), false).map_err(new_playlist_refusal),
+                new_playlist(" Heists ", kinds, true).map_err(new_playlist_refusal),
             ),
             (
                 Err("Give the playlist a name."),
                 Err("Tick at least one kind it holds."),
-                Ok(("Heists".to_owned(), kinds, Visibility::ServerWide)),
+                Ok(NewPlaylist {
+                    name: "Heists".to_owned(),
+                    kinds,
+                    visibility: Visibility::ServerWide
+                }),
             )
         );
     }
@@ -2268,10 +1847,9 @@ mod tests {
     #[test]
     fn liked_and_all_are_listed_first_apart_from_the_users_own() {
         let client = FakeClient::new(None);
-        let list = ready(session(&client, "andrey").playlists())
+        let groups = ready(session(&client, "andrey").playlists())
             .unwrap()
-            .playlists;
-        let groups = sections(&list);
+            .sections();
         assert_eq!(
             (names(&groups.builtin), names(&groups.mine)),
             (
@@ -2301,14 +1879,14 @@ mod tests {
             .playlists;
         let offered: Vec<_> = add_targets(&list, MediaKind::Album)
             .into_iter()
-            .map(|(p, offer)| (p.name.as_str(), offer.reason()))
+            .map(|t| (t.playlist.name, offer_reason(t.offer)))
             .collect();
         assert_eq!(
             offered,
             [
-                ("Road trip", None),
-                ("Liked", Some("Use the heart instead")),
-                ("All", Some("Built in · every track already")),
+                ("Road trip".to_owned(), None),
+                ("Liked".to_owned(), Some("Use the heart instead")),
+                ("All".to_owned(), Some("Built in · every track already")),
             ]
         );
     }
@@ -2472,28 +2050,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_full_heart_unlikes_and_any_other_likes() {
-        assert_eq!(
-            [Liked::All, Liked::Some, Liked::None].map(heart_likes),
-            [false, true, true]
-        );
-    }
-
-    #[test]
-    fn an_albums_heart_is_full_half_or_empty_by_its_tracks() {
-        let tracks = [track(1), track(2)];
-        let liked = |ids: &[MediaId]| ids.iter().cloned().collect();
-        assert_eq!(
-            [
-                album_heart(&tracks, &liked(&[track(1), track(2)])),
-                album_heart(&tracks, &liked(&[track(2)])),
-                album_heart(&tracks, &liked(&[])),
-            ],
-            [Liked::All, Liked::Some, Liked::None]
-        );
-    }
-
     fn movie_night(session: &dyn Session) -> String {
         let list = ready(session.playlists()).unwrap().playlists;
         named(&list, "Movie night").id.clone()
@@ -2588,7 +2144,10 @@ mod tests {
             PlaylistUpdate {
                 visibility: Some(share_change(
                     &now,
-                    &ShareChange::Add("local:mum".into(), true),
+                    &ShareChange::Add {
+                        user: "local:mum".into(),
+                        can_edit: true,
+                    },
                 )),
                 ..PlaylistUpdate::default()
             },
@@ -2600,38 +2159,6 @@ mod tests {
         assert_eq!(
             owner_line(named(&mums, "Movie night")),
             "Andrey’s · you can edit"
-        );
-    }
-
-    #[test]
-    fn adding_someone_shared_with_already_changes_only_their_access() {
-        let now = Visibility::Shared {
-            with: vec![
-                PlaylistShare::new("local:alice", false),
-                PlaylistShare::new("local:bob", true),
-            ],
-        };
-        assert_eq!(
-            share_change(&now, &ShareChange::Add("local:alice".into(), true)),
-            Visibility::Shared {
-                with: vec![
-                    PlaylistShare::new("local:alice", true),
-                    PlaylistShare::new("local:bob", true),
-                ],
-            }
-        );
-    }
-
-    #[test]
-    fn someone_new_goes_last_after_those_shared_with() {
-        assert_eq!(
-            share_change(
-                &Visibility::Personal,
-                &ShareChange::Add("local:alice".into(), false)
-            ),
-            Visibility::Shared {
-                with: vec![PlaylistShare::new("local:alice", false)],
-            }
         );
     }
 

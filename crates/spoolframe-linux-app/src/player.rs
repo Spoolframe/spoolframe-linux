@@ -17,13 +17,14 @@ use adw::prelude::*;
 use gst::prelude::*;
 use gst_play::prelude::*;
 use gtk::glib;
+use spoolframe_client_sdk::{MarkerOffer, UNDO_WINDOW};
 use spoolframe_linux_core::backend::PlaybackPlan;
 use spoolframe_linux_core::format;
 use spoolframe_linux_core::reader;
 use spoolframe_protocol::{AudioAction, ConvertedAudio, ConvertedVideo, SubtitleAction};
 use spoolframe_types::Item;
 
-use crate::playback::{Change, Offer, Playback, UNDO_WINDOW, VideoSink};
+use crate::playback::{Change, Playback, VideoSink};
 
 use crate::transport;
 use crate::volume::Volume;
@@ -325,11 +326,11 @@ impl View {
         }
     }
 
-    fn show_offer(&self, playback: &Playback, offer: Option<Offer>) {
+    fn show_offer(&self, playback: &Playback, offer: Option<MarkerOffer>) {
         let label = match offer {
-            Some(Offer::SkipIntro { .. }) => "Skip Intro".to_owned(),
-            Some(Offer::SkipCredits { .. }) => "Skip Credits".to_owned(),
-            Some(Offer::NextItem) => next_label(playback.playing_from().as_ref()),
+            Some(MarkerOffer::SkipIntro { .. }) => "Skip Intro".to_owned(),
+            Some(MarkerOffer::SkipCredits { .. }) => "Skip Credits".to_owned(),
+            Some(MarkerOffer::Next) => next_label(playback.playing_from().as_ref()),
             None => return self.offer.set_visible(false),
         };
         self.offer.set_label(&label);

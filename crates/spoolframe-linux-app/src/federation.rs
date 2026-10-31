@@ -13,6 +13,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::time::Duration;
 
+use spoolframe_client_sdk::PairedServers;
 use spoolframe_linux_core::backend::{Copies, LibraryServer, RemoteMode, SearchHit, SearchResults};
 use spoolframe_linux_core::format;
 use spoolframe_types::{Item, Library, LibraryKind, MediaId};
@@ -100,26 +101,27 @@ pub fn paired(libraries: &[Library]) -> bool {
 /// The libraries by server: this server's first, then the paired servers
 /// online by name, then those offline by name; each group's libraries in
 /// the order listed.
+/// The SDK's grouping (`PairedServers::library_groups`), by index.
 pub fn groups(libraries: &[Library]) -> Vec<Group> {
-    let mut groups: Vec<Group> = Vec::new();
-    for (index, library) in libraries.iter().enumerate() {
-        let id = library.server.as_ref().map(|s| &s.server_id);
-        match groups
-            .iter_mut()
-            .find(|g| g.server.as_ref().map(|s| &s.server_id) == id)
-        {
-            Some(group) => group.libraries.push(index),
-            None => groups.push(Group {
-                server: library.server.clone(),
-                libraries: vec![index],
-            }),
-        }
-    }
-    groups.sort_by_key(|g| match &g.server {
-        None => (0, String::new()),
-        Some(s) => (if s.online { 1 } else { 2 }, s.name.to_lowercase()),
-    });
-    groups
+    // Each library once: a later one with the same id and server takes
+    // the next place, never the first's again.
+    let mut taken = vec![false; libraries.len()];
+    PairedServers::library_groups(libraries)
+        .into_iter()
+        .map(|group| Group {
+            libraries: group
+                .libraries
+                .iter()
+                .filter_map(|library| {
+                    let at =
+                        (0..libraries.len()).find(|&n| !taken[n] && libraries[n] == *library)?;
+                    taken[at] = true;
+                    Some(at)
+                })
+                .collect(),
+            server: group.server,
+        })
+        .collect()
 }
 
 /// A library's page title in the header: "Bob's Media › Movies" for a

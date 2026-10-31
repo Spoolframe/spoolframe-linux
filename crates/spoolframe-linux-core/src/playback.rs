@@ -6,9 +6,14 @@ use spoolframe_client_sdk::{
     Chunk, LinkMeter, Playback, PlaybackBackend, PlaybackChange, PlaybackOptions, PlaybackQuality,
     PlaybackShare, RemoteMode, Replan, SdkError, Subtitle, SubtitleTimingEvent,
 };
+use spoolframe_client_sdk::{Edited, PlayFrom, PlaylistCursor, PlaylistSource};
+use spoolframe_protocol::playlists::{
+    EntryId, PlaySettings, PlaylistEdit, PlaylistEntry, PlaylistNext, PlaylistPage,
+};
 use spoolframe_protocol::{BitmapSubtitles, PlaybackHandle, Selection};
 use spoolframe_types::MediaId;
-use std::{sync::Arc, time::Duration};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::broadcast;
 
 pub fn backend(session: Arc<dyn Session>) -> Arc<dyn PlaybackBackend> {
@@ -122,6 +127,95 @@ impl PlaybackBackend for Adapter {
     }
 }
 
+/// Follows playlist `id` from `playing`, the entry that plays already,
+/// with `settings`, or the server's while they are not known: the server
+/// was told of the entry when it started, or, from a saved queue, is not,
+/// since playing it would move the user's place and deal a new shuffled
+/// round. What comes up is read from the server's place.
+pub async fn follow_playlist(
+    session: Arc<dyn Session>,
+    id: &str,
+    playing: PlaylistNext,
+    settings: Option<PlaySettings>,
+) -> Result<PlaylistCursor, SdkError> {
+    let settings = match settings {
+        Some(settings) => settings,
+        None => {
+            session
+                .playlist(id, 0, 1)
+                .await
+                .map_err(playlist_error)?
+                .settings
+        }
+    };
+    let from = PlayFrom::Entry(playing.entry);
+    let source = Arc::new(Playlists {
+        session,
+        playing: Mutex::new(Some(playing)),
+    });
+    // An entry to start from: nothing is picked at random.
+    PlaylistCursor::start(source, id, from, settings, |_| 0).await
+}
+
+/// The session's playlist calls, for a [`PlaylistCursor`]; its first
+/// play is answered with the entry playing, not sent.
+struct Playlists {
+    session: Arc<dyn Session>,
+    playing: Mutex<Option<PlaylistNext>>,
+}
+
+#[async_trait]
+impl PlaylistSource for Playlists {
+    async fn page(&self, id: &str, offset: u32, limit: u32) -> Result<PlaylistPage, SdkError> {
+        let page = self.session.playlist(id, offset, limit).await;
+        page.map_err(playlist_error)
+    }
+
+    async fn play(
+        &self,
+        id: &str,
+        from: Option<EntryId>,
+        settings: PlaySettings,
+    ) -> Result<Option<PlaylistNext>, SdkError> {
+        let playing = self.playing.lock().expect("never poisoned").take();
+        if let Some(playing) = playing {
+            return Ok(Some(playing));
+        }
+        let next = self.session.play_playlist(id, from, settings).await;
+        next.map_err(playlist_error)
+    }
+
+    async fn next_after(&self, id: &str, after: EntryId) -> Result<Option<PlaylistNext>, SdkError> {
+        let next = self.session.next_in_playlist(id, after).await;
+        next.map_err(playlist_error)
+    }
+
+    async fn upcoming(&self, id: &str, limit: u32) -> Result<Vec<PlaylistEntry>, SdkError> {
+        let upcoming = self.session.upcoming_in_playlist(id, limit).await;
+        upcoming.map_err(playlist_error)
+    }
+
+    async fn save_settings(&self, id: &str, settings: PlaySettings) -> Result<(), SdkError> {
+        let saved = self.session.set_playlist_settings(id, settings).await;
+        saved.map_err(playlist_error)
+    }
+
+    /// The session says the new revision only: the entries the adds
+    /// made are read again by whoever needs them.
+    async fn edit(
+        &self,
+        id: &str,
+        revision: u64,
+        edits: Vec<PlaylistEdit>,
+    ) -> Result<Edited, SdkError> {
+        let revision = self.session.edit_playlist(id, revision, edits).await;
+        Ok(Edited {
+            revision: revision.map_err(playlist_error)?,
+            added: None,
+        })
+    }
+}
+
 /// This client shows bitmap subtitles the default way.
 fn default_bitmap(bitmap: BitmapSubtitles) -> Result<(), SdkError> {
     if bitmap != BitmapSubtitles::default() {
@@ -145,7 +239,20 @@ fn error(e: BackendError) -> SdkError {
         BackendError::PlaybackStopped => SdkError::PlaybackStopped,
         BackendError::InvalidInput(message) => SdkError::InvalidInput(message),
         BackendError::NotFound(message) => SdkError::NotFound(message),
+        // The SDK's subtitle_file asks again only on this one.
+        BackendError::SubtitleNotReady(done_percent) => SdkError::SubtitleNotReady { done_percent },
         other => SdkError::Server(other.to_string()),
+    }
+}
+
+/// [`error`], and the playlist refusals a [`PlaylistCursor`] acts on: a
+/// server that cannot say what comes up is read page by page instead.
+fn playlist_error(e: BackendError) -> SdkError {
+    match e {
+        BackendError::Unsupported(request) => SdkError::NotOnServer { request },
+        BackendError::PlaylistConflict { revision } => SdkError::PlaylistConflict { revision },
+        BackendError::PlaylistReadOnly => SdkError::PlaylistReadOnly,
+        other => error(other),
     }
 }
 
@@ -193,6 +300,70 @@ mod tests {
         );
     }
 
+    /// The fake's All, played from its top: its id and the entry playing.
+    async fn all_playing(session: &Arc<dyn Session>) -> (String, PlaylistNext) {
+        let list = session.playlists().await.unwrap().playlists;
+        let all = list.into_iter().find(|p| p.name == "All").unwrap();
+        let first = session.play_playlist(&all.id, None, PlaySettings::default());
+        (all.id.clone(), first.await.unwrap().unwrap())
+    }
+
+    /// Restored from a saved queue, or started already: following it
+    /// moves nothing on the server, and what comes up is its own.
+    #[test]
+    fn following_the_entry_playing_leaves_the_servers_place() {
+        crate::testing::runtime().block_on(async {
+            let client = FakeClient::new(None);
+            let session = client.session(&FakeClient::profile("andrey")).unwrap();
+            let (id, first) = all_playing(&session).await;
+            let later = session.playlist(&id, 0, 3).await.unwrap().entries[2].entry;
+            // Played on, on another device.
+            let elsewhere = session.play_playlist(&id, Some(later), PlaySettings::default());
+            elsewhere.await.unwrap();
+            let cursor = follow_playlist(
+                session.clone(),
+                &id,
+                first.clone(),
+                Some(Default::default()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(cursor.current().map(|e| e.entry), Some(first.entry));
+            let place = session.playlist(&id, 0, 1).await.unwrap().place;
+            assert_eq!(place, Some(later));
+        });
+    }
+
+    /// Restored from a queue saved before the modes were kept: they are
+    /// the server's.
+    #[test]
+    fn a_playlist_followed_with_its_modes_unknown_plays_with_the_servers() {
+        crate::testing::runtime().block_on(async {
+            let client = FakeClient::new(None);
+            let session = client.session(&FakeClient::profile("andrey")).unwrap();
+            let (id, first) = all_playing(&session).await;
+            let shuffled = PlaySettings {
+                shuffle: true,
+                ..PlaySettings::default()
+            };
+            session.set_playlist_settings(&id, shuffled).await.unwrap();
+            let cursor = follow_playlist(session, &id, first, None).await.unwrap();
+            assert!(cursor.settings().shuffle);
+        });
+    }
+
+    /// A server older than `UpcomingInPlaylist` refuses it as unsupported:
+    /// the cursor reads the playlist's pages instead.
+    #[test]
+    fn an_unsupported_call_is_one_the_server_does_not_know() {
+        assert_eq!(
+            playlist_error(BackendError::Unsupported("UpcomingInPlaylist".into())),
+            SdkError::NotOnServer {
+                request: "UpcomingInPlaylist".into()
+            }
+        );
+    }
+
     #[test]
     fn a_direct_play_on_a_slow_link_becomes_a_conversion() {
         let (_dir, path) = crate::testing::file_with("limit", &[0; 4096]);
@@ -218,6 +389,17 @@ mod tests {
         assert_eq!(
             playback.read_chunk(&direct, 0, 1).await,
             Err(SdkError::PlaybackRestarted { epoch: next.epoch })
+        );
+    }
+
+    /// A subtitle the server is still reading as text stays one through
+    /// this adapter, so the SDK's `subtitle_file` asks again rather than
+    /// giving up on a server error.
+    #[test]
+    fn a_subtitle_still_being_read_reaches_the_sdk_as_not_ready() {
+        assert_eq!(
+            error(BackendError::SubtitleNotReady(50)),
+            SdkError::SubtitleNotReady { done_percent: 50 }
         );
     }
 

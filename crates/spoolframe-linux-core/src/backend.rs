@@ -468,6 +468,27 @@ pub use spoolframe_client_sdk::ConnectionPath;
 
 /// A subtitle track's timing changed (PX-03), as a server told.
 pub use spoolframe_client_sdk::SubtitleTimingEvent;
+/// The user's watch state changed on another of their devices.
+pub use spoolframe_client_sdk::WatchEvent;
+
+/// One catalog read the SDK keeps ([`Session::catalog_changes`]).
+pub use spoolframe_client_sdk::CatalogKey;
+
+/// A session's kept catalog reads whose re-read came back different, as
+/// they come ([`Session::catalog_changes`]).
+pub struct CatalogChanges(futures::stream::BoxStream<'static, CatalogKey>);
+
+impl CatalogChanges {
+    pub fn new(changes: impl futures::Stream<Item = CatalogKey> + Send + 'static) -> Self {
+        Self(Box::pin(changes))
+    }
+
+    /// The next change; `None` once there will be none. Changes missed
+    /// while not listening are skipped.
+    pub async fn recv(&mut self) -> Option<CatalogKey> {
+        futures::StreamExt::next(&mut self.0).await
+    }
+}
 pub use spoolframe_client_sdk::{
     Chunk, Playback as PlaybackStart, PlaybackChange, PlaybackOptions, PlaybackQuality,
 };
@@ -496,6 +517,10 @@ pub use spoolframe_protocol::downloads::{
 pub use spoolframe_client_sdk::{LibrariesChanged, RemoteMode};
 pub use spoolframe_protocol::{Copies, SearchHit, ServerRow, TitleCopy};
 pub use spoolframe_types::LibraryServer;
+
+/// A change to a signed-in user's profile (removed, its PIN, its session
+/// ended, a new password needed), as the SDK tells it.
+pub use spoolframe_client_sdk::{ProfileChange, ProfileEvent, SessionEndReason};
 
 /// Playlists (PX-40), in the protocol's and the SDK's own types.
 pub use spoolframe_client_sdk::{PlaylistChange, PlaylistEvent, PlaylistList, PlaylistUpdate};
@@ -960,6 +985,11 @@ pub trait Client: Send + Sync {
     /// or offset, by anyone. A player showing the track reads it again.
     fn subtitle_timing_events(&self) -> tokio::sync::broadcast::Receiver<SubtitleTimingEvent>;
 
+    /// Watch state a signed-in user changed on another device, as a
+    /// server with `spoolframe:watch-events` tells it: read again what
+    /// shows it. Changes while not connected are not seen.
+    fn watch_events(&self) -> tokio::sync::broadcast::Receiver<WatchEvent>;
+
     /// The app shows `server`'s `user_id` (PX-60): from now on the
     /// downloads, their events and their watch state are that profile's,
     /// and deleting one lets go of that profile's hold on it. Choosing
@@ -1058,6 +1088,30 @@ pub trait Client: Send + Sync {
     /// or went offline, or shared or stopped sharing a library. List them
     /// again ([`Session::libraries`]).
     fn libraries_events(&self) -> tokio::sync::broadcast::Receiver<LibrariesChanged>;
+
+    /// Changes to any signed-in user's profile on any server: removed, its
+    /// PIN set or cleared, its session ended, a new password needed. Made
+    /// before subscribing, they are not seen.
+    fn profile_events(&self) -> tokio::sync::broadcast::Receiver<ProfileEvent>;
+
+    /// What the app keeps for `username` on `server` between starts.
+    /// Nothing is read until asked.
+    fn profile_store(&self, server: &ServerKey, username: &str) -> Arc<dyn ProfileStore>;
+}
+
+/// One profile's values, by name (lowercase letters, digits, `-` and
+/// `_`): its play queue, its libraries' sort and filter. Kept in the
+/// app's plain data, never its secrets.
+pub trait ProfileStore: Send + Sync {
+    /// Value `name`, as it was set; `None` if it never was.
+    fn get<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<Option<Vec<u8>>, BackendError>>;
+
+    /// Sets value `name`; `None` removes it.
+    fn set<'a>(
+        &'a self,
+        name: &'a str,
+        value: Option<Vec<u8>>,
+    ) -> BoxFuture<'a, Result<(), BackendError>>;
 }
 
 /// One signed-in user's view of a server: the catalog, their watch state
@@ -1268,6 +1322,15 @@ pub trait Session: Send + Sync {
     /// whether a backdrop with no faces yet may have them later.
     fn smart_crop(&self) -> bool {
         false
+    }
+
+    /// The episode after `episode` in its show (P2-10); `None` after the
+    /// last. A session whose server cannot say walks the show's seasons.
+    fn next_episode<'a>(
+        &'a self,
+        episode: &'a spoolframe_types::Episode,
+    ) -> BoxFuture<'a, Result<Option<Item>, BackendError>> {
+        Box::pin(crate::next_episode::walk(self, episode))
     }
 
     fn update_progress<'a>(
@@ -1802,6 +1865,13 @@ pub trait Session: Send + Sync {
     /// offline. The playback's reads, seeks and stop go to whichever plays
     /// it, and its progress to this server, by the `fed:` id.
     fn remote_mode(&self, handle: &PlaybackHandle) -> Option<RemoteMode>;
+
+    /// This session's kept catalog reads whose re-read behind what was
+    /// shown came back different: the page showing one reads it again.
+    /// Kept reads are answered at once; a change made through the session,
+    /// or a server's playlist, heart, library or watch event, forgets what
+    /// it touches first.
+    fn catalog_changes(&self) -> CatalogChanges;
 }
 
 #[cfg(test)]

@@ -11,9 +11,6 @@ use adw::prelude::*;
 use gtk::glib;
 use spoolframe_linux_core::backend::{BackendError, Session};
 
-/// The least a new password may be, as the server checks.
-pub const MIN_LEN: usize = 8;
-
 /// Which field a message goes under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
@@ -24,7 +21,8 @@ pub enum Field {
 
 /// What is wrong with the fields before asking the server, if anything.
 pub fn check(current: &str, new: &str, again: &str) -> Result<(), (Field, &'static str)> {
-    if new.chars().count() < MIN_LEN {
+    // As the server counts: characters, not bytes.
+    if spoolframe_client_sdk::password_problem(new).is_some() {
         return Err((Field::New, "At least 8 characters."));
     }
     if new != again {
