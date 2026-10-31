@@ -557,7 +557,7 @@ pub(crate) mod tests {
             name: "spoolframe-linux playbin test".into(),
             client_name: "spoolframe-linux".into(),
             client_version: env!("CARGO_PKG_VERSION").into(),
-            capabilities: crate::capabilities::capabilities(),
+            capabilities: crate::capabilities::capabilities(false),
         };
         let client = runtime
             .block_on(sdk::Client::open(

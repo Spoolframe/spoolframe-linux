@@ -182,7 +182,7 @@ pub fn backend_error(error: sdk::SdkError) -> BackendError {
         E::PlaybackExpired => BackendError::PlaybackExpired,
         E::NotFound(what) => BackendError::NotFound(what),
         E::NotPinned(id) => BackendError::NotPinned(id),
-        E::IdentityChanged { saved, now } => BackendError::IdentityChanged { saved, now },
+        E::IdentityChanged { saved, now, .. } => BackendError::IdentityChanged { saved, now },
         E::ServerIdChanged { saved, now, .. } => BackendError::ServerIdChanged { saved, now },
         E::Busy => BackendError::Busy,
         E::WanStreamsFull { max } => BackendError::WanStreamsFull { max },
@@ -263,16 +263,6 @@ pub fn connection_state(state: sdk::ConnectionState) -> ConnectionState {
         sdk::ConnectionState::Connecting => ConnectionState::Connecting,
         sdk::ConnectionState::Connected => ConnectionState::Connected,
         sdk::ConnectionState::Reconnecting { attempt } => ConnectionState::Reconnecting { attempt },
-    }
-}
-
-/// The SDK's connection path, in the UI's words.
-pub fn connection_path(path: sdk::ConnectionPath) -> ConnectionPath {
-    match path {
-        sdk::ConnectionPath::Lan { addr } => ConnectionPath::Lan(addr),
-        sdk::ConnectionPath::Direct { addr } => ConnectionPath::Direct(addr),
-        sdk::ConnectionPath::Relay => ConnectionPath::Relay,
-        sdk::ConnectionPath::Unknown => ConnectionPath::Unknown,
     }
 }
 
@@ -789,7 +779,7 @@ impl Client for SdkClient {
         // A malformed id has no connection either.
         self.client
             .connection_path(&key.0)
-            .map_or(ConnectionPath::Unknown, connection_path)
+            .unwrap_or(ConnectionPath::Unknown)
     }
 
     fn forget_profile<'a>(
@@ -1523,7 +1513,7 @@ impl Session for SdkSession {
     }
 
     fn connection_path(&self) -> ConnectionPath {
-        connection_path(self.session.connection_path())
+        self.session.connection_path()
     }
 
     fn link_rate(&self) -> Option<u64> {
@@ -1899,7 +1889,13 @@ impl Session for SdkSession {
         edits: Vec<PlaylistEdit>,
     ) -> BoxFuture<'a, Result<u64, BackendError>> {
         let id = id.to_owned();
-        Box::pin(self.call(move |s| async move { s.edit_playlist(&id, revision, edits).await }))
+        // The revision only, for now: the entries an add made (`added`)
+        // are not used yet.
+        Box::pin(self.call(move |s| async move {
+            s.edit_playlist(&id, revision, edits)
+                .await
+                .map(|edited| edited.revision)
+        }))
     }
 
     fn delete_playlist<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), BackendError>> {
@@ -2261,6 +2257,7 @@ mod tests {
             username: "sam".into(),
             display_name: "Sam".into(),
             pin_required: false,
+            pin_digits: None,
             auto_login: false,
         };
         let merged = with_trust(vec![saved], vec![remembered], &server);

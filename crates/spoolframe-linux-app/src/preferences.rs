@@ -419,7 +419,7 @@ fn streaming(
     current: spoolframe_client_sdk::PlaybackQuality,
     set: SetQuality,
 ) -> adw::PreferencesGroup {
-    let choices = crate::quality::choices();
+    let choices = spoolframe_client_sdk::PlaybackQuality::choices();
     let names: Vec<String> = choices
         .iter()
         .map(|q| crate::quality::label(*q, None))
@@ -433,7 +433,7 @@ fn streaming(
              can change it while playing.",
         )
         .model(&gtk::StringList::new(&names))
-        .selected(crate::quality::index(current) as u32)
+        .selected(current.choice_index() as u32)
         .build();
     row.connect_selected_notify(move |row| {
         if let Some(quality) = choices.get(row.selected() as usize) {

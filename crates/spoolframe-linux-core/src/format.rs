@@ -332,8 +332,8 @@ pub fn seasons(n: u32) -> String {
 pub fn path_chip(path: crate::backend::ConnectionPath) -> Option<&'static str> {
     use crate::backend::ConnectionPath;
     match path {
-        ConnectionPath::Lan(_) => Some("Direct · LAN"),
-        ConnectionPath::Direct(_) => Some("Direct · internet"),
+        ConnectionPath::Lan { .. } => Some("Direct · LAN"),
+        ConnectionPath::Direct { .. } => Some("Direct · internet"),
         ConnectionPath::Relay => Some("Relayed"),
         ConnectionPath::Unknown => None,
     }
@@ -366,8 +366,8 @@ fn link_rate(bits: u64) -> String {
 pub fn connection_path(path: crate::backend::ConnectionPath) -> String {
     use crate::backend::ConnectionPath;
     match path {
-        ConnectionPath::Lan(addr) => format!("LAN · {addr}"),
-        ConnectionPath::Direct(addr) => format!("direct · {addr}"),
+        ConnectionPath::Lan { addr } => format!("LAN · {addr}"),
+        ConnectionPath::Direct { addr } => format!("direct · {addr}"),
         ConnectionPath::Relay => "relayed".to_owned(),
         ConnectionPath::Unknown => "—".to_owned(),
     }
@@ -389,7 +389,9 @@ mod tests {
     #[test]
     fn a_fast_link_is_rounded_and_an_unmeasured_one_is_the_path_alone() {
         use crate::backend::ConnectionPath;
-        let lan = ConnectionPath::Lan(([10, 10, 0, 6], 7431).into());
+        let lan = ConnectionPath::Lan {
+            addr: ([10, 10, 0, 6], 7431).into(),
+        };
         assert_eq!(
             link_line(lan, Some(48_400_000)).as_deref(),
             Some("Direct · LAN · 48 Mbit/s")
@@ -402,7 +404,9 @@ mod tests {
     fn a_public_path_is_not_called_lan() {
         use crate::backend::ConnectionPath;
         assert_eq!(
-            path_chip(ConnectionPath::Direct(([203, 0, 113, 9], 7431).into())),
+            path_chip(ConnectionPath::Direct {
+                addr: ([203, 0, 113, 9], 7431).into(),
+            }),
             Some("Direct · internet")
         );
     }
@@ -411,7 +415,9 @@ mod tests {
     fn a_local_path_says_lan_and_where() {
         use crate::backend::ConnectionPath;
         assert_eq!(
-            connection_path(ConnectionPath::Lan(([10, 10, 0, 6], 7431).into())),
+            connection_path(ConnectionPath::Lan {
+                addr: ([10, 10, 0, 6], 7431).into(),
+            }),
             "LAN · 10.10.0.6:7431"
         );
     }

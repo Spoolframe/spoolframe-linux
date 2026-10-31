@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use gtk::glib;
 use gtk::glib::thread_guard::ThreadGuard;
 use spoolframe_client_sdk::PlaybackOptions;
+use spoolframe_client_sdk::tracks::{self, StreamPicks, SubtitleHandling};
 use spoolframe_linux_core::backend::{
     BackendError, Client, DownloadPhase, EntryId, LocalDownload, Marker, PlaySettings,
     PlaybackHandle, PlaybackPlan, PlaylistEntry, Selection, Session, SubtitleTiming,
@@ -33,7 +34,7 @@ use spoolframe_linux_core::playlists::{self, Advance, Playing};
 use spoolframe_linux_core::progressive::ProgressiveReader;
 use spoolframe_linux_core::reader::{self, ByteSource, MediaReader, Spawn};
 use spoolframe_linux_core::sdk::backend_error;
-use spoolframe_protocol::{ConvertedVideo, PlannedSubtitle, SubtitleAction, SubtitleDelivery};
+use spoolframe_protocol::ConvertedVideo;
 use spoolframe_types::Delivery;
 use spoolframe_types::{Album, Item, MediaId, MediaTracks, SubtitleFormat};
 
@@ -1725,7 +1726,7 @@ impl Playback {
                     current
                         .upgrade()
                         .map_or((Default::default(), None), |this| {
-                            let height = crate::quality::encoded_height(this.plan().as_ref());
+                            let height = this.plan().and_then(|plan| plan.encoded_height());
                             (this.quality.get(), height)
                         })
                 }),
@@ -1760,7 +1761,7 @@ impl Playback {
         let plan = current.plan.borrow().clone()?;
         let tracks = current.track_list.borrow();
         let tracks = tracks.as_ref()?;
-        let named: Vec<(u32, String)> = subtitles_not_in_stream(tracks, &plan)
+        let named: Vec<(u32, String)> = tracks::offered_but_not_in_stream(tracks, &plan)
             .into_iter()
             .map(|n| {
                 let track = &tracks.subtitles[n as usize];
@@ -1957,7 +1958,7 @@ impl Playback {
     /// external subtitle comes as at any start (PR #6's path).
     pub fn use_subtitle(self: &Rc<Self>, track: u32) {
         let Some(current) = self.now() else { return };
-        let selection = subtitle_change(current.selected.get(), track);
+        let selection = tracks::subtitle_change(current.selected.get(), track);
         let (at, playing) = (self.position.get(), self.playing.get());
         let start = Start {
             from: Some(at),
@@ -2673,7 +2674,7 @@ impl Playback {
         // After the answer, not alongside the start: it is needed only at
         // the credits.
         self.follow_episode(&current);
-        let external = subtitle_comes_as_file(&start.plan);
+        let external = tracks::subtitle_comes_as_file(&start.plan);
         let handle = start.handle.clone();
         current.managed.replace(Some(managed.clone()));
         let (mode, resume, reader) = match playback_reader(managed, from, current.catalog_length) {
@@ -3061,11 +3062,7 @@ impl Playback {
         current.media_info.replace(Some(info.clone()));
         let has_streams = !info.audio_streams().is_empty() || !info.subtitle_streams().is_empty();
         if has_streams && let Some(selection) = current.pending.take() {
-            if current.is_converted() {
-                self.apply_converted(&current, info);
-            } else {
-                self.apply(&current, selection, info);
-            }
+            self.apply(&current, selection, info);
         }
         // GstPlay does not pick an external subtitle by itself, and lists
         // it only once its pipeline has it (on each restart for it).
@@ -3075,58 +3072,41 @@ impl Playback {
         self.emit(&Change::MediaInfo(info));
     }
 
-    /// A converted output holds only the tracks picked: one audio, and the
-    /// subtitle when the server copied or converted it into the output.
-    /// One read as text (OCR) comes as a file; one burned in is in the
-    /// picture.
-    fn apply_converted(&self, current: &Current, info: &gst_play::PlayMediaInfo) {
-        if current.subtitle_file.borrow().is_some() {
-            return;
-        }
-        let in_output = current
-            .plan
-            .borrow()
-            .as_ref()
-            .is_some_and(subtitle_in_output);
-        match self.pipeline.select_subtitle(info, in_output.then_some(0)) {
-            Ok(()) => self.subtitles_on.set(in_output),
-            Err(e) => {
-                tracing::warn!(error = %e, "cannot pick the converted subtitle");
-                self.emit(&Change::TrackFailed(SUBTITLES_FAILED));
-            }
-        }
-    }
-
-    /// Picks the tracks that play. The selection counts positions in the
-    /// item's track list; the file's streams are in the same order,
-    /// external subtitles aside.
+    /// Picks the streams that carry `selection`: the SDK's mapping for
+    /// what the plan plays (`tracks::map_selection`). A converted output
+    /// holds only what was picked; one burned in is in the picture.
     fn apply(&self, current: &Current, selection: Selection, info: &gst_play::PlayMediaInfo) {
-        if let Some(audio) = selection.audio
-            && let Err(e) = self.pipeline.select_audio(info, audio as usize)
+        let picks = {
+            let (plan, track_list) = (current.plan.borrow(), current.track_list.borrow());
+            match (plan.as_ref(), track_list.as_ref()) {
+                (Some(plan), Some(tracks)) => tracks::map_selection(tracks, plan, selection),
+                (Some(plan), None) => {
+                    tracks::map_selection(&MediaTracks::default(), plan, selection)
+                }
+                // A download has no plan: its file is played as it is.
+                (None, tracks) => file_picks(tracks, selection),
+            }
+        };
+        if let Some(audio) = picks.audio_stream
+            && let Err(e) = self.pipeline.select_audio(info, audio)
         {
             tracing::warn!(error = %e, audio, "cannot pick the audio track");
             self.emit(&Change::TrackFailed(AUDIO_FAILED));
         }
-        let track_list = current.track_list.borrow();
-        let embedded = selection.subtitle.and_then(|n| {
-            let subtitles = &track_list.as_ref()?.subtitles;
-            let track = subtitles.get(n as usize)?;
-            (!track.external).then(|| {
-                subtitles[..n as usize]
-                    .iter()
-                    .filter(|t| !t.external)
-                    .count()
-            })
-        });
-        // An external subtitle is turned on when it arrives.
-        if embedded.is_none() && current.subtitle_file.borrow().is_some() {
+        let stream = match picks.subtitle {
+            SubtitleHandling::Embedded(n) => Some(n),
+            SubtitleHandling::InOutput => Some(0),
+            SubtitleHandling::Burned | SubtitleHandling::AsFile | SubtitleHandling::None => None,
+        };
+        // A subtitle file is turned on when it arrives.
+        if stream.is_none() && current.subtitle_file.borrow().is_some() {
             return;
         }
-        match self.pipeline.select_subtitle(info, embedded) {
-            Ok(()) => self.subtitles_on.set(embedded.is_some()),
+        match self.pipeline.select_subtitle(info, stream) {
+            Ok(()) => self.subtitles_on.set(stream.is_some()),
             Err(e) => {
-                tracing::warn!(error = %e, ?embedded, "cannot pick the subtitle");
-                if embedded.is_some() {
+                tracing::warn!(error = %e, ?stream, "cannot pick the subtitle");
+                if stream.is_some() {
                     self.emit(&Change::TrackFailed(SUBTITLES_FAILED));
                 }
             }
@@ -3209,15 +3189,6 @@ enum TimingCall {
 /// What the player says when a timing change is refused.
 pub const TIMING_FAILED: &str = "Couldn't change the subtitle's timing";
 
-/// The tracks to ask for to show subtitle `track`: the audio that plays
-/// now, or the server's choice where none was known.
-fn subtitle_change(playing: Option<Selection>, track: u32) -> Selection {
-    Selection {
-        audio: playing.and_then(|s| s.audio),
-        subtitle: Some(track),
-    }
-}
-
 /// The source's video as the server judged it, an RFC 6381 string
 /// ("hvc1.2.4.L153.B0"), for the log: `None` with no video, or from a
 /// server before 0.15.0, or for a plan that plays nothing.
@@ -3229,60 +3200,21 @@ fn source_codec(plan: &PlaybackPlan) -> Option<&str> {
     }
 }
 
-/// Whether the plan's subtitle comes as a file to fetch: a direct play's
-/// external one, or one the server reads as text for a converted
-/// playback (P2-07).
-fn subtitle_comes_as_file(plan: &PlaybackPlan) -> bool {
-    matches!(
-        plan,
-        PlaybackPlan::Direct {
-            subtitle: Some(PlannedSubtitle {
-                delivery: SubtitleDelivery::External,
-                ..
-            }),
-            ..
-        } | PlaybackPlan::Converted {
-            subtitle: Some(spoolframe_protocol::ConvertedSubtitle {
-                action: SubtitleAction::Ocr { .. },
-                ..
-            }),
-            ..
-        }
-    )
-}
-
-/// Whether a converted output carries the subtitle as a stream to show:
-/// copied or converted into it. One burned in is in the picture already,
-/// and the player shows none of its own (P2-07).
-fn subtitle_in_output(plan: &PlaybackPlan) -> bool {
-    matches!(
-        plan,
-        PlaybackPlan::Converted {
-            subtitle: Some(spoolframe_protocol::ConvertedSubtitle {
-                action: SubtitleAction::Copy { .. } | SubtitleAction::Convert { .. },
-                ..
-            }),
-            ..
-        }
-    )
-}
-
-/// The item's subtitle tracks the playback under `plan` has no stream of,
-/// by their place in `tracks`: the menu offers them, and picking one
-/// starts the item again with it, as a downloaded one does. A direct play
-/// has the file's own tracks as streams, and the external one it was
-/// started with; a converted output has only the one it carries.
-fn subtitles_not_in_stream(tracks: &MediaTracks, plan: &PlaybackPlan) -> Vec<u32> {
-    let carried = match plan {
-        PlaybackPlan::Direct { subtitle, .. } => subtitle.as_ref().map(|s| s.index),
-        PlaybackPlan::Converted { subtitle, .. } => subtitle.map(|s| s.index),
-        _ => None,
-    };
-    let converted = matches!(plan, PlaybackPlan::Converted { .. });
-    (0..tracks.subtitles.len() as u32)
-        .filter(|&n| Some(n) != carried)
-        .filter(|&n| converted || tracks.subtitles[n as usize].external)
-        .collect()
+/// The streams of a download's file that carry `selection`, of the file's
+/// tracks (`file_tracks`): the file has every subtitle it took as a
+/// stream of its own, an external one too, in that order, so a track's
+/// place is its stream. Until the SDK's `LocalDownload::stream_picks`
+/// (0.17.0-beta.1): `map_selection` needs a plan, and a download has none.
+fn file_picks(tracks: Option<&MediaTracks>, selection: Selection) -> StreamPicks {
+    let carried = tracks.map_or(0, |t| t.subtitles.len());
+    let subtitle = selection
+        .subtitle
+        .map(|n| n as usize)
+        .filter(|&n| n < carried);
+    StreamPicks {
+        audio_stream: selection.audio.map(|a| a as usize),
+        subtitle: subtitle.map_or(SubtitleHandling::None, SubtitleHandling::Embedded),
+    }
 }
 
 /// Whose a GstPlay error is.
@@ -3549,37 +3481,6 @@ fn spawn() -> Spawn {
     Arc::new(|future| {
         relm4::spawn(future);
     })
-}
-
-#[cfg(test)]
-mod subtitle_change_tests {
-    use super::*;
-
-    #[test]
-    fn a_new_subtitle_keeps_the_audio_that_plays() {
-        let playing = Selection {
-            audio: Some(1),
-            subtitle: Some(0),
-        };
-        assert_eq!(
-            subtitle_change(Some(playing), 4),
-            Selection {
-                audio: Some(1),
-                subtitle: Some(4)
-            }
-        );
-    }
-
-    #[test]
-    fn with_no_audio_known_the_server_chooses_it() {
-        assert_eq!(
-            subtitle_change(None, 4),
-            Selection {
-                audio: None,
-                subtitle: Some(4)
-            }
-        );
-    }
 }
 
 #[cfg(test)]
@@ -3860,6 +3761,46 @@ mod tests {
             .unwrap();
     }
 
+    /// A download's file has every subtitle it took as a stream of its
+    /// own, an external one too, in the file's order: of an item's [en in
+    /// the file, fr external, de in the file], a file with fr and de has
+    /// them as its streams 0 and 1.
+    #[test]
+    fn a_downloads_subtitle_is_the_files_stream_at_its_place() {
+        let track = |language: &str, external| spoolframe_types::SubtitleTrack {
+            language: Some(language.into()),
+            title: None,
+            forced: false,
+            default: false,
+            external,
+            role: Default::default(),
+            timing: None,
+            download: None,
+        };
+        let file = MediaTracks {
+            subtitles: vec![track("fra", true), track("deu", false)],
+            ..Default::default()
+        };
+        let pick = |subtitle| {
+            file_picks(
+                Some(&file),
+                Selection {
+                    audio: None,
+                    subtitle: Some(subtitle),
+                },
+            )
+            .subtitle
+        };
+        assert_eq!(
+            [pick(1), pick(0), pick(2)],
+            [
+                SubtitleHandling::Embedded(1),
+                SubtitleHandling::Embedded(0),
+                SubtitleHandling::None
+            ]
+        );
+    }
+
     #[test]
     fn a_plan_says_the_source_it_judged() {
         let plan = PlaybackPlan::Direct {
@@ -3870,129 +3811,6 @@ mod tests {
             source_codec: Some("hvc1.2.4.L153.B0".into()),
         };
         assert_eq!(source_codec(&plan), Some("hvc1.2.4.L153.B0"));
-    }
-
-    fn converted_with(action: SubtitleAction) -> PlaybackPlan {
-        PlaybackPlan::Converted {
-            delivery: Delivery::Progressive,
-            container: spoolframe_types::Container::Matroska,
-            video: None,
-            audio: None,
-            subtitle: Some(spoolframe_protocol::ConvertedSubtitle { index: 0, action }),
-            reasons: Vec::new(),
-            ladder: Vec::new(),
-            source_codec: None,
-        }
-    }
-
-    /// An item's subtitles: one in the file, then `downloaded` external
-    /// ones, as a track someone downloaded is.
-    fn tracks_with(downloaded: usize) -> MediaTracks {
-        let track = |external| spoolframe_types::SubtitleTrack {
-            language: Some("eng".into()),
-            title: None,
-            forced: false,
-            default: false,
-            external,
-            role: Default::default(),
-            timing: None,
-            download: None,
-        };
-        MediaTracks {
-            subtitles: std::iter::once(track(false))
-                .chain(std::iter::repeat_n(track(true), downloaded))
-                .collect(),
-            ..Default::default()
-        }
-    }
-
-    fn direct_with(subtitle: Option<u32>) -> PlaybackPlan {
-        PlaybackPlan::Direct {
-            container: spoolframe_types::Container::Matroska,
-            video: None,
-            audio: None,
-            subtitle: subtitle.map(|index| PlannedSubtitle {
-                index,
-                format: SubtitleFormat::Srt,
-                delivery: SubtitleDelivery::External,
-            }),
-            source_codec: None,
-        }
-    }
-
-    /// A conversion started without a subtitle carries none: the menu
-    /// offers every track the item has, downloaded ones too.
-    #[test]
-    fn a_conversion_without_a_subtitle_offers_every_track() {
-        let plan = PlaybackPlan::Converted {
-            delivery: Delivery::Progressive,
-            container: spoolframe_types::Container::Matroska,
-            video: None,
-            audio: None,
-            subtitle: None,
-            reasons: Vec::new(),
-            ladder: Vec::new(),
-            source_codec: None,
-        };
-        assert_eq!(subtitles_not_in_stream(&tracks_with(2), &plan), [0, 1, 2]);
-    }
-
-    /// The track a conversion carries is in its stream; the others are not.
-    #[test]
-    fn a_conversion_offers_the_tracks_it_does_not_carry() {
-        let plan = converted_with(SubtitleAction::Copy {
-            format: SubtitleFormat::Srt,
-        });
-        assert_eq!(subtitles_not_in_stream(&tracks_with(2), &plan), [1, 2]);
-    }
-
-    /// A direct play has the file's own tracks; the downloaded ones are
-    /// offered, but not the one it was started with.
-    #[test]
-    fn a_direct_play_offers_the_downloaded_tracks_it_was_not_started_with() {
-        assert_eq!(
-            (
-                subtitles_not_in_stream(&tracks_with(2), &direct_with(None)),
-                subtitles_not_in_stream(&tracks_with(2), &direct_with(Some(1))),
-            ),
-            (vec![1, 2], vec![2])
-        );
-    }
-
-    /// A subtitle the plan burns into the picture is neither fetched nor
-    /// shown by the player: it would show twice.
-    #[test]
-    fn a_burned_in_subtitle_is_not_drawn_again() {
-        let plan = converted_with(SubtitleAction::BurnIn {
-            format: SubtitleFormat::Pgs,
-        });
-        assert_eq!(
-            (subtitle_comes_as_file(&plan), subtitle_in_output(&plan)),
-            (false, false)
-        );
-    }
-
-    #[test]
-    fn a_copied_subtitle_is_shown_from_the_output() {
-        let plan = converted_with(SubtitleAction::Copy {
-            format: SubtitleFormat::Srt,
-        });
-        assert_eq!(
-            (subtitle_comes_as_file(&plan), subtitle_in_output(&plan)),
-            (false, true)
-        );
-    }
-
-    #[test]
-    fn a_subtitle_read_as_text_is_fetched_as_a_file() {
-        let plan = converted_with(SubtitleAction::Ocr {
-            from: SubtitleFormat::Pgs,
-            to: SubtitleFormat::Srt,
-        });
-        assert_eq!(
-            (subtitle_comes_as_file(&plan), subtitle_in_output(&plan)),
-            (true, false)
-        );
     }
 
     /// Four seconds of H.264 in Matroska.
@@ -5228,15 +5046,21 @@ mod tests {
             "the converted playback never played"
         );
         assert!(
-            !playback.plan().as_ref().is_some_and(subtitle_in_output),
+            !playback.plan().as_ref().is_some_and(carries_its_subtitle),
             "the first encode already had the subtitle"
         );
         (playback, failed)
     }
 
+    /// Whether a converted output has its subtitle as a stream to show.
+    fn carries_its_subtitle(plan: &PlaybackPlan) -> bool {
+        tracks::map_selection(&MediaTracks::default(), plan, Selection::default()).subtitle
+            == SubtitleHandling::InOutput
+    }
+
     /// Whether `playback` shows the subtitle its output now carries.
     fn shows_the_copied_subtitle(playback: &Playback) -> bool {
-        playback.plan().as_ref().is_some_and(subtitle_in_output)
+        playback.plan().as_ref().is_some_and(carries_its_subtitle)
             && playback.is_playing()
             && playback.subtitles_on.get()
     }

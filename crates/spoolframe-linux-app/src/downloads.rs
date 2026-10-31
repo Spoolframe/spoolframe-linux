@@ -526,6 +526,8 @@ pub fn apply(downloads: &mut Vec<LocalDownload>, event: &DownloadEvent) -> Appli
             }
             None => Applied::Nothing,
         },
+        // Not a film's or an episode's download: none of the list's.
+        DownloadEvent::MusicChanged(_) | DownloadEvent::WatchSynced { .. } => Applied::Nothing,
     }
 }
 
@@ -1087,7 +1089,7 @@ impl DownloadsPage {
                 .iter()
                 .find(|listed| listed.key == d.key)
                 .map(|listed| std::mem::discriminant(&listed.phase)),
-            DownloadEvent::Removed { .. } => None,
+            _ => None,
         };
         let applied = apply(&mut self.downloads.borrow_mut(), event);
         match (applied, event) {

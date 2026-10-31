@@ -141,13 +141,13 @@ impl Settings {
         self.file
             .string(STREAMING, QUALITY)
             .ok()
-            .and_then(|q| crate::quality::from_setting(&q))
+            .and_then(|q| q.parse().ok())
             .unwrap_or(spoolframe_client_sdk::PlaybackQuality::Original)
     }
 
     pub fn set_preferred_quality(&mut self, quality: spoolframe_client_sdk::PlaybackQuality) {
         self.file
-            .set_string(STREAMING, QUALITY, &crate::quality::to_setting(quality));
+            .set_string(STREAMING, QUALITY, &quality.to_string());
         let _ = self.file.remove_key(STREAMING, MAX_BITRATE);
         self.save();
     }

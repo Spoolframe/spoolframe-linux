@@ -7,7 +7,8 @@
 //! ffprobe's names to.
 
 use spoolframe_types::{
-    AudioCodec, ClientCapabilities, Container, Delivery, SubtitleFormat, VideoCodec,
+    AudioCodec, ClientCapabilities, Container, Decoders, Delivery, DisplayCapabilities,
+    SubtitleFormat, VideoCodec,
 };
 
 const VIDEO: &[(&str, VideoCodec)] = &[
@@ -73,8 +74,15 @@ const SUBTITLES: &[(&str, SubtitleFormat)] = &[
     ("subpicture/x-dvb", SubtitleFormat::DvbSub),
 ];
 
-/// Builds the set from the registry. Call after gst::init.
-pub fn capabilities() -> ClientCapabilities {
+/// What this machine plays, from the registry, on a screen showing HDR
+/// as `show_hdr` says. Call after gst::init.
+pub fn capabilities(show_hdr: bool) -> ClientCapabilities {
+    ClientCapabilities::from_decoders(decoders(), &display(show_hdr))
+}
+
+/// The decoders the registry has. PCM, which needs none, and keeping the
+/// hardware ones to what plays are the SDK's (`from_decoders`).
+fn decoders() -> Decoders {
     // Elements below "marginal" rank are never autoplugged, so they do not
     // count, however installed.
     let decoders = elements(gst::ElementFactoryType::DECODER);
@@ -89,7 +97,7 @@ pub fn capabilities() -> ClientCapabilities {
             | gst::ElementFactoryType::DEMUXER,
     );
     subtitle_handlers.extend(overlays());
-    let mut caps = ClientCapabilities {
+    Decoders {
         video: supported(VIDEO, &decoders),
         // What the GPU decodes (PGPU-06), so the server encodes to a codec
         // that plays without the CPU: AV1 decoded in software is slow.
@@ -100,43 +108,24 @@ pub fn capabilities() -> ClientCapabilities {
         // The file itself first; a progressive encode when it will not
         // play (P2-06). Not HLS: GStreamer's HLS demuxer fetches with its
         // own HTTP client, which cannot reach the server over Iroh.
+        // No channel limit: how much a playback takes is its quality
+        // (P6-06), chosen per playback.
         delivery: vec![Delivery::Range, Delivery::Progressive],
-        // No limits on resolution, channels or bitrate: how much a
-        // playback takes is its quality (P6-06), chosen per playback.
-        ..ClientCapabilities::default()
-    };
-    // Raw PCM needs no decoder; every pipeline plays it.
-    caps.audio.insert(AudioCodec::Pcm);
-    caps
-}
-
-/// `caps` as the user set HDR: shown as HDR10 and HLG (the frames carry
-/// their colour state to GTK, and the compositor maps them per monitor),
-/// or none of it, so the server tone-maps every HDR film to SDR. Never
-/// Dolby Vision: since PGPU-06 claiming it (or no limit) has a profile 5
-/// film copied as it is, in Dolby's own colours until its RPU is applied,
-/// which GTK does not do; the server converts it to HDR10 instead.
-pub fn with_hdr(mut caps: ClientCapabilities, show: bool) -> ClientCapabilities {
-    let limits = caps.max_video.get_or_insert_with(Default::default);
-    limits.hdr = display(show).hdr;
-    caps
-}
-
-/// What the screen shows, as each playback tells the server (PGPU-06): so
-/// a change to Show HDR applies at the next play. The HDR formats as
-/// [`with_hdr`] says them; the bit depth as the client said it connecting.
-pub fn display(show_hdr: bool) -> spoolframe_types::DisplayCapabilities {
-    use spoolframe_types::HdrFormat;
-    spoolframe_types::DisplayCapabilities {
-        bit_depth: None,
-        hdr: Some(if show_hdr {
-            [HdrFormat::Hdr10, HdrFormat::Hlg].into()
-        } else {
-            std::collections::BTreeSet::new()
-        }),
+        max_audio_channels: None,
         // Hello's list, which is none: the server plans by codec alone.
         video_codecs: None,
     }
+}
+
+/// What the screen shows, said connecting and with each playback
+/// (PGPU-06), so a change to Show HDR applies at the next play: HDR10 and
+/// HLG (the frames carry their colour state to GTK, and the compositor
+/// maps them per monitor), or none of it, so the server tone-maps every
+/// HDR film to SDR. Never Dolby Vision: claiming it has a profile 5 film
+/// copied as it is, in Dolby's own colours until its RPU is applied,
+/// which GTK does not do; the server converts it to HDR10 instead.
+pub fn display(show_hdr: bool) -> DisplayCapabilities {
+    DisplayCapabilities::for_hdr(show_hdr, false)
 }
 
 /// The decoders that say they are hardware ("Hardware" in their class):
@@ -195,24 +184,22 @@ fn supported<T: Ord + Copy>(
 
 #[cfg(test)]
 mod tests {
-    use super::with_hdr;
-
     /// Each playback says the same of HDR as the client did connecting.
     #[test]
     fn a_plays_display_says_what_show_hdr_says() {
+        gst::init().unwrap();
         for show in [false, true] {
             assert_eq!(
                 super::display(show).hdr,
-                with_hdr(Default::default(), show)
-                    .max_video
-                    .and_then(|v| v.hdr)
+                super::capabilities(show).max_video.and_then(|v| v.hdr)
             );
         }
     }
 
     #[test]
     fn hdr_off_asks_the_server_to_tone_map_everything() {
-        let caps = with_hdr(Default::default(), false);
+        gst::init().unwrap();
+        let caps = super::capabilities(false);
         assert_eq!(caps.max_video.and_then(|v| v.hdr), Some(Default::default()));
     }
 
@@ -221,7 +208,8 @@ mod tests {
     /// not do: green and purple. The server converts that to HDR10.
     #[test]
     fn hdr_on_takes_hdr10_and_hlg_but_not_dolby_vision() {
-        let caps = with_hdr(Default::default(), true);
+        gst::init().unwrap();
+        let caps = super::capabilities(true);
         assert_eq!(
             caps.max_video.and_then(|v| v.hdr),
             Some(
@@ -239,7 +227,7 @@ mod tests {
 
     fn caps() -> ClientCapabilities {
         gst::init().unwrap();
-        capabilities()
+        capabilities(false)
     }
 
     /// libav decodes H.264 on the CPU: it counts for what plays, not for

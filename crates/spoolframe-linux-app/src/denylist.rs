@@ -258,7 +258,7 @@ mod tests {
     #[test]
     fn the_formats_the_server_sends_still_play() {
         removed();
-        let caps = crate::capabilities::capabilities();
+        let caps = crate::capabilities::capabilities(false);
         for codec in [
             VideoCodec::H264,
             VideoCodec::Hevc,

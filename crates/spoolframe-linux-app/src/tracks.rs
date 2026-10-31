@@ -311,7 +311,7 @@ pub fn menu(
     // Below Subtitles, as sf-design placed it: Auto, the bitrates, and
     // Original. Choosing plans the playback again.
     let quality = quality.map(|menu| {
-        let choices = crate::quality::choices();
+        let choices = spoolframe_client_sdk::PlaybackQuality::choices();
         let names: Vec<String> = choices
             .iter()
             .map(|q| crate::quality::label(*q, None))
@@ -363,7 +363,7 @@ pub fn menu(
                 0,
                 &crate::quality::label(spoolframe_client_sdk::PlaybackQuality::Auto, height),
             );
-            picks.mark(Some(crate::quality::index(chosen)));
+            picks.mark(Some(chosen.choice_index()));
         }
     });
     popover

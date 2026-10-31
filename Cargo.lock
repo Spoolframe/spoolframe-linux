@@ -157,9 +157,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3c3610892ee6e0cbce8ae2700349fcf8f98adb0dbfbee85aec3c9179d29cc072"
 dependencies = [
  "base64ct",
- "blake2",
+ "blake2 0.10.6",
  "cpufeatures 0.2.17",
- "password-hash",
+ "password-hash 0.5.0",
+]
+
+[[package]]
+name = "argon2"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "134c52ddac6d63c576bef8168db10c83c49c26444ecbc68060fef078925a901c"
+dependencies = [
+ "base64ct",
+ "blake2 0.11.0",
+ "cpufeatures 0.3.1",
+ "password-hash 0.6.1",
 ]
 
 [[package]]
@@ -417,6 +429,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "46502ad458c9a52b69d4d4d32775c788b7a1b85e8bc9d482d92250fc0e3f8efe"
 dependencies = [
  "digest 0.10.7",
+]
+
+[[package]]
+name = "blake2"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b5d4d889834ee8ecfc0f8426ad30faf7cdcb10f741a8e6d7224d95325479f6f"
+dependencies = [
+ "digest 0.11.3",
 ]
 
 [[package]]
@@ -990,7 +1011,7 @@ dependencies = [
  "aes",
  "aes-gcm",
  "aes-kw",
- "argon2",
+ "argon2 0.5.3",
  "base64 0.22.1",
  "cbc",
  "cipher",
@@ -1077,12 +1098,35 @@ dependencies = [
 
 [[package]]
 name = "darling"
+version = "0.21.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9cdf337090841a411e2a7f3deb9187445851f91b309c0c0a29e05f74a00a48c0"
+dependencies = [
+ "darling_core 0.21.3",
+ "darling_macro 0.21.3",
+]
+
+[[package]]
+name = "darling"
 version = "0.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed17f5901b6630b993ca003def43f2f8ef4014fc13b047b57aad617ff32bc2ec"
 dependencies = [
- "darling_core",
- "darling_macro",
+ "darling_core 0.24.1",
+ "darling_macro 0.24.1",
+]
+
+[[package]]
+name = "darling_core"
+version = "0.21.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1247195ecd7e3c85f83c8d2a366e4210d588e802133e1e355180a9870b517ea4"
+dependencies = [
+ "fnv",
+ "ident_case",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -1100,11 +1144,22 @@ dependencies = [
 
 [[package]]
 name = "darling_macro"
+version = "0.21.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d38308df82d1080de0afee5d069fa14b0326a88c14f15c5ccda35b4a6c414c81"
+dependencies = [
+ "darling_core 0.21.3",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "darling_macro"
 version = "0.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2ac7135c3ef02b2f7833bbeb1be5ba7f966dcde8a87c6b87f65a778d71a02785"
 dependencies = [
- "darling_core",
+ "darling_core 0.24.1",
  "quote",
  "syn 3.0.9",
 ]
@@ -1562,6 +1617,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "enumset"
+version = "1.1.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e6bd2d7c76d078cd7a460fa169f778c42c026fe16d90e37d7a45d37181bdce5"
+dependencies = [
+ "enumset_derive",
+]
+
+[[package]]
+name = "enumset_derive"
+version = "0.15.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f60587c2044cabd91c4d4c73e3912e9f1ea7d76905f31c7eec51869305dae044"
+dependencies = [
+ "darling 0.21.3",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1706,6 +1782,12 @@ dependencies = [
  "futures-sink",
  "spin 0.9.9",
 ]
+
+[[package]]
+name = "fnv"
+version = "1.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
 name = "foldhash"
@@ -4619,6 +4701,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "password-hash"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aab41826031698d6ffcd9cff78ef56ef998e39dc7e5067cdfebe373842d4723b"
+dependencies = [
+ "getrandom 0.4.3",
+ "phc",
+]
+
+[[package]]
 name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4672,6 +4764,17 @@ checksum = "e9567389417feee6ce15dd6527a8a1ecac205ef62c2932bcf3d9f6fc5b78b414"
 dependencies = [
  "futures",
  "rustc_version",
+]
+
+[[package]]
+name = "phc"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "44dc769b75f93afdddd8c7fa12d685292ddeff1e66f7f0f3a234cf1818afe892"
+dependencies = [
+ "base64ct",
+ "ctutils",
+ "getrandom 0.4.3",
 ]
 
 [[package]]
@@ -5624,7 +5727,7 @@ version = "3.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3e17bbc68e28663bbbb90df47e058aa7eda4fb445b89fe70457bb94fbccf6e49"
 dependencies = [
- "darling",
+ "darling 0.24.1",
  "proc-macro2",
  "quote",
  "syn 3.0.9",
@@ -5870,12 +5973,13 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-client-sdk"
-version = "0.16.3"
+version = "0.16.4-beta.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "563299bcae9f4c0cc1175114ef21e78ad135882a2478232580be452cfaf74174"
+checksum = "5d45f88f2aad215cd930fe44cc2f47b33464dae430bacb1171c78fcaa4be823a"
 dependencies = [
- "argon2",
+ "argon2 0.6.0",
  "async-trait",
+ "base64 0.22.1",
  "bip39",
  "blake3",
  "ed25519-dalek",
@@ -5885,10 +5989,9 @@ dependencies = [
  "iroh-mdns-address-lookup",
  "libc",
  "parking_lot",
- "password-hash",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.1",
  "spoolframe-protocol",
  "spoolframe-types",
  "thiserror 2.0.21",
@@ -5969,9 +6072,9 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-policy"
-version = "0.16.3"
+version = "0.16.4-beta.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c005500a44fddebe853df0522795ec29e149d757b4f3c103951d9b7b04c9e7b"
+checksum = "73740aa07b885497f118b326b2a80595e17dcbc261bb0833e27a112f330ecefa"
 dependencies = [
  "serde",
  "spoolframe-protocol",
@@ -5980,19 +6083,20 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-protocol"
-version = "0.16.3"
+version = "0.16.4-beta.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "37f935b3e18bd33d2b3b91e0e661d650dac1e23f1b5daedcc065660e163c49f1"
+checksum = "e6857a6409f992e3ba1722214faa32880e8497bf87f481c13f3238a333f03a1c"
 dependencies = [
  "base64 0.22.1",
  "blake3",
  "ciborium",
  "ciborium-ll",
  "ed25519-dalek",
+ "enumset",
  "p256 0.14.0",
  "serde",
  "serde_bytes",
- "sha2 0.10.9",
+ "sha2 0.11.1",
  "spoolframe-types",
  "thiserror 2.0.21",
  "tokio",
@@ -6000,9 +6104,9 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-test-dir"
-version = "0.16.3"
+version = "0.16.4-beta.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92711be16827e0090c7115c9b252324dbae2eeb2a3aeca726991bbe75c283336"
+checksum = "0cc09514e784d14488ca931fa74f059dcf824175fa8eac8b7c829d90a8acdb41"
 dependencies = [
  "tmpdir",
  "tokio",
@@ -6010,9 +6114,9 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-types"
-version = "0.16.3"
+version = "0.16.4-beta.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df90d3c84e57ded81a2085cc3766875b098079a5a2d9c93cc720ae0916abd960"
+checksum = "ed7a931342a4c6d15c7c7c4e1e84afe7c6cc440fe1dc1c0295ff4798cb9453c9"
 dependencies = [
  "serde",
  "thiserror 2.0.21",

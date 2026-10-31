@@ -4123,6 +4123,9 @@ impl App {
                     Ok(DownloadEvent::Removed { key }) => {
                         sender.input(Msg::LocalDownloadRemoved(key))
                     }
+                    // Music is not downloaded here; watch state synced from
+                    // here shows at the pages' next read.
+                    Ok(DownloadEvent::MusicChanged(_) | DownloadEvent::WatchSynced { .. }) => {}
                     Err(RecvError::Lagged(_)) => sender.input(Msg::ListDownloads),
                     Err(RecvError::Closed) => break,
                 }

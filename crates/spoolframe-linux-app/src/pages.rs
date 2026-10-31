@@ -588,16 +588,11 @@ impl TrackPickers {
             };
             picker(&row, "Subtitles", &names, selected.min(names.len() - 1))
         });
-        let qualities: Vec<String> = crate::quality::choices()
-            .into_iter()
-            .map(|q| crate::quality::label(q, None))
+        let qualities: Vec<String> = spoolframe_client_sdk::PlaybackQuality::choices()
+            .iter()
+            .map(|q| crate::quality::label(*q, None))
             .collect();
-        let quality = picker(
-            &row,
-            "Quality",
-            &qualities,
-            crate::quality::index(preferred),
-        );
+        let quality = picker(&row, "Quality", &qualities, preferred.choice_index());
 
         // A movie says what its file is, beside the pickers, as designed.
         if !series && let Some(file) = format::file(tracks.container, tracks.video.as_ref()) {
@@ -663,7 +658,7 @@ impl TrackPickers {
 
     /// The quality picked for this playback.
     fn quality(&self) -> spoolframe_client_sdk::PlaybackQuality {
-        crate::quality::choices()
+        spoolframe_client_sdk::PlaybackQuality::choices()
             .get(self.quality.selected() as usize)
             .copied()
             .unwrap_or_default()

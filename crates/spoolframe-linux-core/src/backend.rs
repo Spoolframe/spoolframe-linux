@@ -461,17 +461,9 @@ pub enum ConnectionState {
     Stopped(BackendError),
 }
 
-/// How packets go to the server now, for the player's diagnostics. A
-/// hole punched through NAT and an open port look the same: `Direct` is
-/// any public address, `Lan` a private, link-local or loopback one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConnectionPath {
-    Lan(std::net::SocketAddr),
-    Direct(std::net::SocketAddr),
-    Relay,
-    /// Not connected now, or no path chosen yet.
-    Unknown,
-}
+/// How packets go to the server now, for the player's diagnostics, as
+/// the SDK says it.
+pub use spoolframe_client_sdk::ConnectionPath;
 
 /// A subtitle track's timing changed (PX-03), as a server told.
 pub use spoolframe_client_sdk::SubtitleTimingEvent;
@@ -503,9 +495,6 @@ pub use spoolframe_protocol::downloads::{
 pub use spoolframe_client_sdk::{LibrariesChanged, RemoteMode};
 pub use spoolframe_protocol::{Copies, SearchHit, ServerRow, TitleCopy};
 pub use spoolframe_types::LibraryServer;
-
-/// The most a subtitle may be moved either way (PX-03): ten minutes, ms.
-pub const MAX_SUBTITLE_OFFSET_MS: i64 = 10 * 60 * 1000;
 
 /// Playlists (PX-40), in the protocol's and the SDK's own types.
 pub use spoolframe_client_sdk::{PlaylistChange, PlaylistEvent, PlaylistList, PlaylistUpdate};
@@ -1578,7 +1567,7 @@ pub trait Session: Send + Sync {
 
     /// Moves item `id`'s subtitle `track` by `offset_ms` (positive:
     /// later), for everyone; 0 resets it. At most
-    /// [`MAX_SUBTITLE_OFFSET_MS`] either way. What the server serves has
+    /// [`SubtitleTiming::MAX_OFFSET_MS`] either way. What the server serves has
     /// it already: a player never adds it itself.
     fn set_subtitle_offset<'a>(
         &'a self,

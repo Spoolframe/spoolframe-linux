@@ -2127,7 +2127,9 @@ impl Session for FakeSession {
     }
 
     fn connection_path(&self) -> ConnectionPath {
-        ConnectionPath::Lan(([192, 168, 1, 20], 7431).into())
+        ConnectionPath::Lan {
+            addr: ([192, 168, 1, 20], 7431).into(),
+        }
     }
 
     fn link_rate(&self) -> Option<u64> {
@@ -4618,6 +4620,8 @@ impl FakeClient {
                         .pin_state()
                         .required
                         .contains(THIS_DEVICE),
+                    // An older server's answer: the pad's length unknown.
+                    pin_digits: None,
                     auto_login: trusted[*username],
                 }
             })
@@ -5063,7 +5067,9 @@ impl Client for FakeClient {
     }
 
     fn connection_path(&self, _server: &ServerKey) -> ConnectionPath {
-        ConnectionPath::Lan(([192, 168, 1, 20], 7431).into())
+        ConnectionPath::Lan {
+            addr: ([192, 168, 1, 20], 7431).into(),
+        }
     }
 
     fn forget_profile<'a>(

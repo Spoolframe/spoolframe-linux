@@ -11,10 +11,7 @@ use std::time::Duration;
 
 use gtk::glib;
 use gtk::prelude::*;
-use spoolframe_linux_core::backend::{MAX_SUBTITLE_OFFSET_MS, SubtitleSync, SubtitleTiming};
-
-/// One press of − or +.
-pub const STEP_MS: i64 = 100;
+use spoolframe_linux_core::backend::{SubtitleSync, SubtitleTiming};
 
 /// How long after the last press the offset is sent: a run of presses is
 /// one change for everyone, not one each.
@@ -78,10 +75,17 @@ pub fn offset_label(ms: i64) -> String {
     }
 }
 
-/// The offset after `steps` presses from `ms` (+ for later), within the
-/// server's ten minutes either way.
+/// The offset after `steps` presses from `ms` (+ for later), by the
+/// SDK's step and within its limit. The menu keeps only the offset it
+/// shows, so a timing is made around it.
 pub fn stepped(ms: i64, steps: i64) -> i64 {
-    (ms + steps * STEP_MS).clamp(-MAX_SUBTITLE_OFFSET_MS, MAX_SUBTITLE_OFFSET_MS)
+    SubtitleTiming {
+        sync: SubtitleSync::Original,
+        offset_ms: ms,
+        offset_by: None,
+        offset_at: None,
+    }
+    .offset_stepped(steps)
 }
 
 /// Who set the offset and when, where someone has.

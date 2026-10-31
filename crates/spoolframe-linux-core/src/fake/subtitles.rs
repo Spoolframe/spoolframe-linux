@@ -181,7 +181,7 @@ impl Store {
         offset_ms: i64,
         asker: Asker<'_>,
     ) -> Result<SubtitleTiming, BackendError> {
-        if offset_ms.abs() > crate::backend::MAX_SUBTITLE_OFFSET_MS {
+        if offset_ms.abs() > SubtitleTiming::MAX_OFFSET_MS {
             return Err(BackendError::InvalidInput(
                 "an offset is at most ten minutes either way".into(),
             ));

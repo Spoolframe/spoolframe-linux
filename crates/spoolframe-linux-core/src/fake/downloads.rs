@@ -615,6 +615,7 @@ mod tests {
             seen.push(match event {
                 DownloadEvent::Changed(d) => format!("{:?} {}", d.phase, d.received),
                 DownloadEvent::Removed { key } => format!("removed {key}"),
+                other => format!("{other:?}"),
             });
         }
         seen
