@@ -682,15 +682,6 @@ mod tests {
     }
 
     #[test]
-    fn a_locked_key_ends_the_action_for_good() {
-        assert!(
-            trouble(&SecurityKeyError::Locked.into(), &alice())
-                .unwrap()
-                .for_good
-        );
-    }
-
-    #[test]
     fn keys_are_listed_with_or() {
         assert_eq!(or_list(&["A".into(), "B".into(), "C".into()]), "A, B or C");
     }
@@ -704,15 +695,17 @@ mod tests {
     }
 
     #[test]
-    fn a_locked_key_has_only_ok_and_points_to_the_other_key() {
+    fn a_locked_key_ends_the_action_for_good_and_points_to_the_other_key() {
         let trouble = trouble(&SecurityKeyError::Locked.into(), &alice()).unwrap();
+        assert!(trouble.for_good, "for good");
         assert_eq!(
             (
                 trouble.title.as_str(),
                 trouble.retry,
                 trouble.other_key.as_deref()
             ),
-            ("This key is locked", false, Some("Drawer key"))
+            ("This key is locked", false, Some("Drawer key")),
+            "only OK, and the other key"
         );
     }
 

@@ -78,13 +78,6 @@ fn pick<T: Clone>(all: &[T], places: &[u32]) -> Vec<T> {
         .collect()
 }
 
-/// Whether the SDK is still moving a download (preparing on the server or
-/// coming to this device): the app keeps listening for its events, and
-/// holds back from closing the client, while this is so.
-pub fn keeps_running(downloads: &[LocalDownload]) -> bool {
-    running(downloads) > 0
-}
-
 /// How many downloads the SDK is still moving: what closing the window
 /// names when it asks.
 pub fn running(downloads: &[LocalDownload]) -> usize {
@@ -101,24 +94,18 @@ pub fn running(downloads: &[LocalDownload]) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use spoolframe_types::{MediaId, MediaKind, Namespace};
 
     use super::*;
     use crate::backend::{
-        Client, DownloadFailure, DownloadFile, DownloadSource, DownloadState, DownloadTracks,
-        FileTracks, Session,
+        DownloadFailure, DownloadFile, DownloadSource, DownloadState, DownloadTracks, FileTracks,
     };
     use crate::fake::FakeClient;
+    use crate::testing::andrey;
     use crate::testing::ready;
 
     fn alien() -> MediaId {
         MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap()
-    }
-
-    fn andrey(client: &FakeClient) -> Arc<dyn Session> {
-        client.session(&FakeClient::profile("andrey")).unwrap()
     }
 
     fn started(tracks: DownloadTracks) -> LocalDownload {
@@ -246,20 +233,15 @@ mod tests {
         }
     }
 
+    /// Preparing on the server and coming to this device run; paused,
+    /// failed and done do not.
     #[test]
-    fn preparing_and_transferring_downloads_keep_running() {
-        let preparing = DownloadPhase::Preparing {
-            server: DownloadState::Waiting,
-        };
-        assert_eq!(
-            [preparing, DownloadPhase::Transferring].map(|p| keeps_running(&[in_phase(p)])),
-            [true, true]
-        );
-    }
-
-    #[test]
-    fn paused_failed_and_done_downloads_do_not() {
+    fn each_phase_runs_or_not() {
         let phases = [
+            DownloadPhase::Preparing {
+                server: DownloadState::Waiting,
+            },
+            DownloadPhase::Transferring,
             DownloadPhase::Paused,
             DownloadPhase::Failed {
                 reason: "gone".into(),
@@ -267,19 +249,8 @@ mod tests {
             },
             DownloadPhase::Done,
         ];
-        assert_eq!(
-            phases.map(|p| keeps_running(&[in_phase(p)])),
-            [false, false, false]
-        );
-    }
-
-    #[test]
-    fn one_download_under_way_among_finished_ones_keeps_it_running() {
-        let list = [
-            in_phase(DownloadPhase::Done),
-            in_phase(DownloadPhase::Transferring),
-        ];
-        assert_eq!((keeps_running(&list), keeps_running(&[])), (true, false));
+        assert_eq!(phases.map(|p| running(&[in_phase(p)])), [1, 1, 0, 0, 0]);
+        assert_eq!(running(&[]), 0);
     }
 
     #[test]

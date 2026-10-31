@@ -1280,27 +1280,32 @@ mod tests {
     }
 
     #[test]
-    fn a_paste_that_is_not_an_invite_says_so() {
-        assert_eq!(
-            paste_refusal(&BackendError::NotAnInvite, "hello", false),
-            "This isn’t a Spoolframe invite. Copy the whole link and try again."
-        );
-    }
-
-    #[test]
-    fn opened_for_a_server_text_that_is_neither_says_it_is_not_a_code() {
-        assert_eq!(
-            paste_refusal(&BackendError::NotAnInvite, "hello", true),
-            "That isn’t an invite code. A code is 12 letters and digits, like QW7K-2MFP-XR4T."
-        );
-    }
-
-    #[test]
-    fn the_sdks_not_an_invite_code_says_what_a_code_is() {
-        assert_eq!(
-            link_refusal(&BackendError::NotAnInviteCode),
-            "That isn’t an invite code. A code is 12 letters and digits, like QW7K-2MFP-XR4T."
-        );
+    fn a_refused_paste_says_what_was_wrong() {
+        const NOT_A_CODE: &str =
+            "That isn’t an invite code. A code is 12 letters and digits, like QW7K-2MFP-XR4T.";
+        let cases = [
+            (
+                "a paste that is not an invite",
+                paste_refusal(&BackendError::NotAnInvite, "hello", false),
+                "This isn’t a Spoolframe invite. Copy the whole link and try again.",
+            ),
+            // Opened for a server the field takes a code too, so text that
+            // is neither says it is not a code.
+            (
+                "opened for a server, text that is neither",
+                paste_refusal(&BackendError::NotAnInvite, "hello", true),
+                NOT_A_CODE,
+            ),
+            // The SDK's own "not an invite code" says what a code is.
+            (
+                "the SDK's not an invite code",
+                link_refusal(&BackendError::NotAnInviteCode),
+                NOT_A_CODE,
+            ),
+        ];
+        for (case, got, want) in cases {
+            assert_eq!(got, want, "{case}");
+        }
     }
 
     #[test]
@@ -1322,72 +1327,65 @@ mod tests {
 
     #[test]
     fn a_working_invite_says_whom_from_what_it_makes_and_until_when() {
-        let (line, joins) = outcome_line(
-            &valid(Some("Andrey"), InviteKind::CreateUser, Role::Consumer),
-            SystemTime::now(),
-        );
-        assert!(
-            line.starts_with("Invite from Andrey · consumer account · expires "),
-            "{line}"
-        );
-        assert!(joins);
+        let cases = [
+            (
+                "from a named inviter",
+                valid(Some("Andrey"), InviteKind::CreateUser, Role::Consumer),
+                "Invite from Andrey · consumer account · expires ",
+            ),
+            (
+                "no inviter",
+                valid(None, InviteKind::PortableAccount, Role::Consumer),
+                "A working invite · access for your identity · expires ",
+            ),
+            (
+                "an admin's",
+                valid(Some("Andrey"), InviteKind::CreateUser, Role::Admin),
+                "Invite from Andrey · admin account · expires ",
+            ),
+        ];
+        for (case, outcome, start) in cases {
+            let (line, joins) = outcome_line(&outcome, SystemTime::now());
+            assert!(line.starts_with(start), "{case}: {line}");
+            assert!(joins, "{case}");
+        }
     }
 
+    /// A code that no longer works does not join, and each refusal has its
+    /// own words.
     #[test]
-    fn a_working_invite_with_no_inviter_says_what_it_makes() {
-        let (line, _) = outcome_line(
-            &valid(None, InviteKind::PortableAccount, Role::Consumer),
-            SystemTime::now(),
-        );
-        assert!(
-            line.starts_with("A working invite · access for your identity · expires "),
-            "{line}"
-        );
-    }
-
-    #[test]
-    fn an_admins_invite_says_so() {
-        let (line, _) = outcome_line(
-            &valid(Some("Andrey"), InviteKind::CreateUser, Role::Admin),
-            SystemTime::now(),
-        );
-        assert!(line.contains(" · admin account · "), "{line}");
-    }
-
-    #[test]
-    fn a_code_that_no_longer_works_does_not_join() {
-        let joins: Vec<bool> = [
-            InviteOutcome::Expired {
-                at: SystemTime::now() - Duration::from_secs(3600),
-            },
-            InviteOutcome::Used,
-            InviteOutcome::Revoked,
-            InviteOutcome::NoMatch,
-        ]
-        .iter()
-        .map(|o| outcome_line(o, SystemTime::now()).1)
-        .collect();
-        assert_eq!(joins, [false, false, false, false]);
-    }
-
-    #[test]
-    fn each_refusal_has_its_own_words() {
-        let lines: Vec<String> = [
-            InviteOutcome::Used,
-            InviteOutcome::Revoked,
-            InviteOutcome::NoMatch,
-        ]
-        .iter()
-        .map(|o| outcome_line(o, SystemTime::now()).0)
-        .collect();
-        assert_eq!(
-            lines,
-            [
-                "This invite has been used. Ask for a new one.",
-                "This invite was revoked. Ask for a new one.",
-                "No invite has this code. Check it, or ask for a new invite."
-            ]
-        );
+    fn a_code_that_no_longer_works_does_not_join_and_says_why() {
+        let cases = [
+            (
+                "expired",
+                InviteOutcome::Expired {
+                    at: SystemTime::now() - Duration::from_secs(3600),
+                },
+                None,
+            ),
+            (
+                "used",
+                InviteOutcome::Used,
+                Some("This invite has been used. Ask for a new one."),
+            ),
+            (
+                "revoked",
+                InviteOutcome::Revoked,
+                Some("This invite was revoked. Ask for a new one."),
+            ),
+            (
+                "no match",
+                InviteOutcome::NoMatch,
+                Some("No invite has this code. Check it, or ask for a new invite."),
+            ),
+        ];
+        for (case, outcome, words) in cases {
+            let (line, joins) = outcome_line(&outcome, SystemTime::now());
+            assert!(!joins, "{case}");
+            if let Some(words) = words {
+                assert_eq!(line, words, "{case}");
+            }
+        }
     }
 
     #[test]

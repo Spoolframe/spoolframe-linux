@@ -800,11 +800,33 @@ mod tests {
     }
 
     #[test]
-    fn a_web_passkey_says_where_it_was_made_and_when_it_was_used() {
+    fn a_passkey_says_where_it_was_made_and_when_it_was_used() {
         let day = 86_400;
-        assert_eq!(
-            passkey_line(&passkey(false, Some(0)), "20 Aug", 21 * day),
-            "Made on the web at media.example.org · created 20 Aug · last used 3 weeks ago"
+        let cases = [
+            (
+                "web, used",
+                passkey_line(&passkey(false, Some(0)), "20 Aug", 21 * day),
+                "Made on the web at media.example.org · created 20 Aug · last used 3 weeks ago",
+            ),
+            (
+                "app, never used",
+                passkey_line(&passkey(true, None), "12 Sep", 0),
+                "Spoolframe app · created 12 Sep · never used",
+            ),
+        ];
+        for (case, got, want) in cases {
+            assert_eq!(got, want, "{case}");
+        }
+        // An app passkey from before each server had its own says to add it again.
+        let old = PasskeyInfo {
+            rp_id: "spoolframe.app".into(),
+            usable_here: false,
+            ..passkey(true, None)
+        };
+        let line = passkey_line(&old, "2 Oct", 0);
+        assert!(
+            line.starts_with("Old: add again"),
+            "old app passkey: {line}"
         );
     }
 
@@ -823,16 +845,6 @@ mod tests {
             listed_line(&creation)
                 .ends_with("under k7f3q2m4x5pq6z2a.spoolframe.app, as “alice @ Home Media”.")
         );
-    }
-
-    #[test]
-    fn an_app_passkey_from_before_each_server_had_its_own_says_to_add_it_again() {
-        let old = PasskeyInfo {
-            rp_id: "spoolframe.app".into(),
-            usable_here: false,
-            ..passkey(true, None)
-        };
-        assert!(passkey_line(&old, "2 Oct", 0).starts_with("Old: add again"));
     }
 
     fn run_until(limit: std::time::Duration, done: impl Fn() -> bool) -> bool {
@@ -1012,13 +1024,5 @@ mod tests {
             child = c.next_sibling();
         }
         rows
-    }
-
-    #[test]
-    fn a_passkey_never_used_says_so() {
-        assert_eq!(
-            passkey_line(&passkey(true, None), "12 Sep", 0),
-            "Spoolframe app · created 12 Sep · never used"
-        );
     }
 }

@@ -504,6 +504,17 @@ pub enum Applied {
     Nothing,
 }
 
+/// Whether `event` is of the profile `shown` (every one's with none
+/// shown). The SDK sends only the shown profile's, but one sent before a
+/// switch can still be on its way, and would put the last profile's
+/// download back in the list.
+pub fn is_shown(event: &DownloadEvent, shown: Option<&Holder>) -> bool {
+    match (event, shown) {
+        (DownloadEvent::Changed(download), Some(shown)) => shown.same(&Holder::of(download)),
+        _ => true,
+    }
+}
+
 /// `event` applied to `downloads`, as the SDK's own list would have it.
 pub fn apply(downloads: &mut Vec<LocalDownload>, event: &DownloadEvent) -> Applied {
     match event {
@@ -1435,6 +1446,26 @@ mod tests {
         in_phase(DownloadPhase::Preparing { server })
     }
 
+    /// A change of the last profile's download, sent before the switch,
+    /// is not the shown profile's; one of the shown profile's is.
+    #[test]
+    fn a_change_of_another_profiles_download_is_not_shown() {
+        let download = in_phase(DownloadPhase::Transferring);
+        let other = Holder {
+            user_id: format!("{}-other", download.user_id),
+            ..Holder::of(&download)
+        };
+        let changed = DownloadEvent::Changed(download.clone());
+        assert_eq!(
+            (
+                is_shown(&changed, Some(&other)),
+                is_shown(&changed, Some(&Holder::of(&download))),
+                is_shown(&changed, None)
+            ),
+            (false, true, true)
+        );
+    }
+
     fn failed(cause: DownloadFailure) -> LocalDownload {
         in_phase(DownloadPhase::Failed {
             reason: "it failed".into(),
@@ -2143,43 +2174,42 @@ mod tests {
     }
 
     #[test]
-    fn a_wrong_pin_is_said_as_wrong() {
-        assert_eq!(
-            refusal(&BackendError::WrongCredentials, false),
-            Refusal::Wrong
-        );
-    }
-
-    #[test]
-    fn too_many_tries_wait_as_long_as_the_sdk_says() {
-        assert_eq!(
-            refusal(&BackendError::RateLimited(Duration::from_secs(8)), false),
-            Refusal::Wait(Duration::from_secs(8))
-        );
-    }
-
-    #[test]
-    fn ten_wrong_pins_offline_need_the_server() {
-        assert_eq!(
-            refusal(&BackendError::SignInRequired, false),
-            Refusal::Say("Too many wrong PINs. Connect to the server to unlock.".into())
-        );
-    }
-
-    #[test]
-    fn ten_wrong_pins_online_need_the_password() {
-        assert_eq!(
-            refusal(&BackendError::SignInRequired, true),
-            Refusal::Say("Too many wrong PINs. Sign in again with your password.".into())
-        );
-    }
-
-    #[test]
-    fn nothing_to_check_offline_needs_the_server() {
-        assert_eq!(
-            refusal(&BackendError::NoOfflinePin, false),
-            Refusal::Say("Connect to the server to unlock.".into())
-        );
+    fn a_refused_unlock_is_said_the_way_the_sdk_means_it() {
+        let cases = [
+            (
+                "a wrong pin is said as wrong",
+                BackendError::WrongCredentials,
+                false,
+                Refusal::Wrong,
+            ),
+            (
+                "too many tries wait as long as the sdk says",
+                BackendError::RateLimited(Duration::from_secs(8)),
+                false,
+                Refusal::Wait(Duration::from_secs(8)),
+            ),
+            (
+                "ten wrong pins offline need the server",
+                BackendError::SignInRequired,
+                false,
+                Refusal::Say("Too many wrong PINs. Connect to the server to unlock.".into()),
+            ),
+            (
+                "ten wrong pins online need the password",
+                BackendError::SignInRequired,
+                true,
+                Refusal::Say("Too many wrong PINs. Sign in again with your password.".into()),
+            ),
+            (
+                "nothing to check offline needs the server",
+                BackendError::NoOfflinePin,
+                false,
+                Refusal::Say("Connect to the server to unlock.".into()),
+            ),
+        ];
+        for (label, error, online, expected) in cases {
+            assert_eq!(refusal(&error, online), expected, "{label}");
+        }
     }
 
     #[test]

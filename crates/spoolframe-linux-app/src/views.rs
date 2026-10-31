@@ -1224,17 +1224,18 @@ mod tests {
     }
 
     #[test]
-    fn initials_are_the_first_letters_of_the_first_two_words() {
-        assert_eq!(initials("Ellen Louise Ripley"), "EL");
-    }
-
-    #[test]
-    fn initials_are_capitals() {
-        assert_eq!(initials("bong joon-ho"), "BJ");
-    }
-
-    #[test]
-    fn a_single_name_has_one_initial() {
-        assert_eq!(initials("Zendaya"), "Z");
+    fn initials_are_the_capital_first_letters_of_the_first_two_words() {
+        let cases = [
+            (
+                "the first letters of the first two words",
+                "Ellen Louise Ripley",
+                "EL",
+            ),
+            ("capitals", "bong joon-ho", "BJ"),
+            ("a single name has one initial", "Zendaya", "Z"),
+        ];
+        for (label, name, expected) in cases {
+            assert_eq!(initials(name), expected, "{label}");
+        }
     }
 }

@@ -1060,48 +1060,45 @@ mod tests {
     }
 
     #[test]
-    fn repeat_is_mpris_loop_status() {
-        assert_eq!(
-            [Repeat::Off, Repeat::All, Repeat::One].map(|r| loop_status(r).as_str()),
-            ["None", "Playlist", "Track"]
-        );
+    fn a_loop_status_is_a_repeat_mode_and_reads_back() {
+        // (repeat, its loop status, the status's name)
+        let table = [
+            (Repeat::Off, LoopStatus::None, "None"),
+            (Repeat::All, LoopStatus::Playlist, "Playlist"),
+            (Repeat::One, LoopStatus::Track, "Track"),
+        ];
+        for (repeat, status, name) in table {
+            assert_eq!(loop_status(repeat), status, "{name}: from repeat");
+            assert_eq!(status.as_str(), name, "{name}: its name");
+            assert_eq!(LoopStatus::parse(name), Some(status), "{name}: reads back");
+        }
+        assert_eq!(LoopStatus::parse("Shuffle"), None, "an unknown one");
     }
 
     #[test]
-    fn a_loop_status_reads_back() {
-        let all = [LoopStatus::None, LoopStatus::Track, LoopStatus::Playlist];
-        assert_eq!(all.map(|s| LoopStatus::parse(s.as_str())), all.map(Some));
-    }
-
-    #[test]
-    fn an_unknown_loop_status_is_refused() {
-        assert_eq!(LoopStatus::parse("Shuffle"), None);
-    }
-
-    #[test]
-    fn set_position_moves_within_the_item_playing() {
+    fn set_position_moves_only_within_the_item_playing() {
         let now = track_id(3);
-        assert_eq!(
-            position_to_set(&now, &now, 2_500_000, Some(10_000_000)),
-            Some(Duration::from_millis(2500))
-        );
-    }
-
-    #[test]
-    fn set_position_for_another_item_is_ignored() {
-        assert_eq!(position_to_set(&track_id(3), &track_id(2), 0, None), None);
-    }
-
-    #[test]
-    fn set_position_past_the_end_or_before_the_start_is_ignored() {
-        let now = track_id(3);
-        assert_eq!(
-            [
-                position_to_set(&now, &now, 11_000_000, Some(10_000_000)),
-                position_to_set(&now, &now, -1, Some(10_000_000)),
-            ],
-            [None, None]
-        );
+        let length = Some(10_000_000);
+        // (label, track asked for, position, length, want)
+        let cases = [
+            (
+                "within the item playing",
+                now.clone(),
+                2_500_000,
+                length,
+                Some(Duration::from_millis(2500)),
+            ),
+            ("another item", track_id(2), 0, None, None),
+            ("past the end", now.clone(), 11_000_000, length, None),
+            ("before the start", now.clone(), -1, length, None),
+        ];
+        for (label, track, position, length, want) in cases {
+            assert_eq!(
+                position_to_set(&now, &track, position, length),
+                want,
+                "{label}"
+            );
+        }
     }
 
     #[test]

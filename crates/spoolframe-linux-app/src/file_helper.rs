@@ -416,18 +416,15 @@ mod tests {
     }
 
     #[test]
-    fn a_record_name_may_be_offered() {
-        assert!(offered_name_ok("alice.spoolframe-identity"));
-    }
-
-    #[test]
-    fn a_name_that_climbs_out_is_refused() {
-        assert!(!offered_name_ok("../.ssh/authorized_keys"));
-    }
-
-    #[test]
-    fn a_hidden_record_is_refused() {
-        assert!(!offered_name_ok(".spoolframe-identity"));
+    fn only_a_plain_record_name_may_be_offered() {
+        let cases = [
+            ("a record name", "alice.spoolframe-identity", true),
+            ("a name that climbs out", "../.ssh/authorized_keys", false),
+            ("a hidden record", ".spoolframe-identity", false),
+        ];
+        for (case, name, want) in cases {
+            assert_eq!(offered_name_ok(name), want, "{case}: {name}");
+        }
     }
 
     #[test]

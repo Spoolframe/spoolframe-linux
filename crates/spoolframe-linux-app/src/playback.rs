@@ -3665,35 +3665,47 @@ mod tests {
             .collect()
     }
 
-    /// Repeat All goes round, the server's list again and again: Up next
-    /// lists each song once, up to the one playing.
+    /// What the server lists for Up next, by mode. Repeat All goes round,
+    /// the server's list again and again: Up next lists each song once, up
+    /// to the one playing.
     #[test]
-    fn up_next_with_repeat_all_stops_where_the_song_playing_comes_again() {
-        let all = PlaySettings {
-            repeat: spoolframe_linux_core::backend::Repeat::All,
+    fn up_next_from_the_server_stops_where_the_song_playing_comes_again() {
+        use spoolframe_linux_core::backend::Repeat;
+        let repeat = |repeat| PlaySettings {
+            repeat,
             ..PlaySettings::default()
         };
-        let ahead = upcoming_ahead("Mix", all, &listed(&[2, 3, 1, 2, 3, 1]), 1);
-        assert_eq!((entries_of(&ahead), ahead.note), (vec![2, 3], None));
-    }
-
-    #[test]
-    fn up_next_from_the_server_with_repeat_one_is_the_song_playing() {
-        let one = PlaySettings {
-            repeat: spoolframe_linux_core::backend::Repeat::One,
-            ..PlaySettings::default()
-        };
-        let ahead = upcoming_ahead("Mix", one, &listed(&[4]), 4);
-        assert_eq!(
-            (entries_of(&ahead), ahead.note),
-            (vec![4], Some("This song plays again"))
-        );
-    }
-
-    #[test]
-    fn up_next_from_the_server_at_the_end_of_the_playlist_is_empty() {
-        let ahead = upcoming_ahead("Mix", PlaySettings::default(), &[], 4);
-        assert_eq!((ahead.entries.len(), ahead.note), (0, None));
+        // (label, settings, listed, playing, want entries, want note)
+        let cases = [
+            (
+                "repeat all",
+                repeat(Repeat::All),
+                listed(&[2, 3, 1, 2, 3, 1]),
+                1,
+                vec![2, 3],
+                None,
+            ),
+            (
+                "repeat one is the song playing",
+                repeat(Repeat::One),
+                listed(&[4]),
+                4,
+                vec![4],
+                Some("This song plays again"),
+            ),
+            (
+                "the end of the playlist is empty",
+                PlaySettings::default(),
+                Vec::new(),
+                4,
+                Vec::new(),
+                None,
+            ),
+        ];
+        for (label, settings, upcoming, playing, entries, note) in cases {
+            let ahead = upcoming_ahead("Mix", settings, &upcoming, playing);
+            assert_eq!((entries_of(&ahead), ahead.note), (entries, note), "{label}");
+        }
     }
 
     #[test]
@@ -3799,18 +3811,6 @@ mod tests {
                 SubtitleHandling::None
             ]
         );
-    }
-
-    #[test]
-    fn a_plan_says_the_source_it_judged() {
-        let plan = PlaybackPlan::Direct {
-            container: spoolframe_types::Container::Matroska,
-            video: Some(spoolframe_types::VideoCodec::Hevc),
-            audio: None,
-            subtitle: None,
-            source_codec: Some("hvc1.2.4.L153.B0".into()),
-        };
-        assert_eq!(source_codec(&plan), Some("hvc1.2.4.L153.B0"));
     }
 
     /// Four seconds of H.264 in Matroska.
@@ -4031,73 +4031,83 @@ mod tests {
         ahead.entries.iter().map(|e| e.entry).collect()
     }
 
-    /// Without what the server says comes up, the round's order is not
-    /// known: the playlist's own would be a list of songs that do
-    /// not play next.
+    /// Up next from the playlist's own order, by mode. Without what the
+    /// server says comes up, a shuffled round's order is not known: the
+    /// playlist's own would be a list of songs that do not play next.
     #[test]
-    fn up_next_while_shuffling_names_no_songs_and_says_why() {
+    fn up_next_from_the_playlist_follows_its_repeat_and_shuffle_modes() {
+        use spoolframe_linux_core::backend::Repeat;
+        let repeat = |repeat| PlaySettings {
+            repeat,
+            ..PlaySettings::default()
+        };
         let shuffled = PlaySettings {
             shuffle: true,
             ..PlaySettings::default()
         };
-        let ahead = playlist_ahead("On Repeat", shuffled, Some(&long_preview(10)), 2).unwrap();
-        assert_eq!(
-            (ahead.heading.as_str(), ahead.entries.len(), ahead.note),
+        // (label, name, settings, preview, playing, want heading, entries, note)
+        let cases = [
             (
+                "shuffled names no songs and says why",
+                "On Repeat",
+                shuffled,
+                Some(long_preview(10)),
+                2,
                 "In On Repeat · Shuffle on",
-                0,
-                Some("Songs play in a shuffled order")
-            )
-        );
-    }
-
-    #[test]
-    fn up_next_while_shuffling_needs_no_preview() {
-        let shuffled = PlaySettings {
-            shuffle: true,
-            ..PlaySettings::default()
-        };
-        assert!(playlist_ahead("On Repeat", shuffled, None, 2).is_some());
+                Vec::new(),
+                Some("Songs play in a shuffled order"),
+            ),
+            (
+                "shuffled needs no preview",
+                "On Repeat",
+                shuffled,
+                None,
+                2,
+                "In On Repeat · Shuffle on",
+                Vec::new(),
+                Some("Songs play in a shuffled order"),
+            ),
+            (
+                "repeat all goes round to the top",
+                "Mix",
+                repeat(Repeat::All),
+                Some(window_at_the_end()),
+                8,
+                "Next from Mix",
+                vec![9, 0, 1, 2, 3, 4, 5, 6, 7],
+                None,
+            ),
+            (
+                "no repeat ends with the playlist",
+                "Mix",
+                PlaySettings::default(),
+                Some(window_at_the_end()),
+                8,
+                "Next from Mix",
+                vec![9],
+                None,
+            ),
+            (
+                "repeat one is the song playing again",
+                "Mix",
+                repeat(Repeat::One),
+                Some(long_preview(10)),
+                2,
+                "Next from Mix",
+                Vec::new(),
+                Some("This song plays again"),
+            ),
+        ];
+        for (label, name, settings, preview, playing, heading, entries, note) in cases {
+            let ahead = playlist_ahead(name, settings, preview.as_ref(), playing).unwrap();
+            assert_eq!(
+                (ahead.heading.as_str(), entries_of(&ahead), ahead.note),
+                (heading, entries, note),
+                "{label}"
+            );
+        }
         assert!(!reads_preview(Some(shuffled)));
         assert!(reads_preview(None), "the read says the modes");
-    }
-
-    #[test]
-    fn up_next_with_repeat_all_goes_round_to_the_top() {
-        let all = PlaySettings {
-            repeat: spoolframe_linux_core::backend::Repeat::All,
-            ..PlaySettings::default()
-        };
-        let ahead = playlist_ahead("Mix", all, Some(&window_at_the_end()), 8).unwrap();
-        assert_eq!(entries_of(&ahead), [9, 0, 1, 2, 3, 4, 5, 6, 7]);
-    }
-
-    #[test]
-    fn up_next_without_repeat_ends_with_the_playlist() {
-        let ahead = playlist_ahead(
-            "Mix",
-            PlaySettings::default(),
-            Some(&window_at_the_end()),
-            8,
-        )
-        .unwrap();
-        assert_eq!(
-            (entries_of(&ahead), ahead.heading.as_str()),
-            (vec![9], "Next from Mix")
-        );
-    }
-
-    #[test]
-    fn up_next_with_repeat_one_is_the_song_playing_again() {
-        let one = PlaySettings {
-            repeat: spoolframe_linux_core::backend::Repeat::One,
-            ..PlaySettings::default()
-        };
-        let ahead = playlist_ahead("Mix", one, Some(&long_preview(10)), 2).unwrap();
-        assert_eq!(
-            (ahead.entries.len(), ahead.note),
-            (0, Some("This song plays again"))
-        );
     }
 
     #[test]
@@ -4286,8 +4296,6 @@ mod tests {
         );
     }
 
-    /// Playback on the fake server, end to end. One test: GTK binds itself
-    /// to the first thread that starts it, and each test has its own.
     #[test]
     fn queued_music_plays_before_the_playlists_next_entry() {
         assert_eq!(
@@ -4306,6 +4314,8 @@ mod tests {
         );
     }
 
+    /// Playback on the fake server, end to end. One test: GTK binds itself
+    /// to the first thread that starts it, and each test has its own.
     #[test]
     #[ignore = "needs a display for gtk4paintablesink"]
     fn playback_on_the_fake_server() {

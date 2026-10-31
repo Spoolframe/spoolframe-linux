@@ -1125,29 +1125,30 @@ mod tests {
     }
 
     #[test]
-    fn erasing_from_every_key_warns_that_nobody_can_act_again() {
+    fn erasing_from_all_or_none_of_the_keys_has_its_own_note() {
+        // Every key plugged in: nobody can act again.
         let EraseNote::All { title, body } = erase_note("Alice", &keys(&[true, true])) else {
-            panic!("no warning");
+            panic!("every key: no warning");
         };
         assert_eq!(title, "These are all of Alice’s keys");
         assert!(
             body.starts_with("Erased from both, nobody can act for Alice again"),
             "{body}"
         );
-    }
-
-    #[test]
-    fn an_only_key_plugged_in_is_all_of_them() {
+        // An only key plugged in is all of them.
         let only = vec![("Main key".to_owned(), true)];
-        assert!(matches!(erase_note("Alice", &only), EraseNote::All { .. }));
-    }
-
-    #[test]
-    fn with_no_key_plugged_in_there_is_nothing_to_erase() {
-        assert!(matches!(
-            erase_note("Alice", &keys(&[false, false])),
-            EraseNote::None(_)
-        ));
+        assert!(
+            matches!(erase_note("Alice", &only), EraseNote::All { .. }),
+            "only key"
+        );
+        // No key plugged in: nothing to erase.
+        assert!(
+            matches!(
+                erase_note("Alice", &keys(&[false, false])),
+                EraseNote::None(_)
+            ),
+            "no key plugged in"
+        );
     }
 
     #[test]

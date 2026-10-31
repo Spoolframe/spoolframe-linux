@@ -422,13 +422,8 @@ mod tests {
     }
 
     #[test]
-    fn a_sync_starting_does_not_read_the_subtitle_again() {
-        let before = timing(SubtitleSync::Original, 0);
-        assert!(!rereads(Some(&before), &timing(SubtitleSync::Syncing, 0)));
-    }
-
-    #[test]
-    fn a_sync_ending_or_an_offset_reads_it_again() {
+    fn the_subtitle_is_read_again_only_when_what_the_server_serves_changes() {
+        let original = timing(SubtitleSync::Original, 0);
         let syncing = timing(SubtitleSync::Syncing, 0);
         let synced = timing(
             SubtitleSync::Synced {
@@ -439,13 +434,15 @@ mod tests {
             },
             0,
         );
+        // A sync ending or an offset reads it again; a sync starting does not.
         assert_eq!(
             [
                 rereads(Some(&syncing), &synced),
                 rereads(Some(&syncing), &timing(SubtitleSync::Syncing, 400)),
                 rereads(Some(&synced), &synced),
+                rereads(Some(&original), &timing(SubtitleSync::Syncing, 0)),
             ],
-            [true, true, false]
+            [true, true, false, false]
         );
     }
 }

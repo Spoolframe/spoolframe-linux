@@ -185,41 +185,33 @@ fn supported<T: Ord + Copy>(
 #[cfg(test)]
 mod tests {
     /// Each playback says the same of HDR as the client did connecting.
+    /// Off asks the server to tone-map everything. On takes HDR10 and HLG,
+    /// never Dolby Vision, whose profile 5 is in Dolby's own colours until
+    /// its RPU is applied, which GTK does not do: green and purple. The
+    /// server converts that to HDR10.
     #[test]
-    fn a_plays_display_says_what_show_hdr_says() {
+    fn show_hdr_says_which_hdr_the_screen_takes() {
         gst::init().unwrap();
-        for show in [false, true] {
+        for (show, want) in [
+            (false, Some(Default::default())),
+            (
+                true,
+                Some(
+                    [
+                        spoolframe_types::HdrFormat::Hdr10,
+                        spoolframe_types::HdrFormat::Hlg,
+                    ]
+                    .into(),
+                ),
+            ),
+        ] {
             assert_eq!(
-                super::display(show).hdr,
-                super::capabilities(show).max_video.and_then(|v| v.hdr)
+                super::capabilities(show).max_video.and_then(|v| v.hdr),
+                want,
+                "capabilities, show {show}"
             );
+            assert_eq!(super::display(show).hdr, want, "display, show {show}");
         }
-    }
-
-    #[test]
-    fn hdr_off_asks_the_server_to_tone_map_everything() {
-        gst::init().unwrap();
-        let caps = super::capabilities(false);
-        assert_eq!(caps.max_video.and_then(|v| v.hdr), Some(Default::default()));
-    }
-
-    /// Shown as HDR: HDR10 and HLG, never Dolby Vision, whose profile 5
-    /// is in Dolby's own colours until its RPU is applied, which GTK does
-    /// not do: green and purple. The server converts that to HDR10.
-    #[test]
-    fn hdr_on_takes_hdr10_and_hlg_but_not_dolby_vision() {
-        gst::init().unwrap();
-        let caps = super::capabilities(true);
-        assert_eq!(
-            caps.max_video.and_then(|v| v.hdr),
-            Some(
-                [
-                    spoolframe_types::HdrFormat::Hdr10,
-                    spoolframe_types::HdrFormat::Hlg
-                ]
-                .into()
-            )
-        );
     }
 
     use super::*;
@@ -260,18 +252,6 @@ mod tests {
     }
 
     #[test]
-    fn hardware_is_said_and_within_what_plays() {
-        let caps = caps();
-        let hardware = caps.hardware_video.clone().expect("the registry tells");
-        assert!(hardware.is_subset(&caps.video), "{caps:?}");
-    }
-
-    #[test]
-    fn direct_play_comes_first_then_a_progressive_encode() {
-        assert_eq!(caps().delivery, [Delivery::Range, Delivery::Progressive]);
-    }
-
-    #[test]
     fn every_table_entry_is_valid_caps() {
         gst::init().unwrap();
         for caps in VIDEO
@@ -290,9 +270,30 @@ mod tests {
     #[test]
     fn the_dev_shell_plays_h264_aac_in_matroska() {
         let caps = caps();
-        assert!(caps.video.contains(&VideoCodec::H264), "{caps:?}");
-        assert!(caps.audio.contains(&AudioCodec::Aac), "{caps:?}");
-        assert!(caps.containers.contains(&Container::Matroska), "{caps:?}");
+        assert!(caps.video.contains(&VideoCodec::H264), "h264 {caps:?}");
+        assert!(caps.audio.contains(&AudioCodec::Aac), "aac {caps:?}");
+        assert!(
+            caps.containers.contains(&Container::Matroska),
+            "matroska {caps:?}"
+        );
+        assert!(
+            !caps.video.contains(&VideoCodec::Unknown),
+            "unknown video is never claimed"
+        );
+        assert!(
+            !caps.audio.contains(&AudioCodec::Unknown),
+            "unknown audio is never claimed"
+        );
+        let hardware = caps.hardware_video.clone().expect("the registry tells");
+        assert!(
+            hardware.is_subset(&caps.video),
+            "hardware is within what plays: {caps:?}"
+        );
+        assert_eq!(
+            caps.delivery,
+            [Delivery::Range, Delivery::Progressive],
+            "direct play comes first, then a progressive encode"
+        );
     }
 
     /// Bitmap subtitles are drawn by overlays (dvdspu, dvbsuboverlay),
@@ -307,13 +308,6 @@ mod tests {
         ] {
             assert!(caps.subtitles.contains(&format), "{format:?} in {caps:?}");
         }
-    }
-
-    #[test]
-    fn unknown_is_never_claimed() {
-        let caps = caps();
-        assert!(!caps.video.contains(&VideoCodec::Unknown));
-        assert!(!caps.audio.contains(&AudioCodec::Unknown));
     }
 
     /// PGS as a `.sup` stream: one white `w`×`h` box at (`x`, `y`) on a

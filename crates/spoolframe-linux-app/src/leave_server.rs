@@ -478,21 +478,15 @@ mod tests {
     }
 
     #[test]
-    fn one_name_is_said_alone() {
-        assert_eq!(joined(&names(&["Sam"])), "Sam");
-    }
-
-    #[test]
-    fn two_names_are_joined_with_and() {
-        assert_eq!(joined(&names(&["Sam", "Alice"])), "Sam and Alice");
-    }
-
-    #[test]
-    fn three_names_take_commas_then_and() {
-        assert_eq!(
-            joined(&names(&["Sam", "Alice", "Bob"])),
-            "Sam, Alice and Bob"
-        );
+    fn names_are_joined_with_commas_then_and() {
+        let cases: [(&[&str], &str); 3] = [
+            (&["Sam"], "Sam"),
+            (&["Sam", "Alice"], "Sam and Alice"),
+            (&["Sam", "Alice", "Bob"], "Sam, Alice and Bob"),
+        ];
+        for (given, expected) in cases {
+            assert_eq!(joined(&names(given)), expected, "{given:?}");
+        }
     }
 
     #[test]
@@ -522,16 +516,13 @@ mod tests {
     }
 
     #[test]
-    fn the_left_line_names_the_server() {
+    fn the_leaving_lines_name_the_server() {
         assert_eq!(
             left_line("Home Media"),
-            "You left Home Media. It’s no longer saved here."
+            "You left Home Media. It’s no longer saved here.",
+            "left line"
         );
-    }
-
-    #[test]
-    fn the_kept_line_names_the_server() {
-        assert_eq!(kept_line("Home Media"), "You left Home Media.");
+        assert_eq!(kept_line("Home Media"), "You left Home Media.", "kept line");
     }
 
     #[test]

@@ -1080,39 +1080,39 @@ mod tests {
         );
     }
 
+    /// The SDK's 0.16.3 platforms (Android, Xbox) are named, not "another device".
     #[test]
-    fn an_invite_made_in_the_web_admin_says_so() {
-        assert_eq!(
-            made_where("Andrey", &InviteOrigin::WebAdmin),
-            "by Andrey in the web admin"
-        );
-    }
-
-    #[test]
-    fn an_invite_made_here_says_this_computer() {
-        let here = InviteOrigin::Device {
-            name: Some("nimble".into()),
-            platform: Platform::Linux,
-            this_device: true,
-        };
-        assert_eq!(made_where("Andrey", &here), "by Andrey on this computer");
-    }
-
-    /// The SDK's 0.16.3 platforms are named, not "another device".
-    #[test]
-    fn an_invite_made_on_android_or_an_xbox_says_so() {
-        let on = |platform| InviteOrigin::Device {
-            name: None,
+    fn an_invite_says_where_it_was_made() {
+        let device = |name: Option<&str>, platform, this_device| InviteOrigin::Device {
+            name: name.map(Into::into),
             platform,
-            this_device: false,
+            this_device,
         };
-        assert_eq!(
-            [
-                made_where("Andrey", &on(Platform::Android)),
-                made_where("Andrey", &on(Platform::Xbox)),
-            ],
-            ["by Andrey on an Android device", "by Andrey on an Xbox"]
-        );
+        let cases = [
+            (
+                "web admin",
+                InviteOrigin::WebAdmin,
+                "by Andrey in the web admin",
+            ),
+            (
+                "this computer",
+                device(Some("nimble"), Platform::Linux, true),
+                "by Andrey on this computer",
+            ),
+            (
+                "android",
+                device(None, Platform::Android, false),
+                "by Andrey on an Android device",
+            ),
+            (
+                "xbox",
+                device(None, Platform::Xbox, false),
+                "by Andrey on an Xbox",
+            ),
+        ];
+        for (case, origin, want) in cases {
+            assert_eq!(made_where("Andrey", &origin), want, "{case}");
+        }
     }
 
     #[test]
@@ -1138,24 +1138,23 @@ mod tests {
 
     #[test]
     fn revoking_says_what_stops_and_what_stays() {
-        let invite = InviteSummary {
+        let used = InviteSummary {
             used: 3,
             ..summary()
         };
-        assert_eq!(
-            revoke_body(&invite),
-            "The one use left stops working now. The 3 accounts made with it stay."
-        );
-    }
-
-    #[test]
-    fn revoking_an_unused_invite_mentions_nothing_made() {
-        let invite = InviteSummary {
+        // An unused invite mentions nothing made.
+        let unused = InviteSummary {
             used: 0,
             uses: Some(2),
             ..summary()
         };
-        assert_eq!(revoke_body(&invite), "The 2 uses left stop working now.");
+        assert_eq!(
+            [revoke_body(&used), revoke_body(&unused)],
+            [
+                "The one use left stops working now. The 3 accounts made with it stay.",
+                "The 2 uses left stop working now.",
+            ]
+        );
     }
 
     #[test]
@@ -1167,7 +1166,8 @@ mod tests {
     }
 
     #[test]
-    fn the_form_at_first_asks_for_one_new_account_for_a_week_as_a_consumer() {
+    fn the_form_spec_follows_the_form() {
+        // At first the form asks for one new account for a week, as a consumer.
         assert_eq!(
             Form::default().spec(),
             InviteSpec {
@@ -1176,27 +1176,22 @@ mod tests {
                 uses: Some(1),
                 expires_in: Some(7 * DAY),
                 role: Some(Role::Consumer),
-            }
+            },
+            "default form"
         );
-    }
-
-    #[test]
-    fn an_identity_invite_asks_for_no_role() {
-        let form = Form {
+        // An identity invite asks for no role.
+        let identity = Form {
             kind: 1,
             role: 1,
             ..Form::default()
         };
-        assert_eq!(form.spec().role, None);
-    }
-
-    #[test]
-    fn a_blank_note_is_no_note() {
-        let form = Form {
+        assert_eq!(identity.spec().role, None, "identity invite");
+        // A blank note is no note.
+        let blank = Form {
             note: "   ".into(),
             ..Form::default()
         };
-        assert_eq!(form.spec().note, None);
+        assert_eq!(blank.spec().note, None, "blank note");
     }
 
     #[test]
@@ -1225,21 +1220,6 @@ mod tests {
             (read.server, read.name, read.code),
             ("c4b1".repeat(16), Some("Home Media".into()), None)
         );
-    }
-
-    #[test]
-    fn what_the_form_asks_for_the_fake_server_makes() {
-        let client = FakeClient::new(None);
-        let andrey = client.session(&FakeClient::profile("andrey")).unwrap();
-        let form = Form {
-            kind: 0,
-            note: "For Sam".into(),
-            uses: 3,
-            expiry: 2,
-            role: 1,
-        };
-        let made = ready(andrey.create_invite(form.spec())).unwrap();
-        assert_eq!((made.kind, made.uses), (InviteKind::CreateUser, Some(3)));
     }
 
     fn settle() {

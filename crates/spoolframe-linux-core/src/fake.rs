@@ -866,8 +866,6 @@ const WRONG_PINS: u32 = 10;
 struct Serving {
     /// The file every playback reads; `None` when the fake has no media.
     file: Option<PathBuf>,
-    /// The most one read returns, like a server that answers short.
-    read_limit: u64,
     /// Converts every playback (P2-04): the "encode" is the media file,
     /// revealed this many bytes per chunk read. `None` plays directly.
     converting: Option<u64>,
@@ -893,8 +891,6 @@ struct Serving {
     signed_out: bool,
     /// How long a playback handle may go unused before it expires.
     handle_idle: Duration,
-    /// How fast the link has been, as the SDK would have measured it.
-    link_rate: Option<u64>,
     /// The server ends the first playback once a chunk read reaches this
     /// offset, as when it idled out: the read answers PlaybackExpired.
     expire_at: Option<u64>,
@@ -1651,7 +1647,7 @@ impl FakeSession {
         let mut file = std::fs::File::open(&path).map_err(io)?;
         file.seek(SeekFrom::Start(offset)).map_err(io)?;
         let mut bytes = Vec::new();
-        file.take(length.min(MAX_READ).min(self.serving.read_limit))
+        file.take(length.min(MAX_READ))
             .read_to_end(&mut bytes)
             .map_err(io)?;
         Ok(bytes)
@@ -2132,8 +2128,9 @@ impl Session for FakeSession {
         }
     }
 
+    /// No link is measured here.
     fn link_rate(&self) -> Option<u64> {
-        self.serving.link_rate
+        None
     }
 
     /// A chosen bitrate converts the fake's file; Auto and Original play
@@ -3906,7 +3903,6 @@ impl FakeClient {
             catalog: Arc::new(Catalog::new()),
             serving: Serving {
                 file: media,
-                read_limit: MAX_READ,
                 converting: None,
                 markers: Vec::new(),
                 reading_subtitle: None,
@@ -3917,7 +3913,6 @@ impl FakeClient {
                 stopped: false,
                 signed_out: false,
                 handle_idle: HANDLE_IDLE,
-                link_rate: None,
                 expire_at: None,
             },
             gone: Arc::default(),
@@ -4386,12 +4381,6 @@ impl FakeClient {
         self
     }
 
-    /// The link has been carrying `bits_per_second` (P6-06).
-    pub fn with_link_rate(mut self, bits_per_second: u64) -> Self {
-        self.serving.link_rate = Some(bits_per_second);
-        self
-    }
-
     /// The server ends the first playback once a chunk read reaches
     /// `offset`, as one that idled out, so tests can see it resumed.
     pub fn expiring_at(mut self, offset: u64) -> Self {
@@ -4424,13 +4413,6 @@ impl FakeClient {
                     .expect("fake state is never poisoned")
                     .clone()
             })
-    }
-
-    /// Reads answer at most `limit` bytes, like a server that sends less
-    /// than asked: clients must ask again from where a read stopped.
-    pub fn with_read_limit(mut self, limit: u64) -> Self {
-        self.serving.read_limit = limit;
-        self
     }
 
     /// Every playback is converted (P2-04): a `Converted` progressive plan
@@ -7426,7 +7408,7 @@ mod tests {
         }
 
         #[test]
-        fn a_made_invite_is_copied_as_its_https_link() {
+        fn a_made_invite_is_copied_as_its_https_link_and_carries_its_code() {
             let made = ready(andrey().create_invite(create_user())).unwrap();
             // The same parameters as the QR code's link, after the https
             // prefix: the code with them.
@@ -7439,11 +7421,7 @@ mod tests {
                 ),
                 (true, query(&made.link), made.share_link.clone())
             );
-        }
-
-        #[test]
-        fn a_made_invites_link_carries_its_code_as_shown() {
-            let made = ready(andrey().create_invite(create_user())).unwrap();
+            // The link carries the code as shown.
             assert!(
                 made.link.ends_with(&format!("&cap={}", made.code)),
                 "{}",
@@ -7775,22 +7753,17 @@ mod tests {
         }
 
         #[test]
-        fn an_account_starts_untied() {
-            assert!(ready(andrey().tie_info()).unwrap().is_empty());
-        }
-
-        #[test]
-        fn a_tie_is_what_the_server_then_says() {
+        fn an_account_starts_untied_then_a_tie_is_what_the_server_says() {
             let session = andrey();
+            assert!(ready(session.tie_info()).unwrap().is_empty(), "untied");
             ready(session.tie(id(7))).unwrap();
-            assert_eq!(tied(&session), [id(7)]);
-        }
-
-        #[test]
-        fn a_new_tie_is_not_used_yet() {
-            let session = andrey();
-            ready(session.tie(id(7))).unwrap();
-            assert_eq!(ready(session.tie_info()).unwrap()[0].last_used_at, None);
+            assert_eq!(tied(&session), [id(7)], "tied");
+            // A new tie is not used yet.
+            assert_eq!(
+                ready(session.tie_info()).unwrap()[0].last_used_at,
+                None,
+                "last used"
+            );
         }
 
         #[test]
@@ -8499,11 +8472,8 @@ mod subtitle_search_tests {
 mod subtitle_sync_tests {
     use super::*;
     use crate::backend::SubtitleSync;
+    use crate::testing::andrey;
     use crate::testing::ready;
-
-    fn andrey(client: &FakeClient) -> Arc<dyn Session> {
-        client.session(&FakeClient::profile("andrey")).unwrap()
-    }
 
     fn alien() -> MediaId {
         media(MediaKind::Movie, "1")
@@ -9103,49 +9073,44 @@ mod browse_tests {
     }
 
     #[test]
-    fn a_sort_by_size_is_refused_as_plex_has_none() {
-        let size = ItemSort {
+    fn a_sort_or_filter_plex_cannot_do_is_refused() {
+        let by_size = ItemSort {
             key: SortKey::Size,
             descending: false,
         };
-        assert!(refused(&movies(), Some(size), None));
-    }
-
-    #[test]
-    fn a_tv_library_refuses_a_resolution_filter() {
-        let filter = ItemFilter {
+        let resolution = ItemFilter {
             resolutions: vec![Resolution::Uhd],
             ..ItemFilter::default()
         };
-        assert!(refused(&shows(), None, Some(&filter)));
-    }
-
-    #[test]
-    fn a_music_library_refuses_a_watched_filter() {
-        let filter = ItemFilter {
+        let watched = ItemFilter {
             watched: vec![WatchedState::Watched],
             ..ItemFilter::default()
         };
-        assert!(refused(&music(), None, Some(&filter)));
-    }
-
-    #[test]
-    fn an_unknown_watch_state_is_refused() {
-        let filter = ItemFilter {
+        let unknown = ItemFilter {
             watched: vec![WatchedState::Unknown],
             ..ItemFilter::default()
         };
-        assert!(refused(&movies(), None, Some(&filter)));
-    }
-
-    #[test]
-    fn years_out_of_order_are_refused() {
-        let filter = ItemFilter {
+        let years_backwards = ItemFilter {
             year_from: Some(2000),
             year_to: Some(1990),
             ..ItemFilter::default()
         };
-        assert!(refused(&movies(), None, Some(&filter)));
+        let cases = [
+            // Plex has no size sort.
+            ("a sort by size", movies(), Some(by_size), None),
+            (
+                "a resolution filter on TV",
+                shows(),
+                None,
+                Some(&resolution),
+            ),
+            ("a watched filter on music", music(), None, Some(&watched)),
+            ("an unknown watch state", movies(), None, Some(&unknown)),
+            ("years out of order", movies(), None, Some(&years_backwards)),
+        ];
+        for (case, library, sort, filter) in cases {
+            assert!(refused(&library, sort, filter), "{case}");
+        }
     }
 
     #[test]
@@ -9173,57 +9138,51 @@ mod browse_tests {
     }
 
     #[test]
-    fn a_movie_library_sorts_by_every_key_but_size() {
-        assert_eq!(
-            values_of(&movies()).sorts,
-            [
-                SortKey::Title,
-                SortKey::Released,
-                SortKey::Added,
-                SortKey::LastPlayed,
-                SortKey::Rating,
-                SortKey::AudienceRating,
-                SortKey::Duration
-            ]
-        );
-    }
-
-    #[test]
-    fn a_movie_library_filters_by_every_part() {
-        assert_eq!(
-            values_of(&movies()).filters,
-            [
-                FilterPart::Watched,
-                FilterPart::Genres,
-                FilterPart::Years,
-                FilterPart::ContentRatings,
-                FilterPart::Resolutions,
-                FilterPart::DynamicRanges
-            ]
-        );
-    }
-
-    #[test]
-    fn a_tv_library_has_no_resolution_filter() {
-        assert_eq!(
-            values_of(&shows()).filters,
-            [
-                FilterPart::Watched,
-                FilterPart::Genres,
-                FilterPart::Years,
-                FilterPart::ContentRatings
-            ]
-        );
-    }
-
-    #[test]
-    fn a_music_library_has_no_watched_filter() {
-        assert_eq!(values_of(&music()).filters, [FilterPart::Genres]);
-    }
-
-    #[test]
-    fn a_music_library_sorts_by_title_and_when_added() {
-        assert_eq!(values_of(&music()).sorts, [SortKey::Title, SortKey::Added]);
+    fn a_library_offers_the_sorts_and_filters_of_its_kind() {
+        let movie_sorts = [
+            SortKey::Title,
+            SortKey::Released,
+            SortKey::Added,
+            SortKey::LastPlayed,
+            SortKey::Rating,
+            SortKey::AudienceRating,
+            SortKey::Duration,
+        ];
+        let movie_filters = [
+            FilterPart::Watched,
+            FilterPart::Genres,
+            FilterPart::Years,
+            FilterPart::ContentRatings,
+            FilterPart::Resolutions,
+            FilterPart::DynamicRanges,
+        ];
+        // A movie library sorts by every key but size; a TV library has no
+        // resolution filter and a music library no watched filter.
+        let tv_filters = [
+            FilterPart::Watched,
+            FilterPart::Genres,
+            FilterPart::Years,
+            FilterPart::ContentRatings,
+        ];
+        let music_sorts = [SortKey::Title, SortKey::Added];
+        let music_filters = [FilterPart::Genres];
+        let cases = [
+            (
+                "movies",
+                movies(),
+                Some(&movie_sorts[..]),
+                &movie_filters[..],
+            ),
+            ("tv", shows(), None, &tv_filters[..]),
+            ("music", music(), Some(&music_sorts[..]), &music_filters[..]),
+        ];
+        for (case, library, sorts, filters) in cases {
+            let values = values_of(&library);
+            if let Some(sorts) = sorts {
+                assert_eq!(values.sorts, sorts, "{case} sorts");
+            }
+            assert_eq!(values.filters, filters, "{case} filters");
+        }
     }
 
     #[test]

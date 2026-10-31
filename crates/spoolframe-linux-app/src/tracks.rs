@@ -580,49 +580,42 @@ mod tests {
         (dir, path)
     }
 
+    /// One clip on one Play, each pick made after the one before.
     #[test]
-    fn the_second_audio_stream_can_be_chosen() {
+    fn the_streams_of_a_clip_can_be_chosen() {
         gst::init().unwrap();
-        let (_dir, path) = clip_path("audio");
+        let (_dir, path) = clip_path("streams");
         clip(&path);
         let (play, info) = play(&path);
-        select_audio(&play, &info, 1).unwrap();
-        let playing = play
-            .current_audio_track()
-            .map(|t| PlayStreamInfoExt::stream_id(&t));
+        let audio = || {
+            play.current_audio_track()
+                .map(|t| PlayStreamInfoExt::stream_id(&t))
+        };
+        let subtitle = || {
+            play.current_subtitle_track()
+                .map(|t| PlayStreamInfoExt::stream_id(&t))
+        };
+        // The audio already playing.
+        let same = select_audio(&play, &info, 0);
+        // The second audio stream.
+        let second = select_audio(&play, &info, 1);
+        let playing_audio = audio();
+        // GstPlay selects the first subtitle by default, with subtitles off.
+        let shown = select_subtitle(&play, &info, Some(0), &Default::default());
+        let showing = subtitle();
         play.stop();
+        assert!(same.is_ok(), "the audio already playing: {same:?}");
+        assert!(second.is_ok(), "the second audio: {second:?}");
         assert_eq!(
-            playing,
-            Some(PlayStreamInfoExt::stream_id(&info.audio_streams()[1]))
+            playing_audio,
+            Some(PlayStreamInfoExt::stream_id(&info.audio_streams()[1])),
+            "the second audio plays"
         );
-    }
-
-    #[test]
-    fn choosing_the_audio_already_playing_succeeds() {
-        gst::init().unwrap();
-        let (_dir, path) = clip_path("same-audio");
-        clip(&path);
-        let (play, info) = play(&path);
-        let chosen = select_audio(&play, &info, 0);
-        play.stop();
-        assert!(chosen.is_ok(), "{chosen:?}");
-    }
-
-    /// GstPlay selects the first subtitle by default, with subtitles off.
-    #[test]
-    fn a_subtitle_stream_can_be_chosen() {
-        gst::init().unwrap();
-        let (_dir, path) = clip_path("subtitle");
-        clip(&path);
-        let (play, info) = play(&path);
-        select_subtitle(&play, &info, Some(0), &Default::default()).unwrap();
-        let showing = play
-            .current_subtitle_track()
-            .map(|t| PlayStreamInfoExt::stream_id(&t));
-        play.stop();
+        assert!(shown.is_ok(), "the subtitle: {shown:?}");
         assert_eq!(
             showing,
-            Some(PlayStreamInfoExt::stream_id(&info.subtitle_streams()[0]))
+            Some(PlayStreamInfoExt::stream_id(&info.subtitle_streams()[0])),
+            "the subtitle shows"
         );
     }
 

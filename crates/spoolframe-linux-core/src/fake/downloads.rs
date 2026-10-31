@@ -594,14 +594,11 @@ mod tests {
     use super::*;
     use crate::backend::{Client, OriginalDownload, Session};
     use crate::fake::{FakeClient, media};
+    use crate::testing::andrey;
     use crate::testing::{file_with, ready};
 
     fn alien() -> MediaId {
         media(MediaKind::Movie, "1")
-    }
-
-    fn andrey(client: &FakeClient) -> Arc<dyn Session> {
-        client.session(&FakeClient::profile("andrey")).unwrap()
     }
 
     fn start(session: &dyn Session) -> LocalDownload {

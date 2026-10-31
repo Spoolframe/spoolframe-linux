@@ -548,6 +548,27 @@ impl KeyPage {
         }
     }
 
+    /// Starts a new run, before the server is asked what to sign: what is
+    /// in flight is stopped, and the answer goes on to [`KeyPage::run`]
+    /// only while [`KeyPage::is_current`] says this is still the run.
+    pub fn begin(&self) -> u64 {
+        self.stop();
+        self.run.get()
+    }
+
+    /// Whether `run`, from [`KeyPage::begin`], is still the run: no Back,
+    /// close or other run since.
+    pub fn is_current(&self, run: u64) -> bool {
+        self.run.get() == run
+    }
+
+    /// Lets go of what Try again and the alternative do: they hold the
+    /// dialog that holds this page, so its closing lets go of both.
+    pub fn clear(&self) {
+        self.retry.replace(None);
+        self.alternative_action.replace(None);
+    }
+
     /// Stops listening to the run in flight, and gives up a PIN it waits
     /// for, which ends it. The key may still blink until it times out.
     pub fn stop(&self) {
@@ -838,6 +859,9 @@ impl PasskeySignIn {
         });
         self.back.set_label("Back");
         self.key.show(KeyState::Working("Asking the server…"));
+        // Back while the server is asked stops this run: its answer then
+        // starts no ceremony, nor replaces another method's.
+        let run = self.key.begin();
         let (client, key, username) = (
             self.client.clone(),
             self.server.key.clone(),
@@ -852,6 +876,9 @@ impl PasskeySignIn {
         glib::spawn_future_local(async move {
             let begun = begun.await;
             let Some(screen) = weak.upgrade() else { return };
+            if !screen.key.is_current(run) {
+                return;
+            }
             match begun {
                 Ok(Ok(request)) => {
                     let done: Rc<dyn Fn(Done)> = {
@@ -1010,8 +1037,10 @@ mod tests {
         assert_eq!(waiting, KeyState::Waiting.text("Home Media", Via::Key));
     }
 
+    /// What each state shows and offers, by (state, via).
     #[test]
-    fn a_wrong_pin_says_so_and_keeps_the_field() {
+    fn a_key_state_shows_and_offers_what_it_should() {
+        // A wrong PIN says so and keeps the field.
         let text = KeyState::Pin { wrong: true }.text("Home Media", Via::Key);
         assert_eq!(
             (
@@ -1019,12 +1048,10 @@ mod tests {
                 text.tone,
                 text.body.starts_with("That PIN isn’t right")
             ),
-            (true, "error", true)
+            (true, "error", true),
+            "wrong pin"
         );
-    }
-
-    #[test]
-    fn a_key_without_this_servers_passkey_names_the_server() {
+        // A key without this server's passkey names the server.
         let text = KeyState::Failed(KeyError::NoPasskey).text("Home Media", Via::Key);
         assert_eq!(
             (text.title.as_str(), text.button, text.password),
@@ -1032,8 +1059,22 @@ mod tests {
                 "No passkey for Home Media on this key",
                 Some("Try another key"),
                 true
-            )
+            ),
+            "no passkey"
         );
+        // A phone that timed out offers a new code.
+        let text = KeyState::Failed(KeyError::TimedOut).text("Home Media", Via::Phone);
+        assert_eq!(text.button, Some("Show a new code"), "phone timed out");
+        // Without Bluetooth a security key is offered.
+        let text = KeyState::Failed(KeyError::NoBluetooth).text("Home Media", Via::Phone);
+        assert_eq!(
+            (text.alternative, text.button, text.password),
+            (Some("Use a security key"), None, true),
+            "no bluetooth"
+        );
+        // A locked key offers another key.
+        let text = KeyState::Failed(KeyError::Locked).text("Home Media", Via::Key);
+        assert_eq!(text.button, Some("Try another key"), "locked key");
     }
 
     /// One test: GTK binds itself to the first thread that starts it.
@@ -1045,6 +1086,37 @@ mod tests {
         every_key_state_shows();
         sign_in_opens_on_which_kind();
         touch_your_key_lays_out_with_the_apps_stylesheet();
+        an_answer_after_back_starts_no_ceremony();
+        clearing_lets_go_of_what_the_buttons_hold();
+    }
+
+    /// Back, a close or another method while the server is asked: the
+    /// answer to the run begun before is no longer the run's.
+    fn an_answer_after_back_starts_no_ceremony() {
+        let page = KeyPage::new("Home Media", None);
+        let asked = page.begin();
+        assert!(page.is_current(asked));
+        page.stop();
+        let again = page.begin();
+        assert_eq!(
+            (page.is_current(asked), page.is_current(again)),
+            (false, true)
+        );
+    }
+
+    /// Try again and the alternative hold the dialog that holds the page;
+    /// cleared, they are let go of.
+    fn clearing_lets_go_of_what_the_buttons_hold() {
+        let page = KeyPage::new("Home Media", None);
+        let retry: Rc<dyn Fn()> = Rc::new(|| {});
+        let alternative: Rc<dyn Fn()> = Rc::new(|| {});
+        page.set_retry(retry.clone());
+        page.set_alternative(alternative.clone());
+        page.clear();
+        assert_eq!(
+            (Rc::strong_count(&retry), Rc::strong_count(&alternative)),
+            (1, 1)
+        );
     }
 
     /// GTK's warnings that a widget measured below zero, from here on.
@@ -1148,34 +1220,5 @@ mod tests {
             std::task::Poll::Ready(Ok(servers)) => servers.into_iter().next().unwrap(),
             _ => panic!("the fake lists its servers at once"),
         }
-    }
-
-    #[test]
-    fn a_phone_that_timed_out_offers_a_new_code() {
-        assert_eq!(
-            KeyState::Failed(KeyError::TimedOut)
-                .text("Home Media", Via::Phone)
-                .button,
-            Some("Show a new code")
-        );
-    }
-
-    #[test]
-    fn without_bluetooth_a_security_key_is_offered() {
-        let text = KeyState::Failed(KeyError::NoBluetooth).text("Home Media", Via::Phone);
-        assert_eq!(
-            (text.alternative, text.button, text.password),
-            (Some("Use a security key"), None, true)
-        );
-    }
-
-    #[test]
-    fn a_locked_key_offers_another_key() {
-        assert_eq!(
-            KeyState::Failed(KeyError::Locked)
-                .text("Home Media", Via::Key)
-                .button,
-            Some("Try another key")
-        );
     }
 }

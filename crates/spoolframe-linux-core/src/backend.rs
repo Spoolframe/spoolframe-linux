@@ -1780,9 +1780,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_long_key_is_shortened_to_its_ends() {
-        let key = ServerKey("k5d2r8w1tqz7m3c0vnh4q7fa".into());
-        assert_eq!(key.short(), "k5d2…q7fa");
+    fn a_long_key_is_shortened_to_its_ends_and_a_short_one_is_shown_whole() {
+        assert_eq!(
+            ["k5d2r8w1tqz7m3c0vnh4q7fa", "abc"].map(|key| ServerKey(key.into()).short()),
+            ["k5d2…q7fa", "abc"]
+        );
     }
 
     fn with_id(server_id: Option<&str>) -> Server {
@@ -1835,10 +1837,5 @@ mod tests {
     #[test]
     fn a_server_not_yet_heard_from_has_no_passkey_site() {
         assert_eq!(with_id(None).passkey_site(), None);
-    }
-
-    #[test]
-    fn a_short_key_is_shown_whole() {
-        assert_eq!(ServerKey("abc".into()).short(), "abc");
     }
 }

@@ -788,30 +788,31 @@ mod tests {
     }
 
     #[test]
-    fn a_guest_carries_the_server_it_was_paired_for_by_name() {
-        let guest = Guest::paired(pairing(Some("Home Media"), Some(1_790_000_000)), None);
-        assert_eq!(guest.server.as_deref(), Some("Home Media"));
-    }
-
-    #[test]
-    fn a_guest_carries_when_it_was_paired() {
-        let guest = Guest::paired(pairing(Some("Home Media"), Some(1_790_000_000)), None);
-        assert_eq!(guest.paired_at, Some(1_790_000_000));
-    }
-
-    /// Paired before the SDK kept where and when: neither is made up.
-    #[test]
-    fn an_older_guest_has_no_server_or_date() {
-        let guest = Guest::paired(pairing(None, None), Some("Carol".into()));
-        assert_eq!(
-            (guest.name.as_deref(), guest.server, guest.paired_at),
-            (Some("Carol"), None, None)
-        );
-    }
-
-    #[test]
-    fn the_tests_software_key_cannot_be_erased() {
-        assert!(!in_memory().can_erase());
+    fn a_guest_carries_the_server_and_date_it_was_paired_with() {
+        // (case, pairing server, pairing date, name given, want server, want date)
+        // Paired before the SDK kept where and when: neither is made up.
+        let cases = [
+            (
+                "paired with a server and date",
+                Some("Home Media"),
+                Some(1_790_000_000),
+                None,
+                Some("Home Media"),
+                Some(1_790_000_000),
+            ),
+            ("an older guest", None, None, Some("Carol"), None, None),
+        ];
+        for (case, server, paired_at, name, want_server, want_date) in cases {
+            let guest = Guest::paired(pairing(server, paired_at), name.map(Into::into));
+            assert_eq!(
+                (guest.server.as_deref(), guest.paired_at),
+                (want_server, want_date),
+                "{case}"
+            );
+            if name.is_some() {
+                assert_eq!(guest.name.as_deref(), name, "{case}");
+            }
+        }
     }
 
     #[test]

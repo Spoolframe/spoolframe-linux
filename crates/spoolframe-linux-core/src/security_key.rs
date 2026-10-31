@@ -507,26 +507,28 @@ mod tests {
     }
 
     #[test]
-    fn keys_that_all_hold_none_are_not_ours() {
-        assert!(none_hold(&[Ok(Vec::new()), Ok(Vec::new())]));
-    }
-
-    #[test]
-    fn a_key_that_holds_it_is_used() {
-        assert!(!none_hold(&[Ok(Vec::new()), Ok(vec![vec![1]])]));
-    }
-
-    #[test]
-    fn a_key_that_cannot_say_is_tried() {
-        assert!(!none_hold(&[
-            Ok(Vec::new()),
-            Err(KeyError::Other("busy".into()))
-        ]));
-    }
-
-    #[test]
-    fn no_key_plugged_in_asks_for_one() {
-        assert!(!none_hold(&[]));
+    fn only_keys_that_all_hold_none_are_not_ours() {
+        let cases = [
+            (
+                "keys that all hold none are not ours",
+                vec![Ok(Vec::new()), Ok(Vec::new())],
+                true,
+            ),
+            (
+                "a key that holds it is used",
+                vec![Ok(Vec::new()), Ok(vec![vec![1]])],
+                false,
+            ),
+            (
+                "a key that cannot say is tried",
+                vec![Ok(Vec::new()), Err(KeyError::Other("busy".into()))],
+                false,
+            ),
+            ("no key plugged in asks for one", vec![], false),
+        ];
+        for (case, held, want) in cases {
+            assert_eq!(none_hold(&held), want, "{case}");
+        }
     }
 
     #[test]

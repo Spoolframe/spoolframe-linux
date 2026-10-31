@@ -338,7 +338,14 @@ mod tests {
                 gst::ClockTime::from_seconds(60),
                 &[gst::MessageType::Eos, gst::MessageType::Error],
             )
-            .expect("the clip plays");
+            .unwrap_or_else(|| {
+                panic!(
+                    "{} played to no end: {:?}, plugged {:?}",
+                    path.display(),
+                    playbin.state(gst::ClockTime::ZERO),
+                    plugged.lock().unwrap()
+                )
+            });
         playbin.set_state(gst::State::Null).unwrap();
         assert!(
             matches!(message.view(), gst::MessageView::Eos(_)),
@@ -348,42 +355,60 @@ mod tests {
         plugged.lock().unwrap().clone()
     }
 
-    #[test]
-    fn flac_hevc_and_aac_clips_play_after_startup() {
+    /// Encodes a clip with `encode` (a pipeline ending in a muxer), plays
+    /// it as the player does, and checks `decoder` was plugged in and
+    /// nothing denied.
+    ///
+    /// One clip a test: nextest runs each test in a process of its own, so
+    /// its playbin3 is the process's first. A second playbin3 in a process
+    /// now and then never plays (GStreamer 1.28.7): its decodebin3 posts
+    /// the stream collection but never takes the stream-start's group id,
+    /// so it never selects a stream or plugs a decoder. Three clips in one
+    /// test stalled about one run in twenty under load; a clip made by
+    /// another process and played once never did.
+    fn plays_after_startup(name: &str, encode_with: &str, decoder: &str) {
         removed();
         let dir = TestDir::new_blocking("spoolframe-denylist");
-        let audio = "audiotestsrc num-buffers=20 ! audioconvert";
-        let clips = [
-            (
-                "flac.mkv",
-                format!("{audio} ! flacenc ! flacparse ! matroskamux"),
-                "flacdec",
-            ),
-            (
-                "aac.mp4",
-                format!("{audio} ! avenc_aac ! aacparse ! mp4mux"),
-                "avdec_aac",
-            ),
-            (
-                "hevc.mkv",
-                "videotestsrc num-buffers=10 ! video/x-raw,width=320,height=240 \
-                 ! videoconvert ! x265enc ! h265parse ! matroskamux"
-                    .to_owned(),
-                "h265",
-            ),
-        ];
-        for (name, pipeline, decoder) in clips {
-            let path = dir.join(name);
-            encode(&pipeline, &path);
-            let plugged = play(&path);
-            assert!(
-                plugged.iter().any(|element| element.contains(decoder)),
-                "{name}: {plugged:?}"
-            );
-            assert!(
-                !plugged.iter().any(|element| denied(element)),
-                "{name}: {plugged:?}"
-            );
-        }
+        let path = dir.join(name);
+        encode(encode_with, &path);
+        let plugged = play(&path);
+        assert!(
+            plugged.iter().any(|element| element.contains(decoder)),
+            "{name}: {plugged:?}"
+        );
+        assert!(
+            !plugged.iter().any(|element| denied(element)),
+            "{name}: {plugged:?}"
+        );
+    }
+
+    const AUDIO: &str = "audiotestsrc num-buffers=20 ! audioconvert";
+
+    #[test]
+    fn a_flac_clip_plays_after_startup() {
+        plays_after_startup(
+            "flac.mkv",
+            &format!("{AUDIO} ! flacenc ! flacparse ! matroskamux"),
+            "flacdec",
+        );
+    }
+
+    #[test]
+    fn an_aac_clip_plays_after_startup() {
+        plays_after_startup(
+            "aac.mp4",
+            &format!("{AUDIO} ! avenc_aac ! aacparse ! mp4mux"),
+            "avdec_aac",
+        );
+    }
+
+    #[test]
+    fn an_hevc_clip_plays_after_startup() {
+        plays_after_startup(
+            "hevc.mkv",
+            "videotestsrc num-buffers=10 ! video/x-raw,width=320,height=240 \
+             ! videoconvert ! x265enc ! h265parse ! matroskamux",
+            "h265",
+        );
     }
 }

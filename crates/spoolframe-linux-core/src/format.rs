@@ -492,63 +492,47 @@ mod tests {
     }
 
     #[test]
-    fn under_an_hour_is_minutes_only() {
-        assert_eq!(remaining(mins(50), mins(32)), "18 min left");
-    }
-
-    #[test]
-    fn over_an_hour_has_hours_and_minutes() {
-        assert_eq!(remaining(mins(117), mins(37)), "1 h 20 min left");
-    }
-
-    #[test]
-    fn whole_hours_drop_the_minutes() {
-        assert_eq!(remaining(mins(150), mins(30)), "2 h left");
-    }
-
-    #[test]
-    fn a_partial_minute_counts_as_a_minute() {
+    fn the_time_left_is_hours_and_minutes() {
+        // Under an hour is minutes only, whole hours drop the minutes, and a
+        // partial minute counts as a minute.
         assert_eq!(
-            remaining(mins(10), Duration::from_secs(9 * 60 + 50)),
-            "1 min left"
+            [
+                remaining(mins(50), mins(32)),
+                remaining(mins(117), mins(37)),
+                remaining(mins(150), mins(30)),
+                remaining(mins(10), Duration::from_secs(9 * 60 + 50)),
+            ],
+            ["18 min left", "1 h 20 min left", "2 h left", "1 min left"]
         );
     }
 
     #[test]
-    fn a_length_over_an_hour_has_hours_and_minutes() {
-        assert_eq!(length(mins(117)), "1 h 57 min");
+    fn a_length_is_hours_and_minutes_or_minutes_only() {
+        assert_eq!(
+            [length(mins(117)), length(mins(50))],
+            ["1 h 57 min", "50 min"]
+        );
     }
 
     #[test]
-    fn a_length_under_an_hour_is_minutes_only() {
-        assert_eq!(length(mins(50)), "50 min");
-    }
-
-    #[test]
-    fn a_timestamp_under_an_hour_is_minutes_and_seconds() {
-        assert_eq!(timestamp(Duration::from_secs(37 * 60 + 12)), "37:12");
-    }
-
-    #[test]
-    fn a_timestamp_over_an_hour_pads_minutes_and_seconds() {
-        assert_eq!(timestamp(Duration::from_secs(3723)), "1:02:03");
-    }
-
-    #[test]
-    fn a_known_language_code_reads_as_its_name() {
-        assert_eq!(language("ger"), "German");
-    }
-
-    #[test]
-    fn an_unknown_language_code_is_shown_as_is() {
-        assert_eq!(language("tlh"), "TLH");
+    fn a_timestamp_pads_minutes_and_seconds_over_an_hour() {
+        assert_eq!(
+            [
+                timestamp(Duration::from_secs(37 * 60 + 12)),
+                timestamp(Duration::from_secs(3723)),
+            ],
+            ["37:12", "1:02:03"]
+        );
     }
 
     #[test]
     fn a_subtitle_sites_language_codes_are_named() {
+        // "ger" is a known code, "tlh" and "xx" are unknown and shown as is.
         assert_eq!(
-            ["en", "pt-BR", "pt-br", "sv", "xx"].map(language),
+            ["ger", "tlh", "en", "pt-BR", "pt-br", "sv", "xx"].map(language),
             [
+                "German",
+                "TLH",
                 "English",
                 "Portuguese (Brazil)",
                 "Portuguese (Brazil)",

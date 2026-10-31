@@ -6,6 +6,7 @@
 //! session's sign-in time is refreshed, and the action is made again.
 //! The PIN does not prove it.
 
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -149,13 +150,18 @@ pub fn ask_because(
     stack.add_named(&key.widget, Some("key"));
     crate::start::with_cancel(&dialog, &stack);
 
+    // Set when the dialog closes, by Cancel too: an answer that comes
+    // after it does nothing.
+    let closed = Rc::new(Cell::new(false));
     let confirmed: Rc<dyn Fn()> = {
-        let (dialog, again) = (dialog.downgrade(), again.clone());
+        let (dialog, again, closed) = (dialog.downgrade(), again.clone(), closed.clone());
         Rc::new(move || {
-            if let Some(dialog) = dialog.upgrade() {
-                dialog.close();
-            }
-            again();
+            let close = || {
+                if let Some(dialog) = dialog.upgrade() {
+                    dialog.close();
+                }
+            };
+            confirm_once(&closed, close, &*again);
         })
     };
     {
@@ -214,11 +220,18 @@ pub fn ask_because(
         Rc::new(move |via| {
             stack.set_visible_child_name("key");
             key.show(KeyState::Working("Asking the server…"));
+            // The dialog closed, or another method chosen, while the
+            // server is asked: its answer starts no ceremony.
+            let run = key.begin();
             let asking = session.clone();
             let begun = relm4::spawn(async move { asking.begin_confirm_passkey().await });
             let (session, key, confirmed) = (session.clone(), key.clone(), confirmed.clone());
             glib::spawn_future_local(async move {
-                let request = match begun.await {
+                let begun = begun.await;
+                if !key.is_current(run) {
+                    return;
+                }
+                let request = match begun {
                     Ok(Ok(request)) => request,
                     Ok(Err(e)) => return key.show(KeyState::Refused(refusal(&e))),
                     Err(e) => return key.show(KeyState::Refused(e.to_string())),
@@ -268,15 +281,30 @@ pub fn ask_because(
         key.set_alternative(Rc::new(move || with(Via::Key)));
     }
     {
-        // The dialog holds its pieces while it shows; a key left waiting
-        // gives up when it closes.
-        let held = (key.clone(), with.clone());
+        // The dialog holds its pieces while it shows. Closing it ends what
+        // is in flight, a key left waiting gives up, and the page lets go
+        // of Try again and the alternative, which hold `with` and so the
+        // page itself: else every confirmation was kept, password and all.
+        let held = RefCell::new(Some((key.clone(), with.clone())));
         dialog.connect_closed(move |_| {
-            held.0.stop();
-            let _ = &held.1;
+            closed.set(true);
+            if let Some((key, _with)) = held.take() {
+                key.stop();
+                key.clear();
+            }
         });
     }
     dialog.present(Some(parent));
+}
+
+/// Runs `again` once confirmed, closing the dialog first, unless it was
+/// closed before the answer came: a cancelled confirmation does nothing.
+fn confirm_once(closed: &Cell<bool>, close: impl FnOnce(), again: &dyn Fn()) {
+    if closed.get() {
+        return;
+    }
+    close();
+    again();
 }
 
 fn column() -> gtk::Box {
@@ -293,6 +321,26 @@ fn column() -> gtk::Box {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Cancel, then the server says the password was right: the action
+    /// the user cancelled is not done.
+    #[test]
+    fn an_answer_after_cancel_does_nothing() {
+        let (closed, ran) = (Cell::new(true), Cell::new(0));
+        confirm_once(&closed, || panic!("closed again"), &|| {
+            ran.set(ran.get() + 1)
+        });
+        assert_eq!(ran.get(), 0);
+    }
+
+    #[test]
+    fn an_answer_while_open_closes_then_does_it() {
+        let (closed, order) = (Cell::new(false), RefCell::new(Vec::new()));
+        confirm_once(&closed, || order.borrow_mut().push("close"), &|| {
+            order.borrow_mut().push("again")
+        });
+        assert_eq!(*order.borrow(), ["close", "again"]);
+    }
 
     #[test]
     fn no_app_passkey_points_back_to_the_password() {

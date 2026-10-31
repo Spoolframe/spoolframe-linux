@@ -77,12 +77,12 @@ pub fn file_with(name: &str, bytes: &[u8]) -> (TestDir, PathBuf) {
     (dir, path)
 }
 
-/// A file of `len` bytes where each byte is its offset modulo 251, so a
-/// misplaced range shows.
-pub fn media_file(name: &str, len: usize) -> (TestDir, PathBuf, Vec<u8>) {
-    let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
-    let (dir, path) = file_with(name, &bytes);
-    (dir, path, bytes)
+/// The fake's Andrey, signed in.
+pub fn andrey(client: &crate::fake::FakeClient) -> Arc<dyn crate::backend::Session> {
+    use crate::backend::Client as _;
+    client
+        .session(&crate::fake::FakeClient::profile("andrey"))
+        .unwrap()
 }
 
 /// The first movie of `session`'s catalog.

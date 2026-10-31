@@ -360,31 +360,34 @@ mod tests {
         "/GstPlayBin3:playbin3/GstURIDecodeBin3:uridecodebin3/GstURISourceBin:urisourcebin2";
 
     #[test]
-    fn an_error_inside_the_subtitles_source_is_the_subtitles() {
-        let message = format!(
-            "Error from element {SOURCE}/GstParseBin:parsebin2/GstTypeFindElement:typefind: \
-             GStreamer encountered a general stream error."
-        );
-        assert!(from_element(&message, SOURCE));
-    }
-
-    #[test]
-    fn an_error_from_the_subtitles_source_itself_is_the_subtitles() {
-        let message = format!("Error from element {SOURCE}: Resource not found.");
-        assert!(from_element(&message, SOURCE));
-    }
-
-    #[test]
-    fn an_error_from_a_source_with_a_longer_name_is_not_the_subtitles() {
-        let message = format!("Error from element {SOURCE}0/GstParseBin:parsebin0: Failed.");
-        assert!(!from_element(&message, SOURCE));
-    }
-
-    #[test]
-    fn an_error_from_the_media_is_not_the_subtitles() {
-        let message = "Error from element /GstPlayBin3:playbin3/GstPlaySink:playsink: \
-                       The stream is in the wrong format.";
-        assert!(!from_element(message, SOURCE));
+    fn an_error_is_the_subtitles_when_it_is_from_its_source_or_inside_it() {
+        let media = "Error from element /GstPlayBin3:playbin3/GstPlaySink:playsink: \
+                     The stream is in the wrong format.";
+        // (label, message, is the subtitles)
+        let cases = [
+            (
+                "inside the source",
+                format!(
+                    "Error from element {SOURCE}/GstParseBin:parsebin2/GstTypeFindElement:typefind: \
+                     GStreamer encountered a general stream error."
+                ),
+                true,
+            ),
+            (
+                "from the source itself",
+                format!("Error from element {SOURCE}: Resource not found."),
+                true,
+            ),
+            (
+                "from a source with a longer name",
+                format!("Error from element {SOURCE}0/GstParseBin:parsebin0: Failed."),
+                false,
+            ),
+            ("from the media", media.to_owned(), false),
+        ];
+        for (label, message, want) in cases {
+            assert_eq!(from_element(&message, SOURCE), want, "{label}");
+        }
     }
 
     #[test]

@@ -230,6 +230,9 @@ pub struct App {
     /// Bumped each time another profile is shown: a listing asked for
     /// before is the last profile's, and dropped.
     listing: u64,
+    /// The profile whose downloads the SDK shows, once one is: an event
+    /// of another, sent before the switch, is dropped.
+    shown_holder: Option<crate::downloads::Holder>,
     /// The PIN that unlocked the profile's downloads with no server, for
     /// its session's unlock once it is reached (PX-60). Memory only.
     offline_pin: crate::downloads::OfflinePin,
@@ -1277,6 +1280,7 @@ impl Component for App {
             downloads: Vec::new(),
             holders: Vec::new(),
             listing: 0,
+            shown_holder: None,
             offline_pin: Default::default(),
             downloads_page: None,
             item_downloads: Vec::new(),
@@ -2277,8 +2281,13 @@ impl Component for App {
             // Hidden, the app runs on for the downloads alone: what plays
             // stops, as it would have with the window closed.
             Msg::Closing(crate::closing::Answer::Keep) => {
-                if self.closing.borrow_mut().keep() {
-                    self.hold = Some(relm4::main_application().hold());
+                let kept = self.closing.borrow_mut().keep();
+                match kept {
+                    crate::closing::Kept::Close => return root.close(),
+                    crate::closing::Kept::Hold => {
+                        self.hold = Some(relm4::main_application().hold());
+                    }
+                    crate::closing::Kept::Held => {}
                 }
                 self.stop_playback(widgets);
                 root.set_visible(false);
@@ -4160,8 +4169,18 @@ impl App {
         self.offline_pin.shown(&holder);
         // Known until its listing says it has none.
         if !self.holders.contains(&holder) {
-            self.holders.push(holder);
+            self.holders.push(holder.clone());
         }
+        self.shown_holder = Some(holder);
+        // The last profile's rows go at once, not when the listing comes:
+        // until then they could still be played. The running count is
+        // left as it is: it is of the profile shown, and the last one's
+        // downloads run on.
+        self.downloads.clear();
+        if let Some(page) = &self.downloads_page {
+            page.fill(&self.downloads);
+        }
+        self.show_item_downloads();
         self.listing += 1;
         self.list_downloads(sender);
     }
@@ -4187,13 +4206,16 @@ impl App {
     /// item pages showing it follow, each in place.
     fn download_event(&mut self, event: DownloadEvent, sender: &ComponentSender<Self>) {
         let had = self.has_downloads();
-        crate::downloads::apply(&mut self.downloads, &event);
         if let DownloadEvent::Changed(download) = &event {
             self.holders = crate::downloads::holders(
                 std::mem::take(&mut self.holders),
                 std::slice::from_ref(download),
             );
         }
+        if !crate::downloads::is_shown(&event, self.shown_holder.as_ref()) {
+            return;
+        }
+        crate::downloads::apply(&mut self.downloads, &event);
         if let Some(page) = &self.downloads_page {
             page.apply(&event);
         }
@@ -6315,18 +6337,21 @@ mod tests {
 
     #[test]
     fn a_server_message_reads_as_a_sentence() {
-        assert_eq!(
-            sentence("Cabin does not answer: connection refused"),
-            "Cabin does not answer: connection refused."
-        );
-    }
-
-    #[test]
-    fn a_message_is_capitalised_once() {
-        assert_eq!(
-            sentence("the media file could not be read."),
-            "The media file could not be read."
-        );
+        let cases = [
+            (
+                "a message gets its full stop",
+                "Cabin does not answer: connection refused",
+                "Cabin does not answer: connection refused.",
+            ),
+            (
+                "a message is capitalised once",
+                "the media file could not be read.",
+                "The media file could not be read.",
+            ),
+        ];
+        for (label, message, expected) in cases {
+            assert_eq!(sentence(message), expected, "{label}");
+        }
     }
 
     #[test]

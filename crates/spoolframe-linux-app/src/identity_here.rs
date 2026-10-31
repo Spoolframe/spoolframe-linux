@@ -634,67 +634,73 @@ mod tests {
 
     #[test]
     fn only_this_computers_identity_is_marked_this_device() {
-        let marked: Vec<bool> = ties(&[7, 8, 9])
-            .iter()
-            .map(|t| this_device(&t.id, &with(8)))
-            .collect();
-        assert_eq!(marked, [false, true, false]);
+        // With no identity here, no tie is this device.
+        let cases = [
+            ("7 beside this computer's 8", id(7), with(8), false),
+            ("8 is this computer's", id(8), with(8), true),
+            ("9 beside this computer's 8", id(9), with(8), false),
+            ("no identity here", id(8), TieWith::Create, false),
+        ];
+        for (case, tie, here, want) in cases {
+            assert_eq!(this_device(&tie, &here), want, "{case}");
+        }
     }
 
     #[test]
-    fn with_no_identity_here_no_tie_is_this_device() {
-        assert!(!this_device(&id(8), &TieWith::Create));
+    fn tie_another_is_offered_unless_every_tie_is_taken() {
+        let cases = [
+            (
+                "hides once this computer's identity is tied",
+                offers_another(&ties(&[7, 8]), &with(8)),
+                false,
+            ),
+            (
+                "offers this computer's identity beside others",
+                offers_another(&ties(&[7]), &with(8)),
+                true,
+            ),
+            (
+                "offers to make an identity with none here",
+                offers_another(&ties(&[7]), &TieWith::Create),
+                true,
+            ),
+            (
+                "with no ties the empty row's tie is the only one",
+                offers_another(&[], &with(8)),
+                false,
+            ),
+        ];
+        for (case, got, want) in cases {
+            assert_eq!(got, want, "{case}");
+        }
     }
 
     #[test]
-    fn tie_another_hides_once_this_computers_identity_is_tied() {
-        assert!(!offers_another(&ties(&[7, 8]), &with(8)));
-    }
-
-    #[test]
-    fn tie_another_offers_this_computers_identity_beside_others() {
-        assert!(offers_another(&ties(&[7]), &with(8)));
-    }
-
-    #[test]
-    fn tie_another_offers_to_make_an_identity_with_none_here() {
-        assert!(offers_another(&ties(&[7]), &TieWith::Create));
-    }
-
-    #[test]
-    fn with_no_ties_the_empty_rows_tie_is_the_only_one() {
-        assert!(!offers_another(&[], &with(8)));
-    }
-
-    #[test]
-    fn a_used_tie_says_when_it_was_tied_and_last_used() {
+    fn a_tie_says_when_it_was_tied_and_whether_it_was_used() {
         assert_eq!(
-            tie_line("12 Oct", Some("today")),
-            "Tied 12 Oct · last used today"
+            [tie_line("12 Oct", Some("today")), tie_line("12 Oct", None),],
+            [
+                "Tied 12 Oct · last used today",
+                "Tied 12 Oct · Not used yet"
+            ]
         );
     }
 
     #[test]
-    fn an_unused_tie_says_it_is_not_used_yet() {
-        assert_eq!(tie_line("12 Oct", None), "Tied 12 Oct · Not used yet");
-    }
-
-    #[test]
-    fn severing_another_identity_names_it_and_what_stays() {
+    fn severing_names_the_identity_and_what_stays() {
+        // This computer's own identity also says it stops signing in.
         assert_eq!(
-            sever_body("R2VN-8KQT-M4XA-H7PD", false),
-            "Devices that sign in with R2VN-8KQT-M4XA-H7PD stop opening this account. The other \
-             identities stay tied, and the account keeps everything."
-        );
-    }
-
-    #[test]
-    fn severing_this_computers_identity_says_it_stops_signing_in() {
-        assert_eq!(
-            sever_body("R2VN-8KQT-M4XA-H7PD", true),
-            "Devices that sign in with R2VN-8KQT-M4XA-H7PD stop opening this account. The other \
-             identities stay tied, and the account keeps everything. This computer stops signing \
-             in with it."
+            [
+                sever_body("R2VN-8KQT-M4XA-H7PD", false),
+                sever_body("R2VN-8KQT-M4XA-H7PD", true),
+            ],
+            [
+                "Devices that sign in with R2VN-8KQT-M4XA-H7PD stop opening this account. The other \
+                 identities stay tied, and the account keeps everything.",
+                "Devices that sign in with R2VN-8KQT-M4XA-H7PD stop opening this account. The other \
+                 identities stay tied, and the account keeps everything. This computer stops signing \
+                 in with it.",
+            ]
         );
     }
 

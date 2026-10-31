@@ -17,6 +17,19 @@ pub enum OnClose {
     Ask,
 }
 
+/// What Keep in background does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kept {
+    /// Hold the application now, and hide the window.
+    Hold,
+    /// It is held already: hide the window.
+    Held,
+    /// The last download stopped while the question showed: nothing is
+    /// left to keep the app for, so the window closes. A hold taken now
+    /// would never go, and the app would run on unseen.
+    Close,
+}
+
 /// Where closing stands: how many downloads run, whether the app is kept
 /// in the background for them, and whether the user chose Quit.
 #[derive(Debug, Default)]
@@ -40,10 +53,15 @@ impl Closing {
         self.running
     }
 
-    /// Keep in background: true when the application is to be held now,
-    /// false when it already is.
-    pub fn keep(&mut self) -> bool {
-        !std::mem::replace(&mut self.kept, true)
+    /// Keep in background, as the downloads stand now.
+    pub fn keep(&mut self) -> Kept {
+        if self.running == 0 {
+            return Kept::Close;
+        }
+        match std::mem::replace(&mut self.kept, true) {
+            false => Kept::Hold,
+            true => Kept::Held,
+        }
     }
 
     /// Quit: the next close goes through, downloads or not.
@@ -136,7 +154,19 @@ mod tests {
     #[test]
     fn keep_holds_the_app_once() {
         let mut closing = with_running(1);
-        assert_eq!((closing.keep(), closing.keep()), (true, false));
+        assert_eq!((closing.keep(), closing.keep()), (Kept::Hold, Kept::Held));
+    }
+
+    /// The last download finished while the question showed: Keep in
+    /// background closes, holding nothing.
+    #[test]
+    fn keep_after_the_last_download_finished_closes() {
+        let mut closing = with_running(1);
+        closing.downloads(0);
+        assert_eq!(
+            (closing.keep(), closing.on_close()),
+            (Kept::Close, OnClose::Close)
+        );
     }
 
     #[test]
@@ -165,7 +195,7 @@ mod tests {
         closing.keep();
         closing.downloads(0);
         closing.downloads(1);
-        assert!(closing.keep());
+        assert_eq!(closing.keep(), Kept::Hold);
     }
 
     #[test]

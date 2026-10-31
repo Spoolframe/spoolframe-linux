@@ -189,14 +189,31 @@ fn secret_value(bytes: &[u8]) -> libsecret::Value {
     }
 }
 
-/// Of the items a search found, the one written last: until a store
-/// tidies up, the item oo7 wrote and libsecret's can both be there (see
-/// [`keyring::store`]).
-fn newest<T>(items: impl IntoIterator<Item = T>, modified: impl Fn(&T) -> u64) -> Option<T> {
-    items.into_iter().max_by_key(|item| modified(item))
+/// A keyring error, saying what was being done to which key.
+/// The newest of `items`, by `modified`, and the rest.
+fn split_newest<T>(items: Vec<T>, modified: impl Fn(&T) -> u64) -> (Option<T>, Vec<T>) {
+    let newest_at = items
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, item)| modified(item))
+        .map(|(at, _)| at);
+    let mut rest = items;
+    let newest = newest_at.map(|at| rest.remove(at));
+    (newest, rest)
 }
 
-/// A keyring error, saying what was being done to which key.
+/// Whether clearing by `attributes` (every item having all of them)
+/// leaves the item with `kept`: it does when one of them is not the
+/// kept item's.
+fn clears_only_itself(
+    attributes: &HashMap<String, String>,
+    kept: &HashMap<String, String>,
+) -> bool {
+    attributes
+        .iter()
+        .any(|(name, value)| kept.get(name) != Some(value))
+}
+
 fn keyring_error(doing: &str, key: &str) -> impl FnOnce(glib::Error) -> StorageError {
     let context = format!("{doing} {key:?}");
     move |e| StorageError::Keyring(format!("{context}: {e}"))
@@ -208,6 +225,7 @@ fn keyring_error(doing: &str, key: &str) -> impl FnOnce(glib::Error) -> StorageE
 /// raise two prompts.
 mod keyring {
     use super::*;
+    use glib::prelude::Cast as _;
 
     static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
@@ -258,11 +276,13 @@ mod keyring {
         Ok(Some(value))
     }
 
-    /// The newest item's secret among those with `attributes`.
+    /// The newest item's secret among those with `attributes`: until a
+    /// store tidies up, the item oo7 wrote and libsecret's can both be
+    /// there (see [`keyring::store`]).
     fn find(attributes: HashMap<&str, &str>) -> Result<Option<Vec<u8>>, glib::Error> {
         let flags = libsecret::SearchFlags::ALL | libsecret::SearchFlags::UNLOCK;
         let items = libsecret::password_search_sync(Some(&schema()), attributes, flags, NO_CANCEL)?;
-        let Some(item) = newest(items, |item| item.modified()) else {
+        let Some(item) = split_newest(items, |item| item.modified()).0 else {
             return Ok(None);
         };
         Ok(item
@@ -275,9 +295,11 @@ mod keyring {
     /// libsecret replaces an item only when its attributes are the same
     /// set, and the item oo7 wrote has another (no `xdg:schema` on the
     /// Secret Service; an `xdg:content-type` in a Flatpak's file). So the
-    /// first store after the move from oo7 leaves two: then both go and
-    /// the new value is stored again, alone. The new one is written first,
-    /// so no moment is without it but that one.
+    /// first store after the move from oo7 leaves two. The one written
+    /// now, the newest, stays; the others are deleted one by one. Clearing
+    /// them all by `key`'s attributes and storing again had a moment with
+    /// no copy at all, and a failure then lost the secret (the device key:
+    /// the device's identity).
     pub(super) fn store(key: &str, value: &[u8]) -> Result<(), glib::Error> {
         let (schema, value, label) = (schema(), secret_value(value), label(key));
         let put = || {
@@ -298,11 +320,37 @@ mod keyring {
             NO_CANCEL,
         )?;
         if all.len() > 1 {
-            libsecret::password_clear_sync(Some(&schema), attributes(key), NO_CANCEL)?;
-            put()?;
+            remove_older(all)?;
         }
         // An item under the old id would be read again once this one goes.
         libsecret::password_clear_sync(Some(&schema), legacy_attributes(key), NO_CANCEL)?;
+        Ok(())
+    }
+
+    /// Deletes every item of `items` but the newest. An item of the
+    /// Secret Service is deleted itself; one in a Flatpak's file only by
+    /// its attributes, which is done only where they cannot match the
+    /// newest too. One left is read past: the newest is what is read.
+    fn remove_older(items: Vec<libsecret::Retrievable>) -> Result<(), glib::Error> {
+        let (kept, older) = split_newest(items, |item| item.modified());
+        let Some(kept) = kept else { return Ok(()) };
+        let kept = kept.attributes();
+        for item in older {
+            if let Some(item) = item.downcast_ref::<libsecret::Item>() {
+                item.delete_sync(NO_CANCEL)?;
+                continue;
+            }
+            let attributes = item.attributes();
+            if !clears_only_itself(&attributes, &kept) {
+                tracing::warn!("an older keyring item left: deleting it would delete the new one");
+                continue;
+            }
+            let attributes = attributes
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect();
+            libsecret::password_clear_sync(None, attributes, NO_CANCEL)?;
+        }
         Ok(())
     }
 
@@ -425,27 +473,21 @@ mod tests {
     }
 
     #[test]
-    fn a_key_cannot_climb_out_through_a_directory() {
-        assert!(matches!(
-            check_key("sessions/../servers"),
-            Err(StorageError::BadKey(_))
-        ));
-    }
-
-    #[test]
-    fn a_key_cannot_have_an_empty_name() {
-        assert!(matches!(
-            check_key("sessions//x"),
-            Err(StorageError::BadKey(_))
-        ));
-    }
-
-    #[test]
-    fn a_key_cannot_be_hidden() {
-        assert!(matches!(
-            check_key(".servers"),
-            Err(StorageError::BadKey(_))
-        ));
+    fn a_bad_key_is_refused() {
+        let cases = [
+            // Climbing out through a directory.
+            "sessions/../servers",
+            // An empty name.
+            "sessions//x",
+            // A hidden key.
+            ".servers",
+        ];
+        for key in cases {
+            assert!(
+                matches!(check_key(key), Err(StorageError::BadKey(_))),
+                "{key}"
+            );
+        }
     }
 
     /// The SDK keeps each profile's offline lock (PX-60) as a secret
@@ -526,20 +568,62 @@ mod tests {
         assert_eq!(secret_value(&[]).get(), Vec::<u8>::new());
     }
 
-    /// The item oo7 wrote and the one libsecret wrote after it: the
-    /// later one is read.
+    /// The value just stored is the newest: it stays, the others go. Of
+    /// the item oo7 wrote and the one libsecret wrote after it, the later
+    /// one is read. No items is no secret.
     #[test]
-    fn of_two_items_the_one_written_last_is_read() {
-        let items = [("oo7's", 1_700_000_000), ("libsecret's", 1_800_000_000)];
+    fn the_newest_item_is_kept_and_the_rest_go() {
+        let items = vec![
+            ("oo7's", 1_700_000_000),
+            ("new", 1_900_000_000),
+            ("older", 1),
+        ];
+        let (kept, rest) = split_newest(items, |(_, modified)| *modified);
         assert_eq!(
-            newest(items, |(_, modified)| *modified).map(|(who, _)| who),
-            Some("libsecret's")
+            (
+                kept.map(|(who, _)| who),
+                rest.iter().map(|(who, _)| *who).collect::<Vec<_>>()
+            ),
+            (Some("new"), vec!["oo7's", "older"])
+        );
+        assert_eq!(
+            split_newest(Vec::<u64>::new(), |m| *m),
+            (None, Vec::new()),
+            "no items"
         );
     }
 
+    fn attrs(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect()
+    }
+
+    /// oo7's item in a Flatpak's file has an `xdg:content-type` the new
+    /// one lacks: clearing by its attributes leaves the new one. oo7's on
+    /// the Secret Service has fewer than the new one: clearing by them
+    /// would delete the new one too, so it is not done that way.
     #[test]
-    fn no_items_is_no_secret() {
-        assert_eq!(newest(Vec::<u64>::new(), |m| *m), None);
+    fn an_older_item_is_cleared_by_its_attributes_only_where_the_new_one_is_spared() {
+        let new = attrs(&[
+            ("application", "app"),
+            ("key", "device-key"),
+            ("xdg:schema", "app"),
+        ]);
+        let in_file = attrs(&[
+            ("application", "app"),
+            ("key", "device-key"),
+            ("xdg:content-type", "application/octet-stream"),
+        ]);
+        let on_service = attrs(&[("application", "app"), ("key", "device-key")]);
+        assert_eq!(
+            (
+                clears_only_itself(&in_file, &new),
+                clears_only_itself(&on_service, &new)
+            ),
+            (true, false)
+        );
     }
 
     #[test]

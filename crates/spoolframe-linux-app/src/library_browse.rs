@@ -1101,17 +1101,24 @@ mod tests {
 
     #[test]
     fn the_count_says_how_many_of_all_films() {
-        assert_eq!(count_text(Some(37), 412, films()), "37 of 412 films");
-    }
-
-    #[test]
-    fn without_a_filter_the_count_is_the_librarys() {
-        assert_eq!(count_text(None, 412, films()), "412 films");
-    }
-
-    #[test]
-    fn one_film_is_one() {
-        assert_eq!(count_text(None, 1, films()), "1 film");
+        let cases = [
+            (
+                "a filter shows how many of all",
+                Some(37),
+                412,
+                "37 of 412 films",
+            ),
+            (
+                "without a filter it is the librarys",
+                None,
+                412,
+                "412 films",
+            ),
+            ("one film is one", None, 1, "1 film"),
+        ];
+        for (label, shown, all, expected) in cases {
+            assert_eq!(count_text(shown, all, films()), expected, "{label}");
+        }
     }
 
     #[test]
@@ -1148,34 +1155,48 @@ mod tests {
     }
 
     #[test]
-    fn a_restored_choice_greets_on_the_first_open() {
-        let choice = genre("Drama");
-        assert!(greets(&choice, &shown(&choice), true));
-    }
-
-    #[test]
-    fn a_restored_choice_does_not_greet_again() {
-        let choice = genre("Drama");
-        assert!(!greets(&choice, &shown(&choice), false));
-    }
-
-    #[test]
-    fn the_default_does_not_greet() {
-        assert!(!greets(&Choice::default(), &Plan::Plain, true));
-    }
-
-    #[test]
-    fn a_refused_choice_does_not_greet() {
-        assert!(!greets(
-            &genre("Drama"),
-            &Plan::Refused("gone".into()),
-            true
-        ));
-    }
-
-    #[test]
-    fn a_choice_shown_plainly_for_want_of_values_does_not_greet() {
-        assert!(!greets(&genre("Drama"), &Plan::Plain, true));
+    fn a_choice_greets_only_when_restored_and_sent_on_the_first_open() {
+        let drama = genre("Drama");
+        let cases = [
+            (
+                "a restored choice greets on the first open",
+                &drama,
+                shown(&drama),
+                true,
+                true,
+            ),
+            (
+                "a restored choice does not greet again",
+                &drama,
+                shown(&drama),
+                false,
+                false,
+            ),
+            (
+                "the default does not greet",
+                &Choice::default(),
+                Plan::Plain,
+                true,
+                false,
+            ),
+            (
+                "a refused choice does not greet",
+                &drama,
+                Plan::Refused("gone".into()),
+                true,
+                false,
+            ),
+            (
+                "a choice shown plainly for want of values does not greet",
+                &drama,
+                Plan::Plain,
+                true,
+                false,
+            ),
+        ];
+        for (label, choice, plan, first, expected) in cases {
+            assert_eq!(greets(choice, &plan, first), expected, "{label}");
+        }
     }
 
     #[test]

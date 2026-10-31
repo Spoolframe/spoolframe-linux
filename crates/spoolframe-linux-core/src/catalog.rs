@@ -1599,70 +1599,11 @@ mod tests {
         media(MediaKind::Movie, "1")
     }
 
-    #[test]
-    fn marking_watched_clears_the_session() {
-        assert_eq!(kept_after(|s| ready(s.mark_watched(&alien())).unwrap()), 0);
-    }
-
-    #[test]
-    fn marking_unwatched_clears_the_session() {
-        assert_eq!(
-            kept_after(|s| ready(s.mark_unwatched(&alien())).unwrap()),
-            0
-        );
-    }
-
-    #[test]
-    fn hiding_from_continue_watching_clears_the_session() {
-        assert_eq!(
-            kept_after(|s| ready(s.hide_from_continue(&alien())).unwrap()),
-            0
-        );
-    }
-
-    /// Every kept item's copy that plays may be another after it (P8-05);
-    /// refused or not, as any change.
-    #[test]
-    fn choosing_where_a_title_plays_from_clears_the_session() {
-        let kept = kept_after(|s| {
-            let _ = ready(s.set_play_from(&alien(), None));
-        });
-        assert_eq!(kept, 0);
-    }
-
-    #[test]
-    fn a_playback_stopping_clears_the_session() {
-        let kept = kept_after(|s| {
-            let started = ready(s.start_playback(&alien(), None, Default::default())).unwrap();
-            ready(s.home()).unwrap();
-            ready(s.stop_playback(&started.handle)).unwrap();
-        });
-        assert_eq!(kept, 0);
-    }
-
-    #[test]
-    fn a_playback_starting_clears_the_session() {
-        assert_eq!(
-            kept_after(|s| {
-                ready(s.start_playback(&alien(), None, Default::default())).unwrap();
-            }),
-            0
-        );
-    }
-
     fn episodes() -> Kinds {
         Kinds {
             episodes: true,
             ..Kinds::default()
         }
-    }
-
-    #[test]
-    fn making_a_playlist_clears_the_session() {
-        let kept = kept_after(|s| {
-            ready(s.create_playlist("Heists", episodes(), Visibility::Personal)).unwrap();
-        });
-        assert_eq!(kept, 0);
     }
 
     /// A playlist of the user's, made before the reads, then `change`d.
@@ -1677,91 +1618,11 @@ mod tests {
         f.catalog.len(&scope("andrey"))
     }
 
-    #[test]
-    fn renaming_a_playlist_clears_the_session() {
-        let kept = kept_after_playlist_change(|s, id| {
-            let update = PlaylistUpdate {
-                name: Some("Capers".into()),
-                ..PlaylistUpdate::default()
-            };
-            ready(s.update_playlist(id, update)).unwrap();
-        });
-        assert_eq!(kept, 0);
-    }
-
-    #[test]
-    fn pinning_a_playlist_clears_the_session() {
-        let kept = kept_after_playlist_change(|s, id| ready(s.pin_playlist(id, 0)).unwrap());
-        assert_eq!(kept, 0);
-    }
-
-    #[test]
-    fn deleting_a_playlist_clears_the_session() {
-        let kept = kept_after_playlist_change(|s, id| ready(s.delete_playlist(id)).unwrap());
-        assert_eq!(kept, 0);
-    }
-
-    #[test]
-    fn playing_a_playlist_clears_the_session() {
-        let kept = kept_after_playlist_change(|s, id| {
-            ready(s.play_playlist(id, None, PlaySettings::default())).unwrap();
-        });
-        assert_eq!(kept, 0);
-    }
-
-    #[test]
-    fn editing_a_playlist_clears_the_session() {
-        let kept = kept_after_playlist_change(|s, id| {
-            let page = ready(s.playlist(id, 0, 10)).unwrap();
-            let edits = vec![PlaylistEdit::Add {
-                id: media(MediaKind::Episode, "25"),
-                before: None,
-            }];
-            let _ = ready(s.edit_playlist(id, page.playlist.revision, edits));
-        });
-        assert_eq!(kept, 0);
-    }
-
-    #[test]
-    fn liking_clears_the_session() {
-        let track = media(MediaKind::Track, "42");
-        assert_eq!(
-            kept_after(|s| {
-                ready(s.like(&[track])).unwrap();
-            }),
-            0
-        );
-    }
-
-    #[test]
-    fn unliking_clears_the_session() {
-        let track = media(MediaKind::Track, "42");
-        assert_eq!(
-            kept_after(|s| {
-                ready(s.unlike(&[track])).unwrap();
-            }),
-            0
-        );
-    }
+    type SessionChange = fn(&CachedSession);
+    type OnPlaylist = fn(&CachedSession, &str);
 
     /// A small PNG's first bytes: enough for the fake's check.
     const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
-
-    #[test]
-    fn setting_a_cover_clears_the_session() {
-        let kept = kept_after_playlist_change(|s, id| {
-            ready(s.set_playlist_art(id, PNG.to_vec())).unwrap();
-        });
-        assert_eq!(kept, 0);
-    }
-
-    #[test]
-    fn removing_a_cover_clears_the_session() {
-        let kept = kept_after_playlist_change(|s, id| {
-            ready(s.remove_playlist_art(id)).unwrap();
-        });
-        assert_eq!(kept, 0);
-    }
 
     fn alien_subtitle_result(s: &CachedSession) -> String {
         ready(s.search_subtitles(&alien(), None)).unwrap().results[0]
@@ -1780,65 +1641,106 @@ mod tests {
     }
 
     #[test]
-    fn downloading_a_subtitle_clears_the_session() {
-        assert_eq!(
-            kept_after(|s| {
+    fn a_change_clears_the_session() {
+        let cases: [(&str, SessionChange); 15] = [
+            ("marking watched", |s| {
+                ready(s.mark_watched(&alien())).unwrap();
+            }),
+            ("marking unwatched", |s| {
+                ready(s.mark_unwatched(&alien())).unwrap();
+            }),
+            ("hiding from continue watching", |s| {
+                ready(s.hide_from_continue(&alien())).unwrap();
+            }),
+            // Every kept item's copy that plays may be another after it
+            // (P8-05); refused or not, as any change.
+            ("choosing where a title plays from", |s| {
+                let _ = ready(s.set_play_from(&alien(), None));
+            }),
+            ("a playback stopping", |s| {
+                let started = ready(s.start_playback(&alien(), None, Default::default())).unwrap();
+                ready(s.home()).unwrap();
+                ready(s.stop_playback(&started.handle)).unwrap();
+            }),
+            ("a playback starting", |s| {
+                ready(s.start_playback(&alien(), None, Default::default())).unwrap();
+            }),
+            ("making a playlist", |s| {
+                ready(s.create_playlist("Heists", episodes(), Visibility::Personal)).unwrap();
+            }),
+            ("liking", |s| {
+                ready(s.like(&[media(MediaKind::Track, "42")])).unwrap();
+            }),
+            ("unliking", |s| {
+                ready(s.unlike(&[media(MediaKind::Track, "42")])).unwrap();
+            }),
+            ("downloading a subtitle", |s| {
                 let result = alien_subtitle_result(s);
                 ready(s.download_subtitle(&alien(), &result)).unwrap();
             }),
-            0
-        );
-    }
-
-    #[test]
-    fn removing_a_downloaded_subtitle_clears_the_session() {
-        let kept = kept_after(|s| {
-            let result = alien_subtitle_result(s);
-            let got = ready(s.download_subtitle(&alien(), &result)).unwrap();
-            ready(s.home()).unwrap();
-            let download = got.subtitle.download.unwrap().id;
-            ready(s.remove_subtitle_download(&alien(), &download)).unwrap();
-        });
-        assert_eq!(kept, 0);
-    }
-
-    #[test]
-    fn offsetting_a_subtitle_clears_the_session() {
-        assert_eq!(
-            kept_after(|s| {
+            ("removing a downloaded subtitle", |s| {
+                let result = alien_subtitle_result(s);
+                let got = ready(s.download_subtitle(&alien(), &result)).unwrap();
+                ready(s.home()).unwrap();
+                let download = got.subtitle.download.unwrap().id;
+                ready(s.remove_subtitle_download(&alien(), &download)).unwrap();
+            }),
+            ("offsetting a subtitle", |s| {
                 ready(s.set_subtitle_offset(&alien(), 0, 1500)).unwrap();
             }),
-            0
-        );
-    }
-
-    #[test]
-    fn syncing_a_subtitle_clears_the_session() {
-        assert_eq!(
-            kept_after(|s| {
+            ("syncing a subtitle", |s| {
                 ready(s.sync_subtitle(&alien(), 0)).unwrap();
             }),
-            0
-        );
-    }
-
-    #[test]
-    fn its_original_timing_clears_the_session() {
-        assert_eq!(
-            kept_after(|s| {
+            ("a subtitle's original timing", |s| {
                 ready(s.use_original_subtitle_timing(&alien(), 0)).unwrap();
             }),
-            0
-        );
+            // It may have been made before its answer was lost.
+            ("a failed change", |s| {
+                assert!(ready(s.delete_playlist("nope")).is_err());
+            }),
+        ];
+        for (name, change) in cases {
+            assert_eq!(kept_after(change), 0, "{name}");
+        }
     }
 
     #[test]
-    fn a_failed_change_clears_the_session_too() {
-        // It may have been made before its answer was lost.
-        assert_eq!(
-            kept_after(|s| assert!(ready(s.delete_playlist("nope")).is_err())),
-            0
-        );
+    fn a_change_to_a_playlist_clears_the_session() {
+        let cases: [(&str, OnPlaylist); 7] = [
+            ("renaming", |s, id| {
+                let update = PlaylistUpdate {
+                    name: Some("Capers".into()),
+                    ..PlaylistUpdate::default()
+                };
+                ready(s.update_playlist(id, update)).unwrap();
+            }),
+            ("pinning", |s, id| {
+                ready(s.pin_playlist(id, 0)).unwrap();
+            }),
+            ("deleting", |s, id| {
+                ready(s.delete_playlist(id)).unwrap();
+            }),
+            ("playing", |s, id| {
+                ready(s.play_playlist(id, None, PlaySettings::default())).unwrap();
+            }),
+            ("editing", |s, id| {
+                let page = ready(s.playlist(id, 0, 10)).unwrap();
+                let edits = vec![PlaylistEdit::Add {
+                    id: media(MediaKind::Episode, "25"),
+                    before: None,
+                }];
+                let _ = ready(s.edit_playlist(id, page.playlist.revision, edits));
+            }),
+            ("setting a cover", |s, id| {
+                ready(s.set_playlist_art(id, PNG.to_vec())).unwrap();
+            }),
+            ("removing a cover", |s, id| {
+                ready(s.remove_playlist_art(id)).unwrap();
+            }),
+        ];
+        for (name, change) in cases {
+            assert_eq!(kept_after_playlist_change(change), 0, "{name}");
+        }
     }
 
     #[test]

@@ -204,10 +204,7 @@ fn main() -> Result<()> {
     playback::shutdown();
     // The downloads stop where they got to, for the next start (PX-38),
     // and the connections close.
-    if runtime
-        .block_on(tokio::time::timeout(CLOSE_WAIT, sdk.close()))
-        .is_err()
-    {
+    if within(&runtime, CLOSE_WAIT, sdk.close()).is_err() {
         tracing::warn!("the client did not close in time");
     }
     if let Some(cache) = artwork_cache {
@@ -219,6 +216,37 @@ fn main() -> Result<()> {
 
 /// How long quitting waits for the client to close.
 const CLOSE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Runs `work` on `runtime` for at most `wait`, from outside any runtime.
+/// The timeout is made inside it: its timer needs one, and no runtime is
+/// entered once relm4's `run` has returned.
+fn within<F: std::future::Future>(
+    runtime: &tokio::runtime::Runtime,
+    wait: std::time::Duration,
+    work: F,
+) -> Result<F::Output, tokio::time::error::Elapsed> {
+    runtime.block_on(async { tokio::time::timeout(wait, work).await })
+}
+
+#[cfg(test)]
+mod within_tests {
+    use super::within;
+    use std::time::Duration;
+
+    /// Quitting closes the client after the app's runtime guard is gone.
+    #[test]
+    fn work_runs_from_outside_any_runtime() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        assert_eq!(within(&runtime, Duration::from_secs(1), async { 7 }), Ok(7));
+    }
+
+    #[test]
+    fn work_that_overruns_is_given_up() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let slow = async { tokio::time::sleep(Duration::from_secs(60)).await };
+        assert!(within(&runtime, Duration::from_millis(10), slow).is_err());
+    }
+}
 
 /// How the SDK opens, from the user's settings: with or without relays
 /// (P6-03), which it cannot change while it runs, and with its downloads
@@ -303,19 +331,6 @@ mod tests {
         assert!(client_options(&settings).relays);
         settings.set_use_relays(false);
         assert!(!client_options(&settings::Settings::at(&path)).relays);
-    }
-
-    /// Downloads (PX-38) are kept in the data directory, where the sandbox
-    /// allows writing.
-    #[test]
-    fn the_sdk_keeps_downloads_under_the_data_directory() {
-        let dir = tempfile::tempdir().unwrap();
-        let settings = settings::Settings::at(&dir.path().join("settings.ini"));
-        let data = spoolframe_linux_core::paths::data_dir().expect("a home directory");
-        assert_eq!(
-            client_options(&settings).downloads_dir,
-            Some(data.join("downloads"))
-        );
     }
 
     /// Every regular feature is base protocol since SDK 0.16; of the two

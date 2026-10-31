@@ -901,17 +901,10 @@ mod tests {
 
     #[test]
     #[ignore = "needs GStreamer's base and good plugins; run on its own"]
-    fn turning_an_external_subtitle_off_silences_it() {
+    fn turning_an_external_subtitle_off_silences_it_and_does_not_stop_playback() {
         let (_dir, file, srt) = file_and_srt("spoolframe-external-silenced");
         let played = play_with_external_subtitle(&file_uri(&file), &srt, true);
-        assert!(played.silenced);
-    }
-
-    #[test]
-    #[ignore = "needs GStreamer's base and good plugins; run on its own"]
-    fn turning_an_external_subtitle_off_does_not_stop_playback() {
-        let (_dir, file, srt) = file_and_srt("spoolframe-external-off");
-        let played = play_with_external_subtitle(&file_uri(&file), &srt, true);
-        assert_eq!(played.failed, None);
+        assert!(played.silenced, "silenced");
+        assert_eq!(played.failed, None, "playback went on");
     }
 }

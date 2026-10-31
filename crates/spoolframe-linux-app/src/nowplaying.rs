@@ -1286,11 +1286,13 @@ mod tests {
 
     #[test]
     fn a_codec_name_is_shortened_to_its_parenthesis() {
-        assert_eq!(short_codec("Free Lossless Audio Codec (FLAC)"), "FLAC");
-    }
-
-    #[test]
-    fn a_codec_name_without_a_parenthesis_stays() {
-        assert_eq!(short_codec("Opus"), "Opus");
+        assert_eq!(
+            [
+                short_codec("Free Lossless Audio Codec (FLAC)"),
+                // Without a parenthesis it stays.
+                short_codec("Opus"),
+            ],
+            ["FLAC", "Opus"]
+        );
     }
 }

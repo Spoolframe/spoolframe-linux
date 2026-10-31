@@ -1405,18 +1405,17 @@ mod tests {
     }
 
     #[test]
-    fn an_hdr_picture_goes_to_the_compositor_as_hdr() {
+    fn dynamic_range_says_where_the_picture_goes_or_how_it_was_mapped() {
+        // An HDR picture goes to the compositor as HDR; a server tone-map is named.
         assert_eq!(
-            super::dynamic_range(Some(super::Hdr::Pq), false),
-            "HDR10 (PQ) · to the compositor as HDR"
-        );
-    }
-
-    #[test]
-    fn the_servers_tone_mapping_is_named() {
-        assert_eq!(
-            super::dynamic_range(None, true),
-            "SDR · tone-mapped from HDR by the server"
+            [
+                super::dynamic_range(Some(super::Hdr::Pq), false),
+                super::dynamic_range(None, true),
+            ],
+            [
+                "HDR10 (PQ) · to the compositor as HDR",
+                "SDR · tone-mapped from HDR by the server",
+            ]
         );
     }
 
@@ -1479,11 +1478,10 @@ mod tests {
     }
 
     #[test]
-    fn a_transcode_says_what_is_encoded_and_why() {
-        let summary = PlanSummary::of(&transcode());
+    fn a_transcode_says_why() {
         assert_eq!(
-            (summary.badge, summary.why.as_str()),
-            ("Transcode", "video 0: hevc is not supported")
+            PlanSummary::of(&transcode()).why,
+            "video 0: hevc is not supported"
         );
     }
 
@@ -1502,7 +1500,7 @@ mod tests {
     }
 
     #[test]
-    fn a_plan_that_copies_every_stream_is_a_remux() {
+    fn a_plan_has_the_badge_of_what_it_does() {
         let remux = PlaybackPlan::Converted {
             delivery: Delivery::Progressive,
             container: Container::Matroska,
@@ -1516,11 +1514,6 @@ mod tests {
             ladder: Vec::new(),
             source_codec: None,
         };
-        assert_eq!(PlanSummary::of(&remux).badge, "Remux");
-    }
-
-    #[test]
-    fn direct_play_is_direct() {
         let direct = PlaybackPlan::Direct {
             container: Container::Matroska,
             video: Some(VideoCodec::H264),
@@ -1531,7 +1524,15 @@ mod tests {
             subtitle: None,
             source_codec: None,
         };
-        assert_eq!(PlanSummary::of(&direct).badge, "Direct");
+        // A plan that copies every stream is a remux.
+        assert_eq!(
+            [
+                PlanSummary::of(&transcode()).badge,
+                PlanSummary::of(&remux).badge,
+                PlanSummary::of(&direct).badge,
+            ],
+            ["Transcode", "Remux", "Direct"]
+        );
     }
 
     fn direct_with(delivery: spoolframe_protocol::SubtitleDelivery) -> PlaybackPlan {
@@ -1549,35 +1550,43 @@ mod tests {
     }
 
     #[test]
-    fn a_burned_in_subtitle_says_so_whatever_the_switch() {
-        assert_eq!(
-            subtitle_summary(Some(&transcode()), false, false),
-            format!("{} burned into the video", SubtitleFormat::Pgs)
-        );
-    }
-
-    #[test]
-    fn subtitles_turned_off_read_off() {
-        let plan = direct_with(spoolframe_protocol::SubtitleDelivery::Embedded);
-        assert_eq!(subtitle_summary(Some(&plan), false, false), "off");
-    }
-
-    #[test]
-    fn an_external_subtitle_comes_as_a_file() {
-        let plan = direct_with(spoolframe_protocol::SubtitleDelivery::External);
-        assert_eq!(
-            subtitle_summary(Some(&plan), true, true),
-            format!("{} · file from server", SubtitleFormat::Srt)
-        );
-    }
-
-    #[test]
-    fn an_embedded_subtitle_is_in_the_file() {
-        let plan = direct_with(spoolframe_protocol::SubtitleDelivery::Embedded);
-        assert_eq!(
-            subtitle_summary(Some(&plan), true, false),
-            format!("{} · in the file", SubtitleFormat::Srt)
-        );
+    fn the_subtitle_summary_says_how_the_subtitle_comes() {
+        use spoolframe_protocol::SubtitleDelivery::{Embedded, External};
+        let srt = SubtitleFormat::Srt;
+        // (label, plan, subtitles on, external picked, want)
+        let cases = [
+            (
+                "burned in, whatever the switch",
+                transcode(),
+                false,
+                false,
+                format!("{} burned into the video", SubtitleFormat::Pgs),
+            ),
+            (
+                "turned off",
+                direct_with(Embedded),
+                false,
+                false,
+                "off".to_owned(),
+            ),
+            (
+                "external",
+                direct_with(External),
+                true,
+                true,
+                format!("{srt} · file from server"),
+            ),
+            (
+                "embedded",
+                direct_with(Embedded),
+                true,
+                false,
+                format!("{srt} · in the file"),
+            ),
+        ];
+        for (label, plan, on, external, want) in cases {
+            assert_eq!(subtitle_summary(Some(&plan), on, external), want, "{label}");
+        }
     }
 
     #[test]

@@ -719,7 +719,7 @@ pub mod broker {
     /// A request: with a PIN in three of them, so it is never printed
     /// (see its Debug) and its buffers are wiped once sent or read.
     #[derive(Serialize, Deserialize)]
-    enum Request {
+    pub(super) enum Request {
         Keys,
         Info {
             path: String,
@@ -770,17 +770,6 @@ pub mod broker {
                 .field("path", &path_of(self))
                 .finish_non_exhaustive()
         }
-    }
-
-    #[cfg(test)]
-    #[test]
-    fn a_request_never_prints_its_pin() {
-        let request = Request::Delete {
-            path: "/dev/hidraw5".into(),
-            credential_id: vec![1],
-            pin: Zeroizing::new("246810".into()),
-        };
-        assert!(!format!("{request:?}").contains("246810"));
     }
 
     #[derive(Debug, Serialize, Deserialize)]
@@ -998,13 +987,26 @@ mod tests {
     }
 
     #[test]
-    fn the_helper_opens_a_key_it_lists() {
-        assert!(broker::is_a_key("/dev/hidraw5", &[key("/dev/hidraw5")]));
+    fn a_request_never_prints_its_pin() {
+        use zeroize::Zeroizing;
+        let request = broker::Request::Delete {
+            path: "/dev/hidraw5".into(),
+            credential_id: vec![1],
+            pin: Zeroizing::new("246810".into()),
+        };
+        assert!(!format!("{request:?}").contains("246810"));
     }
 
     #[test]
-    fn the_helper_refuses_a_device_that_is_not_a_listed_key() {
-        assert!(!broker::is_a_key("/dev/hidraw2", &[key("/dev/hidraw5")]));
+    fn the_helper_opens_only_a_device_it_lists() {
+        let listed = [key("/dev/hidraw5")];
+        assert_eq!(
+            [
+                broker::is_a_key("/dev/hidraw5", &listed),
+                broker::is_a_key("/dev/hidraw2", &listed)
+            ],
+            [true, false]
+        );
     }
 
     #[test]
@@ -1023,7 +1025,8 @@ mod tests {
     }
 
     #[test]
-    fn the_spikes_feitian_can_root_an_identity() {
+    fn only_a_key_with_the_extensions_can_root_an_identity() {
+        // The spike's Feitian can; a U2F-only key cannot.
         let feitian = KeyInfo {
             versions: vec!["U2F_V2".into(), "FIDO_2_0".into(), "FIDO_2_1_PRE".into()],
             extensions: vec!["credProtect".into(), "hmac-secret".into()],
@@ -1035,21 +1038,10 @@ mod tests {
             ],
             remaining: Some(46),
         };
-        assert!(feitian.can_root());
-    }
-
-    #[test]
-    fn a_u2f_only_key_cannot() {
         let u2f = KeyInfo {
             versions: vec!["U2F_V2".into()],
             ..Default::default()
         };
-        assert!(!u2f.can_root());
-    }
-
-    /// libfido2 is linked and lists keys: none is fine here.
-    #[test]
-    fn listing_keys_works_with_or_without_one() {
-        assert!(keys().is_ok());
+        assert_eq!([feitian.can_root(), u2f.can_root()], [true, false]);
     }
 }

@@ -369,19 +369,22 @@ mod tests {
     }
 
     #[test]
-    fn follow_system_falls_back_to_mocha_when_the_desktop_has_no_preference() {
-        assert_eq!(Theme::System.effective(false), Theme::Mocha);
-    }
-
-    #[test]
-    fn follow_system_follows_a_desktop_that_has_a_preference() {
-        assert_eq!(Theme::System.effective(true), Theme::System);
-    }
-
-    #[test]
-    fn a_picked_palette_ignores_the_desktop() {
-        assert_eq!(Theme::Latte.effective(false), Theme::Latte);
-        assert_eq!(Theme::Latte.effective(true), Theme::Latte);
+    fn the_effective_theme_depends_on_the_desktop_only_for_follow_system() {
+        // Follow system falls back to Mocha when the desktop has no
+        // preference; a picked palette ignores the desktop.
+        let cases = [
+            (Theme::System, false, Theme::Mocha),
+            (Theme::System, true, Theme::System),
+            (Theme::Latte, false, Theme::Latte),
+            (Theme::Latte, true, Theme::Latte),
+        ];
+        for (theme, desktop_prefers, want) in cases {
+            assert_eq!(
+                theme.effective(desktop_prefers),
+                want,
+                "{theme:?}, desktop preference {desktop_prefers}"
+            );
+        }
     }
 
     #[test]

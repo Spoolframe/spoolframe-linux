@@ -809,15 +809,13 @@ pub fn resume_from(item: &Item) -> Option<Duration> {
 mod tests {
     use std::sync::Arc;
 
+    use crate::testing::ready;
+
     use spoolframe_types::{MediaId, MediaKind, Namespace};
 
     use super::*;
     use crate::backend::{Client, PinNoteReason, PlaySettings, PlaylistUpdate, Repeat};
     use crate::fake::FakeClient;
-
-    fn ready<T>(future: impl std::future::Future<Output = T>) -> T {
-        futures::executor::block_on(future)
-    }
 
     #[test]
     fn a_search_finds_a_name_holding_it_whatever_its_case() {

@@ -2265,13 +2265,25 @@ mod tests {
     }
 
     #[test]
-    fn previews_not_ready_or_none_keep_their_meaning() {
+    fn plain_errors_keep_their_meaning() {
         assert_eq!(
             [
-                backend_error(sdk::SdkError::PreviewsNotReady { done_percent: 40 }),
-                backend_error(sdk::SdkError::NoPreviews)
-            ],
-            [BackendError::PreviewsNotReady(40), BackendError::NoPreviews]
+                sdk::SdkError::PreviewsNotReady { done_percent: 40 },
+                sdk::SdkError::NoPreviews,
+                sdk::SdkError::NotSetUp,
+                sdk::SdkError::SignInDenied,
+                sdk::SdkError::SignInExpired,
+                sdk::SdkError::InvalidCredentials,
+            ]
+            .map(backend_error),
+            [
+                BackendError::PreviewsNotReady(40),
+                BackendError::NoPreviews,
+                BackendError::NotSetUp,
+                BackendError::SignInDenied,
+                BackendError::SignInExpired,
+                BackendError::WrongCredentials,
+            ]
         );
     }
 
@@ -2287,33 +2299,6 @@ mod tests {
                 saved: "k7f3q2m4x9pq8z2a".into(),
                 now: "w4n8b2r6t3kq7x5m".into(),
             }
-        );
-    }
-
-    #[test]
-    fn a_server_not_set_up_keeps_its_meaning() {
-        assert_eq!(
-            backend_error(sdk::SdkError::NotSetUp),
-            BackendError::NotSetUp
-        );
-    }
-
-    #[test]
-    fn a_refused_or_expired_device_sign_in_keeps_its_meaning() {
-        assert_eq!(
-            [
-                backend_error(sdk::SdkError::SignInDenied),
-                backend_error(sdk::SdkError::SignInExpired)
-            ],
-            [BackendError::SignInDenied, BackendError::SignInExpired]
-        );
-    }
-
-    #[test]
-    fn wrong_credentials_keep_their_meaning() {
-        assert_eq!(
-            backend_error(sdk::SdkError::InvalidCredentials),
-            BackendError::WrongCredentials
         );
     }
 

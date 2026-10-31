@@ -932,17 +932,17 @@ mod tests {
     }
 
     #[test]
-    fn the_apps_own_directories_are_written() {
+    fn the_places_are_written_or_read_by_where_they_are() {
         let places = places(&home(), &[]);
+        // The app's own directories are written.
         for dir in &home().app {
             assert!(places.contains(&(dir.clone(), Use::Write)), "{dir:?}");
         }
-    }
-
-    #[test]
-    fn a_search_path_outside_the_home_directory_is_read() {
-        let places = places(&home(), &[]);
-        assert!(places.contains(&("/run/current-system/sw/share".into(), Use::Read)));
+        // A search path outside the home directory is read.
+        assert!(
+            places.contains(&("/run/current-system/sw/share".into(), Use::Read)),
+            "search path outside the home directory"
+        );
     }
 
     #[test]

@@ -1299,22 +1299,17 @@ mod tests {
         }
     }
 
-    /// A library that grew while kept gets placeholders for its new items.
+    /// A library that grew while kept gets placeholders for its new items;
+    /// one that shrank loses the cells past its end.
     #[test]
-    fn a_grown_library_gets_more_cells() {
-        let pages = pages();
-        pages.resize(3);
-        pages.resize(5);
-        assert_eq!(pages.store.n_items(), 5);
-    }
-
-    /// One that shrank loses the cells past its end.
-    #[test]
-    fn a_shrunk_library_loses_cells() {
-        let pages = pages();
-        pages.resize(5);
-        pages.resize(2);
-        assert_eq!(pages.store.n_items(), 2);
+    fn a_kept_library_follows_its_size() {
+        let cases = [("grown", 3, 5), ("shrunk", 5, 2)];
+        for (label, before, after) in cases {
+            let pages = pages();
+            pages.resize(before);
+            pages.resize(after);
+            assert_eq!(pages.store.n_items(), after, "{label}");
+        }
     }
 
     /// The fake's library of `kind` opened in fresh slots, once its page
@@ -1614,23 +1609,20 @@ mod tests {
         );
     }
 
+    /// Any year is the dropdown's first place, a year sits after it, and the
+    /// first place picks any year again.
     #[test]
-    fn any_year_is_the_dropdowns_first_place() {
-        assert_eq!(year_index(&[1995, 1979], None), 0);
-    }
-
-    #[test]
-    fn a_year_sits_after_any() {
-        assert_eq!(year_index(&[1995, 1979], Some(1979)), 2);
-    }
-
-    #[test]
-    fn the_first_place_picks_any_year() {
-        assert_eq!(year_at(&[1995, 1979], 0), None);
-    }
-
-    #[test]
-    fn a_later_place_picks_its_year() {
-        assert_eq!(year_at(&[1995, 1979], 1), Some(1995));
+    fn the_year_dropdown_maps_years_to_places_and_back() {
+        let years = [1995, 1979];
+        assert_eq!(
+            [year_index(&years, None), year_index(&years, Some(1979))],
+            [0, 2],
+            "year to place"
+        );
+        assert_eq!(
+            [year_at(&years, 0), year_at(&years, 1)],
+            [None, Some(1995)],
+            "place to year"
+        );
     }
 }

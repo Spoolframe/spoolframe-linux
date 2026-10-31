@@ -800,35 +800,41 @@ mod tests {
     }
 
     #[test]
-    fn a_result_says_its_language_site_rating_and_downloads() {
-        assert_eq!(
-            result_line(&result()),
-            "English · OpenSubtitles · Rated 9.0 · 31,402 downloads"
-        );
-    }
-
-    #[test]
-    fn a_result_says_it_is_for_the_hard_of_hearing_and_machine_made() {
-        let line = result_line(&SubtitleResult {
-            source: "subdl".into(),
-            hearing_impaired: true,
-            origin: SubtitleOrigin::MachineTranslated,
+    fn a_result_line_says_what_the_result_is() {
+        let bare = SubtitleResult {
             rating: None,
             downloads: 0,
             ..result()
-        });
-        assert_eq!(line, "English · SubDL · HI · Machine-translated");
-    }
-
-    #[test]
-    fn a_forced_result_says_so() {
-        let line = result_line(&SubtitleResult {
-            forced: true,
-            rating: None,
-            downloads: 0,
-            ..result()
-        });
-        assert_eq!(line, "English · OpenSubtitles · Forced");
+        };
+        // (label, result, want)
+        let cases = [
+            (
+                "language, site, rating and downloads",
+                result(),
+                "English · OpenSubtitles · Rated 9.0 · 31,402 downloads",
+            ),
+            (
+                "for the hard of hearing and machine-made",
+                SubtitleResult {
+                    source: "subdl".into(),
+                    hearing_impaired: true,
+                    origin: SubtitleOrigin::MachineTranslated,
+                    ..bare.clone()
+                },
+                "English · SubDL · HI · Machine-translated",
+            ),
+            (
+                "forced",
+                SubtitleResult {
+                    forced: true,
+                    ..bare
+                },
+                "English · OpenSubtitles · Forced",
+            ),
+        ];
+        for (label, result, want) in cases {
+            assert_eq!(result_line(&result), want, "{label}");
+        }
     }
 
     #[test]
@@ -889,24 +895,18 @@ mod tests {
     }
 
     #[test]
-    fn a_time_today_is_a_clock_time() {
-        assert_eq!(when_phrase(17 * 3600, 3600), "at 17:00");
-    }
-
-    #[test]
-    fn a_time_on_the_next_day_says_tomorrow() {
+    fn a_time_is_a_clock_time_tomorrow_or_a_date() {
         assert_eq!(
-            when_phrase(86_400 + 3 * 3600, 23 * 3600),
-            "tomorrow at 03:00"
-        );
-    }
-
-    #[test]
-    fn a_time_further_off_names_its_date() {
-        // 2025-10-10 00:00:00 UTC is 1_760_054_400; a week earlier is "now".
-        assert_eq!(
-            when_phrase(1_760_054_400 + 90 * 60, 1_760_054_400 - 7 * 86_400),
-            "on 2025-10-10 at 01:30"
+            [
+                // Today.
+                when_phrase(17 * 3600, 3600),
+                // On the next day.
+                when_phrase(86_400 + 3 * 3600, 23 * 3600),
+                // Further off names its date. 2025-10-10 00:00:00 UTC is
+                // 1_760_054_400; a week earlier is "now".
+                when_phrase(1_760_054_400 + 90 * 60, 1_760_054_400 - 7 * 86_400),
+            ],
+            ["at 17:00", "tomorrow at 03:00", "on 2025-10-10 at 01:30",]
         );
     }
 
@@ -948,79 +948,72 @@ mod tests {
     }
 
     #[test]
-    fn a_server_without_a_site_says_search_is_off_with_no_retry() {
+    fn a_search_that_failed_says_what_to_do() {
+        let problem = |error| search_problem(&error, "Home Media", &at_utc);
+        // A server without a site says search is off, with no retry.
         assert_eq!(
-            search_problem(&BackendError::NoSubtitleSource, "Home Media", &at_utc),
+            problem(BackendError::NoSubtitleSource),
             Problem {
                 title: "Subtitle search is off on Home Media".into(),
                 detail: "Ask the server’s owner to turn on subtitle search.".into(),
                 retry: false,
+            },
+            "no site"
+        );
+        // Sites out of reach offer try again.
+        let down = problem(BackendError::Unavailable("down".into()));
+        assert_eq!(
+            (down.title.as_str(), down.retry),
+            ("Home Media can’t reach the subtitle sites", true),
+            "sites out of reach"
+        );
+    }
+
+    #[test]
+    fn the_used_up_downloads_say_whose_limit_it_is_and_when_more_come() {
+        let used = "Results still show; downloading waits.";
+        // (label, whose, site, resets at, title, detail)
+        let cases = [
+            (
+                "the server's, with a site and a reset time",
+                QuotaOf::Account,
+                Some("opensubtitles"),
+                Some(17 * 3600),
+                Some("Home Media has used today’s downloads"),
+                format!("OpenSubtitles allows more downloads at 17:00. {used}"),
+            ),
+            (
+                "no reset time says tomorrow, a site named",
+                QuotaOf::Account,
+                Some("subdl"),
+                None,
+                None,
+                format!("SubDL allows more tomorrow. {used}"),
+            ),
+            (
+                "no reset time says tomorrow, no site",
+                QuotaOf::Account,
+                None,
+                None,
+                None,
+                format!("More are allowed tomorrow. {used}"),
+            ),
+            (
+                "the user's own",
+                QuotaOf::User,
+                None,
+                Some(86_400 + 3 * 3600),
+                Some("You’ve used today’s downloads on Home Media"),
+                format!("More downloads tomorrow at 03:00. {used}"),
+            ),
+        ];
+        for (label, of, site, resets_at, title, detail) in cases {
+            let problem = quota_problem(of, site, resets_at, "Home Media", &at_utc);
+            assert_eq!(problem.detail, detail, "{label}");
+            if let Some(title) = title {
+                assert_eq!(problem.title, title, "{label}");
             }
-        );
-    }
-
-    #[test]
-    fn sites_out_of_reach_offer_try_again() {
-        let problem = search_problem(
-            &BackendError::Unavailable("down".into()),
-            "Home Media",
-            &at_utc,
-        );
-        assert_eq!(
-            (problem.title.as_str(), problem.retry),
-            ("Home Media can’t reach the subtitle sites", true)
-        );
-    }
-
-    #[test]
-    fn the_servers_used_up_downloads_name_the_site_and_say_when_more_come() {
-        let problem = quota_problem(
-            QuotaOf::Account,
-            Some("opensubtitles"),
-            Some(17 * 3600),
-            "Home Media",
-            &at_utc,
-        );
-        assert_eq!(
-            (problem.title, problem.detail),
-            (
-                "Home Media has used today’s downloads".to_owned(),
-                "OpenSubtitles allows more downloads at 17:00. Results still show; downloading waits."
-                    .to_owned()
-            )
-        );
-    }
-
-    #[test]
-    fn a_quota_with_no_reset_time_says_tomorrow() {
-        let detail =
-            |site| quota_problem(QuotaOf::Account, site, None, "Home Media", &at_utc).detail;
-        assert_eq!(
-            [detail(Some("subdl")), detail(None)],
-            [
-                "SubDL allows more tomorrow. Results still show; downloading waits.",
-                "More are allowed tomorrow. Results still show; downloading waits."
-            ]
-        );
-    }
-
-    #[test]
-    fn the_users_own_used_up_downloads_say_whose_limit_it_is_and_when_more_come() {
-        let problem = quota_problem(
-            QuotaOf::User,
-            None,
-            Some(86_400 + 3 * 3600),
-            "Home Media",
-            &at_utc,
-        );
-        assert_eq!(
-            (problem.title, problem.detail),
-            (
-                "You’ve used today’s downloads on Home Media".to_owned(),
-                "More downloads tomorrow at 03:00. Results still show; downloading waits."
-                    .to_owned()
-            )
-        );
+        }
     }
 
     #[test]
