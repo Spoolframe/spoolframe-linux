@@ -10,7 +10,9 @@ use gtk::prelude::*;
 use gtk::subclass::prelude::*;
 use gtk::{gdk, glib};
 use spoolframe_linux_core::artcache::ArtworkCache;
-use spoolframe_linux_core::backend::{ArtworkSize, BackendError, ServerKey, Session};
+use spoolframe_linux_core::backend::{
+    ArtworkFace, ArtworkSize, Backdrop, BackendError, ServerKey, Session,
+};
 use spoolframe_types::{Artwork, ArtworkId, ArtworkKind};
 
 /// The most pixels an image from the server may have: 8192 × 8192, 256 MB
@@ -86,6 +88,80 @@ impl Art {
         });
     }
 
+    /// Draws the first of `kinds` the item has over `tile` as a wide hero
+    /// (PX-64): cropped to keep the faces in it. Faces not known yet are
+    /// cropped centred and asked for again a few times, as the server
+    /// finds them after an image's first fetch.
+    pub fn show_backdrop(
+        self: &Rc<Self>,
+        tile: &gtk::Overlay,
+        artwork: &[Artwork],
+        kinds: &[ArtworkKind],
+        size: ArtworkSize,
+    ) {
+        let Some(id) = first_of(artwork, kinds) else {
+            return;
+        };
+        let (session, server, cache) = (
+            self.session.clone(),
+            self.server.clone(),
+            self.cache.clone(),
+        );
+        let fetch = {
+            let (session, id) = (session.clone(), id.clone());
+            relm4::spawn(async move { fetch_backdrop(session, server, cache, id, size).await })
+        };
+        let (tile, art) = (tile.downgrade(), self.clone());
+        glib::spawn_future_local(async move {
+            let backdrop = match fetch.await {
+                Ok(Ok(backdrop)) => backdrop,
+                Ok(Err(e)) => return tracing::debug!(error = %e, "no backdrop"),
+                Err(e) => return tracing::warn!(error = %e, "backdrop fetch panicked"),
+            };
+            let texture = match decode(&backdrop.bytes) {
+                Ok(texture) => texture,
+                Err(e) => return tracing::warn!(error = %e, "backdrop is not an image to show"),
+            };
+            let Some(shown) = tile.upgrade() else { return };
+            let painted = paint(&shown, &texture);
+            drop(shown);
+            let known = backdrop.faces.is_some();
+            painted.set_faces(backdrop.faces);
+            if !known && session.smart_crop() {
+                art.learn_faces(painted.downgrade(), id, size).await;
+            }
+        });
+    }
+
+    /// Asks for backdrop `id` again until the server knows its faces, a
+    /// few times while it is drawn, and crops `painted` to them then.
+    async fn learn_faces(&self, painted: glib::WeakRef<Unsized>, id: ArtworkId, size: ArtworkSize) {
+        for _ in 0..FACE_ASKS {
+            glib::timeout_future(FACE_WAIT).await;
+            if painted.upgrade().is_none() {
+                return;
+            }
+            let ask = {
+                let (session, id) = (self.session.clone(), id.clone());
+                relm4::spawn(async move { session.backdrop(&id, size).await })
+            };
+            let faces = match ask.await {
+                Ok(Ok(backdrop)) => backdrop.faces,
+                Ok(Err(e)) => return tracing::debug!(error = %e, "backdrop faces not asked again"),
+                Err(e) => return tracing::warn!(error = %e, "backdrop fetch panicked"),
+            };
+            let Some(faces) = faces else { continue };
+            tracing::debug!(%id, faces = faces.len(), "backdrop faces learned");
+            if let Some(cache) = &self.cache {
+                cache.keep_faces(&self.server, &id, &faces);
+            }
+            if let Some(painted) = painted.upgrade() {
+                painted.set_faces(Some(faces));
+            }
+            return;
+        }
+    }
+
     /// Draws the artwork `id` names over `tile`, once it loads: a
     /// playlist's cover (PX-53), which is not one of an item's kinds.
     pub fn show_id(self: &Rc<Self>, tile: &gtk::Overlay, id: &ArtworkId, size: ArtworkSize) {
@@ -159,6 +235,33 @@ async fn fetch(
     }
 }
 
+/// A backdrop and its faces, from the device's cache or the server.
+async fn fetch_backdrop(
+    session: Arc<dyn Session>,
+    server: ServerKey,
+    cache: Option<Arc<ArtworkCache>>,
+    id: ArtworkId,
+    size: ArtworkSize,
+) -> Result<Backdrop, BackendError> {
+    let network = {
+        let id = id.clone();
+        async move { session.backdrop(&id, size).await }
+    };
+    match cache {
+        Some(cache) => {
+            cache
+                .get_or_fetch_backdrop(&server, &id, size, network)
+                .await
+        }
+        None => network.await,
+    }
+}
+
+/// How many times a backdrop with no faces known is asked for again, and
+/// how long apart: the server finds them after its first fetch.
+const FACE_ASKS: u32 = 4;
+const FACE_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Runs `bytes` on Relm4's tokio runtime, where the SDK's networking lives,
 /// and paints the image over `tile` on the main loop. Decoded images are
 /// not kept: tiles come and go as a grid scrolls, and decoding cached
@@ -187,13 +290,14 @@ where
 
 /// Replaces the tile's placeholder with the image, at the placeholder's
 /// size, and hides the placeholder's title. Overlays on the tile (progress,
-/// watched badge) stay on top.
-fn paint(tile: &gtk::Overlay, texture: &gdk::Texture) {
+/// watched badge) stay on top. What draws the image, for its faces.
+fn paint(tile: &gtk::Overlay, texture: &gdk::Texture) -> Unsized {
     let (width, height) = tile
         .child()
         .map_or((-1, -1), |c| (c.width_request(), c.height_request()));
+    let paintable = Unsized::new(texture);
     let picture = gtk::Picture::builder()
-        .paintable(&Unsized::new(texture))
+        .paintable(&paintable)
         .content_fit(gtk::ContentFit::Fill)
         .width_request(width)
         .height_request(height)
@@ -207,6 +311,7 @@ fn paint(tile: &gtk::Overlay, texture: &gdk::Texture) {
         }
         child = widget.next_sibling();
     }
+    paintable
 }
 
 glib::wrapper! {
@@ -237,6 +342,12 @@ impl Unsized {
         paintable.imp().inner.replace(Some(inner.clone().upcast()));
         paintable
     }
+
+    /// The faces in the backdrop it draws (PX-64): its crop keeps them.
+    pub fn set_faces(&self, faces: Option<Vec<ArtworkFace>>) {
+        self.imp().faces.replace(faces);
+        self.invalidate_contents();
+    }
 }
 
 /// Where to draw content of shape `aspect` (width over height) so it
@@ -255,6 +366,31 @@ fn cover(aspect: f64, width: f64, height: f64) -> (f64, f64, f64, f64) {
     }
 }
 
+/// [`cover`], keeping `faces` (PX-64): cropped top and bottom, the band the
+/// SDK's [`backdrop_crop`](spoolframe_client_sdk::backdrop_crop) chooses
+/// for them, so every app crops a backdrop alike. With no faces, or none
+/// known yet, centred.
+fn cover_keeping(
+    aspect: f64,
+    width: f64,
+    height: f64,
+    faces: Option<&[ArtworkFace]>,
+) -> (f64, f64, f64, f64) {
+    let centred = cover(aspect, width, height);
+    let (x, _, w, h) = centred;
+    let Some(faces) = faces.filter(|f| !f.is_empty()) else {
+        return centred;
+    };
+    if aspect <= 0.0 || height <= 0.0 || width / height <= aspect {
+        return centred;
+    }
+    let band = spoolframe_client_sdk::backdrop_crop(faces, width / height);
+    // The SDK reckons a 16:9 backdrop; another shape keeps its top, held
+    // inside the image.
+    let y = (-band.top * h).clamp(height - h, 0.0);
+    (x, y, w, h)
+}
+
 mod imp {
     use std::cell::RefCell;
 
@@ -265,6 +401,8 @@ mod imp {
     #[derive(Default)]
     pub struct Unsized {
         pub inner: RefCell<Option<gdk::Paintable>>,
+        /// A backdrop's faces (PX-64), which its crop keeps.
+        pub faces: RefCell<Option<Vec<super::ArtworkFace>>>,
     }
 
     #[glib::object_subclass]
@@ -289,7 +427,12 @@ mod imp {
             let Some(snapshot) = snapshot.downcast_ref::<gtk::Snapshot>() else {
                 return inner.snapshot(snapshot, width, height);
             };
-            let (x, y, w, h) = super::cover(inner.intrinsic_aspect_ratio(), width, height);
+            let (x, y, w, h) = super::cover_keeping(
+                inner.intrinsic_aspect_ratio(),
+                width,
+                height,
+                self.faces.borrow().as_deref(),
+            );
             snapshot.push_clip(&gtk::graphene::Rect::new(
                 0.0,
                 0.0,
@@ -375,6 +518,66 @@ mod tests {
     fn a_wide_backdrop_covers_a_tall_area_cropped_at_the_sides() {
         // 16:9 into 90×90: 160 wide, centred.
         assert_eq!(cover(16.0 / 9.0, 90.0, 90.0), (-35.0, 0.0, 160.0, 90.0));
+    }
+
+    /// A face near the top of a 16:9 backdrop, eyes at 15%.
+    fn face_high() -> ArtworkFace {
+        ArtworkFace {
+            left: 0.4,
+            right: 0.6,
+            top: 0.05,
+            bottom: 0.25,
+            eyes: 0.15,
+        }
+    }
+
+    #[test]
+    fn a_backdrop_with_no_faces_known_is_centred() {
+        let centred = cover(16.0 / 9.0, 300.0, 100.0);
+        assert_eq!(
+            (
+                cover_keeping(16.0 / 9.0, 300.0, 100.0, None),
+                cover_keeping(16.0 / 9.0, 300.0, 100.0, Some(&[])),
+            ),
+            (centred, centred)
+        );
+    }
+
+    /// A 3:1 hero keeps the band of a 16:9 backdrop that the SDK's crop
+    /// chooses for its faces, not the middle, which cut the head off.
+    #[test]
+    fn a_wide_hero_keeps_the_band_with_the_faces() {
+        let (_, y, _, h) = cover_keeping(16.0 / 9.0, 300.0, 100.0, Some(&[face_high()]));
+        let chosen = spoolframe_client_sdk::backdrop_crop(&[face_high()], 3.0);
+        assert!(
+            (y + chosen.top * h).abs() < 1e-9 && chosen.top < 0.1,
+            "y {y}, crop {chosen:?}"
+        );
+    }
+
+    /// A backdrop that is not 16:9 still covers the hero: the band never
+    /// runs past the image's bottom.
+    #[test]
+    fn a_band_never_leaves_the_image() {
+        let low = ArtworkFace {
+            top: 0.85,
+            bottom: 0.99,
+            eyes: 0.9,
+            ..face_high()
+        };
+        // 2:1 into 300×50: 150 tall, so at most 100 of it above the area.
+        let (_, y, _, h) = cover_keeping(2.0, 300.0, 50.0, Some(&[low]));
+        assert!(y <= 0.0 && y + h >= 50.0, "y {y}, h {h}");
+    }
+
+    /// Faces only move a crop top to bottom: a backdrop cropped at its
+    /// sides stays centred.
+    #[test]
+    fn faces_do_not_move_a_crop_at_the_sides() {
+        assert_eq!(
+            cover_keeping(16.0 / 9.0, 90.0, 90.0, Some(&[face_high()])),
+            cover(16.0 / 9.0, 90.0, 90.0)
+        );
     }
 
     #[test]

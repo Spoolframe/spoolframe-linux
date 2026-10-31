@@ -14,13 +14,17 @@ use spoolframe_types::{
     SubtitleTrack,
 };
 
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
 use spoolframe_types::{SubtitleSync, SubtitleTiming};
 use tokio::sync::broadcast;
 
 use crate::backend::{BackendError, SubtitleTimingEvent};
 
-/// When the fake says an offset was set, Unix seconds.
-pub const OFFSET_SET_AT: i64 = 1_760_000_100;
+/// When the fake says an offset was set.
+pub fn offset_set_at() -> SystemTime {
+    UNIX_EPOCH + Duration::from_secs(1_760_000_100)
+}
 
 /// When the fake's OpenSubtitles quota comes back, Unix seconds.
 pub const QUOTA_RESETS_AT: i64 = 1_760_054_400;
@@ -190,7 +194,7 @@ impl Store {
         self.retime(id, track, before, |t| {
             t.offset_ms = offset_ms;
             t.offset_by = Some(by);
-            t.offset_at = Some(OFFSET_SET_AT);
+            t.offset_at = Some(offset_set_at());
         })
     }
 

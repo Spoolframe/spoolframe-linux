@@ -13,6 +13,7 @@
 
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use adw::prelude::*;
 use gtk::glib;
@@ -23,9 +24,9 @@ use spoolframe_linux_core::backend::{
 use spoolframe_protocol::device_sign_in;
 
 /// "Today", "yesterday", "3 days ago": when a device was last used, from
-/// its Unix time and now's.
-pub fn last_used(seen: i64, now: i64) -> String {
-    match (now - seen).max(0) / 86_400 {
+/// its time and now's.
+pub fn last_used(seen: SystemTime, now: SystemTime) -> String {
+    match now.duration_since(seen).map_or(0, |d| d.as_secs()) / 86_400 {
         0 => "Used today".to_owned(),
         1 => "Used yesterday".to_owned(),
         days => format!("Used {days} days ago"),
@@ -70,8 +71,8 @@ pub fn code_from(text: &str, server_key: &str) -> Result<String, &'static str> {
 }
 
 /// "just now", "4 min ago": when the device asked.
-pub fn asked(requested_at: i64, now: i64) -> String {
-    match (now - requested_at).max(0) / 60 {
+pub fn asked(requested_at: SystemTime, now: SystemTime) -> String {
+    match now.duration_since(requested_at).map_or(0, |d| d.as_secs()) / 60 {
         0 => "just now".to_owned(),
         minutes => format!("{minutes} min ago"),
     }
@@ -145,7 +146,7 @@ pub fn plex_summary(link: Option<&PlexLink>) -> String {
 
 /// A device's row: "This computer" for this one, with its name; else its
 /// name. The line under says what it runs and when it was last used.
-pub fn device_line(device: &DeviceInfo, now: i64) -> (String, String) {
+pub fn device_line(device: &DeviceInfo, now: SystemTime) -> (String, String) {
     let name = device
         .name
         .clone()
@@ -631,7 +632,7 @@ impl View {
         // Opening at start needs this computer remembered.
         self.auto_row.set_sensitive(here.trusted);
         self.syncing.set(false);
-        let now = crate::invite::unix_now();
+        let now = SystemTime::now();
         let mut rows = Vec::new();
         for device in devices {
             let row = self.device_row(&device, now);
@@ -643,7 +644,7 @@ impl View {
 
     /// A device: what it is, its PIN switch, whether it is trusted, and
     /// Forget for another device that is.
-    fn device_row(self: &Rc<Self>, device: &DeviceInfo, now: i64) -> adw::ActionRow {
+    fn device_row(self: &Rc<Self>, device: &DeviceInfo, now: SystemTime) -> adw::ActionRow {
         let (title, subtitle) = device_line(device, now);
         let row = adw::ActionRow::builder().use_markup(false).build();
         row.set_title(&title);
@@ -1653,7 +1654,7 @@ impl View {
             "Sign in this device?",
             &format!(
                 "It asked {}, from the {platform}.",
-                asked(request.requested_at, crate::invite::unix_now()),
+                asked(request.requested_at, SystemTime::now()),
             ),
         );
         let facts = gtk::ListBox::builder()
@@ -2179,14 +2180,21 @@ mod tests {
         );
     }
 
+    fn at(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs)
+    }
+
     #[test]
     fn a_device_used_hours_ago_was_used_today() {
-        assert_eq!(last_used(1_000_000, 1_000_000 + 3_600), "Used today");
+        assert_eq!(
+            last_used(at(1_000_000), at(1_000_000 + 3_600)),
+            "Used today"
+        );
     }
 
     #[test]
     fn a_device_used_three_days_ago_says_so() {
-        assert_eq!(last_used(0, 3 * 86_400 + 10), "Used 3 days ago");
+        assert_eq!(last_used(at(0), at(3 * 86_400 + 10)), "Used 3 days ago");
     }
 
     const KEY: &str = "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f";
@@ -2231,7 +2239,10 @@ mod tests {
     #[test]
     fn a_request_minutes_old_says_so() {
         assert_eq!(
-            (asked(100, 130), asked(100, 100 + 4 * 60 + 5)),
+            (
+                asked(at(100), at(130)),
+                asked(at(100), at(100 + 4 * 60 + 5))
+            ),
             ("just now".to_owned(), "4 min ago".to_owned())
         );
     }
@@ -2270,14 +2281,14 @@ mod tests {
             endpoint_id: "x".into(),
             name: Some("andoriyu-desktop".into()),
             platform: Some(Platform::Linux),
-            last_seen_at: 0,
+            last_seen_at: SystemTime::UNIX_EPOCH,
             pin_required: false,
             this_device: true,
             trusted: false,
             auto_login: false,
         };
         assert_eq!(
-            device_line(&device, 0),
+            device_line(&device, SystemTime::UNIX_EPOCH),
             (
                 "This computer".to_owned(),
                 "andoriyu-desktop · Linux app".to_owned()

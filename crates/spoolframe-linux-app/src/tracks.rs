@@ -15,6 +15,8 @@ use gst::glib;
 use gst_play::prelude::*;
 use gtk::prelude::*;
 use spoolframe_linux_core::format;
+use spoolframe_protocol::{PlaybackPlan, SubtitleAction, SubtitleDelivery};
+use spoolframe_types::MediaTracks;
 
 use crate::external_subtitle::ExternalSubtitle;
 
@@ -24,11 +26,12 @@ pub fn select_audio(
     info: &gst_play::PlayMediaInfo,
     position: usize,
 ) -> Result<(), glib::BoolError> {
-    let stream = now(play, info)
-        .audio_streams()
-        .get(position)
-        .cloned()
-        .ok_or_else(|| glib::bool_error!("no audio stream {position}"))?;
+    let stream = resolve(
+        &info.audio_streams(),
+        &now(play, info).audio_streams(),
+        position,
+    )
+    .ok_or_else(|| glib::bool_error!("no audio stream {position}"))?;
     let id = PlayStreamInfoExt::stream_id(&stream);
     if play
         .current_audio_track()
@@ -49,6 +52,89 @@ fn now(play: &gst_play::Play, info: &gst_play::PlayMediaInfo) -> gst_play::PlayM
     play.media_info().unwrap_or_else(|| info.clone())
 }
 
+/// The stream of `now` that the `position`th of `picked_from` is: the
+/// same stream id, where GstPlay still has it, else the same position.
+/// By id first: a subtitle file joining the media is a new stream
+/// collection, whose order need not be the one the menu showed, and a
+/// position alone then picked another subtitle than the one named
+/// (Banshee S3E9).
+fn resolve<T: IsA<gst_play::PlayStreamInfo>>(
+    picked_from: &[T],
+    now: &[T],
+    position: usize,
+) -> Option<T> {
+    let id = picked_from
+        .get(position)
+        .map(|s| PlayStreamInfoExt::stream_id(s));
+    id.and_then(|id| {
+        now.iter()
+            .find(|s| PlayStreamInfoExt::stream_id(*s) == id)
+            .cloned()
+    })
+    .or_else(|| now.get(position).cloned())
+}
+
+/// Every stream `info` lists, by id: the menu is built again when this
+/// changes, so its names and its picks are of the same streams.
+pub fn stream_ids(info: &gst_play::PlayMediaInfo) -> Vec<String> {
+    let audio = info.audio_streams();
+    let subtitles = info.subtitle_streams();
+    audio
+        .iter()
+        .map(|s| PlayStreamInfoExt::stream_id(s).to_string())
+        .chain(
+            subtitles
+                .iter()
+                .map(|s| PlayStreamInfoExt::stream_id(s).to_string()),
+        )
+        .collect()
+}
+
+/// The item's subtitle track each of the player's subtitle `streams` is,
+/// in their order, as `plan` sends them; `None` for a stream that is none
+/// of them. A direct play's file holds the item's embedded tracks in
+/// their order, and the external file, whose stream is `external`, is
+/// the plan's subtitle. A converted output holds one subtitle stream, the
+/// one it was planned with, unless it is burned in or read as a file.
+pub fn stream_tracks(
+    tracks: &MediaTracks,
+    plan: &PlaybackPlan,
+    streams: &[String],
+    external: Option<&str>,
+) -> Vec<Option<u32>> {
+    let (planned, mut own): (Option<u32>, Box<dyn Iterator<Item = u32>>) = match plan {
+        PlaybackPlan::Direct { subtitle, .. } => (
+            subtitle
+                .filter(|s| s.delivery == SubtitleDelivery::External)
+                .map(|s| s.index),
+            Box::new(
+                (0..tracks.subtitles.len() as u32)
+                    .filter(|&n| !tracks.subtitles[n as usize].external),
+            ),
+        ),
+        PlaybackPlan::Converted {
+            subtitle: Some(subtitle),
+            ..
+        } => match subtitle.action {
+            SubtitleAction::Copy { .. } | SubtitleAction::Convert { .. } => {
+                (None, Box::new(std::iter::once(subtitle.index)))
+            }
+            SubtitleAction::Ocr { .. } => (Some(subtitle.index), Box::new(std::iter::empty())),
+            SubtitleAction::BurnIn { .. } | SubtitleAction::Unknown => {
+                (None, Box::new(std::iter::empty()))
+            }
+        },
+        _ => (None, Box::new(std::iter::empty())),
+    };
+    streams
+        .iter()
+        .map(|id| match Some(id.as_str()) == external {
+            true => planned,
+            false => own.next(),
+        })
+        .collect()
+}
+
 /// Shows the `position`th subtitle stream of `info`, or none.
 /// `external` is told first, so an external subtitle picked away from is
 /// not failed by it (see [`crate::external_subtitle`]).
@@ -64,11 +150,12 @@ pub fn select_subtitle(
         }
         return Ok(());
     };
-    let stream = now(play, info)
-        .subtitle_streams()
-        .get(position)
-        .cloned()
-        .ok_or_else(|| glib::bool_error!("no subtitle stream {position}"))?;
+    let stream = resolve(
+        &info.subtitle_streams(),
+        &now(play, info).subtitle_streams(),
+        position,
+    )
+    .ok_or_else(|| glib::bool_error!("no subtitle stream {position}"))?;
     let id = PlayStreamInfoExt::stream_id(&stream);
     external.picking(Some(&id));
     // On before the track is set: with subtitles off, as after an encode
@@ -96,6 +183,9 @@ pub fn select_subtitle(
 /// Subtitle lists longer than this get a search field.
 pub const SEARCH_FROM: usize = 3;
 
+/// The menu's width: its rows wrap within it.
+const MENU_WIDTH: i32 = 320;
+
 /// The player's audio and subtitle menu: lists to pick one from, with a
 /// check mark on what plays. `subtitles_on` is shared with the player,
 /// which also turns subtitles on and off (the item page's choice, an
@@ -118,6 +208,13 @@ pub struct SubtitleExtras {
     pub timing: Option<crate::subtitle_timing::TimingMenu>,
     /// The server's tracks the stream has none of, after its own.
     pub elsewhere: Option<ServerSubtitles>,
+    /// The item's track each subtitle stream of the menu's media info is,
+    /// with the server's name for it, where known ([`stream_tracks`]); a
+    /// stream without one is named by its language and format.
+    pub streams: Vec<Option<(u32, String)>>,
+    /// Told the item's subtitle track a pick from the menu shows: `None`
+    /// for Off, or a stream that is no track of the item.
+    pub picked: Option<Rc<dyn Fn(Option<u32>)>>,
 }
 
 /// The item's subtitle tracks that only the server has for this playback:
@@ -145,6 +242,8 @@ pub fn menu(
         find,
         timing,
         elsewhere,
+        streams: stream_names,
+        picked,
     }: SubtitleExtras,
 ) -> gtk::Popover {
     let column = gtk::Box::builder()
@@ -154,7 +253,7 @@ pub fn menu(
         .margin_bottom(8)
         .margin_start(8)
         .margin_end(8)
-        .width_request(280)
+        .width_request(MENU_WIDTH)
         .build();
 
     let audio_names: Vec<String> = info
@@ -178,9 +277,16 @@ pub fn menu(
     let streams = info.subtitle_streams().len();
     let subtitle_names: Vec<String> = std::iter::once("Off".to_owned())
         .chain(
+            // The server's name where the stream is one of its tracks: a
+            // subtitle file has no language tag, and its format alone
+            // ("SubRip") said nothing of which it was.
             info.subtitle_streams()
                 .iter()
-                .map(|s| stream_label(s.language().as_deref(), s.codec().as_deref(), None)),
+                .enumerate()
+                .map(|(n, s)| match stream_names.get(n) {
+                    Some(Some((_, name))) => name.clone(),
+                    _ => stream_label(s.language().as_deref(), s.codec().as_deref(), None),
+                }),
         )
         .chain(
             elsewhere
@@ -299,6 +405,13 @@ pub fn menu(
                 Ok(()) => {
                     on.set(position.is_some());
                     marks.mark(Some(row.index() as usize));
+                    if let Some(picked) = &picked {
+                        picked(
+                            position.and_then(|p| {
+                                stream_names.get(p).cloned().flatten().map(|(n, _)| n)
+                            }),
+                        );
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, ?position, "cannot switch subtitles");
@@ -330,7 +443,18 @@ pub fn menu(
         (picks, menu.current)
     });
 
-    let popover = gtk::Popover::builder().child(&column).build();
+    // One width whatever it holds, its end at the button's: centred on
+    // the button, it was as wide as its widest row (Timing shown or not,
+    // the server's track names), and moved sideways between openings.
+    let clamp = adw::Clamp::builder()
+        .maximum_size(MENU_WIDTH)
+        .tightening_threshold(MENU_WIDTH)
+        .child(&column)
+        .build();
+    let popover = gtk::Popover::builder()
+        .child(&clamp)
+        .halign(gtk::Align::End)
+        .build();
     if let Some((button, find)) = find_button {
         let popover = popover.downgrade();
         button.connect_clicked(move |_| {
@@ -666,5 +790,106 @@ mod tests {
     #[test]
     fn the_count_says_how_many_tracks_a_search_shows() {
         assert_eq!(count_label(3, 41), "3 of 41");
+    }
+
+    /// An item's subtitles, each embedded or external.
+    fn item_subtitles(external: &[bool]) -> MediaTracks {
+        MediaTracks {
+            subtitles: external
+                .iter()
+                .map(|&external| spoolframe_types::SubtitleTrack {
+                    language: Some("eng".into()),
+                    title: None,
+                    forced: false,
+                    default: false,
+                    external,
+                    role: spoolframe_types::SubtitleRole::default(),
+                    timing: None,
+                    download: None,
+                })
+                .collect(),
+            ..MediaTracks::default()
+        }
+    }
+
+    fn direct(subtitle: Option<(u32, SubtitleDelivery)>) -> PlaybackPlan {
+        PlaybackPlan::Direct {
+            container: spoolframe_types::Container::Matroska,
+            video: None,
+            audio: None,
+            subtitle: subtitle.map(|(index, delivery)| spoolframe_protocol::PlannedSubtitle {
+                index,
+                format: spoolframe_types::SubtitleFormat::Srt,
+                delivery,
+            }),
+            source_codec: None,
+        }
+    }
+
+    fn converted(index: u32, action: SubtitleAction) -> PlaybackPlan {
+        PlaybackPlan::Converted {
+            delivery: spoolframe_types::Delivery::Progressive,
+            container: spoolframe_types::Container::Matroska,
+            video: None,
+            audio: None,
+            subtitle: Some(spoolframe_protocol::ConvertedSubtitle { index, action }),
+            reasons: Vec::new(),
+            ladder: Vec::new(),
+            source_codec: None,
+        }
+    }
+
+    fn ids(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    /// Banshee S3E9: a searched subtitle (the item's third track, after
+    /// two embedded ones) joined GstPlay's streams between the embedded
+    /// ones. It is the plan's track wherever it lands, and the embedded
+    /// streams keep their order around it.
+    #[test]
+    fn a_direct_plays_file_and_its_subtitle_file_are_the_items_tracks() {
+        let tracks = item_subtitles(&[false, false, true]);
+        let plan = direct(Some((2, SubtitleDelivery::External)));
+        assert_eq!(
+            stream_tracks(&tracks, &plan, &ids(&["e0", "file", "e1"]), Some("file")),
+            [Some(0), Some(2), Some(1)]
+        );
+    }
+
+    /// An external track between embedded ones is not in the file: the
+    /// file's streams are the embedded tracks around it.
+    #[test]
+    fn an_external_track_takes_no_place_among_the_files_streams() {
+        let tracks = item_subtitles(&[false, true, false]);
+        let plan = direct(Some((0, SubtitleDelivery::Embedded)));
+        assert_eq!(
+            stream_tracks(&tracks, &plan, &ids(&["e0", "e1"]), None),
+            [Some(0), Some(2)]
+        );
+    }
+
+    #[test]
+    fn a_converted_outputs_one_subtitle_is_the_planned_track_unless_burned_in() {
+        let tracks = item_subtitles(&[false, false]);
+        let copied = converted(
+            1,
+            SubtitleAction::Copy {
+                format: spoolframe_types::SubtitleFormat::Srt,
+            },
+        );
+        let burned = converted(
+            1,
+            SubtitleAction::BurnIn {
+                format: spoolframe_types::SubtitleFormat::Pgs,
+            },
+        );
+        assert_eq!(
+            (
+                stream_tracks(&tracks, &copied, &ids(&["out"]), None),
+                stream_tracks(&tracks, &burned, &ids(&["out"]), None),
+            ),
+            (vec![Some(1)], vec![None])
+        );
     }
 }

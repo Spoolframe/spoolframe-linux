@@ -9,6 +9,19 @@
   GStreamer.
 </p>
 
+<p align="center">
+  <img src="docs/screenshots/library.png" alt="A movie library: six film posters in a grid, with the sidebar on the left">
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/details.png" alt="A film's page: backdrop, poster, year, runtime, rating, summary, and Play, Mark watched and Download buttons">
+</p>
+
+<p align="center">
+  <sub>The library is the Blender Foundation's open movies; see
+  <a href="docs/screenshots/CREDITS.md">the artwork credits</a>.</sub>
+</p>
+
 ## Building
 
 Every crate comes from crates.io, the Spoolframe SDK crates

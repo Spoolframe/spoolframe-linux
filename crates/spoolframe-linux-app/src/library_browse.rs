@@ -756,7 +756,7 @@ mod tests {
 
     #[test]
     fn each_key_words_its_directions() {
-        let worded: Vec<[&str; 2]> = SortKey::ALL.into_iter().map(directions).collect();
+        let worded: Vec<[&str; 2]> = SortKey::ALL.iter().copied().map(directions).collect();
         assert_eq!(
             worded,
             vec![
@@ -789,7 +789,7 @@ mod tests {
     #[test]
     fn a_release_date_sort_notes_where_undated_films_go() {
         assert_eq!(
-            sort_note(SortKey::Released, films(), &SortKey::ALL).as_deref(),
+            sort_note(SortKey::Released, films(), SortKey::ALL).as_deref(),
             Some("Films without a release date come last, either way.")
         );
     }
@@ -811,7 +811,7 @@ mod tests {
 
     #[test]
     fn a_library_with_every_key_has_no_note_by_title() {
-        assert_eq!(sort_note(SortKey::Title, films(), &SortKey::ALL), None);
+        assert_eq!(sort_note(SortKey::Title, films(), SortKey::ALL), None);
     }
 
     #[test]

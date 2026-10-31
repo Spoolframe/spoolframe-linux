@@ -52,6 +52,11 @@ struct Inner {
     flow: Flow,
     /// Turned off from the menu while it showed.
     hidden: bool,
+    /// Given mid-play: read from where playback is once shown.
+    mid_play: bool,
+    /// Shown mid-play: read again from where playback is once GstPlay
+    /// plays ([`ExternalSubtitle::playing`]).
+    reread: bool,
     /// The overlays that draw subtitles, to silence while it is hidden.
     overlays: Vec<glib::WeakRef<gst::Element>>,
 }
@@ -122,11 +127,14 @@ impl ExternalSubtitle {
     }
 
     /// The subtitle GstPlay is given now, by URI; `None` for none. Its
-    /// buffers are held again until [`Self::show`].
-    pub fn attach(&self, uri: Option<String>) {
+    /// buffers are held again until [`Self::show`]. `mid_play` when it
+    /// joins media already playing, rather than opening with it.
+    pub fn attach(&self, uri: Option<String>, mid_play: bool) {
         let held = {
             let mut inner = self.0.lock().unwrap();
             inner.uri = uri;
+            inner.mid_play = mid_play;
+            inner.reread = false;
             inner.stream = None;
             inner.sources.clear();
             inner.flow = Flow::Held;
@@ -174,6 +182,11 @@ impl ExternalSubtitle {
         }
     }
 
+    /// The subtitle's stream, once its source has started.
+    pub fn stream(&self) -> Option<String> {
+        self.0.lock().unwrap().stream.clone()
+    }
+
     /// Shows the subtitle once GstPlay knows of it, `info` being what it
     /// knows, and lets its buffers through: once for each pipeline that
     /// reads it, so a pick from the menu since stands. Whether it was
@@ -212,7 +225,22 @@ impl ExternalSubtitle {
             }
         }
         self.passing();
+        let mut inner = self.0.lock().unwrap();
+        inner.reread = std::mem::take(&mut inner.mid_play) && info.is_seekable();
         true
+    }
+
+    /// GstPlay plays again. A subtitle shown mid-play is read from where
+    /// playback is, once: GstPlay restarts for it and seeks the media
+    /// back before it is picked, and that seek does not reach it, so it
+    /// was read from its start. Its first, long past cues came, and none
+    /// after until the next seek (a retimed subtitle, Banshee S3E9 sixteen
+    /// minutes in).
+    pub fn playing(&self, play: &gst_play::Play) {
+        let reread = std::mem::take(&mut self.0.lock().unwrap().reread);
+        if reread && let Some(at) = play.position() {
+            play.seek(at);
+        }
     }
 
     /// Before GstPlay is told to show `stream` (`None`: none). Turned

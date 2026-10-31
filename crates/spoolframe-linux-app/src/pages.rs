@@ -20,7 +20,9 @@ const POSTER_LARGE: (i32, i32) = (220, 330);
 /// An episode's still in its row.
 const THUMB: (i32, i32) = (112, 63);
 const SQUARE: (i32, i32) = (300, 300);
-const BACKDROP_HEIGHT: i32 = 240;
+/// The hero's height across the page: an inch taller than the first 240,
+/// so a wide window crops less of a backdrop and its faces fit (PX-64).
+const BACKDROP_HEIGHT: i32 = 336;
 /// How far a page's poster reaches up into the backdrop.
 const POSTER_OVER_BACKDROP: i32 = 150;
 /// A cast member's round portrait.
@@ -206,7 +208,7 @@ pub fn playable(
     // How often it was played, or when it was last viewed (PX-52).
     if let Some(line) = facts
         .playback
-        .and_then(|p| crate::history::played_line(p, crate::history::now()))
+        .and_then(|p| crate::history::played_line(p, std::time::SystemTime::now()))
     {
         info.append(&label(&line, &["dim-label"]));
     }
@@ -278,7 +280,8 @@ pub fn playable(
         )
         .overflow(gtk::Overflow::Hidden)
         .build();
-    cards.art(
+    // A wide hero: cropped to keep the faces in it (PX-64).
+    cards.backdrop(
         &backdrop,
         facts.artwork,
         &[ArtworkKind::Background],
@@ -733,7 +736,7 @@ fn search_row(
             if let Some(download) = &download {
                 note.set_label(&crate::subtitle_search::download_note(
                     download,
-                    crate::subtitle_search::now(),
+                    std::time::SystemTime::now(),
                 ));
                 remove.set_visible(download.can_remove);
             }
@@ -1639,7 +1642,7 @@ pub fn album(
         .build();
     // Each track's row and number, to mark the one playing.
     let mut marked: Vec<(MediaId, adw::ActionRow, gtk::Label, String)> = Vec::new();
-    let now = crate::history::now();
+    let now = std::time::SystemTime::now();
     for (index, track) in tracks.iter().enumerate() {
         let Item::Track(t) = track else { continue };
         let row = adw::ActionRow::builder()

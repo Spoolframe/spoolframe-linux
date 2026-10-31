@@ -51,8 +51,7 @@ pub(super) struct Browsed {
     pub genres: Vec<String>,
     pub duration_ms: Option<u64>,
     pub watched: Option<WatchedState>,
-    /// Unix seconds.
-    pub last_played: Option<i64>,
+    pub last_played: Option<std::time::SystemTime>,
     pub facts: Facts,
 }
 
@@ -195,7 +194,10 @@ fn value(key: SortKey, item: &Browsed) -> Option<i64> {
     match key {
         SortKey::Released => item.facts.released.map(day),
         SortKey::Added => item.facts.added_at,
-        SortKey::LastPlayed => item.last_played,
+        SortKey::LastPlayed => item.last_played.map(|at| {
+            at.duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() as i64)
+        }),
         SortKey::Rating => item.facts.rating.map(i64::from),
         SortKey::AudienceRating => item.facts.audience_rating.map(i64::from),
         SortKey::Duration => item.duration_ms.and_then(|ms| i64::try_from(ms).ok()),

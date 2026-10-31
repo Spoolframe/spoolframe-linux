@@ -11,6 +11,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -57,9 +58,9 @@ pub struct Guest {
     /// The name of the server it was paired for. `None` when there was
     /// none, or it was paired before the SDK kept it.
     pub server: Option<String>,
-    /// When it was last paired onto this computer, Unix seconds. `None`
-    /// when it was paired before the SDK kept it.
-    pub paired_at: Option<u64>,
+    /// When it was last paired onto this computer. `None` when it was
+    /// paired before the SDK kept it.
+    pub paired_at: Option<SystemTime>,
 }
 
 impl Guest {
@@ -642,6 +643,7 @@ pub fn in_memory() -> Identities {
 mod tests {
     use super::*;
     use crate::testing::ready;
+    use std::time::{Duration, UNIX_EPOCH};
 
     use crate::testing::NoPrompt;
 
@@ -775,7 +777,7 @@ mod tests {
 
     fn pairing(
         server: Option<&str>,
-        paired_at: Option<u64>,
+        paired_at: Option<SystemTime>,
     ) -> spoolframe_client_sdk::GuestPairing {
         spoolframe_client_sdk::GuestPairing {
             id: PortableUserId::from_bytes([7; 32]).unwrap(),
@@ -795,10 +797,10 @@ mod tests {
             (
                 "paired with a server and date",
                 Some("Home Media"),
-                Some(1_790_000_000),
+                Some(UNIX_EPOCH + Duration::from_secs(1_790_000_000)),
                 None,
                 Some("Home Media"),
-                Some(1_790_000_000),
+                Some(UNIX_EPOCH + Duration::from_secs(1_790_000_000)),
             ),
             ("an older guest", None, None, Some("Carol"), None, None),
         ];

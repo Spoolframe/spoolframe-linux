@@ -14,6 +14,7 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use adw::prelude::*;
 use gtk::glib;
@@ -299,13 +300,16 @@ pub fn language_choices(searched: &[String]) -> Vec<String> {
 
 /// What the item page says of a downloaded track (PX-02): its site, who
 /// downloaded it and when, and whether it was made for this file.
-pub fn download_note(download: &SubtitleDownload, now: i64) -> String {
+pub fn download_note(download: &SubtitleDownload, now: SystemTime) -> String {
     let mut parts = vec![
         format!("From {}", SubtitleSource::name_of(&download.source)),
         format!(
             "downloaded by {} {}",
             download.by,
-            crate::reachability::ago(download.at.max(0) as u64, now.max(0) as u64)
+            crate::reachability::ago(
+                UNIX_EPOCH + Duration::from_secs(download.at.max(0) as u64),
+                now
+            )
         ),
     ];
     match (download.hash_match, download.origin) {
@@ -315,13 +319,6 @@ pub fn download_note(download: &SubtitleDownload, now: i64) -> String {
         (false, SubtitleOrigin::Human) => {}
     }
     parts.join(" · ")
-}
-
-/// Now, Unix seconds.
-pub fn now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64)
 }
 
 /// What the panel needs: whose item, and what to do with the track a
@@ -770,7 +767,6 @@ fn label(text: &str, classes: &[&str]) -> gtk::Label {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     fn result() -> SubtitleResult {
         SubtitleResult {
@@ -1066,7 +1062,7 @@ mod tests {
             can_remove: true,
         };
         assert_eq!(
-            download_note(&download, 3 * 86_400),
+            download_note(&download, UNIX_EPOCH + Duration::from_secs(3 * 86_400)),
             "From OpenSubtitles · downloaded by Alice 3 days ago · machine-translated"
         );
     }

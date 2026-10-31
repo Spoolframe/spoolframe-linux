@@ -508,6 +508,8 @@ pub enum Msg {
     LocalDownloadChanged(Box<LocalDownload>),
     /// A download was cancelled or deleted, by its key.
     LocalDownloadRemoved(String),
+    /// How many downloads run now, every profile's (the SDK's count).
+    DownloadsRunning(usize),
     /// "Download" on an item's page: what may be downloaded of it.
     OpenDownloadPicker(Box<Item>),
     StartDownload(MediaId, DownloadSource, DownloadTracks),
@@ -1046,13 +1048,7 @@ impl Component for App {
         library_column.append(&scroller);
         // The Filters pane at the right, as the boards have it: beside the
         // grid, which stays in view; over it in a narrow window.
-        let library_pane = adw::OverlaySplitView::builder()
-            .content(&library_column)
-            .sidebar_position(gtk::PackType::End)
-            .show_sidebar(false)
-            .min_sidebar_width(320.0)
-            .max_sidebar_width(320.0)
-            .build();
+        let library_pane = filters_pane(&library_column);
         let root_toolbar = views::toolbar(&header, &[banner.upcast_ref()], &library_pane);
         let root_page = adw::NavigationPage::builder()
             .title("Home")
@@ -2221,9 +2217,9 @@ impl Component for App {
                 }
                 self.show_item_downloads();
                 self.offer_downloads(had, &sender);
-                self.downloads_running();
             }
             Msg::ListDownloads => self.list_downloads(&sender),
+            Msg::DownloadsRunning(running) => self.downloads_running(running),
             Msg::LocalDownloadChanged(download) => {
                 self.download_event(DownloadEvent::Changed(*download), &sender)
             }
@@ -2540,6 +2536,9 @@ impl Component for App {
             Msg::MinimizePlayer => {
                 close_player(widgets);
                 self.refresh_home(&sender);
+                // A subtitle found while it played is the item's now; the
+                // page under the player read its tracks before.
+                self.redraw_item(&sender);
             }
             Msg::ExpandPlayer => {
                 let showing_player = widgets
@@ -2557,6 +2556,7 @@ impl Component for App {
             Msg::StopPlayback => {
                 self.stop_playback(widgets);
                 self.refresh_home(&sender);
+                self.redraw_item(&sender);
             }
             Msg::Enqueue(item, at) => {
                 let Some(session) = self.session.clone() else {
@@ -2805,9 +2805,7 @@ impl Component for App {
                     Rc::new(move || sender.input(Msg::OpenOfflineDownloads))
                 });
                 let unreachable = self.unreachable.as_ref().map(|(server, reach)| {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_or(0, |d| d.as_secs());
+                    let now = std::time::SystemTime::now();
                     start::Unreachable {
                         key: server.key.clone(),
                         name: server.name.clone(),
@@ -4120,6 +4118,16 @@ impl App {
     /// Hears this computer's downloads change (PX-38), for as long as the
     /// app runs; missed changes list them all again.
     fn watch_downloads(&self, sender: &ComponentSender<Self>) {
+        let mut running = self.client.downloads_running();
+        let counts = sender.clone();
+        glib::spawn_future_local(async move {
+            loop {
+                counts.input(Msg::DownloadsRunning(*running.borrow_and_update()));
+                if running.changed().await.is_err() {
+                    break;
+                }
+            }
+        });
         let mut events = self.client.download_events();
         let sender = sender.clone();
         glib::spawn_future_local(async move {
@@ -4173,9 +4181,7 @@ impl App {
         }
         self.shown_holder = Some(holder);
         // The last profile's rows go at once, not when the listing comes:
-        // until then they could still be played. The running count is
-        // left as it is: it is of the profile shown, and the last one's
-        // downloads run on.
+        // until then they could still be played.
         self.downloads.clear();
         if let Some(page) = &self.downloads_page {
             page.fill(&self.downloads);
@@ -4221,14 +4227,14 @@ impl App {
         }
         self.show_item_downloads();
         self.offer_downloads(had, sender);
-        self.downloads_running();
     }
 
-    /// Closing follows how many downloads run. Once none does, the app
+    /// Closing follows how many downloads run, every profile's: the
+    /// SDK goes on with a profile's downloads after another is shown, and
+    /// quitting would stop them. Once none does, the app
     /// kept in the background for them lets go, and a hidden window
     /// closes, which quits as closing it would have.
-    fn downloads_running(&mut self) {
-        let running = spoolframe_linux_core::downloads::running(&self.downloads);
+    fn downloads_running(&mut self, running: usize) {
         if !self.closing.borrow_mut().downloads(running) {
             return;
         }
@@ -5546,6 +5552,21 @@ fn refresh_for(read: &catalog::Read, shown: &Shown) -> Option<Refresh> {
     }
 }
 
+/// The Filters pane at the right of `content`, as the boards have it:
+/// beside the grid, which stays in view; over it in a narrow window.
+fn filters_pane(content: &impl IsA<gtk::Widget>) -> adw::OverlaySplitView {
+    adw::OverlaySplitView::builder()
+        .content(content)
+        .sidebar_position(gtk::PackType::End)
+        .show_sidebar(false)
+        // Pinned: only Filters shows it. Unpinned, libadwaita shows it
+        // whenever the window widens past the breakpoint, empty on Home.
+        .pin_sidebar(true)
+        .min_sidebar_width(320.0)
+        .max_sidebar_width(320.0)
+        .build()
+}
+
 /// What an episode's or movie's page reads: the item, and an episode's
 /// show for its title.
 fn reads_of_playable(item: &Item) -> Vec<MediaId> {
@@ -6539,6 +6560,20 @@ mod tests {
             limit: 200,
         };
         assert_eq!(refresh_for(&read, &shown), None);
+    }
+
+    /// Started in a quarter of an ultrawide, where the pane collapses,
+    /// then moved to a wider screen: libadwaita shows a split view's
+    /// sidebar when it stops being collapsed, and the empty Filters pane
+    /// took the right of Home. Only Filters shows it.
+    #[test]
+    #[ignore = "needs a display"]
+    fn widening_the_window_does_not_open_the_filters_pane() {
+        gtk::init().unwrap();
+        let pane = filters_pane(&gtk::Box::new(gtk::Orientation::Vertical, 0));
+        pane.set_collapsed(true);
+        pane.set_collapsed(false);
+        assert!(!pane.shows_sidebar());
     }
 
     #[test]

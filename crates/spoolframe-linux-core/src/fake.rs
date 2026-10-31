@@ -10,7 +10,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use spoolframe_policy::{
     plays::{self, PlayKind, PlayProgress},
@@ -117,8 +117,8 @@ struct FakePasskey {
     username: String,
     credential_id: Vec<u8>,
     name: String,
-    created_at: i64,
-    last_used_at: Option<i64>,
+    created_at: SystemTime,
+    last_used_at: Option<SystemTime>,
     /// The relying party it was made for: Home Media's own, the old
     /// shared `spoolframe.app`, or the web UI's host.
     rp_id: String,
@@ -626,11 +626,11 @@ struct WatchState {
     /// until their progress next changes.
     hidden: std::collections::HashSet<MediaId>,
     /// Each item's counted plays (PX-52): how many, and when the latest
-    /// was counted, Unix seconds.
-    plays: HashMap<MediaId, (u32, i64)>,
-    /// When each item was last viewed, Unix seconds: its last progress
+    /// was counted.
+    plays: HashMap<MediaId, (u32, SystemTime)>,
+    /// When each item was last viewed: its last progress
     /// report or mark as watched or unwatched.
-    viewed: HashMap<MediaId, i64>,
+    viewed: HashMap<MediaId, SystemTime>,
 }
 
 impl WatchState {
@@ -654,7 +654,7 @@ impl WatchState {
     }
 
     /// A counted play of `id`, at `at`.
-    fn played(&mut self, id: &MediaId, at: i64) {
+    fn played(&mut self, id: &MediaId, at: SystemTime) {
         let plays = self.plays.entry(id.clone()).or_insert((0, at));
         *plays = (plays.0 + 1, at);
     }
@@ -795,7 +795,7 @@ impl Default for SignIns {
         let request = DeviceSignInRequest {
             device_name: Some("Living Room Apple TV".into()),
             client_name: "spoolframe-tvos".into(),
-            requested_at: unix_now() - 30,
+            requested_at: unix_now() - Duration::from_secs(30),
             platform: Platform::Tvos,
             // It asks to be remembered, so the approver's box shows ticked.
             remember: true,
@@ -833,10 +833,13 @@ pub const FAKE_OWN_SIGN_IN_CODE: &str = "ZZZZZZZZ";
 /// Wrong codes in a row before lookups are refused for a while.
 const WRONG_CODES: u32 = 5;
 
-fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64)
+fn unix_now() -> SystemTime {
+    SystemTime::now()
+}
+
+/// `secs` after the Unix epoch.
+fn unix(secs: u64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_secs(secs)
 }
 
 /// One user's PIN, as the fake server keeps it (P2-08).
@@ -1009,7 +1012,7 @@ impl FakeSession {
             }
             // Played and viewed, from other devices (PX-52): Severance's
             // watched episodes once each, Low Tide's tracks a few times.
-            let days_ago = |days: i64| unix_now() - days * 86_400;
+            let days_ago = |days: u64| unix_now() - Duration::from_secs(days * 86_400);
             for (key, days) in [("22", 9), ("23", 8), ("24", 3)] {
                 let id = media(MediaKind::Episode, key);
                 watch.played(&id, days_ago(days));
@@ -1965,6 +1968,7 @@ impl Session for FakeSession {
                 chosen,
                 epoch: 0,
                 markers: self.serving.markers.clone(),
+                duration: length_of(item),
             })
         })
     }
@@ -2198,7 +2202,7 @@ impl Session for FakeSession {
                 _ => {}
             }
             Ok(Previews {
-                interval_ms: 1000,
+                interval: Duration::from_secs(1),
                 tile_width: 64,
                 tile_height: 36,
                 columns: 2,
@@ -2947,7 +2951,7 @@ impl Session for FakeSession {
         Box::pin(async move {
             self.guard()?;
             let watch = self.watch();
-            let mut played: Vec<(&MediaId, i64)> =
+            let mut played: Vec<(&MediaId, SystemTime)> =
                 watch.plays.iter().map(|(id, (_, at))| (id, *at)).collect();
             // Newest first; plays at the same second by id, so a test
             // knows the order.
@@ -3414,7 +3418,7 @@ impl Session for FakeSession {
                 username: self.username.clone(),
                 credential_id: made.credential_id,
                 name,
-                created_at: 1_791_000_000,
+                created_at: unix(1_791_000_000),
                 last_used_at: None,
                 rp_id: fake_server_id().rp_id(),
             });
@@ -3483,10 +3487,10 @@ impl Session for FakeSession {
             let pin = self.pin_state();
             let auth = self.lock_passkeys();
             let here = auth.trusted.get(&self.username).copied();
-            let device = |id: &str, name: &str, ago: i64| DeviceInfo {
+            let device = |id: &str, name: &str, ago: u64| DeviceInfo {
                 endpoint_id: id.to_owned(),
                 name: Some(name.to_owned()),
-                last_seen_at: 1_790_000_000 - ago,
+                last_seen_at: unix(1_790_000_000 - ago),
                 pin_required: pin.required.contains(id),
                 trusted: if id == THIS_DEVICE {
                     here.is_some()
@@ -3746,7 +3750,7 @@ impl FakeSession {
         Some(PlaylistNext {
             entry,
             item: self.with_state(found, &self.watch()),
-            markers: self.serving.markers.clone(),
+            markers: self.serving.markers.clone().into(),
             liked: self.lock_playlists().liked(&self.username).contains(item),
         })
     }
@@ -3978,15 +3982,15 @@ impl FakeClient {
                         username: "andrey".into(),
                         credential_id: vec![1, 2, 3, 4],
                         name: "Firefox on nimble".into(),
-                        created_at: 1_790_000_000,
-                        last_used_at: Some(1_790_500_000),
+                        created_at: unix(1_790_000_000),
+                        last_used_at: Some(unix(1_790_500_000)),
                         rp_id: "media.example.org".into(),
                     },
                     FakePasskey {
                         username: "andrey".into(),
                         credential_id: vec![5, 6, 7, 8],
                         name: "Old YubiKey".into(),
-                        created_at: 1_789_000_000,
+                        created_at: unix(1_789_000_000),
                         last_used_at: None,
                         rp_id: spoolframe_protocol::LEGACY_APP_RP_ID.into(),
                     },
@@ -4842,7 +4846,7 @@ impl Client for FakeClient {
                 .cloned()
                 .ok_or_else(|| BackendError::NotFound(key.0.clone()))?;
             let gone = self.gone.load(std::sync::atomic::Ordering::SeqCst);
-            let now = unix_now() as u64;
+            let now = unix_now();
             Ok(Reachability {
                 endpoint_id: server.key.0.clone(),
                 name: Some(server.name.clone()),
@@ -4853,7 +4857,7 @@ impl Client for FakeClient {
                     .map(|addr| SavedAddr {
                         addr: addr.clone(),
                         reached: !gone,
-                        last_seen: now - 3600,
+                        last_seen: now - Duration::from_secs(3600),
                     })
                     .collect(),
                 advertised_addrs: server.advertised.clone(),
@@ -4873,8 +4877,8 @@ impl Client for FakeClient {
                 lookups: vec!["mdns".into()],
                 lookup_results: Vec::new(),
                 last_dial: Some(DialReport {
-                    at: now - 10,
-                    took_ms: if gone { 10_000 } else { 40 },
+                    at: now - Duration::from_secs(10),
+                    took: Duration::from_millis(if gone { 10_000 } else { 40 }),
                     connected: !gone,
                     stage: gone.then_some(DialStage::Timeout),
                     error: gone.then(|| "timed out".to_owned()),
@@ -4889,7 +4893,9 @@ impl Client for FakeClient {
                         })
                         .collect(),
                 }),
-                last_connected_at: Some(now - if gone { 3 * 24 * 3600 } else { 10 }),
+                last_connected_at: Some(
+                    now - Duration::from_secs(if gone { 3 * 24 * 3600 } else { 10 }),
+                ),
                 live: Vec::new(),
             })
         })
@@ -5235,7 +5241,7 @@ impl Client for FakeClient {
                     .iter_mut()
                     .find(|k| k.usable() && k.credential_id == signed.credential_id)
                     .ok_or(BackendError::WrongCredentials)?;
-                key.last_used_at = Some(1_791_000_000);
+                key.last_used_at = Some(unix(1_791_000_000));
                 let username = key.username.clone();
                 passkeys.by_passkey.insert(username.clone());
                 username
@@ -5427,6 +5433,10 @@ impl Client for FakeClient {
 
     fn download_events(&self) -> tokio::sync::broadcast::Receiver<DownloadEvent> {
         self.lock_downloads().subscribe()
+    }
+
+    fn downloads_running(&self) -> tokio::sync::watch::Receiver<usize> {
+        self.lock_downloads().watch_running()
     }
 
     fn libraries_events(
@@ -8537,7 +8547,7 @@ mod subtitle_sync_tests {
                 SubtitleTiming {
                     offset_ms: -1500,
                     offset_by: Some("Andrey".into()),
-                    offset_at: Some(subtitles::OFFSET_SET_AT),
+                    offset_at: Some(subtitles::offset_set_at()),
                     ..original()
                 },
                 Some((0, timing))

@@ -149,7 +149,7 @@ pub fn page(playback: &Rc<Playback>, actions: Actions) -> adw::NavigationPage {
         error,
         offer,
         undo,
-        tracks_built: Cell::new(None),
+        tracks_built: RefCell::new(None),
     });
     {
         let view = Rc::downgrade(&view);
@@ -273,8 +273,8 @@ struct View {
     /// Skip Intro, Skip Credits or Next Episode (P2-10).
     offer: gtk::Button,
     undo: UndoSkip,
-    /// The audio and subtitle stream counts the menu was built for.
-    tracks_built: Cell<Option<(usize, usize)>>,
+    /// The streams the menu was built for ([`crate::tracks::stream_ids`]).
+    tracks_built: RefCell<Option<Vec<String>>>,
 }
 
 impl View {
@@ -349,18 +349,20 @@ impl View {
             .detail
             .set_label(detail.as_deref().unwrap_or_default());
         self.top.detail.set_visible(detail.is_some());
-        self.tracks_built.set(None);
+        self.tracks_built.replace(None);
     }
 
     fn media_info(&self, playback: &Playback, info: &gst_play::PlayMediaInfo) {
         self.diagnostics.show_plan(playback.plan().as_ref());
         self.diagnostics.show_media(info);
         // GstPlay updates the media info as streams turn up; the menu is
-        // built again whenever the stream lists change.
-        let counts = (info.audio_streams().len(), info.subtitle_streams().len());
-        if counts == (0, 0) || self.tracks_built.replace(Some(counts)) == Some(counts) {
+        // built again whenever the streams change, not only their number:
+        // a subtitle file joining is a new collection of as many streams.
+        let ids = crate::tracks::stream_ids(info);
+        if ids.is_empty() || self.tracks_built.borrow().as_ref() == Some(&ids) {
             return;
         }
+        self.tracks_built.replace(Some(ids));
         self.controls
             .tracks
             .set_popover(Some(&playback.track_menu(info)));

@@ -7,7 +7,7 @@
 
 use std::cell::Cell;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use gtk::glib;
 use gtk::prelude::*;
@@ -89,13 +89,10 @@ pub fn stepped(ms: i64, steps: i64) -> i64 {
 }
 
 /// Who set the offset and when, where someone has.
-pub fn offset_by_line(timing: &SubtitleTiming, now: i64) -> Option<String> {
+pub fn offset_by_line(timing: &SubtitleTiming, now: SystemTime) -> Option<String> {
     let by = timing.offset_by.as_deref()?;
     Some(match timing.offset_at {
-        Some(at) => format!(
-            "Set by {by} {}",
-            crate::reachability::ago(at.max(0) as u64, now.max(0) as u64)
-        ),
+        Some(at) => format!("Set by {by} {}", crate::reachability::ago(at, now)),
         None => format!("Set by {by}"),
     })
 }
@@ -221,7 +218,7 @@ pub fn section(menu: TimingMenu) -> (gtk::Box, Rc<dyn Fn()>) {
             state.set_label(&line.unwrap_or_default());
             pending.set(timing.offset_ms);
             shown.set_label(&offset_label(timing.offset_ms));
-            let set_by = offset_by_line(&timing, crate::subtitle_search::now());
+            let set_by = offset_by_line(&timing, SystemTime::now());
             by.set_visible(set_by.is_some());
             by.set_label(&set_by.unwrap_or_default());
             match sync_button(&timing.sync) {
@@ -384,13 +381,16 @@ mod tests {
     fn who_set_the_offset_is_said_with_when() {
         let set = SubtitleTiming {
             offset_by: Some("Alice".into()),
-            offset_at: Some(0),
+            offset_at: Some(SystemTime::UNIX_EPOCH),
             ..timing(SubtitleSync::Original, 500)
         };
         assert_eq!(
             [
-                offset_by_line(&set, 300),
-                offset_by_line(&timing(SubtitleSync::Original, 0), 300)
+                offset_by_line(&set, SystemTime::UNIX_EPOCH + Duration::from_secs(300)),
+                offset_by_line(
+                    &timing(SubtitleSync::Original, 0),
+                    SystemTime::UNIX_EPOCH + Duration::from_secs(300)
+                )
             ],
             [Some("Set by Alice 5 minutes ago".to_owned()), None]
         );

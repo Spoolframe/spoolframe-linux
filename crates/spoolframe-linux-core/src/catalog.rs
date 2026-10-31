@@ -592,6 +592,18 @@ impl Session for CachedSession {
         self.inner.artwork(id, size)
     }
 
+    fn backdrop<'a>(
+        &'a self,
+        id: &'a ArtworkId,
+        size: ArtworkSize,
+    ) -> BoxFuture<'a, Result<crate::backend::Backdrop, BackendError>> {
+        self.inner.backdrop(id, size)
+    }
+
+    fn smart_crop(&self) -> bool {
+        self.inner.smart_crop()
+    }
+
     fn update_progress<'a>(
         &'a self,
         handle: &'a PlaybackHandle,

@@ -309,9 +309,10 @@ mod imp {
                     );
                     return Err(gst::FlowError::Error);
                 }
-                Err(ReadError::Backend(spoolframe_client_sdk::SdkError::PlaybackRestarted {
-                    ..
-                })) => {
+                Err(ReadError::Backend(
+                    spoolframe_client_sdk::SdkError::PlaybackRestarted { .. }
+                    | spoolframe_client_sdk::SdkError::Replanned,
+                )) => {
                     gst::element_imp_error!(
                         self,
                         gst::ResourceError::Read,

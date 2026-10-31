@@ -203,11 +203,11 @@ pub fn status(download: &LocalDownload) -> Status {
 /// the server has not heard yet says so: it goes at the next sync.
 pub fn watch_line(download: &LocalDownload) -> Option<String> {
     let watch = &download.watch;
-    let line = match (watch.watched, watch.position_ms) {
+    let line = match (watch.watched, watch.position) {
         (Some(true), _) => "Watched".to_owned(),
-        (_, Some(ms)) if ms > 0 => {
+        (_, Some(position)) if !position.is_zero() => {
             let length = crate::views::Facts::of(&download.item).length?;
-            format::remaining(length, Duration::from_millis(ms))
+            format::remaining(length, position)
         }
         _ => return None,
     };
@@ -222,7 +222,7 @@ pub fn watch_line(download: &LocalDownload) -> Option<String> {
 pub fn resume_point(watch: &LocalWatch) -> Option<Duration> {
     match watch.watched {
         Some(true) => None,
-        _ => watch.position_ms.map(Duration::from_millis),
+        _ => watch.position,
     }
 }
 
@@ -261,10 +261,10 @@ pub fn pending_line(downloads: &[LocalDownload]) -> Option<String> {
         .filter(|d| d.watch.pending)
         .map(|d| {
             let name = title(d);
-            match (d.watch.watched, d.watch.position_ms) {
+            match (d.watch.watched, d.watch.position) {
                 (Some(true), _) => format!("{name} watched"),
-                (_, Some(ms)) => {
-                    format!("{name} at {}", format::timestamp(Duration::from_millis(ms)))
+                (_, Some(position)) => {
+                    format!("{name} at {}", format::timestamp(position))
                 }
                 _ => format!("{name} not watched"),
             }
@@ -1409,6 +1409,7 @@ fn poster(download: &LocalDownload) -> gtk::Widget {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::UNIX_EPOCH;
 
     use spoolframe_linux_core::backend::{DownloadTracks, Session};
     use spoolframe_linux_core::fake::FakeClient;
@@ -1743,11 +1744,11 @@ mod tests {
         );
     }
 
-    fn watched(position_ms: Option<u64>, watched: Option<bool>, pending: bool) -> LocalWatch {
+    fn watched(position: Option<Duration>, watched: Option<bool>, pending: bool) -> LocalWatch {
         LocalWatch {
-            position_ms,
+            position,
             watched,
-            at: 0,
+            at: UNIX_EPOCH,
             pending,
         }
     }
@@ -1761,7 +1762,11 @@ mod tests {
 
     #[test]
     fn a_download_started_says_how_much_is_left() {
-        let download = done_with(watched(Some(10 * 60 * 1000), None, false));
+        let download = done_with(watched(
+            Some(Duration::from_millis(10 * 60 * 1000)),
+            None,
+            false,
+        ));
         let length = crate::views::Facts::of(&download.item).length.unwrap();
         assert_eq!(
             watch_line(&download),
@@ -1796,7 +1801,7 @@ mod tests {
     fn its_own_play_resumes_where_it_stopped_and_starts_over_once_watched() {
         assert_eq!(
             (
-                resume_point(&watched(Some(5_000), None, true)),
+                resume_point(&watched(Some(Duration::from_millis(5_000)), None, true)),
                 resume_point(&watched(None, Some(true), false))
             ),
             (Some(Duration::from_secs(5)), None)
@@ -1808,9 +1813,18 @@ mod tests {
         let asked = Some(Duration::from_secs(60));
         assert_eq!(
             (
-                start_from(&watched(Some(90_000), None, true), asked),
-                start_from(&watched(Some(90_000), None, false), asked),
-                start_from(&watched(Some(90_000), None, true), None)
+                start_from(
+                    &watched(Some(Duration::from_millis(90_000)), None, true),
+                    asked
+                ),
+                start_from(
+                    &watched(Some(Duration::from_millis(90_000)), None, false),
+                    asked
+                ),
+                start_from(
+                    &watched(Some(Duration::from_millis(90_000)), None, true),
+                    None
+                )
             ),
             (Some(Duration::from_secs(90)), asked, None)
         );
@@ -1844,7 +1858,7 @@ mod tests {
     #[test]
     fn what_waits_for_the_server_is_named() {
         let alien = done_with(watched(None, Some(true), true));
-        let heat = done_with(watched(Some(4_360_000), None, true));
+        let heat = done_with(watched(Some(Duration::from_millis(4_360_000)), None, true));
         let name = title(&alien);
         assert_eq!(
             pending_line(&[alien, heat]),
@@ -1916,7 +1930,7 @@ mod tests {
         let listed: Vec<LocalDownload> = ready(client.downloads())
             .into_iter()
             .map(|d| LocalDownload {
-                created_at: d.created_at + i64::from(d.key == mobile.key),
+                created_at: d.created_at + Duration::from_secs(u64::from(d.key == mobile.key)),
                 ..d
             })
             .collect();

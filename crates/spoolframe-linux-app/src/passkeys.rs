@@ -10,6 +10,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use adw::prelude::*;
 use gtk::glib;
@@ -30,7 +31,7 @@ pub struct Needs {
 const FIRST_NAME: &str = "Security key";
 
 /// "Made on the web · created 20 Aug · last used 3 weeks ago".
-pub fn passkey_line(passkey: &PasskeyInfo, created: &str, now: i64) -> String {
+pub fn passkey_line(passkey: &PasskeyInfo, created: &str, now: SystemTime) -> String {
     let kind = match (passkey.app, passkey.usable_here) {
         (true, true) => "Spoolframe app".to_owned(),
         // Made for spoolframe.app before each server had its own relying
@@ -46,8 +47,8 @@ pub fn passkey_line(passkey: &PasskeyInfo, created: &str, now: i64) -> String {
 }
 
 /// "today", "yesterday", "3 days ago", "3 weeks ago", "4 months ago".
-pub fn ago(at: i64, now: i64) -> String {
-    match (now - at).max(0) / 86_400 {
+pub fn ago(at: SystemTime, now: SystemTime) -> String {
+    match now.duration_since(at).map_or(0, |d| d.as_secs()) / 86_400 {
         0 => "today".to_owned(),
         1 => "yesterday".to_owned(),
         days @ 2..=13 => format!("{days} days ago"),
@@ -57,8 +58,11 @@ pub fn ago(at: i64, now: i64) -> String {
 }
 
 /// "12 Sep", in the local time zone.
-fn day(at: i64) -> String {
-    glib::DateTime::from_unix_local(at)
+fn day(at: SystemTime) -> String {
+    let secs = at
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    glib::DateTime::from_unix_local(secs)
         .and_then(|d| d.format("%-d %b"))
         .map(|s| s.to_string())
         .unwrap_or_default()
@@ -151,7 +155,7 @@ impl View {
         for row in self.rows.take() {
             self.group.remove(&row);
         }
-        let now = crate::invite::unix_now();
+        let now = SystemTime::now();
         let mut rows = Vec::new();
         if passkeys.is_empty() {
             let row = adw::ActionRow::builder()
@@ -783,11 +787,11 @@ impl Adding {
 mod tests {
     use super::*;
 
-    fn passkey(app: bool, last_used_at: Option<i64>) -> PasskeyInfo {
+    fn passkey(app: bool, last_used_at: Option<SystemTime>) -> PasskeyInfo {
         PasskeyInfo {
             id: "AQID".into(),
             name: "YubiKey 5C".into(),
-            created_at: 0,
+            created_at: UNIX_EPOCH,
             last_used_at,
             rp_id: if app {
                 "homemediaserver2.spoolframe.app".into()
@@ -801,16 +805,17 @@ mod tests {
 
     #[test]
     fn a_passkey_says_where_it_was_made_and_when_it_was_used() {
+        let at = |secs: u64| UNIX_EPOCH + std::time::Duration::from_secs(secs);
         let day = 86_400;
         let cases = [
             (
                 "web, used",
-                passkey_line(&passkey(false, Some(0)), "20 Aug", 21 * day),
+                passkey_line(&passkey(false, Some(at(0))), "20 Aug", at(21 * day)),
                 "Made on the web at media.example.org · created 20 Aug · last used 3 weeks ago",
             ),
             (
                 "app, never used",
-                passkey_line(&passkey(true, None), "12 Sep", 0),
+                passkey_line(&passkey(true, None), "12 Sep", at(0)),
                 "Spoolframe app · created 12 Sep · never used",
             ),
         ];
@@ -823,7 +828,7 @@ mod tests {
             usable_here: false,
             ..passkey(true, None)
         };
-        let line = passkey_line(&old, "2 Oct", 0);
+        let line = passkey_line(&old, "2 Oct", at(0));
         assert!(
             line.starts_with("Old: add again"),
             "old app passkey: {line}"

@@ -89,6 +89,19 @@ impl Cards {
             art.show(tile, artwork, kinds, size);
         }
     }
+
+    /// [`Self::art`] for a wide hero, cropped to keep its faces (PX-64).
+    pub fn backdrop(
+        &self,
+        tile: &gtk::Overlay,
+        artwork: &[Artwork],
+        kinds: &[ArtworkKind],
+        size: ArtworkSize,
+    ) {
+        if let Some(art) = &self.art {
+            art.show_backdrop(tile, artwork, kinds, size);
+        }
+    }
 }
 
 /// The hues a placeholder tile can take; see `.tile-*` in style.css.

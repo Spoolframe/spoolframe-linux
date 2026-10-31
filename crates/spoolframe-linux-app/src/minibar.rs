@@ -51,8 +51,8 @@ pub struct MiniBar {
     /// Video ends here; music has none on the board, and Queue in its place.
     stop: gtk::Button,
     queue: gtk::Button,
-    /// The audio and subtitle stream counts the menu was built for.
-    tracks_built: Cell<Option<(usize, usize)>>,
+    /// The streams the menu was built for ([`crate::tracks::stream_ids`]).
+    tracks_built: RefCell<Option<Vec<String>>>,
     current: Current,
     /// Draws a music cover; set on attach.
     art: RefCell<Option<Rc<crate::artwork::Art>>>,
@@ -272,7 +272,7 @@ impl MiniBar {
             bar,
             stop: stop_button,
             queue: queue_button,
-            tracks_built: Cell::new(None),
+            tracks_built: RefCell::new(None),
             current,
             art: RefCell::new(None),
             cover_album: RefCell::new(None),
@@ -339,7 +339,7 @@ impl MiniBar {
             self.bar.add_css_class("music");
         }
         self.tracks.set_popover(None::<&gtk::Popover>);
-        self.tracks_built.set(None);
+        self.tracks_built.replace(None);
         let music = (!video).then(|| Transport::new(playback, false));
         self.music_slot.set_child(music.as_ref().map(|t| &t.row));
         self.music.replace(music);
@@ -475,8 +475,9 @@ impl MiniBar {
             }
             Change::Volume(_) | Change::Muted(_) => self.volume.show(change),
             Change::MediaInfo(info) if playback.is_video() => {
-                let counts = (info.audio_streams().len(), info.subtitle_streams().len());
-                if counts != (0, 0) && self.tracks_built.replace(Some(counts)) != Some(counts) {
+                let ids = crate::tracks::stream_ids(info);
+                if !ids.is_empty() && self.tracks_built.borrow().as_ref() != Some(&ids) {
+                    self.tracks_built.replace(Some(ids));
                     self.tracks.set_popover(Some(&playback.track_menu(info)));
                 }
             }

@@ -1212,6 +1212,10 @@ impl Client for SdkClient {
     fn download_events(&self) -> tokio::sync::broadcast::Receiver<DownloadEvent> {
         self.client.download_events()
     }
+
+    fn downloads_running(&self) -> tokio::sync::watch::Receiver<usize> {
+        self.client.downloads().watch_running()
+    }
 }
 
 pub struct SdkSession {
@@ -1506,6 +1510,19 @@ impl Session for SdkSession {
     ) -> BoxFuture<'a, Result<Vec<u8>, BackendError>> {
         let id = id.clone();
         Box::pin(self.call(move |s| async move { s.artwork(&id, size).await }))
+    }
+
+    fn backdrop<'a>(
+        &'a self,
+        id: &'a ArtworkId,
+        size: ArtworkSize,
+    ) -> BoxFuture<'a, Result<crate::backend::Backdrop, BackendError>> {
+        let id = id.clone();
+        Box::pin(self.call(move |s| async move { s.backdrop(&id, size).await }))
+    }
+
+    fn smart_crop(&self) -> bool {
+        self.session.experimental().smart_crop
     }
 
     fn web_url(&self) -> Option<String> {

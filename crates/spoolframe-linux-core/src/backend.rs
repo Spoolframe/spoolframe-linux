@@ -14,12 +14,13 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+pub use spoolframe_client_sdk::Backdrop;
 pub use spoolframe_protocol::{
     AddressNetwork, DeviceAddress, TrackPreferencesInfo, TrustedProfile,
 };
 pub use spoolframe_protocol::{
-    ArtworkSize, ChosenTracks, DeviceInfo, DeviceSignInRequest, HomeScreen, PlaybackHandle,
-    PlaybackPlan, Selection, TrackReason,
+    ArtworkFace, ArtworkSize, ChosenTracks, DeviceInfo, DeviceSignInRequest, HomeScreen,
+    PlaybackHandle, PlaybackPlan, Selection, TrackReason,
 };
 pub use spoolframe_protocol::{
     FinishPasskeyRegistration, FinishPasskeySignIn, PasskeyCreation, PasskeyInfo, PasskeyRequest,
@@ -1048,6 +1049,11 @@ pub trait Client: Send + Sync {
     /// they are not seen: list the downloads first.
     fn download_events(&self) -> tokio::sync::broadcast::Receiver<DownloadEvent>;
 
+    /// How many downloads are under way (preparing or transferring), every
+    /// profile's and not only the one shown: what quitting would stop. Now,
+    /// and on each change.
+    fn downloads_running(&self) -> tokio::sync::watch::Receiver<usize>;
+
     /// A server's libraries changed (P8-02): a paired server came online
     /// or went offline, or shared or stopped sharing a library. List them
     /// again ([`Session::libraries`]).
@@ -1240,6 +1246,29 @@ pub trait Session: Send + Sync {
         id: &'a ArtworkId,
         size: ArtworkSize,
     ) -> BoxFuture<'a, Result<Vec<u8>, BackendError>>;
+
+    /// A backdrop, and where the faces in it are (PX-64, experimental
+    /// smart crop): `None` until the server has looked, or on a server
+    /// without [`Session::smart_crop`]. A session that does not know
+    /// faces answers with the image alone.
+    fn backdrop<'a>(
+        &'a self,
+        id: &'a ArtworkId,
+        size: ArtworkSize,
+    ) -> BoxFuture<'a, Result<Backdrop, BackendError>> {
+        Box::pin(async move {
+            Ok(Backdrop {
+                bytes: self.artwork(id, size).await?,
+                faces: None,
+            })
+        })
+    }
+
+    /// Whether the server turned smart crop (PX-64) on for this session:
+    /// whether a backdrop with no faces yet may have them later.
+    fn smart_crop(&self) -> bool {
+        false
+    }
 
     fn update_progress<'a>(
         &'a self,

@@ -4,7 +4,7 @@
 
 use spoolframe_types::MediaTracks;
 
-use crate::backend::{DownloadPhase, LocalDownload, Selection};
+use crate::backend::{LocalDownload, Selection};
 
 /// The tracks in `download`'s file, as the player and the track menus
 /// should list them: the download's `tracks` cut down to what the file
@@ -78,28 +78,12 @@ fn pick<T: Clone>(all: &[T], places: &[u32]) -> Vec<T> {
         .collect()
 }
 
-/// How many downloads the SDK is still moving: what closing the window
-/// names when it asks.
-pub fn running(downloads: &[LocalDownload]) -> usize {
-    downloads
-        .iter()
-        .filter(|d| {
-            matches!(
-                d.phase,
-                DownloadPhase::Preparing { .. } | DownloadPhase::Transferring
-            )
-        })
-        .count()
-}
-
 #[cfg(test)]
 mod tests {
     use spoolframe_types::{MediaId, MediaKind, Namespace};
 
     use super::*;
-    use crate::backend::{
-        DownloadFailure, DownloadFile, DownloadSource, DownloadState, DownloadTracks, FileTracks,
-    };
+    use crate::backend::{DownloadFile, DownloadSource, DownloadTracks, FileTracks};
     use crate::fake::FakeClient;
     use crate::testing::andrey;
     use crate::testing::ready;
@@ -224,45 +208,5 @@ mod tests {
             subtitles: Vec::new(),
         });
         assert_eq!(file_tracks(&download).video, download.tracks.video);
-    }
-
-    fn in_phase(phase: DownloadPhase) -> LocalDownload {
-        LocalDownload {
-            phase,
-            ..started(DownloadTracks::All)
-        }
-    }
-
-    /// Preparing on the server and coming to this device run; paused,
-    /// failed and done do not.
-    #[test]
-    fn each_phase_runs_or_not() {
-        let phases = [
-            DownloadPhase::Preparing {
-                server: DownloadState::Waiting,
-            },
-            DownloadPhase::Transferring,
-            DownloadPhase::Paused,
-            DownloadPhase::Failed {
-                reason: "gone".into(),
-                cause: DownloadFailure::SourceMissing,
-            },
-            DownloadPhase::Done,
-        ];
-        assert_eq!(phases.map(|p| running(&[in_phase(p)])), [1, 1, 0, 0, 0]);
-        assert_eq!(running(&[]), 0);
-    }
-
-    #[test]
-    fn only_the_downloads_under_way_are_counted() {
-        let list = [
-            in_phase(DownloadPhase::Done),
-            in_phase(DownloadPhase::Transferring),
-            in_phase(DownloadPhase::Paused),
-            in_phase(DownloadPhase::Preparing {
-                server: DownloadState::Waiting,
-            }),
-        ];
-        assert_eq!(running(&list), 2);
     }
 }

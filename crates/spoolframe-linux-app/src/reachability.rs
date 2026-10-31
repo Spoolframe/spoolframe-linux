@@ -4,13 +4,19 @@
 //! Try again does, through the app.
 
 use std::rc::Rc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use adw::prelude::*;
 use spoolframe_linux_core::backend::{DialStage, LookupOutcome, PathKind, Reachability, SavedAddr};
 
-/// "3 days ago", "5 minutes ago", "just now", from unix seconds.
-pub fn ago(at: u64, now: u64) -> String {
-    let secs = now.saturating_sub(at);
+/// `at` as whole Unix seconds, 0 before the epoch.
+pub fn unix_secs(at: SystemTime) -> u64 {
+    at.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// "3 days ago", "5 minutes ago", "just now".
+pub fn ago(at: SystemTime, now: SystemTime) -> String {
+    let secs = now.duration_since(at).map_or(0, |d| d.as_secs());
     let (n, unit) = match secs {
         0..60 => return "just now".to_owned(),
         60..3600 => (secs / 60, "minute"),
@@ -24,8 +30,8 @@ pub fn ago(at: u64, now: u64) -> String {
 }
 
 /// "Oct 14, 18:04", in local time.
-fn when(at: u64) -> String {
-    gtk::glib::DateTime::from_unix_local(at as i64)
+fn when(at: SystemTime) -> String {
+    gtk::glib::DateTime::from_unix_local(unix_secs(at) as i64)
         .ok()
         .and_then(|t| t.format("%b %-d, %H:%M").ok())
         .map(|s| s.to_string())
@@ -35,7 +41,7 @@ fn when(at: u64) -> String {
 /// The banner's line: what was tried, and when it last worked. "Tried its
 /// 2 addresses for 10 s; relays are off for Cabin. Last connected 3 days
 /// ago."
-pub fn tried_line(reach: &Reachability, now: u64) -> String {
+pub fn tried_line(reach: &Reachability, now: SystemTime) -> String {
     let name = reach.name.as_deref().unwrap_or("this server");
     let mut line = match &reach.last_dial {
         Some(dial) => {
@@ -44,7 +50,7 @@ pub fn tried_line(reach: &Reachability, now: u64) -> String {
                 1 => "Tried its address".to_owned(),
                 n => format!("Tried its {n} addresses"),
             };
-            format!("{what} for {} s", dial.took_ms.div_ceil(1000))
+            format!("{what} for {} s", dial.took.as_millis().div_ceil(1000))
         }
         None => "Hasn't been tried yet".to_owned(),
     };
@@ -131,7 +137,7 @@ fn list_or_none(list: &[String]) -> String {
     }
 }
 
-fn address_line(addr: &SavedAddr, now: u64) -> String {
+fn address_line(addr: &SavedAddr, now: SystemTime) -> String {
     format!(
         "{} · last seen {}",
         if addr.reached {
@@ -144,19 +150,20 @@ fn address_line(addr: &SavedAddr, now: u64) -> String {
 }
 
 /// `at` as ISO 8601 in UTC: `2026-10-11T21:40:02Z`.
-fn iso(at: u64) -> String {
-    gtk::glib::DateTime::from_unix_utc(at as i64)
+fn iso(at: SystemTime) -> String {
+    let secs = unix_secs(at);
+    gtk::glib::DateTime::from_unix_utc(secs as i64)
         .ok()
         .and_then(|t| t.format("%Y-%m-%dT%H:%M:%SZ").ok())
         .map(|s| s.to_string())
-        .unwrap_or_else(|| at.to_string())
+        .unwrap_or_else(|| secs.to_string())
 }
 
 /// The whole snapshot as plain text, for Copy report, line for line as the
 /// Apple apps write it (Reachability.swift, mac-app 388e228f), so a report
 /// reads the same from either: a header naming when it failed, the build
 /// and the device, then the SDK's facts. Nothing about the account.
-pub fn report(reach: &Reachability, now: u64, device: &str) -> String {
+pub fn report(reach: &Reachability, now: SystemTime, device: &str) -> String {
     let failed_at = reach
         .last_dial
         .as_ref()
@@ -262,7 +269,11 @@ pub fn report(reach: &Reachability, now: u64, device: &str) -> String {
     }
     match &reach.last_dial {
         Some(dial) => {
-            let mut line = format!("last dial: {} · {} ms · ", iso(dial.at), dial.took_ms);
+            let mut line = format!(
+                "last dial: {} · {} ms · ",
+                iso(dial.at),
+                dial.took.as_millis()
+            );
             if dial.connected {
                 line.push_str("connected");
             } else {
@@ -292,7 +303,7 @@ pub fn report(reach: &Reachability, now: u64, device: &str) -> String {
             "live {} {} · {} ms{}",
             path_kind(path.kind),
             path.addr,
-            path.rtt_ms,
+            path.rtt.as_millis(),
             if path.selected { " · selected" } else { "" }
         ));
     }
@@ -308,7 +319,7 @@ pub struct Actions {
 
 /// "Why <name> can't be reached".
 pub fn dialog(reach: &Reachability, app_on: bool, actions: Actions) -> adw::Dialog {
-    let now = now();
+    let now = SystemTime::now();
     let name = reach
         .name
         .clone()
@@ -415,7 +426,7 @@ pub fn dialog(reach: &Reachability, app_on: bool, actions: Actions) -> adw::Dial
         Some(last) => {
             let row = value_row(
                 "When",
-                &format!("{} · took {} ms", when(last.at), last.took_ms),
+                &format!("{} · took {} ms", when(last.at), last.took.as_millis()),
             );
             row.add_suffix(&match (last.connected, last.stage) {
                 (true, _) => pill("connected", "success"),
@@ -463,7 +474,7 @@ pub fn dialog(reach: &Reachability, app_on: bool, actions: Actions) -> adw::Dial
         ));
     }
     for path in &reach.live {
-        let row = value_row(&path.addr, &format!("{} ms", path.rtt_ms));
+        let row = value_row(&path.addr, &format!("{} ms", path.rtt.as_millis()));
         row.add_css_class("monospace");
         let kind = path_kind(path.kind);
         row.add_prefix(&pill(
@@ -548,12 +559,6 @@ pub fn dialog(reach: &Reachability, app_on: bool, actions: Actions) -> adw::Dial
     dialog
 }
 
-fn now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
-
 fn group(title: &str) -> adw::PreferencesGroup {
     adw::PreferencesGroup::builder()
         .title(crate::markup::plain(title))
@@ -582,11 +587,21 @@ fn pill(text: &str, class: &str) -> gtk::Label {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::time::Duration;
+
     use spoolframe_linux_core::backend::{DialReport, LookupResult};
 
     use super::*;
 
-    pub(crate) const NOW: u64 = 1_800_000_000;
+    /// Unix second `secs`.
+    pub(crate) fn at(secs: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    /// The moment the tests say it is.
+    pub(crate) fn now() -> SystemTime {
+        at(1_800_000_000)
+    }
 
     /// Cabin, last dialled 30 s ago and not reached: what other tests
     /// build on.
@@ -599,12 +614,12 @@ pub(crate) mod tests {
                 SavedAddr {
                     addr: "203.0.113.24:41641".into(),
                     reached: true,
-                    last_seen: NOW - 3 * 86400,
+                    last_seen: now() - Duration::from_secs(3 * 86400),
                 },
                 SavedAddr {
                     addr: "192.168.7.2:7430".into(),
                     reached: false,
-                    last_seen: NOW - 86400,
+                    last_seen: now() - Duration::from_secs(86400),
                 },
             ],
             advertised_addrs: vec!["203.0.113.24:41641".into()],
@@ -620,19 +635,19 @@ pub(crate) mod tests {
             lookups: vec!["mdns".into()],
             lookup_results: vec![LookupResult {
                 lookup: "https://dns.iroh.link/pkarr".into(),
-                at: NOW - 60,
+                at: now() - Duration::from_secs(60),
                 outcome: LookupOutcome::NoRecord,
             }],
             last_dial: Some(DialReport {
-                at: NOW - 30,
-                took_ms: 10_000,
+                at: now() - Duration::from_secs(30),
+                took: Duration::from_millis(10_000),
                 connected: false,
                 stage: Some(DialStage::Timeout),
                 error: Some("timed out".into()),
                 dialled: vec!["203.0.113.24:41641".into(), "192.168.7.2:7430".into()],
                 known: Vec::new(),
             }),
-            last_connected_at: Some(NOW - 3 * 86400),
+            last_connected_at: Some(now() - Duration::from_secs(3 * 86400)),
             live: Vec::new(),
         }
     }
@@ -640,7 +655,7 @@ pub(crate) mod tests {
     #[test]
     fn the_banner_says_what_was_tried_as_the_board_does() {
         assert_eq!(
-            tried_line(&cabin(), NOW),
+            tried_line(&cabin(), now()),
             "Tried its 2 addresses for 10 s; relays are off for Cabin. Last connected 3 days ago."
         );
     }
@@ -660,7 +675,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_report_reads_as_the_apple_apps_write_it() {
-        let report = report(&cabin(), NOW, "nimble");
+        let report = report(&cabin(), now(), "nimble");
         let lines: Vec<&str> = report.lines().collect();
         assert_eq!(
             lines,
@@ -694,9 +709,9 @@ pub(crate) mod tests {
     fn times_read_as_how_long_ago() {
         assert_eq!(
             (
-                ago(NOW - 30, NOW),
-                ago(NOW - 120, NOW),
-                ago(NOW - 86400, NOW)
+                ago(now() - Duration::from_secs(30), now()),
+                ago(now() - Duration::from_secs(120), now()),
+                ago(now() - Duration::from_secs(86400), now())
             ),
             (
                 "just now".to_owned(),

@@ -1746,8 +1746,52 @@ impl Playback {
                 find: self.subtitle_search(),
                 timing: self.timing_menu(),
                 elsewhere: self.subtitles_elsewhere(),
+                streams: self.subtitle_streams(info),
+                picked: Some(self.subtitle_picked()),
             },
         )
+    }
+
+    /// The item's track each of `info`'s subtitle streams is, with the
+    /// server's name for it (see [`crate::tracks::stream_tracks`]). A
+    /// download has no plan: its streams keep their own names.
+    fn subtitle_streams(&self, info: &gst_play::PlayMediaInfo) -> Vec<Option<(u32, String)>> {
+        let Some(current) = self.now() else {
+            return Vec::new();
+        };
+        let (plan, tracks) = (current.plan.borrow(), current.track_list.borrow());
+        let (Some(plan), Some(tracks)) = (plan.as_ref(), tracks.as_ref()) else {
+            return Vec::new();
+        };
+        let ids: Vec<String> = info
+            .subtitle_streams()
+            .iter()
+            .map(|s| gst_play::prelude::PlayStreamInfoExt::stream_id(s).to_string())
+            .collect();
+        let external = self.pipeline.external_stream();
+        crate::tracks::stream_tracks(tracks, plan, &ids, external.as_deref())
+            .into_iter()
+            .map(|track| {
+                let named = tracks.subtitles.get(track? as usize)?;
+                Some((track?, spoolframe_linux_core::format::subtitle_track(named)))
+            })
+            .collect()
+    }
+
+    /// A pick from the menu is what shows now: Timing, a timing change and
+    /// the next track asked for go by it, as by one chosen at the start.
+    fn subtitle_picked(&self) -> Rc<dyn Fn(Option<u32>)> {
+        let me = self.me.clone();
+        Rc::new(move |track| {
+            let Some(current) = me.upgrade().and_then(|this| this.now()) else {
+                return;
+            };
+            let selection = current.selected.get().unwrap_or_default();
+            current.selected.set(Some(Selection {
+                subtitle: track,
+                ..selection
+            }));
+        })
     }
 
     /// The item's subtitle tracks this playback has no stream of (see
@@ -3002,10 +3046,13 @@ impl Playback {
     /// what the markers there call for.
     fn check_markers(self: &Rc<Self>, at: Duration) {
         let Some(current) = self.now() else { return };
-        if current.markers.borrow().is_empty() {
-            return;
-        }
-        let offer = markers::offer(&current.markers.borrow(), at, self.has_next());
+        // A film or an episode with no markers still offers Next near its
+        // end; a song goes on to the next as it always has.
+        let length = Some(self.length.get())
+            .filter(|l| !l.is_zero())
+            .or_else(|| current.item.duration())
+            .filter(|_| self.is_video());
+        let offer = markers::offer(&current.markers.borrow(), at, length, self.has_next());
         // Only where a seek lands: not mid-seek, mid-restart, or before
         // the length is known.
         if let Some(Offer::SkipIntro { to }) = offer
@@ -3050,6 +3097,9 @@ impl Playback {
             }
         }
         let playing = state == gst_play::PlayState::Playing;
+        if playing {
+            self.pipeline.playing();
+        }
         let paused = self.playing.replace(playing) && !playing;
         if paused && !self.stopped.get() {
             self.report_progress();
@@ -3087,17 +3137,27 @@ impl Playback {
                 (None, tracks) => file_picks(tracks, selection),
             }
         };
-        if let Some(audio) = picks.audio_stream
-            && let Err(e) = self.pipeline.select_audio(info, audio)
-        {
-            tracing::warn!(error = %e, audio, "cannot pick the audio track");
-            self.emit(&Change::TrackFailed(AUDIO_FAILED));
-        }
         let stream = match picks.subtitle {
             SubtitleHandling::Embedded(n) => Some(n),
             SubtitleHandling::InOutput => Some(0),
             SubtitleHandling::Burned | SubtitleHandling::AsFile | SubtitleHandling::None => None,
         };
+        // A converted output holds the one audio picked, which GstPlay
+        // plays by itself. Picked by place, it could come after the first
+        // media info (GstPlay lists streams as they turn up) and "fail":
+        // "Couldn't switch the audio track" on every subtitle change.
+        let audio = picks.audio_stream.filter(|_| !current.is_converted());
+        // The subtitle waits until it is listed.
+        if stream.is_some_and(|s| s >= info.subtitle_streams().len()) {
+            current.pending.set(Some(selection));
+            return;
+        }
+        if let Some(audio) = audio
+            && let Err(e) = self.pipeline.select_audio(info, audio)
+        {
+            tracing::warn!(error = %e, audio, "cannot pick the audio track");
+            self.emit(&Change::TrackFailed(AUDIO_FAILED));
+        }
         // A subtitle file is turned on when it arrives.
         if stream.is_none() && current.subtitle_file.borrow().is_some() {
             return;
@@ -4763,8 +4823,8 @@ mod tests {
     fn intro() -> Vec<spoolframe_linux_core::backend::Marker> {
         vec![spoolframe_linux_core::backend::Marker {
             kind: spoolframe_linux_core::backend::MarkerKind::Intro,
-            start_ms: 1_000,
-            end_ms: 2_500,
+            start: Duration::from_millis(1_000),
+            end: Duration::from_millis(2_500),
             to_end: false,
         }]
     }
@@ -5104,6 +5164,52 @@ mod tests {
             playback.is_playing()
         );
         assert_eq!(*failed.borrow(), Vec::<String>::new());
+        playback.stop();
+    }
+
+    /// The menu names a subtitle stream the server's way, by the item's
+    /// track it carries: GstPlay knows only its format ("SubRip", Banshee
+    /// S3E9), which said nothing of which track it was. A pick of it is
+    /// what shows, for Timing and the next track asked for.
+    #[test]
+    #[ignore = "needs a display for gtk4paintablesink"]
+    fn a_carried_subtitle_is_named_as_the_server_names_it_and_a_pick_shows_it() {
+        gtk::init().unwrap();
+        init().unwrap();
+        let dir = TestDir::new_blocking("spoolframe-named-subtitle");
+        let path = dir.join("clip.mkv");
+        clip_with_subtitle(&path);
+        let client = FakeClient::new(Some(path))
+            .converting(64 * 1024)
+            .copying_subtitle();
+        let profile = FakeClient::profile("andrey");
+        let (playback, failed) = converted_without_a_subtitle(&client, &profile);
+        playback.use_subtitle(1);
+        assert!(
+            run_until(Duration::from_secs(20), || shows_the_copied_subtitle(
+                &playback
+            ) || !failed.borrow().is_empty()),
+            "the subtitle never showed (plan {:?})",
+            playback.plan()
+        );
+        assert_eq!(*failed.borrow(), Vec::<String>::new());
+        let info = || playback.now()?.media_info.borrow().clone();
+        assert!(
+            run_until(Duration::from_secs(20), || info()
+                .is_some_and(|i| !i.subtitle_streams().is_empty())),
+            "GstPlay never listed the carried subtitle"
+        );
+        let (current, info) = (playback.now().unwrap(), info().unwrap());
+        let name = {
+            let tracks = current.track_list.borrow();
+            spoolframe_linux_core::format::subtitle_track(&tracks.as_ref().unwrap().subtitles[1])
+        };
+        assert_eq!(playback.subtitle_streams(&info), [Some((1, name))]);
+        playback.subtitle_picked()(None);
+        let off = current.selected.get().and_then(|s| s.subtitle);
+        playback.subtitle_picked()(Some(1));
+        let on = current.selected.get().and_then(|s| s.subtitle);
+        assert_eq!((off, on), (None, Some(1)));
         playback.stop();
     }
 
@@ -5701,8 +5807,8 @@ mod tests {
         playback.toggle();
         assert!(
             run_until(Duration::from_secs(3), || kept()
-                .position_ms
-                .is_some_and(|ms| ms >= 1_000)),
+                .position
+                .is_some_and(|position| position >= Duration::from_secs(1))),
             "pausing kept no place ({:?})",
             kept()
         );

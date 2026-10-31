@@ -80,7 +80,11 @@ pub fn device_name(device: &Device) -> String {
 /// without its key.
 pub fn device_line(device: &Device) -> String {
     let c = &device.credential;
-    let mut line = format!("Paired {} · ends {}", day(c.issued_at), day(c.expires_at));
+    let mut line = format!(
+        "Paired {} · ends {}",
+        crate::invite::month_day(c.issued_at),
+        crate::invite::month_day(c.expires_at)
+    );
     if !device.this_computer {
         line.push_str(&format!(" · key {}", c.device_key.fingerprint()));
     }

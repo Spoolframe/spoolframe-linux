@@ -15,10 +15,10 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use spoolframe_types::{Container, Item, Marker, MediaTracks};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 use crate::backend::{
     BackendError, DownloadEvent, DownloadFailure, DownloadFile, DownloadPhase, DownloadSource,
@@ -27,8 +27,10 @@ use crate::backend::{
 };
 use spoolframe_protocol::downloads::OfflineWatchOutcome;
 
-/// When the fake says every download was started, Unix seconds.
-pub const STARTED_AT: i64 = 1_760_000_200;
+/// When the fake says every download was started.
+pub fn started_at() -> SystemTime {
+    UNIX_EPOCH + Duration::from_secs(1_760_000_200)
+}
 
 /// The size a fake download says its file is, until it is finished with
 /// a real file.
@@ -55,6 +57,8 @@ pub(in crate::fake) struct Store {
     downloads: Vec<Held>,
     next: u64,
     events: broadcast::Sender<DownloadEvent>,
+    /// How many run, every profile's: the SDK's watch_running.
+    running: watch::Sender<usize>,
     /// The profile the app shows (PX-60); every profile's downloads are
     /// listed before there is one.
     shown: Option<Shown>,
@@ -100,6 +104,7 @@ impl Store {
             downloads: Vec::new(),
             next: 1,
             events: broadcast::channel(64).0,
+            running: watch::channel(0).0,
             shown: None,
             locks: HashMap::new(),
         }
@@ -107,6 +112,21 @@ impl Store {
 
     pub fn subscribe(&self) -> broadcast::Receiver<DownloadEvent> {
         self.events.subscribe()
+    }
+
+    pub fn watch_running(&self) -> watch::Receiver<usize> {
+        self.running.subscribe()
+    }
+
+    /// Counts again what runs, whoever's it is.
+    fn recount(&self) {
+        let running = self
+            .downloads
+            .iter()
+            .filter(|held| under_way(&held.download.phase))
+            .count();
+        self.running
+            .send_if_modified(|was| std::mem::replace(was, running) != running);
     }
 
     /// The app shows `server`'s `user_id`: another profile than before
@@ -282,7 +302,7 @@ impl Store {
             file_path: None,
             file_url: None,
             note: None,
-            created_at: STARTED_AT,
+            created_at: started_at(),
         };
         self.next += 1;
         self.downloads.push(Held {
@@ -349,13 +369,14 @@ impl Store {
         if held.holders.is_empty() {
             self.downloads.remove(at);
         }
+        self.recount();
         // Nobody listening is fine: nothing is shown.
         let _ = self.events.send(DownloadEvent::Removed { key: key.into() });
         Ok(())
     }
 
     pub fn position(&mut self, key: &str, at: Duration) -> Result<LocalDownload, BackendError> {
-        self.watched(key, Some(at.as_millis() as u64), None)
+        self.watched(key, Some(at), None)
     }
 
     pub fn mark(&mut self, key: &str, watched: bool) -> Result<LocalDownload, BackendError> {
@@ -367,7 +388,7 @@ impl Store {
     fn watched(
         &mut self,
         key: &str,
-        position_ms: Option<u64>,
+        position: Option<Duration>,
         watched: Option<bool>,
     ) -> Result<LocalDownload, BackendError> {
         let at = self.find(key)?;
@@ -379,9 +400,9 @@ impl Store {
         };
         if let Some((_, watch)) = watch {
             *watch = LocalWatch {
-                position_ms,
+                position,
                 watched,
-                at: STARTED_AT,
+                at: started_at(),
                 pending: true,
             };
         }
@@ -523,6 +544,7 @@ impl Store {
     /// The download at `at` changed: told only to a profile that sees
     /// it, as the SDK's events are.
     fn tell(&self, at: usize) {
+        self.recount();
         let held = &self.downloads[at];
         if self.sees(held) {
             // Nobody listening is fine: nothing is shown.
@@ -576,13 +598,19 @@ fn watch_of(item: &Item) -> LocalWatch {
         _ => None,
     };
     LocalWatch {
-        position_ms: playback
-            .and_then(|p| p.position)
-            .map(|p| p.as_millis() as u64),
+        position: playback.and_then(|p| p.position),
         watched: playback.map(|p| p.watched),
-        at: STARTED_AT,
+        at: started_at(),
         pending: false,
     }
+}
+
+/// Preparing on the server or coming to this device: what quitting stops.
+fn under_way(phase: &DownloadPhase) -> bool {
+    matches!(
+        phase,
+        DownloadPhase::Preparing { .. } | DownloadPhase::Transferring
+    )
 }
 
 #[cfg(test)]
@@ -616,6 +644,42 @@ mod tests {
             });
         }
         seen
+    }
+
+    /// Preparing on the server and coming to this device run; paused,
+    /// failed and done do not.
+    #[test]
+    fn each_phase_runs_or_not() {
+        let phases = [
+            DownloadPhase::Preparing {
+                server: DownloadState::Waiting,
+            },
+            DownloadPhase::Transferring,
+            DownloadPhase::Paused,
+            DownloadPhase::Failed {
+                reason: "gone".into(),
+                cause: DownloadFailure::SourceMissing,
+            },
+            DownloadPhase::Done,
+        ];
+        assert_eq!(
+            phases.map(|p| under_way(&p)),
+            [true, true, false, false, false]
+        );
+    }
+
+    /// A download runs on after another profile is shown, and counts
+    /// until it is done: quitting would stop it.
+    #[test]
+    fn another_profiles_download_runs_until_it_is_done() {
+        let (_dir, path) = file_with("download", b"stand-in file");
+        let client = FakeClient::new(Some(path));
+        let running = client.downloads_running();
+        let download = start(andrey(&client).as_ref());
+        client.set_download_profile(&download.server, "someone-else");
+        let counted = *running.borrow();
+        client.finish_download(&download.key);
+        assert_eq!((counted, *running.borrow()), (1, 0));
     }
 
     #[test]
@@ -813,12 +877,12 @@ mod tests {
         let after = ready(client.download(&key)).unwrap();
         assert_eq!(
             (
-                (kept.watch.position_ms, kept.watch.pending),
+                (kept.watch.position, kept.watch.pending),
                 synced.len(),
                 after.watch.pending,
                 ready(session.sync_download_watch()).unwrap().len()
             ),
-            ((Some(90_000), true), 1, false, 0)
+            ((Some(Duration::from_secs(90)), true), 1, false, 0)
         );
     }
 
@@ -830,7 +894,7 @@ mod tests {
             .unwrap()
             .watch;
         assert_eq!(
-            (watch.watched, watch.position_ms, watch.pending),
+            (watch.watched, watch.position, watch.pending),
             (Some(true), None, true)
         );
     }

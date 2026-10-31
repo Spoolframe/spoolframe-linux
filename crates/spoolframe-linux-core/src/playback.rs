@@ -3,11 +3,13 @@ use crate::backend::{BackendError, Session};
 use async_trait::async_trait;
 pub use spoolframe_client_sdk::ManagedPlayback;
 use spoolframe_client_sdk::{
-    Chunk, Playback, PlaybackBackend, PlaybackChange, PlaybackOptions, PlaybackQuality, SdkError,
+    Chunk, LinkMeter, Playback, PlaybackBackend, PlaybackChange, PlaybackOptions, PlaybackQuality,
+    PlaybackShare, RemoteMode, Replan, SdkError, Subtitle, SubtitleTimingEvent,
 };
 use spoolframe_protocol::{BitmapSubtitles, PlaybackHandle, Selection};
 use spoolframe_types::MediaId;
 use std::{sync::Arc, time::Duration};
+use tokio::sync::broadcast;
 
 pub fn backend(session: Arc<dyn Session>) -> Arc<dyn PlaybackBackend> {
     Arc::new(Adapter(session))
@@ -50,8 +52,7 @@ impl PlaybackBackend for Adapter {
         &self,
         _: &PlaybackHandle,
         _: Option<u32>,
-        _: BitmapSubtitles,
-        _: Duration,
+        _: &Replan,
     ) -> Result<PlaybackChange, SdkError> {
         Err(SdkError::InvalidInput(
             "this player changes tracks by replacing playback".into(),
@@ -68,16 +69,11 @@ impl PlaybackBackend for Adapter {
         &self,
         h: &PlaybackHandle,
         quality: PlaybackQuality,
-        bitmap: BitmapSubtitles,
-        position: Duration,
+        replan: &Replan,
     ) -> Result<PlaybackChange, SdkError> {
-        if bitmap != BitmapSubtitles::default() {
-            return Err(SdkError::InvalidInput(
-                "this client uses the default bitmap subtitle mode".into(),
-            ));
-        }
+        default_bitmap(replan.bitmap)?;
         self.0
-            .change_quality(h, quality, position)
+            .change_quality(h, quality, replan.position)
             .await
             .map_err(error)
     }
@@ -87,19 +83,53 @@ impl PlaybackBackend for Adapter {
         &self,
         h: &PlaybackHandle,
         link_bitrate: u64,
-        bitmap: BitmapSubtitles,
-        position: Duration,
+        replan: &Replan,
     ) -> Result<PlaybackChange, SdkError> {
-        if bitmap != BitmapSubtitles::default() {
-            return Err(SdkError::InvalidInput(
-                "this client uses the default bitmap subtitle mode".into(),
-            ));
-        }
+        default_bitmap(replan.bitmap)?;
         self.0
-            .limit_playback(h, link_bitrate, position)
+            .limit_playback(h, link_bitrate, replan.position)
             .await
             .map_err(error)
     }
+    async fn set_track_override(
+        &self,
+        item: &MediaId,
+        selection: Selection,
+    ) -> Result<(), SdkError> {
+        self.0
+            .set_track_override(item, selection)
+            .await
+            .map_err(error)
+    }
+    async fn read_subtitle(&self, h: &PlaybackHandle) -> Result<Subtitle, SdkError> {
+        let (format, bytes) = self.0.read_subtitle(h).await.map_err(error)?;
+        Ok(Subtitle { format, bytes })
+    }
+    // The session port has none of these yet: the player's own reader
+    // measures the link, and a paired item's route is asked by handle
+    // (`Session::remote_mode`). As before the SDK made them required.
+    fn link_meter(&self) -> Option<Arc<LinkMeter>> {
+        None
+    }
+    fn shares(&self) -> Option<broadcast::Receiver<PlaybackShare>> {
+        None
+    }
+    fn subtitle_timings(&self) -> Option<(String, broadcast::Receiver<SubtitleTimingEvent>)> {
+        None
+    }
+    fn route(&self) -> Option<RemoteMode> {
+        None
+    }
+}
+
+/// This client shows bitmap subtitles the default way.
+fn default_bitmap(bitmap: BitmapSubtitles) -> Result<(), SdkError> {
+    if bitmap != BitmapSubtitles::default() {
+        return Err(SdkError::InvalidInput(
+            "this client uses the default bitmap subtitle mode".into(),
+        ));
+    }
+    Ok(())
 }
 fn error(e: BackendError) -> SdkError {
     match e {
@@ -209,6 +239,8 @@ mod tests {
             bit_depth: None,
             hdr: Some(Default::default()),
             video_codecs: None,
+            height: None,
+            frame_rate: None,
         };
         let options = PlaybackOptions {
             display: Some(sdr.clone()),

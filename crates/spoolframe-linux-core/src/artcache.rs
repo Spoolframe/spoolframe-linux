@@ -20,7 +20,7 @@ use foyer::{
 };
 use spoolframe_types::{ArtworkId, Namespace};
 
-use crate::backend::{ArtworkSize, BackendError, ServerKey};
+use crate::backend::{ArtworkFace, ArtworkSize, Backdrop, BackendError, ServerKey};
 
 /// How much the cache may hold.
 #[derive(Debug, Clone, Copy)]
@@ -128,12 +128,68 @@ impl ArtworkCache {
         Ok(entry.value().clone())
     }
 
+    /// A backdrop and its faces (PX-64), from the cache or from `fetch`
+    /// (then kept), as [`Self::get_or_fetch`]. A cache hit skips the
+    /// server's reply that carries the faces, so known faces are kept
+    /// beside the image; `None`, not known yet, is not kept, so a later
+    /// fetch can still learn them ([`Self::keep_faces`]).
+    pub async fn get_or_fetch_backdrop<F>(
+        &self,
+        server: &ServerKey,
+        id: &ArtworkId,
+        size: ArtworkSize,
+        fetch: F,
+    ) -> Result<Backdrop, BackendError>
+    where
+        F: Future<Output = Result<Backdrop, BackendError>> + Send + 'static,
+    {
+        let (cache, faces_key) = (self.cache.clone(), Self::faces_key(server, id));
+        let fetch = async move {
+            let backdrop = fetch.await?;
+            if let Some(faces) = &backdrop.faces {
+                cache.insert(faces_key, encode_faces(faces));
+            }
+            Ok(backdrop.bytes)
+        };
+        let bytes = self.get_or_fetch(server, id, size, fetch).await?;
+        let faces = match self.cache.get(&Self::faces_key(server, id)).await {
+            Ok(entry) => entry.and_then(|e| decode_faces(e.value())),
+            Err(e) => {
+                tracing::debug!(error = %e, "backdrop faces not read from the cache");
+                None
+            }
+        };
+        Ok(Backdrop { bytes, faces })
+    }
+
+    /// Keeps the faces a later fetch learned for backdrop `id`, for every
+    /// size of it: they are fractions of the image.
+    pub fn keep_faces(&self, server: &ServerKey, id: &ArtworkId, faces: &[ArtworkFace]) {
+        self.cache
+            .insert(Self::faces_key(server, id), encode_faces(faces));
+    }
+
+    fn faces_key(server: &ServerKey, id: &ArtworkId) -> String {
+        format!("{}/faces/{}", server.0, id)
+    }
+
     /// Writes what is still in memory to disk; call before quitting.
     pub async fn close(&self) {
         if let Err(e) = self.cache.close().await {
             tracing::warn!(error = %e, "artwork cache not closed cleanly");
         }
     }
+}
+
+/// Faces as kept in the cache, beside the image's bytes.
+fn encode_faces(faces: &[ArtworkFace]) -> Vec<u8> {
+    serde_json::to_vec(faces).expect("faces are plain numbers")
+}
+
+/// Kept faces; `None` for an entry this build cannot read, which then
+/// counts as not known.
+fn decode_faces(bytes: &[u8]) -> Option<Vec<ArtworkFace>> {
+    serde_json::from_slice(bytes).ok()
 }
 
 #[cfg(test)]
@@ -286,6 +342,104 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn backdrop() -> ArtworkId {
+        ArtworkId::new(Namespace::Plex, "/library/metadata/1/art/9").unwrap()
+    }
+
+    fn face() -> ArtworkFace {
+        ArtworkFace {
+            left: 0.4,
+            right: 0.6,
+            top: 0.1,
+            bottom: 0.3,
+            eyes: 0.18,
+        }
+    }
+
+    /// A backdrop fetch that counts its calls and answers `faces`.
+    fn counted_backdrop(
+        calls: &Arc<AtomicUsize>,
+        faces: Option<Vec<ArtworkFace>>,
+    ) -> impl Future<Output = Result<Backdrop, BackendError>> + Send + 'static {
+        let calls = calls.clone();
+        async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Backdrop {
+                bytes: b"jpeg bytes".to_vec(),
+                faces,
+            })
+        }
+    }
+
+    /// A cache hit skips the reply that carries the faces, so they are
+    /// kept beside the image, past the app, and come back with it.
+    #[tokio::test]
+    async fn a_backdrops_faces_come_back_with_it_from_the_cache() {
+        let (_tmp, dir) = temp_dir("faces").await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        {
+            let cache = ArtworkCache::open(&dir, small()).await.unwrap();
+            let fetch = counted_backdrop(&calls, Some(vec![face()]));
+            cache
+                .get_or_fetch_backdrop(&server(), &backdrop(), ArtworkSize::Large, fetch)
+                .await
+                .unwrap();
+            cache.close().await;
+        }
+        let cache = ArtworkCache::open(&dir, small()).await.unwrap();
+        let fetch = counted_backdrop(&calls, None);
+        let kept = cache
+            .get_or_fetch_backdrop(&server(), &backdrop(), ArtworkSize::Large, fetch)
+            .await
+            .unwrap();
+        assert_eq!(
+            (kept.faces, calls.load(Ordering::SeqCst)),
+            (Some(vec![face()]), 1)
+        );
+    }
+
+    /// Faces not known yet are not kept as "none": the image comes from
+    /// the cache with none, and the faces a later fetch learns are kept
+    /// for it, at every size.
+    #[tokio::test]
+    async fn faces_learned_later_are_kept_for_a_cached_backdrop() {
+        let (_tmp, dir) = temp_dir("faces-later").await;
+        let cache = ArtworkCache::open(&dir, small()).await.unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let first = cache
+            .get_or_fetch_backdrop(
+                &server(),
+                &backdrop(),
+                ArtworkSize::Large,
+                counted_backdrop(&calls, None),
+            )
+            .await
+            .unwrap();
+        let before = cache
+            .get_or_fetch_backdrop(
+                &server(),
+                &backdrop(),
+                ArtworkSize::Large,
+                counted_backdrop(&calls, None),
+            )
+            .await
+            .unwrap();
+        cache.keep_faces(&server(), &backdrop(), &[face()]);
+        let after = cache
+            .get_or_fetch_backdrop(
+                &server(),
+                &backdrop(),
+                ArtworkSize::Small,
+                counted_backdrop(&calls, None),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (first.faces, before.faces, after.faces),
+            (None, None, Some(vec![face()]))
+        );
     }
 
     #[tokio::test]

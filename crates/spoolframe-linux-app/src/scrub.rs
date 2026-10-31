@@ -150,7 +150,7 @@ impl Frames {
         else {
             return None;
         };
-        let tile = previews.tile(position.as_millis() as u64)?;
+        let tile = previews.tile(position)?;
         match sheets.get(tile.sheet)? {
             Some(sheet) => {
                 let scale = sheet.width as f64 / f64::from(previews.columns * previews.tile_width);

@@ -859,9 +859,7 @@ fn list_guests(
         for guest in guests {
             let row = adw::ActionRow::builder().use_markup(false).build();
             row.set_title(&guest_title(&guest));
-            let day = guest.paired_at.map(|secs| {
-                crate::start::day(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
-            });
+            let day = guest.paired_at.map(crate::start::day);
             row.set_subtitle(&guest_line(day.as_deref(), guest.server.as_deref()));
             // As Your identity marks a portable one.
             row.add_suffix(
@@ -986,7 +984,7 @@ pub fn reach_line(
     reach: Reach,
     path: Option<&str>,
     report: Option<&Reachability>,
-    now: u64,
+    now: std::time::SystemTime,
 ) -> String {
     let mut parts: Vec<String> = server
         .shown_address()
@@ -1148,7 +1146,7 @@ pub(crate) fn server_page(
                 return;
             };
             let state = report.as_ref().map_or(Reach::Unknown, reach);
-            let now = crate::invite::unix_now().max(0) as u64;
+            let now = std::time::SystemTime::now();
             name.set_subtitle(&reach_line(&server_c, state, path, report.as_ref(), now));
             match state {
                 Reach::Connected => {
@@ -1489,7 +1487,7 @@ fn track_groups(info: TrackPreferencesInfo, set_tracks: SetTracks) -> [adw::Pref
 mod tests {
     use super::*;
 
-    use crate::reachability::tests::{NOW, cabin};
+    use crate::reachability::tests::{cabin, now};
 
     #[test]
     fn only_sdh_is_offered_and_saved_as_it_is() {
@@ -1602,10 +1600,10 @@ mod tests {
         let report = cabin();
         let server = cabin_server();
         assert!(
-            reach_line(&server, Reach::Unreachable, None, Some(&report), NOW)
+            reach_line(&server, Reach::Unreachable, None, Some(&report), now())
                 .ends_with("last connected 3 days ago"),
             "{}",
-            reach_line(&server, Reach::Unreachable, None, Some(&report), NOW)
+            reach_line(&server, Reach::Unreachable, None, Some(&report), now())
         );
     }
 
