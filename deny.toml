@@ -22,8 +22,9 @@ exceptions = [
 
 # Accepted advisories (PX-11), so `cargo deny --locked check advisories`
 # passes and a new one stands out. .cargo/audit.toml (cargo audit, daily in
-# .forgejo/workflows/audit.yaml) accepts the same ones: keep the two lists
-# the same.
+# .forgejo/workflows/audit.yaml) accepts all of these, and zstd-safe's
+# `unsound` advisories too: cargo audit fails on those, and cargo deny does
+# not report them here, so an ignore for one would be a warning.
 [advisories]
 ignore = [
   # paste: unmaintained, not vulnerable. A proc-macro run at build time
@@ -45,18 +46,8 @@ ignore = [
   # an entry whose header says zstd, in the client's own cache files, would
   # reach the decoder. Accepted until foyer moves to zstd 0.14; then these go.
   { id = "RUSTSEC-2026-0391", reason = "zstd 0.13 / zstd-safe 7 through foyer-storage 0.22, which needs zstd 0.13; its compression is off here, so no zstd code runs on entries the client wrote" },
-  { id = "RUSTSEC-2026-0395", reason = "zstd 0.13 / zstd-safe 7 through foyer-storage 0.22, which needs zstd 0.13; its compression is off here, so no zstd code runs on entries the client wrote" },
-  { id = "RUSTSEC-2026-0396", reason = "zstd 0.13 / zstd-safe 7 through foyer-storage 0.22, which needs zstd 0.13; its compression is off here, so no zstd code runs on entries the client wrote" },
-  { id = "RUSTSEC-2026-0397", reason = "zstd 0.13 / zstd-safe 7 through foyer-storage 0.22, which needs zstd 0.13; its compression is off here, so no zstd code runs on entries the client wrote" },
   { id = "RUSTSEC-2026-0398", reason = "zstd 0.13 / zstd-safe 7 through foyer-storage 0.22, which needs zstd 0.13; its compression is off here, so no zstd code runs on entries the client wrote" },
-  { id = "RUSTSEC-2026-0399", reason = "zstd 0.13 / zstd-safe 7 through foyer-storage 0.22, which needs zstd 0.13; its compression is off here, so no zstd code runs on entries the client wrote" },
-  { id = "RUSTSEC-2026-0400", reason = "zstd 0.13 / zstd-safe 7 through foyer-storage 0.22, which needs zstd 0.13; its compression is off here, so no zstd code runs on entries the client wrote" },
-  { id = "RUSTSEC-2026-0401", reason = "zstd 0.13 / zstd-safe 7 through foyer-storage 0.22, which needs zstd 0.13; its compression is off here, so no zstd code runs on entries the client wrote" },
-  { id = "RUSTSEC-2026-0402", reason = "zstd 0.13 / zstd-safe 7 through foyer-storage 0.22, which needs zstd 0.13; its compression is off here, so no zstd code runs on entries the client wrote" },
   { id = "RUSTSEC-2026-0403", reason = "zstd 0.13 / zstd-safe 7 through foyer-storage 0.22, which needs zstd 0.13; its compression is off here, so no zstd code runs on entries the client wrote" },
-  { id = "RUSTSEC-2026-0404", reason = "zstd 0.13 / zstd-safe 7 through foyer-storage 0.22, which needs zstd 0.13; its compression is off here, so no zstd code runs on entries the client wrote" },
-  { id = "RUSTSEC-2026-0405", reason = "zstd 0.13 / zstd-safe 7 through foyer-storage 0.22, which needs zstd 0.13; its compression is off here, so no zstd code runs on entries the client wrote" },
-  { id = "RUSTSEC-2026-0406", reason = "zstd 0.13 / zstd-safe 7 through foyer-storage 0.22, which needs zstd 0.13; its compression is off here, so no zstd code runs on entries the client wrote" },
 ]
 
 # Several versions of one crate come from upstream (iroh, webauthn-rs's

@@ -212,8 +212,9 @@ in {
         exec = "cargo llvm-cov nextest --locked --workspace --profile ci --no-tests=warn --ignore-filename-regex '/\\.cargo/(registry|git)/|/vendor/' --lcov --output-path target/lcov.info";
       };
       # Daily, in .forgejo/workflows/audit.yaml. cargo audit reads
-      # .cargo/audit.toml: deny.toml's accepted advisories, and warnings
-      # (unmaintained, yanked) fail it. One Cargo.lock, at the root.
+      # .cargo/audit.toml: deny.toml's accepted advisories and the `unsound`
+      # ones only this reports, and warnings (unmaintained, unsound, yanked)
+      # fail it. One Cargo.lock, at the root.
       "ci:audit" = {
         description = "Audit dependencies for known vulnerabilities";
         exec = "cargo audit";

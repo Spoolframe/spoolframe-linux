@@ -2,10 +2,10 @@ name: Audit
 
 # New RustSec advisories land against crates already in Cargo.lock, with
 # no change here to run CI: this audits master's Cargo.lock every day, and
-# on demand. The accepted advisories are in .cargo/audit.toml, the same as
-# deny.toml's. A failed run is the alert: fix it with
-# `cargo update -p <crate>`, or accept the advisory in both files with its
-# reason.
+# on demand. The accepted advisories are in .cargo/audit.toml: deny.toml's,
+# and the `unsound` ones only this reports. A failed run is the alert: fix
+# it with `cargo update -p <crate>`, or accept the advisory with its reason
+# (in both files, unless cargo deny does not report it).
 on:
   schedule:
     # 06:17 UTC daily: off the hour, when scheduled runs pile up.
