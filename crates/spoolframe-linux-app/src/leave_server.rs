@@ -418,6 +418,8 @@ fn ask(anchor: &impl IsA<gtk::Widget>, server_name: &str, body: &str, leave: Rc<
 
 #[cfg(test)]
 mod tests {
+    use spoolframe_linux_core::mock::accounts::{self, MockAccount, MockClient, profile};
+
     use super::*;
 
     fn id(byte: u8) -> PortableUserId {
@@ -491,28 +493,23 @@ mod tests {
 
     #[test]
     fn the_leaving_profile_is_not_among_the_others() {
-        use spoolframe_linux_core::fake::FakeClient;
-        let profiles = [FakeClient::profile("steve"), FakeClient::profile("alice")];
-        assert_eq!(others(&profiles, "steve"), Some(names(&["alice"])));
+        let profiles = [profile("steve", "Steve"), profile("alice", "Alice")];
+        assert_eq!(others(&profiles, "steve"), Some(names(&["Alice"])));
     }
 
     #[test]
     fn one_unnamed_other_makes_them_all_the_others() {
-        use spoolframe_linux_core::fake::FakeClient;
-        let mut unnamed = FakeClient::profile("sam");
-        unnamed.display_name.clear();
         let profiles = [
-            FakeClient::profile("steve"),
-            FakeClient::profile("alice"),
-            unnamed,
+            profile("steve", "Steve"),
+            profile("alice", "Alice"),
+            profile("sam", ""),
         ];
         assert_eq!(others(&profiles, "steve"), Some(Vec::new()));
     }
 
     #[test]
     fn the_last_profile_has_no_others() {
-        use spoolframe_linux_core::fake::FakeClient;
-        assert_eq!(others(&[FakeClient::profile("steve")], "steve"), None);
+        assert_eq!(others(&[profile("steve", "Steve")], "steve"), None);
     }
 
     #[test]
@@ -601,26 +598,12 @@ mod tests {
         left: Rc<RefCell<Vec<ServerKey>>>,
     }
 
-    /// A fake with `username` the only profile kept for Home Media.
-    fn last_here(username: &str) -> Arc<spoolframe_linux_core::fake::FakeClient> {
-        let client = Arc::new(spoolframe_linux_core::fake::FakeClient::new(None));
-        let home = spoolframe_linux_core::fake::FakeClient::profile(username).server;
-        let context = glib::MainContext::default();
-        for profile in context.block_on(client.profiles(&home)).unwrap() {
-            if profile.username != username {
-                context
-                    .block_on(client.forget_profile(&home, &profile.username))
-                    .unwrap();
-            }
-        }
-        client
-    }
-
-    /// `username`'s Leave group on `client`, in a window, with Leave…
-    /// pressed and the question answered Leave.
-    fn left_as(client: Arc<spoolframe_linux_core::fake::FakeClient>, username: &str) -> Left {
-        use spoolframe_linux_core::fake::FakeClient;
-        let profile = FakeClient::profile(username);
+    /// `username`'s Leave group on `client`, with `account` the session
+    /// behind it, in a window, with Leave… pressed and the question
+    /// answered Leave.
+    fn left_as(client: MockClient, account: Arc<MockAccount>, username: &str) -> Left {
+        let client = Arc::new(client.with_session(username, account));
+        let profile = accounts::profile(username, username);
         let dropped = Rc::new(std::cell::Cell::new(0));
         let forgotten = Rc::new(RefCell::new(Vec::new()));
         let signed_out = Rc::new(std::cell::Cell::new(0));
@@ -690,7 +673,7 @@ mod tests {
     /// One test: GTK binds itself to the first thread that starts it.
     #[test]
     #[ignore = "needs a display; run on its own"]
-    fn leave_server_on_the_fake_server() {
+    fn leave_server_on_a_display() {
         gtk::init().unwrap();
         adw::init().unwrap();
         leaving_drops_the_server_and_lets_the_app_go_of_it();
@@ -700,8 +683,12 @@ mod tests {
     }
 
     /// The last profile kept here: the question says the server goes, and
-    /// it does.
+    /// once the server is no longer listed, it does.
     fn leaving_drops_the_server_and_lets_the_app_go_of_it() {
+        let account = Arc::new(MockAccount::new().with_leave_answers([Ok(())]));
+        let client = MockClient::new()
+            .with_profiles(vec![profile("steve", "Steve")])
+            .with_servers(Vec::new());
         let Left {
             window,
             asked,
@@ -709,25 +696,40 @@ mod tests {
             forgotten,
             signed_out,
             ..
-        } = left_as(last_here("steve"), "steve");
+        } = left_as(client, account.clone(), "steve");
         assert!(crate::ui_test::spin_until(
             std::time::Duration::from_secs(5),
             || dropped.get() == 1
         ));
-        let home = spoolframe_linux_core::fake::FakeClient::profile("steve").server;
         assert_eq!(
-            (asked, forgotten.borrow().clone(), signed_out.get()),
-            (question_body(false, "Home Media", None), vec![home], 0)
+            (
+                asked,
+                account.left(),
+                forgotten.borrow().clone(),
+                signed_out.get()
+            ),
+            (
+                question_body(false, "Home Media", None),
+                1,
+                vec![accounts::home()],
+                0
+            )
         );
         window.close();
     }
 
-    /// Andrey and Alice are kept here too: the question names them, the
-    /// server stays, Settings shows it signed out and the app lets go of
-    /// Steve.
+    /// Andrey and Alice are kept here too: the question names them, and
+    /// with the server still listed Settings shows it signed out and the
+    /// app lets go of Steve.
     fn leaving_a_server_others_keep_signs_out_and_keeps_it() {
-        use spoolframe_linux_core::fake::FakeClient;
-        let client = Arc::new(FakeClient::new(None));
+        let account = Arc::new(MockAccount::new().with_leave_answers([Ok(())]));
+        let client = MockClient::new()
+            .with_profiles(vec![
+                profile("andrey", "Andrey"),
+                profile("alice", "Alice"),
+                profile("steve", "Steve"),
+            ])
+            .with_servers(vec![accounts::server(accounts::home(), "Home Media")]);
         let Left {
             window,
             asked,
@@ -736,24 +738,18 @@ mod tests {
             signed_out,
             left,
             ..
-        } = left_as(client.clone(), "steve");
+        } = left_as(client, account.clone(), "steve");
         assert!(crate::ui_test::spin_until(
             std::time::Duration::from_secs(5),
             || signed_out.get() == 1
         ));
-        let home = FakeClient::profile("steve").server;
-        let saved = glib::MainContext::default()
-            .block_on(client.servers())
-            .unwrap()
-            .iter()
-            .any(|s| s.key == home);
         assert_eq!(
             (
                 asked,
+                account.left(),
                 left.borrow().clone(),
                 dropped.get(),
-                forgotten.borrow().len(),
-                saved
+                forgotten.borrow().len()
             ),
             (
                 question_body(
@@ -761,10 +757,10 @@ mod tests {
                     "Home Media",
                     Some(&["Andrey".into(), "Alice".into()])
                 ),
-                vec![home],
+                1,
+                vec![accounts::home()],
                 0,
-                0,
-                true
+                0
             )
         );
         window.close();
@@ -773,9 +769,9 @@ mod tests {
     /// The last admin, as the session says: greyed out from the start,
     /// saying why, with nothing asked.
     fn the_last_admin_is_greyed_out_before_trying() {
-        use spoolframe_linux_core::fake::{FAKE_ADMIN, FakeClient};
-        let client = Arc::new(FakeClient::new(None));
-        let profile = FakeClient::profile(FAKE_ADMIN);
+        let account = Arc::new(MockAccount::new().last_admin());
+        let client = Arc::new(MockClient::new().with_session("andrey", account));
+        let profile = profile("andrey", "Andrey");
         let toasts = adw::ToastOverlay::new();
         let group = group(
             Needs {
@@ -783,7 +779,7 @@ mod tests {
                 client: client.clone(),
                 server: profile.server.clone(),
                 server_name: "Home Media".into(),
-                username: FAKE_ADMIN.into(),
+                username: "andrey".into(),
                 dropped: Rc::new(|| {}),
                 forgotten: Rc::new(|_| {}),
                 signed_out: Rc::new(|| {}),
@@ -800,15 +796,13 @@ mod tests {
 
     /// Refused as the last admin all the same: the backstop dialog.
     fn the_last_admin_is_told_and_greyed_out() {
+        let client = MockClient::new().with_profiles(vec![profile("andrey", "Andrey")]);
         let Left {
             window,
             row,
             dropped,
             ..
-        } = left_as(
-            Arc::new(spoolframe_linux_core::fake::FakeClient::new(None)),
-            spoolframe_linux_core::fake::FAKE_ADMIN,
-        );
+        } = left_as(client, Arc::new(MockAccount::new().last_admin()), "andrey");
         // Said at once, not only on the greyed-out row: the row is greyed
         // out from the start, so wait for the refusal's dialog itself.
         let said = || {

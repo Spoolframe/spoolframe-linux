@@ -1650,8 +1650,7 @@ fn clear(container: &impl IsA<gtk::Widget>) {
 mod tests {
     use std::time::Instant;
 
-    use spoolframe_linux_core::backend::Client;
-    use spoolframe_linux_core::fake::FakeClient;
+    use spoolframe_linux_core::mock::shell::MockCatalog;
 
     use super::*;
 
@@ -1669,12 +1668,79 @@ mod tests {
         done()
     }
 
-    /// The page on the fake's Home Media, in a window.
+    fn group(kind: SearchKind, items: Vec<Item>) -> SearchGroup {
+        SearchGroup {
+            kind,
+            total: Some(items.len() as u32),
+            items,
+            people: Vec::new(),
+            more: false,
+            hidden: 0,
+        }
+    }
+
+    /// What Home Media answers each search the tests type: "low tide" is
+    /// a song only, "arrival 1990" matches only in other years, "denis
+    /// villeneuve" is a person, and anything else finds films.
+    fn answer(request: &SearchRequest) -> SearchResults {
+        use spoolframe_linux_core::mock::{movie, track};
+        let films = || vec![movie("1", "Arrival"), movie("2", "Alien")];
+        let low_tide = SearchCounts {
+            all: Some(2),
+            movies: Some(0),
+            shows: Some(0),
+            episodes: Some(0),
+            music: Some(2),
+        };
+        match (request.query.as_str(), request.kind, request.scope) {
+            ("denis villeneuve", _, _) => SearchResults {
+                top: Some(TopResult::Person(Person {
+                    id: spoolframe_linux_core::backend::PersonId::new(
+                        spoolframe_types::Namespace::Plex,
+                        "7",
+                    )
+                    .unwrap(),
+                    name: "Denis Villeneuve".into(),
+                    role: PersonRole::Director,
+                    count: Some(2),
+                })),
+                groups: vec![group(SearchKind::Movies, films())],
+                ..SearchResults::default()
+            },
+            (_, Some(kind), _) => SearchResults {
+                groups: vec![group(kind, films())],
+                ..SearchResults::default()
+            },
+            ("low tide", None, SearchScope::Movies) => SearchResults {
+                counts: low_tide,
+                ..SearchResults::default()
+            },
+            ("low tide", None, _) => SearchResults {
+                top: Some(TopResult::Item(track("1", "Low Tide"))),
+                groups: vec![group(
+                    SearchKind::Tracks,
+                    vec![track("2", "Low Tide (Live)")],
+                )],
+                counts: low_tide,
+                ..SearchResults::default()
+            },
+            ("arrival 1990", None, _) => SearchResults {
+                year: Some(1990),
+                without_year: vec![movie("1", "Arrival")],
+                ..SearchResults::default()
+            },
+            _ => SearchResults {
+                top: Some(TopResult::Item(movie("1", "Arrival"))),
+                groups: vec![group(SearchKind::Movies, vec![movie("2", "Alien")])],
+                ..SearchResults::default()
+            },
+        }
+    }
+
+    /// The page on Home Media, in a window.
     fn page() -> Rc<SearchPage> {
-        let client = FakeClient::new(None);
-        let session = client.session(&FakeClient::profile("andrey")).unwrap();
         let page = SearchPage::new(Needs {
-            session,
+            session: Arc::new(MockCatalog::new().with_search(answer)),
             cards: Rc::new(Cards {
                 open: Rc::new(|_| {}),
                 art: None,
@@ -1769,7 +1835,7 @@ mod tests {
     /// One test: GTK binds itself to the first thread that starts it.
     #[test]
     #[ignore = "needs a display; run on its own"]
-    fn search_on_the_fake_server() {
+    fn search_on_a_server() {
         gtk::init().unwrap();
         adw::init().unwrap();
         typing_shows_the_top_result_and_the_counts();

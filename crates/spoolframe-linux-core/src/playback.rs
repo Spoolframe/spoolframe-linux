@@ -6,13 +6,13 @@ use spoolframe_client_sdk::{
     Chunk, LinkMeter, Playback, PlaybackBackend, PlaybackChange, PlaybackOptions, PlaybackQuality,
     PlaybackShare, RemoteMode, Replan, SdkError, Subtitle, SubtitleTimingEvent,
 };
-use spoolframe_client_sdk::{Edited, PlayFrom, PlaylistCursor, PlaylistSource};
+use spoolframe_client_sdk::{Edited, PlaylistCursor, PlaylistSource};
 use spoolframe_protocol::playlists::{
     EntryId, PlaySettings, PlaylistEdit, PlaylistEntry, PlaylistNext, PlaylistPage,
 };
 use spoolframe_protocol::{BitmapSubtitles, PlaybackHandle, Selection};
 use spoolframe_types::MediaId;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
 
@@ -110,9 +110,9 @@ impl PlaybackBackend for Adapter {
         let (format, bytes) = self.0.read_subtitle(h).await.map_err(error)?;
         Ok(Subtitle { format, bytes })
     }
-    // The session port has none of these yet: the player's own reader
-    // measures the link, and a paired item's route is asked by handle
-    // (`Session::remote_mode`). As before the SDK made them required.
+    // This adapter serves only a session with no server (a test's mock):
+    // a real server's playbacks open through the SDK's own session
+    // (`Session::player_session`), which fills these.
     fn link_meter(&self) -> Option<Arc<LinkMeter>> {
         None
     }
@@ -148,20 +148,18 @@ pub async fn follow_playlist(
                 .settings
         }
     };
-    let from = PlayFrom::Entry(playing.entry);
-    let source = Arc::new(Playlists {
-        session,
-        playing: Mutex::new(Some(playing)),
-    });
-    // An entry to start from: nothing is picked at random.
-    PlaylistCursor::start(source, id, from, settings, |_| 0).await
+    let source = Arc::new(Playlists { session });
+    Ok(PlaylistCursor::playing(
+        source,
+        id,
+        playing.into(),
+        settings,
+    ))
 }
 
-/// The session's playlist calls, for a [`PlaylistCursor`]; its first
-/// play is answered with the entry playing, not sent.
+/// The session's playlist calls, for a [`PlaylistCursor`].
 struct Playlists {
     session: Arc<dyn Session>,
-    playing: Mutex<Option<PlaylistNext>>,
 }
 
 #[async_trait]
@@ -177,10 +175,6 @@ impl PlaylistSource for Playlists {
         from: Option<EntryId>,
         settings: PlaySettings,
     ) -> Result<Option<PlaylistNext>, SdkError> {
-        let playing = self.playing.lock().expect("never poisoned").take();
-        if let Some(playing) = playing {
-            return Ok(Some(playing));
-        }
         let next = self.session.play_playlist(id, from, settings).await;
         next.map_err(playlist_error)
     }
@@ -259,15 +253,21 @@ fn playlist_error(e: BackendError) -> SdkError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::Client;
-    use crate::fake::FakeClient;
+    use crate::backend::Kinds;
+    use crate::mock::playback::{MockPlayback, PlaylistCall};
+    use crate::mock::{self, MockSession};
     use spoolframe_protocol::PlaybackPlan;
 
-    /// A direct play the link is too slow for is planned again (P6-06):
-    /// through this adapter the SDK swaps the conversion in, and the
-    /// direct reader's next read is told to start a new reader.
+    /// A film, playing direct from `path`.
+    fn film(path: std::path::PathBuf) -> (Arc<MockPlayback>, MediaId) {
+        let movie = mock::movie("1", "Arrival");
+        let id = movie.id().clone();
+        (Arc::new(MockPlayback::new(Some(path), [movie])), id)
+    }
+
     /// The viewer's quality choice reaches the server through this
-    /// adapter (P6-06): a bitrate converts, Original plays the file again.
+    /// adapter (P6-06), and the plan it answers is the playback's: a
+    /// bitrate converts, Original plays the file again.
     #[test]
     fn a_chosen_quality_plans_the_playback_again() {
         let (_dir, path) = crate::testing::file_with("quality", &[0; 4096]);
@@ -275,14 +275,14 @@ mod tests {
     }
 
     async fn choose_quality(path: std::path::PathBuf) {
-        let client = FakeClient::new(Some(path));
-        let session = client.session(&FakeClient::profile("andrey")).unwrap();
-        let item = crate::testing::first_movie_id(&session).await;
-        let playback = ManagedPlayback::open(backend(session), item, None, Default::default())
+        let (server, item) = film(path);
+        let backend = backend(server.clone());
+        let playback = ManagedPlayback::open(backend, item, None, Default::default())
             .await
             .unwrap();
+        let at = Duration::from_secs(5);
         let capped = playback
-            .change_quality(PlaybackQuality::Bitrate(8_000_000), Duration::from_secs(5))
+            .change_quality(PlaybackQuality::Bitrate(8_000_000), at)
             .await
             .unwrap();
         assert!(
@@ -291,46 +291,55 @@ mod tests {
         );
         assert_eq!(playback.quality(), PlaybackQuality::Bitrate(8_000_000));
         let original = playback
-            .change_quality(PlaybackQuality::Original, Duration::from_secs(5))
+            .change_quality(PlaybackQuality::Original, at)
             .await
             .unwrap();
         assert!(
             matches!(original.plan, PlaybackPlan::Direct { .. }),
             "{original:?}"
         );
+        assert_eq!(
+            server.quality_changes(),
+            [
+                (PlaybackQuality::Bitrate(8_000_000), at),
+                (PlaybackQuality::Original, at)
+            ]
+        );
     }
 
-    /// The fake's All, played from its top: its id and the entry playing.
-    async fn all_playing(session: &Arc<dyn Session>) -> (String, PlaylistNext) {
-        let list = session.playlists().await.unwrap().playlists;
-        let all = list.into_iter().find(|p| p.name == "All").unwrap();
-        let first = session.play_playlist(&all.id, None, PlaySettings::default());
-        (all.id.clone(), first.await.unwrap().unwrap())
+    /// All, three songs, the server's place on the first; and that
+    /// entry, playing.
+    fn all_playing() -> (PlaylistPage, PlaylistNext) {
+        let songs = Kinds {
+            tracks: true,
+            ..Kinds::default()
+        };
+        let tracks = (1..=3).map(|n| mock::track(&n.to_string(), &format!("Song {n}")));
+        let mut page = mock::page(mock::playlist("all", "All", songs), tracks.collect());
+        let first = page.entries[0].clone();
+        page.place = Some(first.entry);
+        let playing = PlaylistNext {
+            entry: first.entry,
+            item: first.item,
+            markers: Default::default(),
+            liked: false,
+        };
+        (page, playing)
     }
 
-    /// Restored from a saved queue, or started already: following it
-    /// moves nothing on the server, and what comes up is its own.
+    /// Restored from a saved queue, or started already: following it with
+    /// its modes known asks the server nothing, so moves nothing there.
     #[test]
     fn following_the_entry_playing_leaves_the_servers_place() {
         crate::testing::runtime().block_on(async {
-            let client = FakeClient::new(None);
-            let session = client.session(&FakeClient::profile("andrey")).unwrap();
-            let (id, first) = all_playing(&session).await;
-            let later = session.playlist(&id, 0, 3).await.unwrap().entries[2].entry;
-            // Played on, on another device.
-            let elsewhere = session.play_playlist(&id, Some(later), PlaySettings::default());
-            elsewhere.await.unwrap();
-            let cursor = follow_playlist(
-                session.clone(),
-                &id,
-                first.clone(),
-                Some(Default::default()),
-            )
-            .await
-            .unwrap();
+            let (page, first) = all_playing();
+            let server = Arc::new(MockPlayback::new(None, []).with_playlist(page));
+            let modes = Some(Default::default());
+            let cursor = follow_playlist(server.clone(), "all", first.clone(), modes)
+                .await
+                .unwrap();
             assert_eq!(cursor.current().map(|e| e.entry), Some(first.entry));
-            let place = session.playlist(&id, 0, 1).await.unwrap().place;
-            assert_eq!(place, Some(later));
+            assert_eq!(server.playlist_calls(), Vec::<PlaylistCall>::new());
         });
     }
 
@@ -339,15 +348,10 @@ mod tests {
     #[test]
     fn a_playlist_followed_with_its_modes_unknown_plays_with_the_servers() {
         crate::testing::runtime().block_on(async {
-            let client = FakeClient::new(None);
-            let session = client.session(&FakeClient::profile("andrey")).unwrap();
-            let (id, first) = all_playing(&session).await;
-            let shuffled = PlaySettings {
-                shuffle: true,
-                ..PlaySettings::default()
-            };
-            session.set_playlist_settings(&id, shuffled).await.unwrap();
-            let cursor = follow_playlist(session, &id, first, None).await.unwrap();
+            let (mut page, first) = all_playing();
+            page.settings.shuffle = true;
+            let server = Arc::new(MockSession::new().with_playlist(page));
+            let cursor = follow_playlist(server, "all", first, None).await.unwrap();
             assert!(cursor.settings().shuffle);
         });
     }
@@ -364,6 +368,9 @@ mod tests {
         );
     }
 
+    /// A direct play the link is too slow for is planned again (P6-06):
+    /// through this adapter the SDK swaps the conversion in, and the
+    /// direct reader's next read is told to start a new reader.
     #[test]
     fn a_direct_play_on_a_slow_link_becomes_a_conversion() {
         let (_dir, path) = crate::testing::file_with("limit", &[0; 4096]);
@@ -371,10 +378,9 @@ mod tests {
     }
 
     async fn slow_link(path: std::path::PathBuf) {
-        let client = FakeClient::new(Some(path));
-        let session = client.session(&FakeClient::profile("andrey")).unwrap();
-        let item = crate::testing::first_movie_id(&session).await;
-        let playback = ManagedPlayback::open(backend(session), item, None, Default::default())
+        let (server, item) = film(path);
+        let backend = backend(server.clone());
+        let playback = ManagedPlayback::open(backend, item, None, Default::default())
             .await
             .unwrap();
         let direct = playback.snapshot();
@@ -385,6 +391,7 @@ mod tests {
             matches!(next.plan, PlaybackPlan::Converted { .. }),
             "{next:?}"
         );
+        assert_eq!(server.limits(), [1_000_000]);
         assert_eq!(playback.snapshot().epoch, next.epoch);
         assert_eq!(
             playback.read_chunk(&direct, 0, 1).await,
@@ -413,10 +420,7 @@ mod tests {
     }
 
     async fn display_reaches(path: std::path::PathBuf) {
-        let client = FakeClient::new(Some(path));
-        let profile = FakeClient::profile("andrey");
-        let session = client.session(&profile).unwrap();
-        let item = crate::testing::first_movie_id(&session).await;
+        let (server, item) = film(path);
         let sdr = spoolframe_types::DisplayCapabilities {
             bit_depth: None,
             hdr: Some(Default::default()),
@@ -428,9 +432,11 @@ mod tests {
             display: Some(sdr.clone()),
             ..Default::default()
         };
-        ManagedPlayback::open(backend(session), item, None, options)
+        ManagedPlayback::open(backend(server.clone()), item, None, options)
             .await
             .unwrap();
-        assert_eq!(client.displays_asked(&profile), vec![Some(sdr)]);
+        let starts = server.starts();
+        let displays: Vec<_> = starts.into_iter().map(|s| s.options.display).collect();
+        assert_eq!(displays, [Some(sdr)]);
     }
 }

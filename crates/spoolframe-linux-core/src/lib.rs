@@ -4,17 +4,16 @@
 
 pub mod artcache;
 pub mod backend;
-// A server answering from fixed data, for tests only: the app talks to
-// real servers, through the SDK.
-#[cfg(any(test, feature = "testing"))]
-pub mod fake;
 pub mod fido2;
 pub mod format;
 pub mod helper;
 pub mod history;
 pub mod identity;
 pub mod invites;
-pub mod next_episode;
+// Per-test stand-ins for a server, for tests only: the app talks to
+// real servers, through the SDK.
+#[cfg(any(test, feature = "testing"))]
+pub mod mock;
 pub mod passkey;
 pub mod paths;
 pub mod playlists;

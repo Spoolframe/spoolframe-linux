@@ -6542,16 +6542,10 @@ mod tests {
         );
     }
 
-    /// The fake's server stops being dialled for `why`; what the banner
-    /// then says.
+    /// What the banner says once the SDK stopped dialling Home Media for
+    /// `why`.
     fn banner_once_stopped(why: BackendError) -> (String, Option<String>) {
-        let client = spoolframe_linux_core::fake::FakeClient::new(None);
-        let server = spoolframe_linux_core::fake::FakeClient::profile("andrey").server;
-        let states = client.connection(&server);
-        assert_eq!(*states.borrow(), ConnectionState::Connected);
-        client.stop_dialling(&server, why);
-        let state = states.borrow().clone();
-        connection_text("Home Media", &state)
+        connection_text("Home Media", &ConnectionState::Stopped(why))
     }
 
     /// A 0.15 server says revision 15 to this app on 1 (0.16 restarted
@@ -6623,10 +6617,20 @@ mod tests {
     /// written, escapes and all, or the invite would not read.
     #[test]
     fn an_opened_invite_link_comes_through_gio_unchanged() {
-        let link = spoolframe_linux_core::fake::FakeClient::invite_link(Some(
-            spoolframe_linux_core::fake::INVITE_CODE,
-        ));
-        let link = link.replace("name=Cabin", "name=Home%20Media");
+        use spoolframe_protocol::invite::{Invite, InviteLinkKind};
+        let link = Invite {
+            server: "c4b1".repeat(16),
+            name: Some("Home Media".into()),
+            addrs: vec!["203.0.113.24:41641".parse().unwrap()],
+            relays: vec!["https://relay.home.example".into()],
+            code: Some("QW7K2MFPXR4T".into()),
+            expires_at: Some(2_000_000_000),
+            role: Some(spoolframe_types::Role::Consumer),
+            kind: InviteLinkKind::CreateUser,
+            lookup: None,
+        }
+        .link();
+        assert!(link.contains("name=Home%20Media"), "{link}");
         assert_eq!(gtk::gio::File::for_uri(&link).uri(), link);
     }
 
@@ -6706,47 +6710,130 @@ mod tests {
         }
     }
 
-    /// The playlists the show page of Andor lists, read as the page is.
-    fn andor_page_playlists(client: spoolframe_linux_core::fake::FakeClient) -> Vec<String> {
-        use spoolframe_linux_core::testing::ready;
-        let session = client
-            .session(&spoolframe_linux_core::fake::FakeClient::profile("andrey"))
-            .unwrap();
-        let id = MediaId::new(
-            spoolframe_types::Namespace::Plex,
-            spoolframe_types::MediaKind::Show,
-            "60",
-        )
-        .unwrap();
-        let Item::Show(show) = ready(session.item(&id)).unwrap().0 else {
-            panic!("60 is a show")
+    /// Andor, as an episode's page knows it: its id and title only.
+    fn andor() -> Show {
+        Show {
+            id: spoolframe_linux_core::mock::media(spoolframe_types::MediaKind::Show, "60"),
+            title: "Andor".into(),
+            year: None,
+            summary: None,
+            artwork: Vec::new(),
+            content_rating: None,
+            season_count: None,
+            genres: Vec::new(),
+            cast: Vec::new(),
+            last_aired: None,
+        }
+    }
+
+    /// Andor's season 1, with its first episode.
+    fn andor_season() -> (Item, Item) {
+        let episode = spoolframe_linux_core::mock::episode("61", "60", 1, 1, "Kassa");
+        let Item::Episode(e) = &episode else {
+            unreachable!()
         };
-        let (_, seasons, refs) = ready(show_with_seasons(session.as_ref(), show));
-        assert!(seasons.is_ok());
-        refs.into_iter().map(|p| p.name).collect()
+        let season = Item::Season(spoolframe_types::Season {
+            id: e.season_id.clone(),
+            show_id: e.show_id.clone(),
+            show_title: Some("Andor".into()),
+            season: 1,
+            title: "Season 1".into(),
+            artwork: Vec::new(),
+        });
+        (season, episode)
+    }
+
+    /// A session where Andor has one season, and the heists playlist
+    /// holds one of its episodes.
+    fn andor_session() -> spoolframe_linux_core::mock::shell::MockCatalog {
+        let (season, episode) = andor_season();
+        let heists = spoolframe_linux_core::backend::PlaylistRef {
+            id: "heists".into(),
+            name: "Andor: the heists".into(),
+            owner_kind: spoolframe_linux_core::backend::PlaylistOwnerKind::Mine,
+            builtin: None,
+            owner_name: None,
+            artwork: None,
+        };
+        spoolframe_linux_core::mock::shell::MockCatalog::new()
+            .with_detail(ItemDetail {
+                item: Item::Show(Show {
+                    season_count: Some(1),
+                    ..andor()
+                }),
+                children: vec![season.clone()],
+                playlists: vec![heists],
+                liked: None,
+                liked_children: Vec::new(),
+                copies: None,
+            })
+            .with_item(season, vec![episode])
     }
 
     #[test]
     fn a_shows_page_reads_the_playlists_holding_its_episodes() {
-        let client = spoolframe_linux_core::fake::FakeClient::new(None);
-        assert_eq!(andor_page_playlists(client), ["Andor: the heists"]);
+        let session = andor_session();
+        let (_, _, refs) =
+            spoolframe_linux_core::testing::ready(show_with_seasons(&session, andor()));
+        let names: Vec<_> = refs.into_iter().map(|p| p.name).collect();
+        assert_eq!(names, ["Andor: the heists"]);
     }
 
-    fn home_recent_albums(client: spoolframe_linux_core::fake::FakeClient) -> Vec<String> {
-        use spoolframe_linux_core::testing::ready;
-        let session = client
-            .session(&spoolframe_linux_core::fake::FakeClient::profile("andrey"))
-            .unwrap();
-        ready(recent_albums(session.as_ref()))
+    /// The page is drawn from the show as the server has it, not as the
+    /// episode knew it, with each season's episodes read.
+    #[test]
+    fn a_shows_page_reads_the_show_and_each_seasons_episodes() {
+        let session = andor_session();
+        let (show, seasons, _) =
+            spoolframe_linux_core::testing::ready(show_with_seasons(&session, andor()));
+        let episodes: Vec<_> = seasons
+            .unwrap()
             .into_iter()
-            .map(|a| a.title)
-            .collect()
+            .map(|(season, episodes)| (season.season, episodes.len()))
+            .collect();
+        assert_eq!((show.season_count, episodes), (Some(1), vec![(1, 1)]));
+    }
+
+    /// Tracks played lately: two of Low Tide, then one of Arrival's score.
+    fn played() -> Vec<Item> {
+        let on = |key: &str, album: &str| {
+            let Item::Track(track) = spoolframe_linux_core::mock::track(key, key) else {
+                unreachable!()
+            };
+            Item::Track(spoolframe_types::Track {
+                album_id: spoolframe_linux_core::mock::media(
+                    spoolframe_types::MediaKind::Album,
+                    album,
+                ),
+                album_title: Some(album.into()),
+                ..track
+            })
+        };
+        vec![on("1", "Low Tide"), on("2", "Low Tide"), on("3", "Arrival")]
     }
 
     #[test]
     fn home_lists_the_albums_of_the_tracks_played_lately() {
-        let client = spoolframe_linux_core::fake::FakeClient::new(None);
-        assert_eq!(home_recent_albums(client), ["Low Tide"]);
+        let session =
+            spoolframe_linux_core::mock::shell::MockCatalog::new().with_recently_played(played());
+        let albums: Vec<_> = spoolframe_linux_core::testing::ready(recent_albums(&session))
+            .into_iter()
+            .map(|a| a.title)
+            .collect();
+        assert_eq!(albums, ["Low Tide", "Arrival"]);
+    }
+
+    #[test]
+    fn home_asks_only_for_the_tracks_played_lately() {
+        let session = spoolframe_linux_core::mock::shell::MockCatalog::new();
+        spoolframe_linux_core::testing::ready(recent_albums(&session));
+        assert_eq!(
+            session.recently_played_asked(),
+            [Some(Kinds {
+                tracks: true,
+                ..Kinds::default()
+            })]
+        );
     }
 
     fn nothing_shown() -> Shown {

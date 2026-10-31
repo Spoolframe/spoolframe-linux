@@ -378,10 +378,10 @@ pub(crate) mod tests {
 
     use spoolframe_linux_core::testing::{TestDir, ready, thread_spawn};
 
-    use spoolframe_linux_core::backend::{Client, Selection, ServerKey};
-    use spoolframe_linux_core::fake::FakeClient;
+    use spoolframe_linux_core::backend::{Client, PlaybackStart, Selection, ServerKey, Session};
+    use spoolframe_linux_core::mock::{self, playback::MockPlayback};
     use spoolframe_linux_core::reader::{MediaReader, Spawn};
-    use spoolframe_types::{MediaId, MediaKind, Namespace};
+    use spoolframe_types::{MediaId, MediaKind};
 
     use super::*;
 
@@ -414,12 +414,18 @@ pub(crate) mod tests {
         run_to_eos(&pipeline, Duration::from_secs(30));
     }
 
-    pub(crate) fn published(path: PathBuf) -> Published {
-        let client = FakeClient::new(Some(path));
-        let profile = FakeClient::profile("andrey");
-        let session = client.session(&profile).unwrap();
-        let item = MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap();
+    /// A film's playback on `server`, as it started.
+    fn started(server: MockPlayback) -> (Arc<dyn Session>, MediaId, PlaybackStart) {
+        let session: Arc<dyn Session> = Arc::new(server);
+        let item = mock::media(MediaKind::Movie, "1");
         let start = ready(session.start_playback(&item, None, Default::default())).unwrap();
+        (session, item, start)
+    }
+
+    /// `path` played direct, as the server's file.
+    pub(crate) fn published(path: PathBuf) -> Published {
+        let server = MockPlayback::new(Some(path), [mock::movie("1", "Arrival")]);
+        let (session, item, start) = started(server);
         Published::new(MediaReader::new(
             spoolframe_linux_core::testing::managed(session, item, Selection::default(), start),
             thread_spawn(),
@@ -511,11 +517,8 @@ pub(crate) mod tests {
         let dir = TestDir::new_blocking("spoolframe-grow");
         let path = dir.join("clip.mkv");
         clip(&path);
-        let client = FakeClient::new(Some(path)).converting(16 * 1024);
-        let profile = FakeClient::profile("andrey");
-        let session = client.session(&profile).unwrap();
-        let item = MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap();
-        let start = ready(session.start_playback(&item, None, Default::default())).unwrap();
+        let server = MockPlayback::new(Some(path), [mock::movie("1", "Arrival")]);
+        let (session, item, start) = started(server.converting(16 * 1024));
         let published = Published::new(ProgressiveReader::new(
             spoolframe_linux_core::testing::managed(session, item, Selection::default(), start),
             thread_spawn(),

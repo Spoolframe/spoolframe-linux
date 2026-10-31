@@ -586,10 +586,22 @@ impl View {
 
 #[cfg(test)]
 mod tests {
+    use spoolframe_linux_core::identity::in_memory;
+    use spoolframe_linux_core::mock::accounts::MockAccount;
+
     use super::*;
 
     fn id(byte: u8) -> PortableUserId {
         PortableUserId::from_bytes([byte; 32]).unwrap()
+    }
+
+    /// A tie to `id`, made at the epoch and never used.
+    fn tie(id: PortableUserId) -> Tie {
+        Tie {
+            id,
+            tied_at: std::time::UNIX_EPOCH,
+            last_used_at: None,
+        }
     }
 
     fn with(n: u8) -> TieWith {
@@ -600,14 +612,7 @@ mod tests {
     }
 
     fn ties(bytes: &[u8]) -> Vec<Tie> {
-        bytes
-            .iter()
-            .map(|&b| Tie {
-                id: id(b),
-                tied_at: std::time::UNIX_EPOCH,
-                last_used_at: None,
-            })
-            .collect()
+        bytes.iter().map(|&b| tie(id(b))).collect()
     }
 
     #[test]
@@ -752,27 +757,26 @@ mod tests {
         false
     }
 
-    /// `username`'s group on the fake in a window, which owns the view,
-    /// once a row titled `title` shows; `opened` counts the times This
-    /// computer › Your identity was opened to make one.
+    /// Andrey's group on `account` in a window, which owns the view, with
+    /// `identities` as this computer's, once a row titled `title` shows;
+    /// `opened` counts the times This computer › Your identity was opened
+    /// to make one.
     fn shown(
-        client: &spoolframe_linux_core::fake::FakeClient,
-        username: &str,
+        account: Arc<MockAccount>,
+        identities: Identities,
         title: &str,
         opened: Rc<std::cell::Cell<u32>>,
     ) -> (adw::Window, adw::PreferencesGroup) {
-        use spoolframe_linux_core::backend::Client;
-        use spoolframe_linux_core::fake::FakeClient;
         let toasts = adw::ToastOverlay::new();
         let window = adw::Window::builder().content(&toasts).build();
         let page = adw::PreferencesPage::new();
         toasts.set_child(Some(&page));
         let group = group(
             Needs {
-                session: client.session(&FakeClient::profile(username)).unwrap(),
-                identities: client.identities(),
+                session: account,
+                identities,
                 server_name: "Home Media".into(),
-                username: username.into(),
+                username: "andrey".into(),
                 open_identity: Rc::new(move || opened.set(opened.get() + 1)),
             },
             &toasts,
@@ -792,7 +796,7 @@ mod tests {
     /// One test: GTK binds itself to the first thread that starts it.
     #[test]
     #[ignore = "needs a display; run on its own"]
-    fn identity_here_on_the_fake_server() {
+    fn identity_here_on_a_display() {
         gtk::init().unwrap();
         adw::init().unwrap();
         with_no_identity_here_tie_opens_your_identity();
@@ -800,14 +804,12 @@ mod tests {
         tie_asks_first_and_cancel_ties_nothing();
     }
 
-    /// Tie… names this computer's identity and waits: Cancel leaves the
-    /// account untied, Tie ties it.
+    /// Tie… names this computer's identity and waits: Cancel sends
+    /// nothing, Tie ties it, and the tie the server then lists is marked
+    /// as this computer's.
     fn tie_asks_first_and_cancel_ties_nothing() {
-        use spoolframe_linux_core::backend::Client;
-        use spoolframe_linux_core::fake::FakeClient;
         use spoolframe_linux_core::testing::{NoPrompt, ready};
-        let client = FakeClient::new(None);
-        let identities = client.identities();
+        let identities = in_memory();
         let key = identities.key(std::sync::Arc::new(NoPrompt));
         let label = spoolframe_linux_core::identity::KeyLabel {
             name: "Keyring key".into(),
@@ -815,8 +817,17 @@ mod tests {
             added_at: 1_791_000_000,
         };
         let mine = ready(identities.create("Alice", &[(key, label)])).unwrap();
-        let session = client.session(&FakeClient::profile("andrey")).unwrap();
-        let (window, group) = shown(&client, "andrey", "Not tied to an identity", Rc::default());
+        let account = Arc::new(
+            MockAccount::new()
+                .with_ties([Vec::new(), vec![tie(mine)]])
+                .with_tie_answers([Ok(())]),
+        );
+        let (window, group) = shown(
+            account.clone(),
+            identities,
+            "Not tied to an identity",
+            Rc::default(),
+        );
         let press_tie = || {
             let row = crate::ui_test::row_titled(group.upcast_ref(), "Not tied to an identity");
             button_labelled(row.unwrap().upcast_ref(), "Tie…")
@@ -845,7 +856,7 @@ mod tests {
             .unwrap()
             .emit_clicked();
         crate::ui_test::spin_until(std::time::Duration::from_millis(300), || false);
-        assert!(ready(session.tie_info()).unwrap().is_empty());
+        assert!(account.tied().is_empty(), "Cancel tied");
         let asked = press_tie();
         button_labelled(asked.upcast_ref(), "Tie")
             .unwrap()
@@ -854,12 +865,13 @@ mod tests {
             crate::ui_test::spin_until(std::time::Duration::from_secs(5), || {
                 crate::ui_test::row_titled(group.upcast_ref(), &mine.fingerprint()).is_some()
             }),
-            "Tie did not tie this computer's identity"
+            "Tie did not list this computer's identity"
         );
         let tied_dialog = window.visible_dialog();
         if let Some(dialog) = tied_dialog {
             dialog.force_close();
         }
+        assert_eq!(account.tied(), [mine]);
         assert!(label_reading(
             group.upcast_ref(),
             "This computer’s identity is already tied."
@@ -868,9 +880,14 @@ mod tests {
     }
 
     fn with_no_identity_here_tie_opens_your_identity() {
-        let client = spoolframe_linux_core::fake::FakeClient::new(None);
         let opened = Rc::new(std::cell::Cell::new(0));
-        let (window, group) = shown(&client, "andrey", "Not tied to an identity", opened.clone());
+        let account = Arc::new(MockAccount::new().with_ties([Vec::new()]));
+        let (window, group) = shown(
+            account,
+            in_memory(),
+            "Not tied to an identity",
+            opened.clone(),
+        );
         let row = crate::ui_test::row_titled(group.upcast_ref(), "Not tied to an identity");
         button_labelled(row.unwrap().upcast_ref(), "Create your identity…")
             .expect("the empty row has Create your identity…")
@@ -880,17 +897,16 @@ mod tests {
     }
 
     /// Two ties listed, oldest first; Sever… on the first asks, and once
-    /// answered Sever only the second is left.
+    /// answered Sever that one is severed and what the server lists then
+    /// shows.
     fn every_tie_is_listed_and_severing_one_leaves_the_other() {
-        use spoolframe_linux_core::backend::Client;
-        use spoolframe_linux_core::fake::FakeClient;
-        use spoolframe_linux_core::testing::ready;
-        let client = FakeClient::new(None);
-        let session = client.session(&FakeClient::profile("andrey")).unwrap();
-        ready(session.tie(id(7))).unwrap();
-        ready(session.tie(id(8))).unwrap();
+        let account = Arc::new(
+            MockAccount::new()
+                .with_ties([vec![tie(id(7)), tie(id(8))], vec![tie(id(8))]])
+                .with_untie_answers([Ok(())]),
+        );
         let (first, second) = (id(7).fingerprint(), id(8).fingerprint());
-        let (window, group) = shown(&client, "andrey", &first, Rc::default());
+        let (window, group) = shown(account.clone(), in_memory(), &first, Rc::default());
         let listed = || {
             (
                 crate::ui_test::row_titled(group.upcast_ref(), &first).is_some(),
@@ -915,6 +931,7 @@ mod tests {
                 == (false, true)),
             "the severed tie is still listed, or the other is gone"
         );
+        assert_eq!(account.untied(), [id(7)]);
         window.close();
     }
 }

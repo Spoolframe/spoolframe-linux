@@ -1493,11 +1493,129 @@ pub fn new_playlist_dialog(
 mod tests {
     use std::sync::Arc;
 
-    use spoolframe_linux_core::backend::{Client, Session};
-    use spoolframe_linux_core::fake::{FakeClient, PLAYLIST_PAGE_LIMIT};
-    use spoolframe_linux_core::testing::ready;
+    use spoolframe_linux_core::backend::Session;
+    use spoolframe_linux_core::mock::{self, MockSession};
 
     use super::*;
+
+    fn episodes() -> Kinds {
+        Kinds {
+            episodes: true,
+            ..Kinds::default()
+        }
+    }
+
+    fn music() -> Kinds {
+        Kinds {
+            tracks: true,
+            ..Kinds::default()
+        }
+    }
+
+    fn heists() -> PlaylistSummary {
+        mock::playlist("1", "Andor: the heists", episodes())
+    }
+
+    /// The heists as Alice sees them: Andrey's, read only.
+    fn heists_read_only() -> PlaylistSummary {
+        PlaylistSummary {
+            owner_kind: PlaylistOwnerKind::SharedWithMe,
+            owner_name: Some("Andrey".into()),
+            can_edit: false,
+            can_manage: false,
+            ..heists()
+        }
+    }
+
+    fn movie_night() -> PlaylistSummary {
+        mock::playlist(
+            "2",
+            "Movie night",
+            Kinds {
+                movies: true,
+                ..episodes()
+            },
+        )
+    }
+
+    /// Alice's, shared with the user to edit.
+    fn road_trip() -> PlaylistSummary {
+        PlaylistSummary {
+            owner_kind: PlaylistOwnerKind::SharedWithMe,
+            owner_name: Some("Alice".into()),
+            can_manage: false,
+            ..mock::playlist("3", "Road trip", music())
+        }
+    }
+
+    /// Server-wide films, as an admin or anyone else sees them.
+    fn new_this_month(admin: bool) -> PlaylistSummary {
+        PlaylistSummary {
+            owner_kind: PlaylistOwnerKind::ServerWide,
+            visibility: Visibility::ServerWide,
+            can_edit: admin,
+            can_manage: admin,
+            ..mock::playlist(
+                "4",
+                "New this month",
+                Kinds {
+                    movies: true,
+                    ..Kinds::default()
+                },
+            )
+        }
+    }
+
+    fn liked() -> PlaylistSummary {
+        PlaylistSummary {
+            builtin: Some(Builtin::Liked),
+            can_manage: false,
+            ..mock::playlist("5", "Liked", music())
+        }
+    }
+
+    fn all() -> PlaylistSummary {
+        PlaylistSummary {
+            builtin: Some(Builtin::All),
+            can_edit: false,
+            can_manage: false,
+            ..mock::playlist("6", "All", music())
+        }
+    }
+
+    /// Every playlist Andrey sees, in the server's order.
+    fn andreys() -> Vec<PlaylistSummary> {
+        vec![
+            liked(),
+            all(),
+            heists(),
+            movie_night(),
+            road_trip(),
+            new_this_month(true),
+        ]
+    }
+
+    /// Every playlist Alice sees: the road trip is hers.
+    fn alices() -> Vec<PlaylistSummary> {
+        vec![
+            liked(),
+            all(),
+            heists_read_only(),
+            mock::playlist("3", "Road trip", music()),
+            new_this_month(false),
+        ]
+    }
+
+    fn heists_page() -> PlaylistPage {
+        mock::page(
+            heists(),
+            vec![
+                mock::episode("64", "Andor", 1, 3, "Reckoning"),
+                mock::episode("65", "Andor", 1, 4, "Aldhani"),
+                mock::episode("72", "Andor", 2, 2, "Sagrona Teema"),
+            ],
+        )
+    }
 
     #[test]
     #[ignore = "needs a GTK display"]
@@ -1509,11 +1627,16 @@ mod tests {
                 context.iteration(false);
             }
         };
-        let client = FakeClient::new(None);
-        let session = client.session(&FakeClient::profile("andrey")).unwrap();
-        let list = ready(session.playlists()).unwrap().playlists;
-        let all = list.iter().find(|p| p.name == "All").unwrap();
-        let mut page = ready(session.playlist(&all.id, 0, 200)).unwrap();
+        // Only for the art; nothing here asks it anything else.
+        let session: Arc<dyn Session> = Arc::new(MockSession::new());
+        let list = andreys();
+        let mut page = mock::page(
+            all(),
+            vec![
+                mock::track("41", "Night Ferry"),
+                mock::track("42", "Driftwood"),
+            ],
+        );
         let opened = Rc::new(Cell::new(0));
         let played = Rc::new(Cell::new(0));
         let cards = Rc::new(Cards {
@@ -1720,11 +1843,16 @@ mod tests {
             .iter()
             .filter(|p| p.kinds.movies || p.kinds.episodes)
             .count();
-        assert!(flow.child_at_index(count as i32).is_none());
-        assert!(flow.child_at_index(count as i32 - 1).is_some());
+        // The filter only hides cards: the flow keeps every one.
+        let shown = || -> Vec<gtk::FlowBoxChild> {
+            (0..)
+                .map_while(|i| flow.child_at_index(i))
+                .filter(|child| child.is_child_visible())
+                .collect()
+        };
+        assert_eq!(shown().len(), count);
         let picture = || {
-            flow.child_at_index(0)
-                .unwrap()
+            shown()[0]
                 .child()
                 .unwrap()
                 .downcast::<gtk::Button>()
@@ -1747,8 +1875,9 @@ mod tests {
             picture().is::<gtk::Overlay>(),
             "the existing browser should render the new cover"
         );
-        assert!(
-            flow.child_at_index(count as i32).is_none(),
+        assert_eq!(
+            shown().len(),
+            count,
             "refresh should preserve the media filters"
         );
         assert_eq!(flow.max_children_per_line(), 4);
@@ -1812,10 +1941,10 @@ mod tests {
     #[ignore = "needs a GTK display"]
     fn browse_all_is_offered_without_playlists_of_ones_own() {
         gtk::init().unwrap();
-        let client = FakeClient::new(None);
-        let mut list = ready(andrey(&client).playlists()).unwrap();
-        list.playlists.retain(|p| p.builtin.is_some());
-        assert!(!list.playlists.is_empty());
+        let list = PlaylistList {
+            playlists: vec![liked(), all()],
+            pin_notes: Vec::new(),
+        };
         let browsed = Rc::new(Cell::new(false));
         let actions = Rc::new(ListActions {
             open: Rc::new(|_| {}),
@@ -1848,20 +1977,9 @@ mod tests {
         assert!(browsed.get());
     }
 
-    fn andrey(client: &FakeClient) -> Arc<dyn Session> {
-        client.session(&FakeClient::profile("andrey")).unwrap()
-    }
-
-    fn page_of(session: &dyn Session, name: &str) -> PlaylistPage {
-        let list = ready(session.playlists()).unwrap().playlists;
-        let id = list.iter().find(|p| p.name == name).unwrap().id.clone();
-        ready(session.playlist(&id, 0, PLAYLIST_PAGE_LIMIT)).unwrap()
-    }
-
     #[test]
     fn a_playlist_never_played_plays_from_the_top() {
-        let client = FakeClient::new(None);
-        let page = page_of(andrey(&client).as_ref(), "Andor: the heists");
+        let page = heists_page();
         assert_eq!(
             (play_label(&page), from_start(&page)),
             ("Play".to_owned(), None)
@@ -1870,29 +1988,19 @@ mod tests {
 
     #[test]
     fn a_playlist_played_before_continues_and_can_start_again() {
-        let client = FakeClient::new(None);
-        let session = andrey(&client);
-        let page = page_of(session.as_ref(), "Andor: the heists");
-        let first = page.entries[0].entry;
-        ready(session.play_playlist(
-            &page.playlist.id,
-            Some(page.entries[1].entry),
-            page.settings,
-        ))
-        .unwrap();
-        let page = page_of(session.as_ref(), "Andor: the heists");
-        let label = play_label(&page);
+        let page = PlaylistPage {
+            place: Some(2),
+            ..heists_page()
+        };
         assert_eq!(
-            (label.starts_with("Continue · S"), from_start(&page)),
-            (true, Some(first))
+            (play_label(&page), from_start(&page)),
+            ("Continue · S1 · E4 Aldhani".to_owned(), Some(1))
         );
     }
 
     #[test]
     fn a_season_is_offered_only_the_playlists_that_take_episodes() {
-        let client = FakeClient::new(None);
-        let list = ready(andrey(&client).playlists()).unwrap().playlists;
-        let names: Vec<_> = add_rows(&list, MediaKind::Season)
+        let names: Vec<_> = add_rows(&andreys(), MediaKind::Season)
             .into_iter()
             .map(|row| (row.name, row.adds))
             .collect();
@@ -1953,12 +2061,7 @@ mod tests {
 
     #[test]
     fn whoever_edits_the_entries_may_change_the_cover() {
-        let client = FakeClient::new(None);
-        let alice = client.session(&FakeClient::profile("alice")).unwrap();
-        ready(alice.unlock(spoolframe_linux_core::fake::FAKE_PIN)).unwrap();
-        let editable: Vec<(String, bool)> = ready(alice.playlists())
-            .unwrap()
-            .playlists
+        let editable: Vec<(String, bool)> = alices()
             .iter()
             .map(|p| (p.name.clone(), cover_editable(p)))
             .collect();
@@ -1989,18 +2092,18 @@ mod tests {
 
     #[test]
     fn a_greyed_playlist_says_why() {
-        let client = FakeClient::new(None);
-        let alice = client.session(&FakeClient::profile("alice")).unwrap();
-        ready(alice.unlock(spoolframe_linux_core::fake::FAKE_PIN)).unwrap();
-        let list = ready(alice.playlists()).unwrap().playlists;
-        let month = list.iter().find(|p| p.name == "New this month").unwrap();
+        let cover = ArtworkId::new(spoolframe_types::Namespace::Preview, "month").unwrap();
+        let mut list = alices();
+        for playlist in &mut list {
+            playlist.artwork = Some(cover.clone());
+        }
         assert_eq!(
             add_rows(&list, MediaKind::Movie),
             [AddRow {
-                id: month.id.clone(),
+                id: "4".into(),
                 name: "New this month".into(),
                 builtin: None,
-                artwork: month.artwork.clone(),
+                artwork: Some(cover),
                 line: "Server-wide · admins edit".into(),
                 adds: false,
             }]
@@ -2009,9 +2112,7 @@ mod tests {
 
     #[test]
     fn a_playable_row_says_what_it_holds_and_whose_it_is() {
-        let client = FakeClient::new(None);
-        let list = ready(andrey(&client).playlists()).unwrap().playlists;
-        let lines: Vec<_> = add_rows(&list, MediaKind::Track)
+        let lines: Vec<_> = add_rows(&andreys(), MediaKind::Track)
             .into_iter()
             .map(|row| row.line)
             .collect();
@@ -2041,13 +2142,7 @@ mod tests {
 
     #[test]
     fn an_albums_page_says_liked_is_built_in() {
-        let client = FakeClient::new(None);
-        let session = andrey(&client);
-        let id = |kind, key| {
-            spoolframe_types::MediaId::new(spoolframe_types::Namespace::Plex, kind, key).unwrap()
-        };
-        ready(session.like(&[id(MediaKind::Track, "41")])).unwrap();
-        let lines: Vec<_> = refs_of(session.as_ref(), &id(MediaKind::Album, "31"))
+        let lines: Vec<_> = [reference(&liked()), reference(&road_trip())]
             .iter()
             .map(|r| (r.name.clone(), ref_subtitle(r)))
             .collect();
@@ -2060,19 +2155,21 @@ mod tests {
         );
     }
 
-    fn refs_of(session: &dyn Session, id: &spoolframe_types::MediaId) -> Vec<PlaylistRef> {
-        ready(session.item_detail(id)).unwrap().playlists
-    }
-
-    fn andor() -> spoolframe_types::MediaId {
-        spoolframe_types::MediaId::new(spoolframe_types::Namespace::Plex, MediaKind::Show, "60")
-            .unwrap()
+    /// `playlist` as an item's details list it.
+    fn reference(playlist: &PlaylistSummary) -> PlaylistRef {
+        PlaylistRef {
+            id: playlist.id.clone(),
+            name: playlist.name.clone(),
+            owner_kind: playlist.owner_kind,
+            builtin: playlist.builtin,
+            owner_name: playlist.owner_name.clone(),
+            artwork: playlist.artwork.clone(),
+        }
     }
 
     #[test]
     fn a_show_in_a_playlist_lists_it() {
-        let client = FakeClient::new(None);
-        let refs = refs_of(andrey(&client).as_ref(), &andor());
+        let refs = [reference(&heists())];
         let shown: Vec<_> = shown_refs(&refs)
             .unwrap()
             .iter()
@@ -2083,10 +2180,7 @@ mod tests {
 
     #[test]
     fn an_item_in_no_playlist_has_no_section() {
-        let client = FakeClient::new(None);
-        let mum = client.session(&FakeClient::profile("mum")).unwrap();
-        let refs = refs_of(mum.as_ref(), &andor());
-        assert_eq!(shown_refs(&refs), None);
+        assert_eq!(shown_refs(&[]), None);
     }
 
     #[test]
@@ -2113,8 +2207,14 @@ mod tests {
 
     #[test]
     fn the_header_says_how_many_whose_and_what_it_holds() {
-        let client = FakeClient::new(None);
-        let page = page_of(andrey(&client).as_ref(), "Movie night");
+        let page = mock::page(
+            movie_night(),
+            vec![
+                mock::movie("1", "Alien"),
+                mock::movie("2", "Heat"),
+                mock::episode("61", "Andor", 1, 1, "Kassa"),
+            ],
+        );
         assert_eq!(
             (header_line(&page), holds_line(page.playlist.kinds)),
             (
@@ -2126,14 +2226,13 @@ mod tests {
 
     #[test]
     fn the_menu_offers_to_pin_what_is_not_pinned_and_to_unpin_what_is() {
-        let client = FakeClient::new(None);
-        let list = ready(andrey(&client).playlists()).unwrap().playlists;
-        let labels: Vec<_> = ["Andor: the heists", "Movie night"]
-            .into_iter()
-            .map(|name| {
-                let playlist = list.iter().find(|p| p.name == name).unwrap();
-                pin_label(playlist.pinned.is_some()).0
-            })
+        let pinned = PlaylistSummary {
+            pinned: Some(0),
+            ..heists()
+        };
+        let labels: Vec<_> = [pinned, movie_night()]
+            .iter()
+            .map(|playlist| pin_label(playlist.pinned.is_some()).0)
             .collect();
         assert_eq!(labels, ["Unpin from the sidebar", "Pin to the sidebar"]);
     }

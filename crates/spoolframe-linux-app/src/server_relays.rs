@@ -377,8 +377,7 @@ impl View {
 #[cfg(test)]
 mod tests {
     use spoolframe_linux_core::backend::ServerKey;
-    use spoolframe_linux_core::fake::FakeClient;
-    use spoolframe_linux_core::testing::ready;
+    use spoolframe_linux_core::mock::accounts::{MockClient, RelayEdit};
 
     use super::*;
 
@@ -463,16 +462,16 @@ mod tests {
         }
     }
 
-    /// The dialog with the fake: a bad relay is refused in place, a good
-    /// one makes the list the user's, Off is saved, and "Use the server's
-    /// list" gives the list back.
+    /// The dialog: a bad relay is refused in place, a good one is saved
+    /// as the user's list, Off is saved, and "Use the server's list" saves
+    /// an empty list, giving the server's back.
     #[test]
     #[ignore = "needs a display; run on its own"]
     fn the_relays_dialog_edits_a_servers_relays() {
         gtk::init().unwrap();
         adw::init().unwrap();
-        let client = Arc::new(FakeClient::new(None));
-        let home = ready(client.servers()).unwrap().remove(0);
+        let client = Arc::new(MockClient::new());
+        let home = server(None, &[], false);
         let view = Rc::new(View::new(Needs {
             client: client.clone(),
             server: home.clone(),
@@ -480,33 +479,31 @@ mod tests {
             changed: Rc::new(|| {}),
         }));
         view.show();
-        let saved = || {
-            ready(client.servers())
-                .unwrap()
-                .into_iter()
-                .find(|s| s.key == home.key)
-                .unwrap()
-        };
 
         view.entry.set_text("relay.example");
         view.add.emit_clicked();
+        settle();
         assert!(view.entry.has_css_class("error") && view.error.is_visible());
+        assert_eq!(client.relay_edits(), [], "a bad relay was saved");
 
         view.entry.set_text("https://relay.example");
         view.add.emit_clicked();
         settle();
-        assert_eq!(
-            (saved().relays, saved().relays_edited),
-            (vec!["https://relay.example".to_owned()], true)
-        );
         assert!(view.servers_list.is_visible());
 
         view.choice.set_selected(2);
         settle();
-        assert_eq!(saved().use_relays, Some(false));
 
         view.servers_list.emit_clicked();
         settle();
-        assert!(!saved().relays_edited);
+        assert!(!view.servers_list.is_visible());
+        assert_eq!(
+            client.relay_edits(),
+            [
+                RelayEdit::Urls(home.key.clone(), vec!["https://relay.example".to_owned()]),
+                RelayEdit::Use(home.key.clone(), Some(false)),
+                RelayEdit::Urls(home.key.clone(), Vec::new()),
+            ]
+        );
     }
 }

@@ -6,6 +6,7 @@ use std::time::Duration;
 use spoolframe_client_sdk::describe::{
     self, Channels, HoursMinutes, TrackLabel, TrackOrigin, TrackRole,
 };
+use spoolframe_types::preferences::DEVICE_LANGUAGE;
 
 /// How much of an item is left, as "1 h 20 min left" or "18 min left".
 /// Rounds up, so an item is never shown as having "0 min" left before its
@@ -44,9 +45,22 @@ pub fn timestamp(position: Duration) -> String {
 /// The name of an ISO 639-2 language code, or of a two-letter one with
 /// or without its region as subtitle sites name them (`en`, `pt-BR`,
 /// PX-02), for the common ones; the code itself, upper-cased, for the
-/// rest.
+/// rest. "device" in a preference's languages is this device's.
 pub fn language(code: &str) -> String {
+    if code == DEVICE_LANGUAGE {
+        return "This device's language".to_owned();
+    }
     language_name(&describe::language(code))
+}
+
+/// "device" in a preference's languages, with the language it is here:
+/// `device`, this computer's as the server hears it (BCP 47). "This
+/// device's language (English)"; without one, the server leaves it out.
+pub fn device_language(device: Option<&str>) -> String {
+    match device {
+        Some(code) => format!("{} ({})", language(DEVICE_LANGUAGE), language(code)),
+        None => format!("{} (none is set)", language(DEVICE_LANGUAGE)),
+    }
 }
 
 fn language_name(language: &describe::Language) -> String {
@@ -135,13 +149,14 @@ fn channel_count(channels: Channels) -> u32 {
     }
 }
 
-/// A preference's languages as typed in a field: "original, eng, ger".
+/// A preference's languages as typed in a field: "original, device, eng".
 pub fn language_list(languages: &[String]) -> String {
     languages.join(", ")
 }
 
 /// What was typed in a languages field: codes separated by commas or
-/// spaces, lower-cased, each once, in the order given.
+/// spaces, lower-cased, each once, in the order given. "original" and
+/// "device" are codes like the rest: the server resolves them.
 pub fn parse_language_list(text: &str) -> Vec<String> {
     let mut languages: Vec<String> = Vec::new();
     for code in text
@@ -623,6 +638,27 @@ mod tests {
     fn a_language_list_reads_back_as_typed() {
         let languages = vec!["original".to_owned(), "eng".to_owned()];
         assert_eq!(parse_language_list(&language_list(&languages)), languages);
+    }
+
+    #[test]
+    fn device_in_a_language_list_is_named_as_this_devices() {
+        assert_eq!(language("device"), "This device's language");
+    }
+
+    #[test]
+    fn this_devices_language_is_named_with_what_it_is_here() {
+        assert_eq!(
+            device_language(Some("en-US")),
+            "This device's language (English)"
+        );
+    }
+
+    #[test]
+    fn this_devices_language_says_when_none_is_set() {
+        assert_eq!(
+            device_language(None),
+            "This device's language (none is set)"
+        );
     }
 
     #[test]

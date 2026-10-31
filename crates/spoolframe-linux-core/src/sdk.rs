@@ -17,17 +17,17 @@ use std::time::Duration;
 use async_trait::async_trait;
 use spoolframe_client_sdk as sdk;
 use spoolframe_types::{
-    ArtworkId, Item, Library, LibraryId, MediaId, MediaTracks, SubtitleFormat, TrackPreferences,
+    ArtworkId, Item, Library, LibraryId, MediaId, MediaTracks, TrackPreferences,
 };
 use tokio::runtime::Handle;
 use tokio::sync::watch;
 
 use crate::backend::Reachability;
 use crate::backend::{
-    ArtworkSize, BackendError, BoxFuture, ChosenTracks, Chunk, Client, ConnectionPath,
-    ConnectionState, DeviceInfo, DeviceSignIn, DeviceSignInRequest, HomeScreen, Invite, PersonId,
-    PinProof, PinState, PlaybackHandle, PlaybackPlan, PlaybackStart, PlexLink, Previews, Profile,
-    ProfileSignIn, SearchRequest, SearchResults, Selection, Server, ServerKey, Session,
+    ArtworkSize, BackendError, BoxFuture, ChosenTracks, Client, ConnectionPath, ConnectionState,
+    DeviceInfo, DeviceSignIn, DeviceSignInRequest, HomeScreen, Invite, PersonId, PinProof,
+    PinState, PlaybackPlan, PlexLink, Profile, ProfileSignIn, SearchRequest, SearchResults,
+    Selection, Server, ServerKey, Session,
 };
 use crate::backend::{
     DownloadEvent, DownloadOptionsInfo, DownloadSource, DownloadSpace, DownloadTracks,
@@ -215,6 +215,7 @@ pub fn backend_error(error: sdk::SdkError) -> BackendError {
         // An older server: what needs the request is hidden, as for a
         // feature it lacks.
         E::NotOnServer { request } => BackendError::Unsupported(request),
+        E::FeatureOff { feature } => BackendError::Unsupported(feature.to_string()),
         E::PlaylistReadOnly => BackendError::PlaylistReadOnly,
         E::KindNotAllowed { kind } => BackendError::KindNotAllowed(kind),
         E::PlaylistConflict { revision } => BackendError::PlaylistConflict { revision },
@@ -414,21 +415,6 @@ impl sdk::Storage for SdkStorage {
 /// taken out.
 type Sessions = Arc<Mutex<HashMap<(ServerKey, String), sdk::Session>>>;
 
-/// A paired server's item playing (P8-04), by its handle: the playback's
-/// reads, seeks and stop go to the session that plays it (the paired
-/// server's, direct; the user's own, proxied), and its progress to the
-/// user's own server, by the `fed:` id. Kept by the client, since a
-/// session's adapter is made anew for each `Client::session`; the
-/// `RemotePlayback` holds the paired server's relays for as long as the
-/// play lives.
-type Routes = Arc<Mutex<HashMap<PlaybackHandle, Route>>>;
-
-struct Route {
-    playing: sdk::RemotePlayback,
-    /// The item's `fed:` id, which its progress is reported by.
-    id: MediaId,
-}
-
 /// Runs `call` on the SDK's runtime and maps its error. A task that
 /// panicked or was cancelled is an error too, never a hang.
 async fn on_runtime<T, F>(handle: &Handle, call: F) -> Result<T, BackendError>
@@ -470,7 +456,6 @@ pub struct SdkClient {
     sign_outs: Mutex<HashMap<ServerKey, watch::Sender<u64>>>,
     servers_changed: watch::Sender<()>,
     identities: crate::identity::Identities,
-    routes: Routes,
 }
 
 impl SdkClient {
@@ -518,7 +503,6 @@ impl SdkClient {
             states: Mutex::new(HashMap::new()),
             sign_outs: Mutex::new(HashMap::new()),
             servers_changed,
-            routes: Arc::default(),
         }
     }
 
@@ -1056,7 +1040,6 @@ impl Client for SdkClient {
             handle: self.handle.clone(),
             sessions: self.sessions.clone(),
             key,
-            routes: self.routes.clone(),
         }))
     }
 
@@ -1268,35 +1251,9 @@ pub struct SdkSession {
     handle: Handle,
     sessions: Sessions,
     key: (ServerKey, String),
-    routes: Routes,
 }
 
 impl SdkSession {
-    /// The session a playback's calls go to: the one playing a paired
-    /// server's item (P8-04), else this one.
-    fn routed(&self, handle: &PlaybackHandle) -> Option<sdk::Session> {
-        self.routes
-            .lock()
-            .expect("never poisoned")
-            .get(handle)
-            .map(|route| route.playing.session.clone())
-    }
-
-    /// [`SdkSession::call`] on the session playing `handle`. A paired
-    /// server's session that is gone does not forget this one: it is
-    /// that server's, for one item.
-    async fn call_on<T, F, Fut>(&self, handle: &PlaybackHandle, call: F) -> Result<T, BackendError>
-    where
-        T: Send + 'static,
-        F: FnOnce(sdk::Session) -> Fut,
-        Fut: Future<Output = Result<T, sdk::SdkError>> + Send + 'static,
-    {
-        match self.routed(handle) {
-            Some(session) => on_runtime(&self.handle, call(session)).await,
-            None => self.call(call).await,
-        }
-    }
-
     /// Runs a call on the session; if the session turns out to be gone,
     /// forgets it, so "Who's watching" no longer offers it.
     async fn call<T, F, Fut>(&self, call: F) -> Result<T, BackendError>
@@ -1436,117 +1393,6 @@ impl Session for SdkSession {
         }))
     }
 
-    fn start_playback<'a>(
-        &'a self,
-        id: &'a MediaId,
-        selection: Option<Selection>,
-        options: sdk::PlaybackOptions,
-    ) -> BoxFuture<'a, Result<PlaybackStart, BackendError>> {
-        let id = id.clone();
-        // A paired server's item (P8-04): the SDK dials that server once,
-        // briefly, and plays through this one when it is not reached.
-        let remote = id.namespace() == spoolframe_types::Namespace::Federated && self.federation();
-        if !remote {
-            return Box::pin(self.call(move |s| async move {
-                s.start_playback_with(&id, selection, options).await
-            }));
-        }
-        Box::pin(async move {
-            let asked = id.clone();
-            let playing =
-                self.call(move |s| async move {
-                    s.start_remote_playback(&asked, selection, options).await
-                })
-                .await?;
-            tracing::info!(%id, mode = ?playing.mode, "a paired server's item plays");
-            let start = playing.playback.clone();
-            self.routes
-                .lock()
-                .expect("never poisoned")
-                .insert(start.handle.clone(), Route { playing, id });
-            Ok(start)
-        })
-    }
-
-    fn change_quality<'a>(
-        &'a self,
-        handle: &'a PlaybackHandle,
-        quality: sdk::PlaybackQuality,
-        position: Duration,
-    ) -> BoxFuture<'a, Result<sdk::PlaybackChange, BackendError>> {
-        let asked = handle.clone();
-        Box::pin(self.call_on(handle, move |s| async move {
-            let handle = asked;
-            s.change_quality(&handle, quality, Default::default(), position)
-                .await
-        }))
-    }
-
-    fn read_chunk<'a>(
-        &'a self,
-        handle: &'a PlaybackHandle,
-        epoch: u32,
-        offset: u64,
-        length: u64,
-    ) -> BoxFuture<'a, Result<Chunk, BackendError>> {
-        let asked = handle.clone();
-        Box::pin(self.call_on(handle, move |s| async move {
-            s.read_chunk(&asked, epoch, offset, length).await
-        }))
-    }
-
-    fn seek_playback<'a>(
-        &'a self,
-        handle: &'a PlaybackHandle,
-        position: Duration,
-    ) -> BoxFuture<'a, Result<u32, BackendError>> {
-        let asked = handle.clone();
-        Box::pin(self.call_on(handle, move |s| async move {
-            s.seek_playback(&asked, position).await
-        }))
-    }
-
-    fn stop_playback<'a>(
-        &'a self,
-        handle: &'a PlaybackHandle,
-    ) -> BoxFuture<'a, Result<(), BackendError>> {
-        let asked = handle.clone();
-        Box::pin(async move {
-            let stopped = self
-                .call_on(
-                    handle,
-                    move |s| async move { s.stop_playback(&asked).await },
-                )
-                .await;
-            // Stopped or not, the play is over here: its relays go too.
-            self.routes.lock().expect("never poisoned").remove(handle);
-            stopped
-        })
-    }
-
-    fn read<'a>(
-        &'a self,
-        handle: &'a PlaybackHandle,
-        offset: u64,
-        length: u64,
-    ) -> BoxFuture<'a, Result<Vec<u8>, BackendError>> {
-        let asked = handle.clone();
-        Box::pin(self.call_on(handle, move |s| async move {
-            s.read(&asked, offset, length).await
-        }))
-    }
-
-    fn read_subtitle<'a>(
-        &'a self,
-        handle: &'a PlaybackHandle,
-    ) -> BoxFuture<'a, Result<(SubtitleFormat, Vec<u8>), BackendError>> {
-        let asked = handle.clone();
-        Box::pin(self.call_on(handle, move |s| async move {
-            let subtitle = s.read_subtitle(&asked).await?;
-            Ok((subtitle.format, subtitle.bytes))
-        }))
-    }
-
     fn artwork<'a>(
         &'a self,
         id: &'a ArtworkId,
@@ -1569,19 +1415,17 @@ impl Session for SdkSession {
         self.session.experimental().smart_crop
     }
 
-    /// The server's own answer when it has `NextEpisodes`: in order,
-    /// specials first, as the walk without it goes.
+    /// The server's own answer, in order, specials first. A server without
+    /// `October2026` refuses it (`FeatureOff`, so `Unsupported`) and the
+    /// episode has no Next.
     fn next_episode<'a>(
         &'a self,
         episode: &'a spoolframe_types::Episode,
     ) -> BoxFuture<'a, Result<Option<Item>, BackendError>> {
         Box::pin(async move {
-            if !self.session.has_feature(sdk::Feature::NextEpisodes) {
-                return crate::next_episode::walk(self, episode).await;
-            }
             let id = episode.id.clone();
             self.call(move |s| async move {
-                s.feature::<sdk::gate::NextEpisodes>()?
+                s.feature::<sdk::gate::October2026>()?
                     .next_episode(&id, sdk::NextMode::InOrder, true)
                     .await
             })
@@ -1599,47 +1443,6 @@ impl Session for SdkSession {
 
     fn link_rate(&self) -> Option<u64> {
         self.session.link_rate()
-    }
-
-    fn limit_playback<'a>(
-        &'a self,
-        handle: &'a PlaybackHandle,
-        link_bitrate: u64,
-        position: Duration,
-    ) -> BoxFuture<'a, Result<sdk::PlaybackChange, BackendError>> {
-        let asked = handle.clone();
-        Box::pin(self.call_on(handle, move |s| async move {
-            s.limit_playback(&asked, link_bitrate, Default::default(), position)
-                .await
-        }))
-    }
-
-    fn previews<'a>(&'a self, id: &'a MediaId) -> BoxFuture<'a, Result<Previews, BackendError>> {
-        let id = id.clone();
-        Box::pin(self.call(move |s| async move { s.previews(&id).await }))
-    }
-
-    fn update_progress<'a>(
-        &'a self,
-        handle: &'a PlaybackHandle,
-        position: Duration,
-    ) -> BoxFuture<'a, Result<(), BackendError>> {
-        // A paired server's item: the user's own server keeps their place
-        // (P8-03), by the `fed:` id, however it plays; that server keeps
-        // nothing of it.
-        let fed = self
-            .routes
-            .lock()
-            .expect("never poisoned")
-            .get(handle)
-            .map(|route| route.id.clone());
-        let handle = handle.clone();
-        Box::pin(self.call(move |s| async move {
-            match fed {
-                Some(id) => s.update_watch_progress(&id, position).await,
-                None => s.update_progress(&handle, position).await,
-            }
-        }))
     }
 
     fn mark_watched<'a>(&'a self, id: &'a MediaId) -> BoxFuture<'a, Result<(), BackendError>> {
@@ -2109,12 +1912,8 @@ impl Session for SdkSession {
         Box::pin(self.call(move |s| async move { s.set_play_from(&title, from.as_deref()).await }))
     }
 
-    fn remote_mode(&self, handle: &PlaybackHandle) -> Option<crate::backend::RemoteMode> {
-        self.routes
-            .lock()
-            .expect("never poisoned")
-            .get(handle)
-            .map(|route| route.playing.mode)
+    fn player_session(&self) -> Option<sdk::PlayerSession> {
+        Some(sdk::PlayerSession::for_session(self.session.clone()))
     }
 
     fn catalog_changes(&self) -> crate::backend::CatalogChanges {
@@ -2466,6 +2265,9 @@ mod tests {
                 sdk::SdkError::NotOnServer {
                     request: "UpcomingInPlaylist".into(),
                 },
+                sdk::SdkError::FeatureOff {
+                    feature: sdk::Feature::October2026,
+                },
             ]
             .map(backend_error),
             [
@@ -2474,6 +2276,7 @@ mod tests {
                 BackendError::KindNotAllowed(ItemKind::Movie),
                 BackendError::PlaylistConflict { revision: 9 },
                 BackendError::Unsupported("UpcomingInPlaylist".into()),
+                BackendError::Unsupported("spoolframe:october-2026".into()),
             ]
         );
     }

@@ -1015,9 +1015,7 @@ impl Making {
 
 #[cfg(test)]
 mod tests {
-    use spoolframe_linux_core::backend::Client;
-    use spoolframe_linux_core::fake::FakeClient;
-    use spoolframe_linux_core::testing::ready;
+    use spoolframe_linux_core::mock::accounts::{MockAccount, home, server};
 
     use super::*;
 
@@ -1230,27 +1228,57 @@ mod tests {
         }
     }
 
-    fn admin(client: &FakeClient, username: &str) -> Admin {
+    /// `username` as Home Media's admin, on `account`.
+    fn admin(account: Arc<MockAccount>, username: &str) -> Admin {
         Admin {
-            session: client.session(&FakeClient::profile(username)).unwrap(),
-            server: ready(client.servers()).unwrap().remove(0),
+            session: account,
+            server: server(home(), "Home Media"),
             username: username.into(),
         }
     }
 
-    /// The page with the fake: the list, a new invite made through the
-    /// dialog and shown, the list with it, and revoking it.
+    /// The invite the dialog makes here, as made and as then listed.
+    fn book_club() -> (MintedInvite, InviteSummary) {
+        let made = MintedInvite {
+            id: "inv-1".into(),
+            kind: InviteKind::CreateUser,
+            code: "QW7K-2MFP-XR4T".into(),
+            link: "spoolframe://invite?code=QW7K2MFPXR4T".into(),
+            share_link: "https://spoolframe.app/i#QW7K2MFPXR4T".into(),
+            copy_string: "https://spoolframe.app/i#QW7K2MFPXR4T".into(),
+            expires_at: Some(SystemTime::now() + 7 * DAY),
+            uses: Some(1),
+        };
+        let listed = InviteSummary {
+            used: 0,
+            uses: Some(1),
+            expires_at: made.expires_at,
+            ..summary()
+        };
+        (made, listed)
+    }
+
+    /// The page: the list, a new invite made through the dialog and
+    /// shown, the list with it, and revoking it.
     #[test]
     #[ignore = "needs a display; run on its own"]
     fn the_invites_page_makes_lists_and_revokes() {
         gtk::init().unwrap();
         adw::init().unwrap();
-        let client = FakeClient::new(None);
-        let admin = admin(&client, "andrey");
-        let session = admin.session.clone();
+        let (minted, listed) = book_club();
+        let revoked = InviteSummary {
+            revoked: true,
+            ..listed.clone()
+        };
+        let account = Arc::new(
+            MockAccount::new()
+                .with_invites([Ok(Vec::new()), Ok(vec![listed]), Ok(vec![revoked])])
+                .with_created_invites([Ok(minted)])
+                .with_revoke_answers([Ok(())]),
+        );
         let toasts = adw::ToastOverlay::new();
         let page = adw::PreferencesPage::new();
-        let view = View::new(admin, &toasts);
+        let view = View::new(admin(account.clone(), "andrey"), &toasts);
         page.add(&view.group);
         view.load();
         settle();
@@ -1266,11 +1294,17 @@ mod tests {
             (making.code.label(), making.cancel.label()),
             (made.code.as_str().into(), Some("Done".into()))
         );
-        assert_eq!(view.rows.borrow().len(), 1, "the invite, not the empty row");
+        let titles: Vec<String> = view
+            .rows
+            .borrow()
+            .iter()
+            .filter_map(|r| r.downcast_ref::<adw::ActionRow>().map(|r| r.title().into()))
+            .collect();
+        assert_eq!(titles, ["Book club"], "the invite, not the empty row");
 
         view.revoke(made.id.clone());
         settle();
-        assert!(ready(session.invites()).unwrap()[0].revoked);
+        assert_eq!(account.revoked(), [made.id]);
         assert_eq!(view.rows.borrow().len(), 1, "the empty row again");
     }
 
@@ -1280,10 +1314,9 @@ mod tests {
     fn a_refused_list_takes_the_page_away() {
         gtk::init().unwrap();
         adw::init().unwrap();
-        let client = FakeClient::new(None);
         let toasts = adw::ToastOverlay::new();
         let page = adw::PreferencesPage::new();
-        let view = View::new(admin(&client, "bob"), &toasts);
+        let view = View::new(admin(not_admin(), "bob"), &toasts);
         page.add(&view.group);
         view.load();
         settle();
@@ -1291,12 +1324,16 @@ mod tests {
         the_admin_heading_goes_with_the_list();
     }
 
+    /// A session the server refuses invites to: not its admin.
+    fn not_admin() -> Arc<MockAccount> {
+        Arc::new(MockAccount::new().with_invites([Err(BackendError::AdminOnly)]))
+    }
+
     /// Part of the display test above: GTK binds itself to one thread.
     fn the_admin_heading_goes_with_the_list() {
-        let client = FakeClient::new(None);
         let toasts = adw::ToastOverlay::new();
         let page = adw::PreferencesPage::new();
-        fill(&page, admin(&client, "bob"), &toasts);
+        fill(&page, admin(not_admin(), "bob"), &toasts);
         settle();
         let mut shown = Vec::new();
         let mut widgets = vec![page.clone().upcast::<gtk::Widget>()];

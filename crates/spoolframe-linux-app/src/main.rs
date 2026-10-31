@@ -272,7 +272,7 @@ fn client_options(settings: &settings::Settings) -> sdk::ClientOptions {
         }),
         relays: settings.use_relays(),
         downloads_dir: downloads_dir(),
-        language: language_of(&gtk::glib::language_names()),
+        language: device_language(),
         experimental: sdk::Experimental {
             federation: true,
             smart_crop: true,
@@ -280,6 +280,12 @@ fn client_options(settings: &settings::Settings) -> sdk::ClientOptions {
         },
         ..sdk::ClientOptions::default()
     }
+}
+
+/// This computer's language, as the server hears it: what "device" in
+/// the track preferences' languages stands for.
+pub fn device_language() -> Option<String> {
+    language_of(&gtk::glib::language_names())
 }
 
 /// The first of the system's locale names (most preferred first, as GLib

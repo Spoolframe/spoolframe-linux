@@ -1855,6 +1855,7 @@ fn step_body(icon: &str, heading: &str, line: &str) -> gtk::Box {
 #[cfg(test)]
 mod tests {
     use spoolframe_linux_core::backend::AddressNetwork;
+    use spoolframe_linux_core::mock::accounts::{MockAccount, Trusted};
 
     use super::*;
 
@@ -1919,51 +1920,54 @@ mod tests {
     /// One test: GTK binds itself to the first thread that starts it.
     #[test]
     #[ignore = "needs a display; run on its own"]
-    fn profile_page_on_the_fake_server() {
+    fn profile_page_on_a_display() {
         gtk::init().unwrap();
         adw::init().unwrap();
         remembering_this_computer_lets_it_open_at_start();
         only_another_device_can_be_deleted();
     }
 
-    fn only_another_device_can_be_deleted() {
-        use spoolframe_linux_core::backend::{Client, Server};
-        use spoolframe_linux_core::fake::FakeClient;
-        let client: Arc<dyn Client> = Arc::new(FakeClient::new(None));
-        let profile = FakeClient::profile("andrey");
-        let server = Server {
-            key: profile.server.clone(),
-            name: "Home Media".into(),
-            addresses: Vec::new(),
-            pinned: true,
-            fingerprint: String::new(),
-            verified: true,
-            on_network: true,
-            verified_at: None,
-            last_connected_at: None,
-            server_id: None,
-            advertised: Vec::new(),
-            relays: Vec::new(),
-            advertised_at: None,
-            use_relays: None,
-            relays_edited: false,
+    /// This computer, remembered for the profile or not, and the TV.
+    fn devices(remembered: bool) -> Vec<DeviceInfo> {
+        let device = |name: &str, this_device, trusted| DeviceInfo {
+            endpoint_id: name.into(),
+            name: Some(name.into()),
+            platform: Some(Platform::Linux),
+            last_seen_at: SystemTime::now(),
+            pin_required: false,
+            this_device,
+            trusted,
+            auto_login: false,
         };
-        let page = adw::PreferencesPage::new();
-        fill(
-            &page,
-            Signed {
-                session: client.session(&profile).unwrap(),
-                server_key: server.key.0.clone(),
-                server_name: server.name.clone(),
-                server,
-                display_name: "Andrey".into(),
-                username: "andrey".into(),
-                left: Rc::new(|| {}),
-                switch_profile: Rc::new(|| {}),
-                sign_out: Rc::new(|| {}),
-            },
-            &adw::ToastOverlay::new(),
+        vec![
+            device("nimble", true, remembered),
+            device("Living room TV", false, true),
+        ]
+    }
+
+    /// Andrey's page on Home Media, on `account`.
+    fn andreys(account: Arc<MockAccount>) -> Signed {
+        let server = spoolframe_linux_core::mock::accounts::server(
+            spoolframe_linux_core::mock::accounts::home(),
+            "Home Media",
         );
+        Signed {
+            session: account,
+            server_key: server.key.0.clone(),
+            server_name: server.name.clone(),
+            server,
+            display_name: "Andrey".into(),
+            username: "andrey".into(),
+            left: Rc::new(|| {}),
+            switch_profile: Rc::new(|| {}),
+            sign_out: Rc::new(|| {}),
+        }
+    }
+
+    fn only_another_device_can_be_deleted() {
+        let account = Arc::new(MockAccount::new().with_devices([devices(false)]));
+        let page = adw::PreferencesPage::new();
+        fill(&page, andreys(account), &adw::ToastOverlay::new());
         let deletable = |title: &str| {
             all::<adw::ActionRow>(page.upcast_ref())
                 .into_iter()
@@ -1987,47 +1991,17 @@ mod tests {
         );
     }
 
+    /// Remember this device asks the server to trust this computer, and
+    /// once the server lists it trusted, Open at start may be turned on.
     fn remembering_this_computer_lets_it_open_at_start() {
-        use spoolframe_linux_core::backend::{Client, Server};
-        use spoolframe_linux_core::fake::FakeClient;
-        use spoolframe_linux_core::testing::ready;
-        let fake = Arc::new(FakeClient::new(None));
-        let client: Arc<dyn Client> = fake.clone();
-        let profile = FakeClient::profile("andrey");
-        let server = Server {
-            key: profile.server.clone(),
-            name: "Home Media".into(),
-            addresses: Vec::new(),
-            pinned: true,
-            fingerprint: String::new(),
-            verified: true,
-            on_network: true,
-            verified_at: None,
-            last_connected_at: None,
-            server_id: None,
-            advertised: Vec::new(),
-            relays: Vec::new(),
-            advertised_at: None,
-            use_relays: None,
-            relays_edited: false,
-        };
+        let account = Arc::new(
+            MockAccount::new()
+                .with_devices([devices(false), devices(true)])
+                .with_trust_answers([Ok(())]),
+        );
         let toasts = adw::ToastOverlay::new();
         let page = adw::PreferencesPage::new();
-        fill(
-            &page,
-            Signed {
-                session: client.session(&profile).unwrap(),
-                server_key: server.key.0.clone(),
-                server_name: server.name.clone(),
-                server,
-                display_name: "Andrey".into(),
-                username: "andrey".into(),
-                left: Rc::new(|| {}),
-                switch_profile: Rc::new(|| {}),
-                sign_out: Rc::new(|| {}),
-            },
-            &toasts,
-        );
+        fill(&page, andreys(account.clone()), &toasts);
         let switch = |title: &str| {
             all::<adw::SwitchRow>(page.upcast_ref())
                 .into_iter()
@@ -2036,21 +2010,28 @@ mod tests {
         };
         let remember = switch("Remember this device");
         let at_start = switch("Open this profile when Spoolframe starts");
+        assert!(
+            run_until(std::time::Duration::from_secs(5), || {
+                !all::<adw::ActionRow>(page.upcast_ref())
+                    .iter()
+                    .all(|r| r.title() != "Living room TV")
+            }),
+            "the devices never listed"
+        );
         assert!(!remember.is_active() && !at_start.is_sensitive());
         remember.set_active(true);
-        assert!(
-            run_until(std::time::Duration::from_secs(5), || ready(
-                client.trusted_profiles(&profile.server)
-            )
-            .unwrap()
-            .iter()
-            .any(|t| t.username == "andrey")),
-            "the switch did not make this computer remember the profile"
-        );
         assert!(
             run_until(std::time::Duration::from_secs(5), || at_start
                 .is_sensitive()),
             "Open at start stayed off-limits once remembered"
+        );
+        assert_eq!(
+            account.trusted(),
+            [Trusted {
+                device: None,
+                trusted: true,
+                auto_login: false
+            }]
         );
     }
 

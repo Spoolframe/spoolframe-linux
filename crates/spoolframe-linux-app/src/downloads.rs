@@ -1411,35 +1411,40 @@ mod tests {
     use std::sync::Arc;
     use std::time::UNIX_EPOCH;
 
-    use spoolframe_linux_core::backend::{DownloadTracks, Session};
-    use spoolframe_linux_core::fake::FakeClient;
+    use spoolframe_linux_core::mock::accounts::{MockClient, local_download};
+    use spoolframe_linux_core::mock::{self, media};
     use spoolframe_linux_core::testing::ready;
-    use spoolframe_types::{MediaKind, Namespace};
+    use spoolframe_types::{MediaKind, Movie};
 
     use super::*;
 
-    fn id(kind: MediaKind, key: &str) -> MediaId {
-        MediaId::new(Namespace::Plex, kind, key).unwrap()
-    }
-
     fn alien() -> MediaId {
-        id(MediaKind::Movie, "1")
+        media(MediaKind::Movie, "1")
     }
 
-    fn andrey(client: &FakeClient) -> Arc<dyn Session> {
-        client.session(&FakeClient::profile("andrey")).unwrap()
+    /// Alien, 1 h 57 min long, downloaded as `key`.
+    fn alien_download(key: &str) -> LocalDownload {
+        let Item::Movie(movie) = mock::movie("1", "Alien") else {
+            unreachable!("a movie")
+        };
+        local_download(
+            key,
+            Item::Movie(Movie {
+                duration: Some(Duration::from_secs(117 * 60)),
+                ..movie
+            }),
+        )
     }
 
-    fn started(client: &FakeClient, item: &MediaId) -> LocalDownload {
-        ready(andrey(client).start_download(item, DownloadSource::Original, DownloadTracks::All))
-            .unwrap()
+    /// Andor's 1×4, downloaded as `key`.
+    fn episode_download(key: &str) -> LocalDownload {
+        local_download(key, mock::episode("65", "Andor", 1, 4, "Aldhani"))
     }
 
     fn in_phase(phase: DownloadPhase) -> LocalDownload {
-        let client = FakeClient::new(None);
         LocalDownload {
             phase,
-            ..started(&client, &alien())
+            ..alien_download("download-1")
         }
     }
 
@@ -1832,21 +1837,18 @@ mod tests {
 
     #[test]
     fn only_a_finished_download_plays_in_place_of_the_server() {
-        let client = FakeClient::new(None);
-        let first = started(&client, &alien());
-        let listed = ready(client.downloads());
-        let before = playable_here(&listed, &alien()).is_some();
-        client.finish_download(&first.key);
-        let listed = ready(client.downloads());
-        let mut finished = listed.clone();
-        // A file the fake serves for it: none here, so one is named.
-        finished[0].file_url = Some("file:///tmp/alien.mkv".into());
+        let waiting = alien_download("download-1");
+        let finished = LocalDownload {
+            phase: DownloadPhase::Done,
+            file_url: Some("file:///tmp/alien.mkv".into()),
+            ..waiting.clone()
+        };
         assert_eq!(
             (
-                before,
-                playable_here(&finished, &alien()).map(|d| d.key.clone())
+                playable_here(std::slice::from_ref(&waiting), &alien()).is_some(),
+                playable_here(&[finished], &alien()).map(|d| d.key.clone())
             ),
-            (false, Some(first.key))
+            (false, Some(waiting.key))
         );
     }
 
@@ -1879,61 +1881,32 @@ mod tests {
 
     #[test]
     fn an_episode_is_named_with_its_show_and_place() {
-        let client = FakeClient::new(None);
-        let episode = started(&client, &id(MediaKind::Episode, "65"));
-        let Item::Episode(e) = &episode.item else {
-            panic!("65 is an episode")
-        };
         assert_eq!(
-            title(&episode),
-            format!(
-                "{} · S{} E{} · {}",
-                e.show_title.clone().unwrap(),
-                e.season,
-                e.episode,
-                e.title
-            )
+            title(&episode_download("download-1")),
+            "Andor · S1 E4 · Aldhani"
         );
     }
 
-    fn bobs_episode(client: &FakeClient) -> LocalDownload {
-        ready(
-            client
-                .session(&FakeClient::profile("bob"))
-                .unwrap()
-                .start_download(
-                    &id(MediaKind::Episode, "65"),
-                    DownloadSource::Original,
-                    DownloadTracks::All,
-                ),
-        )
-        .unwrap()
-    }
-
-    fn andrey_shown(client: &FakeClient) {
-        client.set_download_profile(&FakeClient::profile("andrey").server.0, "andrey");
+    /// Bob's download of Andor's 1×4, on the same server as andrey's.
+    fn bobs_episode() -> LocalDownload {
+        LocalDownload {
+            user_id: "bob".into(),
+            username: "bob".into(),
+            ..episode_download("download-bob")
+        }
     }
 
     #[test]
     fn an_items_page_shows_the_latest_download_of_it() {
-        let client = FakeClient::new(None);
-        let mobile = ready(andrey(&client).start_download(
-            &alien(),
-            DownloadSource::Profile {
+        let mobile = LocalDownload {
+            source: DownloadSource::Profile {
                 name: "Mobile".into(),
             },
-            DownloadTracks::All,
-        ))
-        .unwrap();
-        started(&client, &alien());
-        // The Mobile one newer, though listed first.
-        let listed: Vec<LocalDownload> = ready(client.downloads())
-            .into_iter()
-            .map(|d| LocalDownload {
-                created_at: d.created_at + Duration::from_secs(u64::from(d.key == mobile.key)),
-                ..d
-            })
-            .collect();
+            // The Mobile one newer, though listed first.
+            created_at: UNIX_EPOCH + Duration::from_secs(1),
+            ..alien_download("download-1")
+        };
+        let listed = [mobile.clone(), alien_download("download-2")];
         assert_eq!(
             for_item(&listed, &alien()).map(|d| d.key.clone()),
             Some(mobile.key)
@@ -1942,11 +1915,12 @@ mod tests {
 
     #[test]
     fn the_profiles_with_downloads_are_each_named_once() {
-        let client = FakeClient::new(None);
-        started(&client, &alien());
-        started(&client, &id(MediaKind::Movie, "2"));
-        bobs_episode(&client);
-        let named: Vec<String> = holders(Vec::new(), &ready(client.downloads()))
+        let listed = [
+            alien_download("download-1"),
+            local_download("download-2", mock::movie("2", "Heat")),
+            bobs_episode(),
+        ];
+        let named: Vec<String> = holders(Vec::new(), &listed)
             .into_iter()
             .map(|h| h.username)
             .collect();
@@ -1982,11 +1956,14 @@ mod tests {
 
     #[test]
     fn a_changed_download_is_changed_in_place() {
-        let client = FakeClient::new(None);
-        let first = started(&client, &alien());
-        let mut listed = ready(client.downloads());
-        client.advance_download(&first.key, 500);
-        let changed = ready(client.download(&first.key)).unwrap();
+        let first = alien_download("download-1");
+        let mut listed = vec![first.clone()];
+        let changed = LocalDownload {
+            phase: DownloadPhase::Transferring,
+            size: Some(1_000),
+            received: 500,
+            ..first
+        };
         assert_eq!(
             (
                 apply(&mut listed, &DownloadEvent::Changed(changed.clone())),
@@ -1998,9 +1975,8 @@ mod tests {
 
     #[test]
     fn a_removed_download_leaves_the_list() {
-        let client = FakeClient::new(None);
-        let first = started(&client, &alien());
-        let mut listed = ready(client.downloads());
+        let first = alien_download("download-1");
+        let mut listed = vec![first.clone()];
         let removed = DownloadEvent::Removed {
             key: first.key.clone(),
         };
@@ -2016,9 +1992,8 @@ mod tests {
 
     #[test]
     fn a_new_download_is_added() {
-        let client = FakeClient::new(None);
         let mut listed = Vec::new();
-        let first = started(&client, &alien());
+        let first = alien_download("download-1");
         assert_eq!(
             apply(&mut listed, &DownloadEvent::Changed(first)),
             Applied::Added
@@ -2034,28 +2009,28 @@ mod tests {
         assert_eq!(used_fraction(space), 0.25);
     }
 
-    /// With no server, the page lists the profile shown's downloads alone
-    /// (PX-60), a finished one with Play, the banner says what waits to be
-    /// sent, and offers the other profile with downloads here.
+    /// With no server, the page lists the profile shown's downloads (PX-60),
+    /// a finished one with Play, the banner says what waits to be sent,
+    /// and offers the other profile with downloads here.
     #[test]
     #[ignore = "needs a display; run on its own"]
     fn the_page_lists_and_plays_with_no_session() {
         gtk::init().unwrap();
         adw::init().unwrap();
-        let client = Arc::new(FakeClient::new(None));
-        let first = started(&client, &alien());
-        client.finish_download(&first.key);
-        ready(client.record_download_position(&first.key, Duration::from_secs(60))).unwrap();
-        let bobs = bobs_episode(&client);
-        let known = holders(Vec::new(), &ready(client.downloads()));
-        andrey_shown(&client);
+        // Finished, and stopped at a minute the server has not heard.
+        let first = LocalDownload {
+            phase: DownloadPhase::Done,
+            watch: watched(Some(Duration::from_secs(60)), None, true),
+            ..alien_download("download-1")
+        };
+        let known = holders(Vec::new(), &[first.clone(), bobs_episode()]);
         let played = Rc::new(RefCell::new(Vec::new()));
         let acts: Acts = {
             let played = played.clone();
             Rc::new(move |download, act| played.borrow_mut().push((download.key, act)))
         };
         let chosen = Rc::new(RefCell::new(Vec::new()));
-        let page = DownloadsPage::new(client.clone(), acts, Rc::new(|_| {}));
+        let page = DownloadsPage::new(Arc::new(MockClient::new()), acts, Rc::new(|_| {}));
         page.set_offline(Offline {
             heading: "Home Media can’t be reached".into(),
             try_now: Rc::new(|| {}),
@@ -2066,14 +2041,8 @@ mod tests {
                 Rc::new(move |h: Holder| chosen.borrow_mut().push(h.username))
             },
         });
-        page.fill(&ready(client.downloads()));
-        let row = page
-            .rows
-            .borrow()
-            .iter()
-            .position(|r| r.key == first.key)
-            .unwrap();
-        let play = page.rows.borrow()[row]
+        page.fill(std::slice::from_ref(&first));
+        let play = page.rows.borrow()[0]
             .view
             .actions
             .first_child()
@@ -2088,14 +2057,12 @@ mod tests {
                 page.titles().len(),
                 played.borrow().clone(),
                 banner.contains("1 change to send"),
-                page.rows.borrow().iter().any(|r| r.key == bobs.key),
                 chosen.borrow().clone()
             ),
             (
                 1,
                 vec![(first.key.clone(), Act::Play)],
                 true,
-                false,
                 vec!["bob".to_owned()]
             )
         );
@@ -2115,41 +2082,21 @@ mod tests {
         None
     }
 
-    /// Another profile's download moving on never reaches the page of the
-    /// profile shown: its events are not sent (PX-60).
-    #[test]
-    #[ignore = "needs a display; run on its own"]
-    fn another_profiles_events_do_not_reach_the_page() {
-        gtk::init().unwrap();
-        adw::init().unwrap();
-        let client = Arc::new(FakeClient::new(None));
-        let mine = started(&client, &alien());
-        let bobs = bobs_episode(&client);
-        andrey_shown(&client);
-        let page = DownloadsPage::new(client.clone(), Rc::new(|_, _| {}), Rc::new(|_| {}));
-        page.fill(&ready(client.downloads()));
-        let mut events = client.download_events();
-        client.advance_download(&bobs.key, 500);
-        client.finish_download(&bobs.key);
-        while let Ok(event) = events.try_recv() {
-            page.apply(&event);
-        }
-        assert_eq!(page.titles(), [(false, title(&mine))]);
-    }
-
-    /// The page with the fake: a Changed event changes the row it has, a
-    /// finished one moves to Downloaded, and Removed takes it away.
+    /// A Changed event changes the row the page has, a finished one moves
+    /// to Downloaded, and Removed takes it away.
     #[test]
     #[ignore = "needs a display; run on its own"]
     fn the_page_changes_rows_in_place() {
         gtk::init().unwrap();
         adw::init().unwrap();
-        let client = Arc::new(FakeClient::new(None));
-        let first = started(&client, &alien());
-        let second = started(&client, &id(MediaKind::Episode, "65"));
-        andrey_shown(&client);
-        let page = DownloadsPage::new(client.clone(), Rc::new(|_, _| {}), Rc::new(|_| {}));
-        page.fill(&ready(client.downloads()));
+        let first = alien_download("download-1");
+        let second = episode_download("download-2");
+        let page = DownloadsPage::new(
+            Arc::new(MockClient::new()),
+            Rc::new(|_, _| {}),
+            Rc::new(|_| {}),
+        );
+        page.fill(&[first.clone(), second.clone()]);
         let row_of = |key: &str| {
             page.rows
                 .borrow()
@@ -2159,9 +2106,12 @@ mod tests {
         };
         let before = row_of(&first.key).unwrap();
 
-        client.advance_download(&first.key, 500_000);
-        let moving = ready(client.download(&first.key)).unwrap();
-        page.apply(&DownloadEvent::Changed(moving));
+        page.apply(&DownloadEvent::Changed(LocalDownload {
+            phase: DownloadPhase::Transferring,
+            size: Some(1_000_000),
+            received: 500_000,
+            ..first.clone()
+        }));
         let after = row_of(&first.key).unwrap();
         let heading = page.rows.borrow()[0].view.heading.label();
         assert_eq!(
@@ -2169,10 +2119,12 @@ mod tests {
             (true, "Downloading · 50%")
         );
 
-        client.finish_download(&second.key);
-        page.apply(&DownloadEvent::Changed(
-            ready(client.download(&second.key)).unwrap(),
-        ));
+        page.apply(&DownloadEvent::Changed(LocalDownload {
+            phase: DownloadPhase::Done,
+            size: Some(1_000_000),
+            received: 1_000_000,
+            ..second
+        }));
         assert_eq!(
             page.titles()
                 .into_iter()
@@ -2256,23 +2208,19 @@ mod tests {
         assert!(!format!("{kept:?}").contains("1234"));
     }
 
-    /// Andrey's downloads, his PIN asked for here and checked offline
-    /// against 1234, on a page whose pad hands what is typed to `sent`.
-    fn locked_page(client: &Arc<FakeClient>, sent: &Rc<RefCell<Vec<String>>>) -> Rc<DownloadsPage> {
-        client.require_offline_pin(
-            &FakeClient::profile("andrey").server,
-            "andrey",
-            Some("1234"),
-        );
-        andrey_shown(client);
+    /// The page for Andrey, locked here, with `client` answering his
+    /// unlocks; its pad hands what is typed to the PINs returned.
+    fn locked_page(client: &Arc<MockClient>) -> (Rc<DownloadsPage>, Rc<RefCell<Vec<String>>>) {
+        let sent = Rc::new(RefCell::new(Vec::new()));
         let unlock: Rc<dyn Fn(String)> = {
             let sent = sent.clone();
             Rc::new(move |pin| sent.borrow_mut().push(pin))
         };
         let page = DownloadsPage::new(client.clone(), Rc::new(|_, _| {}), unlock);
         page.set_name("Andrey");
-        page.fill(&ready(client.downloads()));
-        page
+        // A locked profile's downloads list empty, as the SDK lists them.
+        page.fill(&[]);
+        (page, sent)
     }
 
     /// A locked profile's page is the PIN pad, with none of its rows.
@@ -2281,29 +2229,27 @@ mod tests {
     fn a_locked_profiles_page_shows_the_pin_pad_not_its_downloads() {
         gtk::init().unwrap();
         adw::init().unwrap();
-        let client = Arc::new(FakeClient::new(None));
-        started(&client, &alien());
-        let page = locked_page(&client, &Rc::default());
+        let (page, _) = locked_page(&Arc::new(MockClient::new().with_locked_downloads([])));
         assert_eq!((page.pad().is_some(), page.titles().len()), (true, 0));
     }
 
-    /// The right PIN, checked here, opens the list: the pad goes.
+    /// The PIN typed is what is checked; once it unlocks, the list shows
+    /// and the pad goes.
     #[test]
     #[ignore = "needs a display; run on its own"]
     fn the_right_pin_unlocks_and_lists() {
         gtk::init().unwrap();
         adw::init().unwrap();
-        let client = Arc::new(FakeClient::new(None));
-        let mine = started(&client, &alien());
-        let sent = Rc::default();
-        let page = locked_page(&client, &sent);
+        let client = Arc::new(MockClient::new().with_locked_downloads([Ok(())]));
+        let (page, sent) = locked_page(&client);
         page.pad().unwrap().enter("1234");
         let pin = sent.borrow_mut().pop().unwrap();
         ready(client.unlock_downloads_offline(&pin)).unwrap();
-        page.fill(&ready(client.downloads()));
+        let mine = alien_download("download-1");
+        page.fill(std::slice::from_ref(&mine));
         assert_eq!(
-            (page.pad().is_some(), page.titles()),
-            (false, vec![(false, title(&mine))])
+            (pin.as_str(), page.pad().is_some(), page.titles()),
+            ("1234", false, vec![(false, title(&mine))])
         );
     }
 
@@ -2314,10 +2260,14 @@ mod tests {
     fn too_many_wrong_pins_rest_the_keys_with_a_countdown() {
         gtk::init().unwrap();
         adw::init().unwrap();
-        let client = Arc::new(FakeClient::new(None));
-        started(&client, &alien());
-        let sent = Rc::default();
-        let page = locked_page(&client, &sent);
+        let wrong = || Err(BackendError::WrongCredentials);
+        let client = Arc::new(MockClient::new().with_locked_downloads([
+            wrong(),
+            wrong(),
+            wrong(),
+            Err(BackendError::RateLimited(Duration::from_secs(2))),
+        ]));
+        let (page, sent) = locked_page(&client);
         for _ in 0..4 {
             page.pad().unwrap().enter("0000");
             let pin = sent.borrow_mut().pop().unwrap();

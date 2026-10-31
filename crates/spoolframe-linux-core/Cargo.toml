@@ -38,7 +38,7 @@ spoolframe-test-dir = { workspace = true, optional = true }
 pkg-config = "0.3"
 
 [features]
-# TestDir and the fake server, for the app's tests too.
+# TestDir and the mocks, for the app's tests too.
 testing = ["dep:spoolframe-test-dir", "dep:spoolframe-policy"]
 
 [dev-dependencies]

@@ -385,8 +385,10 @@ impl View {
         self.show(name);
     }
 
-    /// The saved servers, each with who is signed in there, listed above
-    /// Add a server…; then the page `open` asked for.
+    /// The saved servers listed above Add a server… as soon as they are
+    /// read, then the page `open` asked for. Who is signed in on each other
+    /// server comes as that server answers: one that is down (its connect
+    /// waits out its timeout) holds back only its own line.
     fn load_servers(self: &Rc<Self>, open: Open) {
         let weak = Rc::downgrade(self);
         let (client, current) = (
@@ -399,26 +401,13 @@ impl View {
                 Ok(list) => list,
                 Err(e) => return tracing::warn!(error = %e, "cannot list servers"),
             };
-            let mut listed = Vec::new();
-            for server in saved.into_iter().filter(|s| s.pinned) {
-                let user = if Some(&server.key) == current.as_ref() {
-                    user_here.clone()
-                } else {
-                    match client.profiles(&server.key).await {
-                        Ok(profiles) => profiles.first().map(|p| p.display_name.clone()),
-                        Err(_) => None,
-                    }
-                };
-                listed.push((server, user));
-            }
             let Some(view) = weak.upgrade() else { return };
-            for (server, user) in listed {
+            for server in saved.into_iter().filter(|s| s.pinned) {
+                let here = Some(&server.key) == current.as_ref();
+                let user = user_here.clone().filter(|_| here);
                 let name = server_page_name(&server.key);
-                let row = sidebar_row(
-                    &server.name,
-                    Some(&server_line(user.as_deref())),
-                    crate::icons::SERVER,
-                );
+                let line = here.then(|| server_line(user.as_deref()));
+                let row = sidebar_row(&server.name, line.as_deref(), crate::icons::SERVER);
                 row.set_widget_name(&name);
                 // Above Add a server…, the last row.
                 let at = view.rows.borrow().len() as i32;
@@ -426,10 +415,35 @@ impl View {
                 if open == Open::Server(server.key.clone()) {
                     view.servers_list.select_row(Some(&row));
                 }
+                if !here {
+                    view.ask_who_is_signed_in(&row, &server.key);
+                }
                 view.rows.borrow_mut().push((name, server, user));
             }
             if let Open::Server(key) = &open {
                 view.show(&server_page_name(key));
+            }
+        });
+    }
+
+    /// Who is signed in on `server`, for its `row` and its page.
+    fn ask_who_is_signed_in(self: &Rc<Self>, row: &gtk::ListBoxRow, server: &ServerKey) {
+        let (weak, row) = (Rc::downgrade(self), row.downgrade());
+        let (client, server) = (self.servers.client.clone(), server.clone());
+        glib::spawn_future_local(async move {
+            let user = match client.profiles(&server).await {
+                Ok(profiles) => profiles.first().map(|p| p.display_name.clone()),
+                Err(_) => None,
+            };
+            let (Some(view), Some(row)) = (weak.upgrade(), row.upgrade()) else {
+                return;
+            };
+            set_subtitle(&row, &server_line(user.as_deref()));
+            let name = server_page_name(&server);
+            for (n, _, u) in view.rows.borrow_mut().iter_mut() {
+                if *n == name {
+                    *u = user.clone();
+                }
             }
         });
     }
@@ -487,6 +501,8 @@ fn set_subtitle(row: &gtk::ListBoxRow, text: &str) {
 
 #[cfg(test)]
 mod tests {
+    use spoolframe_linux_core::mock::shell::{self, MockClient};
+
     use super::*;
 
     #[test]
@@ -494,10 +510,22 @@ mod tests {
         assert_eq!(server_line(None), "Not signed in");
     }
 
+    /// A client with one saved server, Home Media, and Andrey signed in.
+    fn home_media() -> MockClient {
+        let home = shell::server(&"h0me".repeat(6), "Home Media");
+        let andrey = shell::profile(&home.key, "andrey");
+        MockClient::new()
+            .with_server(home)
+            .with_profiles(vec![andrey])
+    }
+
     fn needs() -> Needs {
+        needs_of(home_media())
+    }
+
+    fn needs_of(client: MockClient) -> Needs {
         use std::sync::Arc;
-        let client: Arc<dyn spoolframe_linux_core::backend::Client> =
-            Arc::new(spoolframe_linux_core::fake::FakeClient::new(None));
+        let client: Arc<dyn spoolframe_linux_core::backend::Client> = Arc::new(client);
         let off: preferences::SetSkipIntros = Rc::new(|_| {});
         Needs {
             theme: Theme::default(),
@@ -529,17 +557,9 @@ mod tests {
         }
     }
 
-    /// Settings opens on This computer, before any sign-in, and lists the
-    /// saved servers beside it.
-    #[test]
-    #[ignore = "needs a display; run on its own"]
-    fn settings_opens_on_this_computer_and_lists_the_servers() {
-        gtk::init().unwrap();
-        adw::init().unwrap();
-        let parent = adw::Window::new();
-        let window = window(&parent, needs(), Open::ThisComputer);
-        window.present();
-        let listed = crate::ui_test::spin_until(std::time::Duration::from_secs(2), || {
+    /// Whether `window` lists a saved server, within 2 s.
+    fn lists_a_server(window: &adw::Window) -> bool {
+        crate::ui_test::spin_until(std::time::Duration::from_secs(2), || {
             let mut found = false;
             let mut child = window.first_child();
             let mut stack = Vec::new();
@@ -555,13 +575,40 @@ mod tests {
                 child = widget.first_child();
             }
             found
-        });
+        })
+    }
+
+    /// Settings opens on This computer, before any sign-in, and lists the
+    /// saved servers beside it.
+    #[test]
+    #[ignore = "needs a display; run on its own"]
+    fn settings_opens_on_this_computer_and_lists_the_servers() {
+        gtk::init().unwrap();
+        adw::init().unwrap();
+        let parent = adw::Window::new();
+        let window = window(&parent, needs(), Open::ThisComputer);
+        window.present();
+        let listed = lists_a_server(&window);
         let page = window
             .content()
             .and_downcast::<adw::NavigationSplitView>()
             .and_then(|split| split.content())
             .map(|content| content.title());
         assert_eq!((listed, page.as_deref()), (true, Some("Appearance")));
+    }
+
+    /// A saved server that does not answer who is signed in (it is down)
+    /// is listed all the same, with every other.
+    #[test]
+    #[ignore = "needs a display; run on its own"]
+    fn a_server_that_does_not_answer_is_listed_at_once() {
+        gtk::init().unwrap();
+        adw::init().unwrap();
+        let parent = adw::Window::new();
+        let client = home_media().with_profiles_pending();
+        let window = window(&parent, needs_of(client), Open::ThisComputer);
+        window.present();
+        assert!(lists_a_server(&window), "no server listed");
     }
 
     #[test]

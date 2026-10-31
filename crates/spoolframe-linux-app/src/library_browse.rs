@@ -642,25 +642,38 @@ pub fn count_text(kept: Option<u32>, all: u32, noun: Noun) -> String {
 
 #[cfg(test)]
 mod tests {
-    use spoolframe_linux_core::backend::Client;
-    use spoolframe_linux_core::fake::FakeClient;
+    use spoolframe_linux_core::mock::movie;
+    use spoolframe_linux_core::mock::shell::{self, MockCatalog};
     use spoolframe_linux_core::testing::ready;
-    use spoolframe_types::{Library, LibraryKind};
+    use spoolframe_types::Library;
 
     use super::*;
 
-    fn session() -> std::sync::Arc<dyn Session> {
-        FakeClient::new(None)
-            .session(&FakeClient::profile("andrey"))
-            .unwrap()
+    fn movies() -> Library {
+        shell::library("1", LibraryKind::Movies, "Movies")
     }
 
-    fn library(session: &dyn Session, kind: LibraryKind) -> Library {
-        ready(session.libraries())
-            .unwrap()
-            .into_iter()
-            .find(|l| l.kind == kind)
-            .unwrap()
+    fn eight_films() -> Vec<Item> {
+        (1..=8)
+            .map(|n| movie(&n.to_string(), &format!("Film {n}")))
+            .collect()
+    }
+
+    /// A session with a library of eight films, whose sorted and
+    /// filtered reads `sorted` answers.
+    fn session(
+        sorted: impl Fn(
+            &LibraryId,
+            Option<ItemSort>,
+            Option<&ItemFilter>,
+        ) -> Result<Vec<Item>, BackendError>
+        + Send
+        + Sync
+        + 'static,
+    ) -> MockCatalog {
+        MockCatalog::new()
+            .with_library(movies(), eight_films(), ItemFilterValues::default())
+            .with_sorted(sorted)
     }
 
     fn titles(items: &[Item]) -> Vec<String> {
@@ -1217,47 +1230,57 @@ mod tests {
     }
 
     #[test]
-    fn date_added_newest_first_orders_the_movies_so() {
-        let session = session();
-        let movies = library(session.as_ref(), LibraryKind::Movies);
+    fn a_sorted_first_page_asks_the_server_for_that_order() {
+        let session = session(|_, _, _| Ok(Vec::new()));
         let request = sorted(SortKey::Added, true).request().unwrap();
-        let First::Items(items, _) = ready(first(session.as_ref(), &movies.id, &request, 500))
-        else {
-            panic!("no items");
-        };
+        ready(first(&session, &movies().id, &request, 500));
         assert_eq!(
-            titles(&items),
-            vec![
-                "Arrival",
-                "Heat",
-                "Blade Runner",
-                "Moon",
-                "Sunshine",
-                "Contact",
-                "Dune: Part Two",
-                "Alien"
-            ]
+            session.sorted_asked(),
+            [(
+                movies().id,
+                Some(ItemSort {
+                    key: SortKey::Added,
+                    descending: true
+                }),
+                None
+            )]
         );
     }
 
     #[test]
-    fn a_genre_narrows_the_movies_and_the_count_says_of_how_many() {
-        let session = session();
-        let movies = library(session.as_ref(), LibraryKind::Movies);
-        let (_, all) = ready(session.items(&movies.id, 0, 1)).unwrap();
-        let request = genre("Drama").request().unwrap();
-        let First::Items(_, kept) = ready(first(session.as_ref(), &movies.id, &request, 500))
-        else {
+    fn a_sorted_first_page_is_in_the_servers_order() {
+        let session = session(|_, _, _| Ok(vec![movie("2", "Heat"), movie("1", "Arrival")]));
+        let request = sorted(SortKey::Added, true).request().unwrap();
+        let First::Items(items, _) = ready(first(&session, &movies().id, &request, 500)) else {
             panic!("no items");
         };
-        assert_eq!(count_text(Some(kept), all, films()), "4 of 8 films");
+        assert_eq!(titles(&items), ["Heat", "Arrival"]);
     }
 
     #[test]
+    fn a_genre_narrows_the_movies_and_the_count_says_of_how_many() {
+        // The server keeps 4 of the 8.
+        let session = session(|_, _, _| Ok(eight_films().into_iter().take(4).collect()));
+        let request = genre("Drama").request().unwrap();
+        let First::Items(_, kept) = ready(first(&session, &movies().id, &request, 500)) else {
+            panic!("no items");
+        };
+        let (_, all) = ready(session.items(&movies().id, 0, 1)).unwrap();
+        assert_eq!(count_text(Some(kept), all, films()), "4 of 8 films");
+    }
+
+    /// A music library lists genres only; Watched is not added for it.
+    #[test]
     fn a_music_library_has_no_watched_section() {
-        let session = session();
-        let music = library(session.as_ref(), LibraryKind::Music);
-        let values = ready(session.item_filter_values(&music.id)).unwrap();
+        let values = ItemFilterValues {
+            genres: vec![Counted {
+                value: "Jazz".into(),
+                count: None,
+            }],
+            sorts: vec![SortKey::Title, SortKey::Added],
+            filters: vec![FilterPart::Genres],
+            ..ItemFilterValues::default()
+        };
         assert!(
             !sections(&values)
                 .iter()
@@ -1267,31 +1290,24 @@ mod tests {
 
     #[test]
     fn a_filter_that_keeps_nothing_is_the_empty_state() {
-        let session = session();
-        let movies = library(session.as_ref(), LibraryKind::Movies);
-        // Alien, the one horror film, is 1080p.
+        let session = session(|_, _, _| Ok(Vec::new()));
         let mut choice = genre("Horror");
         choice.set(&Value::Resolution(Resolution::Uhd), true);
         let request = choice.request().unwrap();
         assert!(matches!(
-            ready(first(session.as_ref(), &movies.id, &request, 500)),
+            ready(first(&session, &movies().id, &request, 500)),
             First::Nothing
         ));
     }
 
     #[test]
     fn a_sort_the_server_refuses_after_all_falls_back() {
-        let session = session();
-        let shows = library(session.as_ref(), LibraryKind::Shows);
-        // The movies' values, as if the TV library had listed duration
-        // before it changed.
-        let movies = library(session.as_ref(), LibraryKind::Movies);
-        let stale = ready(session.item_filter_values(&movies.id)).unwrap();
-        let Plan::Sorted(request) = plan(&sorted(SortKey::Duration, true), Some(&stale)) else {
-            panic!("refused before sending");
-        };
+        // The library listed duration before it changed; the server no
+        // longer has it.
+        let session = session(|_, _, _| Err(BackendError::InvalidInput("no duration".into())));
+        let request = sorted(SortKey::Duration, true).request().unwrap();
         assert!(matches!(
-            ready(first(session.as_ref(), &shows.id, &request, 500)),
+            ready(first(&session, &movies().id, &request, 500)),
             First::Refused
         ));
     }

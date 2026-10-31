@@ -159,7 +159,7 @@ async fn moved(store: &dyn ProfileStore, data: &DataStore, key: &str) -> Option<
 #[cfg(test)]
 mod tests {
     use spoolframe_linux_core::backend::{ItemFilterValues, ItemSort, ServerKey, SortKey};
-    use spoolframe_linux_core::fake::FakeClient;
+    use spoolframe_linux_core::mock::shell::MockClient;
     use spoolframe_linux_core::testing::{TestDir, runtime};
 
     use super::*;
@@ -180,14 +180,14 @@ mod tests {
         TestDir::new_blocking(&format!("spoolframe-saved-choices-{name}"))
     }
 
-    fn store(client: &FakeClient, username: &str) -> Arc<dyn ProfileStore> {
+    fn store(client: &MockClient, username: &str) -> Arc<dyn ProfileStore> {
         let profile = profile(username);
         client.profile_store(&profile.server, &profile.username)
     }
 
     /// `username`'s choices as read now, with `legacy` the data directory
     /// from before the store.
-    fn read(client: &FakeClient, legacy: Option<DataStore>, username: &str) -> SavedChoices {
+    fn read(client: &MockClient, legacy: Option<DataStore>, username: &str) -> SavedChoices {
         let store = store(client, username);
         runtime().block_on(SavedChoices::in_store(store, legacy, &profile(username)))
     }
@@ -204,7 +204,7 @@ mod tests {
 
     #[test]
     fn a_saved_choice_comes_back() {
-        let client = FakeClient::new(None);
+        let client = MockClient::new();
         read(&client, None, "andrey").set("movies", newest());
         written();
         assert_eq!(read(&client, None, "andrey").get("movies"), Some(&newest()));
@@ -212,7 +212,7 @@ mod tests {
 
     #[test]
     fn each_profile_has_its_own_choices() {
-        let client = FakeClient::new(None);
+        let client = MockClient::new();
         read(&client, None, "andrey").set("movies", newest());
         written();
         assert!(read(&client, None, "alice").get("movies").is_none());
@@ -220,7 +220,7 @@ mod tests {
 
     #[test]
     fn choosing_the_default_forgets_the_library() {
-        let client = FakeClient::new(None);
+        let client = MockClient::new();
         let mut saved = read(&client, None, "andrey");
         saved.set("movies", newest());
         saved.set("shows", newest());
@@ -235,7 +235,7 @@ mod tests {
 
     #[test]
     fn the_last_default_removes_the_value() {
-        let client = FakeClient::new(None);
+        let client = MockClient::new();
         let mut saved = read(&client, None, "andrey");
         saved.set("movies", newest());
         saved.set("movies", Choice::default());
@@ -246,7 +246,7 @@ mod tests {
 
     #[test]
     fn an_unreadable_value_is_no_choices() {
-        let client = FakeClient::new(None);
+        let client = MockClient::new();
         write(
             store(&client, "andrey"),
             CHOICES,
@@ -258,7 +258,7 @@ mod tests {
 
     #[test]
     fn choices_from_before_the_store_move_into_it_and_their_file_goes() {
-        let (client, data) = (FakeClient::new(None), dir("legacy"));
+        let (client, data) = (MockClient::new(), dir("legacy"));
         let key = profile_key("library-choices", &profile("andrey"));
         let file = serde_json::json!({ "movies": newest() });
         DataStore::new(data.path())
@@ -277,7 +277,7 @@ mod tests {
 
     #[test]
     fn a_choice_made_while_they_are_read_stays() {
-        let client = FakeClient::new(None);
+        let client = MockClient::new();
         read(&client, None, "andrey").set("shows", newest());
         written();
         let mut shown = SavedChoices::default();
@@ -295,7 +295,7 @@ mod tests {
     /// refuses: the page falls back, and forgets it.
     #[test]
     fn a_saved_sort_this_build_does_not_know_is_refused() {
-        let client = FakeClient::new(None);
+        let client = MockClient::new();
         let file = serde_json::json!({ "movies": { "sort": { "key": "loudness" }, "filter": {} } });
         write(
             store(&client, "andrey"),

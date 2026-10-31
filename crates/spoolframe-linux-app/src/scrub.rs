@@ -415,8 +415,8 @@ impl Drop for Preview {
 mod tests {
     use std::time::Instant;
 
-    use spoolframe_linux_core::backend::{Client, PreviewTile};
-    use spoolframe_linux_core::fake::{FakeClient, PreviewsAnswer};
+    use spoolframe_linux_core::backend::PreviewTile;
+    use spoolframe_linux_core::mock::playback::{MockPlayback, PreviewsAnswer};
     use spoolframe_types::{MediaKind, Namespace};
 
     use super::*;
@@ -436,10 +436,8 @@ mod tests {
     }
 
     fn frames(answer: PreviewsAnswer) -> Rc<Frames> {
-        let client = FakeClient::new(None).with_previews(answer);
-        Frames::new(Some(
-            client.session(&FakeClient::profile("andrey")).unwrap(),
-        ))
+        let server = MockPlayback::new(None, []).with_previews(answer);
+        Frames::new(Some(Arc::new(server)))
     }
 
     fn arrival() -> MediaId {
@@ -457,7 +455,7 @@ mod tests {
     /// One test: the frames go through GLib's main loop.
     #[test]
     #[ignore = "needs a display; run on its own"]
-    fn frames_on_the_fake_server() {
+    fn frames_from_a_mock_server() {
         gtk::init().unwrap();
         a_frame_comes_once_its_sheet_has();
         frames_still_being_made_are_asked_for_again();

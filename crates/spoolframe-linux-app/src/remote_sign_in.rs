@@ -602,10 +602,12 @@ fn lead(before: &str, address: &str, after: &str) -> Markup {
 
 #[cfg(test)]
 mod tests {
-    use spoolframe_linux_core::fake::{FakeClient, PhoneAnswer};
-    use spoolframe_linux_core::testing::ready;
+    use spoolframe_linux_core::mock::accounts::{self, Approval, MockClient};
 
     use super::*;
+
+    /// The page Home Media approves codes on.
+    const PAGE: &str = "https://media.example.org/auth/device?code=BCDFGHJK";
 
     #[test]
     fn a_device_not_remembered_says_it_is_just_this_once() {
@@ -622,6 +624,19 @@ mod tests {
         );
     }
 
+    /// Andrey approved, remembered here as the approver chose.
+    fn approved(remembered: Option<bool>) -> Approval {
+        Approval::Approved {
+            profile: accounts::profile("andrey", "Andrey"),
+            remembered,
+        }
+    }
+
+    /// Home Media with its web page, a sign-in there ending as `approval`.
+    fn on_the_web(approval: Approval) -> MockClient {
+        MockClient::new().with_device_sign_in(Some(PAGE), approval)
+    }
+
     /// What the screen handed back: the profile, whether it gave up for
     /// want of a web address, and the pages it opened in the browser.
     #[derive(Default)]
@@ -631,23 +646,18 @@ mod tests {
         opened: RefCell<Vec<String>>,
     }
 
-    /// The screen on the fake's Home Media, shown in a window, and what
-    /// it handed back.
-    fn open(client: FakeClient) -> (Rc<RemoteSignIn>, Rc<Ended>) {
+    /// The screen on Home Media, shown in a window, and what it handed
+    /// back.
+    fn open(client: MockClient) -> (Rc<RemoteSignIn>, Rc<Ended>) {
         open_via(client, Via::Phone)
     }
 
-    fn open_via(client: FakeClient, via: Via) -> (Rc<RemoteSignIn>, Rc<Ended>) {
+    fn open_via(client: MockClient, via: Via) -> (Rc<RemoteSignIn>, Rc<Ended>) {
         open_asking(client, via, false)
     }
 
-    fn open_asking(client: FakeClient, via: Via, remember: bool) -> (Rc<RemoteSignIn>, Rc<Ended>) {
-        let client: Arc<dyn Client> = Arc::new(client);
-        let server = ready(client.servers())
-            .unwrap()
-            .into_iter()
-            .find(|s| s.pinned)
-            .unwrap();
+    fn open_asking(client: MockClient, via: Via, remember: bool) -> (Rc<RemoteSignIn>, Rc<Ended>) {
+        let server = accounts::server(accounts::home(), "Home Media");
         let ended = Rc::new(Ended::default());
         let ends = Ends {
             done: {
@@ -665,7 +675,7 @@ mod tests {
                 Rc::new(move |url| ended.opened.borrow_mut().push(url.to_owned()))
             },
         };
-        let screen = RemoteSignIn::new(client, &server, via, remember, ends);
+        let screen = RemoteSignIn::new(Arc::new(client), &server, via, remember, ends);
         let window = adw::Window::builder()
             .default_width(800)
             .default_height(760)
@@ -690,7 +700,7 @@ mod tests {
     /// One test: GTK binds itself to the first thread that starts it.
     #[test]
     #[ignore = "needs a display; run on its own"]
-    fn remote_sign_in_on_the_fake_server() {
+    fn remote_sign_in_on_a_display() {
         gtk::init().unwrap();
         adw::init().unwrap();
         an_approval_ends_as_a_password_sign_in();
@@ -705,22 +715,16 @@ mod tests {
     }
 
     fn the_browser_opens_the_page_and_the_screen_waits() {
-        let (screen, ended) = open_via(
-            FakeClient::new(None).answering_phone_sign_in(PhoneAnswer::Wait),
-            Via::Browser,
-        );
+        let (screen, ended) = open_via(on_the_web(Approval::Waiting), Via::Browser);
         assert!(reaches(&screen, "waiting"));
-        let url = "https://media.example.org/auth/device?code=BCDFGHJK";
-        assert_eq!(*ended.opened.borrow(), [url]);
+        assert_eq!(*ended.opened.borrow(), [PAGE]);
         assert!(!screen.qr.is_visible() && screen.code.label() == "BCDF-GHJK");
         screen.dialog.force_close();
     }
 
     fn without_a_web_address_the_browser_gives_way_to_the_password() {
         let (screen, ended) = open_via(
-            FakeClient::new(None)
-                .without_web_address()
-                .answering_phone_sign_in(PhoneAnswer::Wait),
+            MockClient::new().with_device_sign_in(None, Approval::Waiting),
             Via::Browser,
         );
         assert!(crate::ui_test::spin_until(Duration::from_secs(5), || ended
@@ -733,7 +737,7 @@ mod tests {
     }
 
     fn an_approval_ends_as_a_password_sign_in() {
-        let (_screen, ended) = open(FakeClient::new(None));
+        let (_screen, ended) = open(on_the_web(approved(Some(false))));
         assert!(crate::ui_test::spin_until(Duration::from_secs(5), || ended
             .profile
             .borrow()
@@ -742,7 +746,7 @@ mod tests {
     }
 
     fn a_remembered_approval_says_so_before_the_profile_opens() {
-        let (screen, ended) = open_asking(FakeClient::new(None), Via::Phone, true);
+        let (screen, ended) = open_asking(on_the_web(approved(Some(true))), Via::Phone, true);
         assert!(reaches(&screen, "approved"), "the approval was not said");
         assert_eq!(screen.approved.title(), "Signed in as Andrey");
         assert!(
@@ -756,19 +760,14 @@ mod tests {
     }
 
     fn an_approval_that_forgot_the_device_says_just_this_once() {
-        let (screen, _) = open_asking(
-            FakeClient::new(None).answering_phone_sign_in(PhoneAnswer::ApproveForgetting("andrey")),
-            Via::Phone,
-            true,
-        );
+        let (screen, _) = open_asking(on_the_web(approved(Some(false))), Via::Phone, true);
         assert!(reaches(&screen, "approved"));
         assert!(screen.approved.title().ends_with("just this once"));
         screen.dialog.force_close();
     }
 
     fn an_expired_code_is_replaced_on_asking() {
-        let (screen, ended) =
-            open(FakeClient::new(None).answering_phone_sign_in(PhoneAnswer::Expire));
+        let (screen, ended) = open(on_the_web(Approval::Expired));
         assert!(reaches(&screen, "expired"), "an expired code was not said");
         assert_eq!(screen.expired_code.label(), "BCDF-GHJK");
         screen.new_code.emit_clicked();
@@ -779,8 +778,7 @@ mod tests {
     }
 
     fn a_denial_offers_another_try() {
-        let (screen, ended) =
-            open(FakeClient::new(None).answering_phone_sign_in(PhoneAnswer::Deny));
+        let (screen, ended) = open(on_the_web(Approval::Denied));
         assert!(reaches(&screen, "denied"), "the denial was not said");
         screen.try_again.emit_clicked();
         assert_eq!(showing_page(&screen).as_deref(), Some("asking"));
@@ -789,19 +787,14 @@ mod tests {
     }
 
     fn without_a_web_address_there_is_only_the_code() {
-        let (screen, _) = open(
-            FakeClient::new(None)
-                .without_web_address()
-                .answering_phone_sign_in(PhoneAnswer::Wait),
-        );
+        let (screen, _) = open(MockClient::new().with_device_sign_in(None, Approval::Waiting));
         assert!(reaches(&screen, "waiting"));
         assert!(!screen.qr.is_visible() && screen.code.label() == "BCDF-GHJK");
         screen.dialog.force_close();
     }
 
     fn closing_the_screen_stops_waiting() {
-        let (screen, ended) =
-            open(FakeClient::new(None).answering_phone_sign_in(PhoneAnswer::Wait));
+        let (screen, ended) = open(on_the_web(Approval::Waiting));
         assert!(reaches(&screen, "waiting"), "the code was never shown");
         assert!(screen.qr.is_visible() && screen.page.text().contains("media.example.org"));
         assert!(screen.call.borrow().is_some(), "not waiting");

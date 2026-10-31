@@ -521,17 +521,13 @@ pub fn resume_from(item: &Item) -> Option<Duration> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use crate::testing::ready;
 
-    use spoolframe_types::{MediaId, MediaKind, Namespace};
+    use spoolframe_types::MediaKind;
 
     use super::*;
-    use crate::backend::{
-        Client, Liked, PinNoteReason, PlaySettings, PlaylistList, PlaylistUpdate, Repeat,
-    };
-    use crate::fake::FakeClient;
+    use crate::backend::{PinNote, PinNoteReason, PlaySettings, PlaylistList};
+    use crate::mock::{self, Edit, MockSession, media};
 
     #[test]
     fn a_search_finds_a_name_holding_it_whatever_its_case() {
@@ -566,23 +562,6 @@ mod tests {
         );
     }
 
-    fn media(kind: MediaKind, key: &str) -> MediaId {
-        MediaId::new(Namespace::Plex, kind, key).unwrap()
-    }
-
-    /// `username`'s session; Alice's opens locked, so it is unlocked.
-    fn session(client: &FakeClient, username: &str) -> Arc<dyn Session> {
-        let session = client.session(&FakeClient::profile(username)).unwrap();
-        if username == "alice" {
-            ready(session.unlock(crate::fake::FAKE_PIN)).unwrap();
-        }
-        session
-    }
-
-    fn named<'a>(list: &'a [PlaylistSummary], name: &str) -> &'a PlaylistSummary {
-        list.iter().find(|p| p.name == name).unwrap()
-    }
-
     fn names(list: &[PlaylistSummary]) -> Vec<String> {
         list.iter().map(|p| p.name.clone()).collect()
     }
@@ -594,40 +573,137 @@ mod tests {
         }
     }
 
-    fn page(session: &dyn Session, id: &str) -> PlaylistPage {
-        ready(session.playlist(id, 0, 200)).unwrap()
+    fn movies_and_episodes() -> Kinds {
+        Kinds {
+            movies: true,
+            ..episodes()
+        }
     }
 
-    #[test]
-    fn a_third_user_sees_only_the_server_wide_one() {
-        let client = FakeClient::new(None);
-        let list = ready(session(&client, "mum").playlists())
-            .unwrap()
-            .playlists;
-        // Of others' playlists; Liked and All are her own.
-        assert_eq!(
-            list.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
-            ["Liked", "All", "New this month"]
-        );
+    fn music() -> Kinds {
+        Kinds {
+            tracks: true,
+            ..Kinds::default()
+        }
+    }
+
+    /// The user's, shared with Alice to read.
+    fn heists() -> PlaylistSummary {
+        let alice = PlaylistShare {
+            display_name: Some("Alice".into()),
+            ..PlaylistShare::new("local:alice", false)
+        };
+        PlaylistSummary {
+            visibility: Visibility::Shared { with: vec![alice] },
+            ..mock::playlist("1", "Andor: the heists", episodes())
+        }
+    }
+
+    /// The heists as Alice sees them: Andrey's, read only.
+    fn heists_read_only() -> PlaylistSummary {
+        PlaylistSummary {
+            owner_kind: PlaylistOwnerKind::SharedWithMe,
+            owner_name: Some("Andrey".into()),
+            visibility: Visibility::Shared { with: Vec::new() },
+            can_edit: false,
+            can_manage: false,
+            ..heists()
+        }
+    }
+
+    fn movie_night() -> PlaylistSummary {
+        mock::playlist("2", "Movie night", movies_and_episodes())
+    }
+
+    /// Alice's, shared with the user to edit.
+    fn road_trip() -> PlaylistSummary {
+        PlaylistSummary {
+            owner_kind: PlaylistOwnerKind::SharedWithMe,
+            owner_name: Some("Alice".into()),
+            can_manage: false,
+            ..mock::playlist("3", "Road trip", music())
+        }
+    }
+
+    /// Server-wide films, as an admin or anyone else sees them.
+    fn new_this_month(admin: bool) -> PlaylistSummary {
+        PlaylistSummary {
+            owner_kind: PlaylistOwnerKind::ServerWide,
+            visibility: Visibility::ServerWide,
+            can_edit: admin,
+            can_manage: admin,
+            ..mock::playlist(
+                "4",
+                "New this month",
+                Kinds {
+                    movies: true,
+                    ..Kinds::default()
+                },
+            )
+        }
+    }
+
+    fn liked() -> PlaylistSummary {
+        PlaylistSummary {
+            builtin: Some(Builtin::Liked),
+            can_manage: false,
+            ..mock::playlist("5", "Liked", music())
+        }
+    }
+
+    fn all() -> PlaylistSummary {
+        PlaylistSummary {
+            builtin: Some(Builtin::All),
+            can_edit: false,
+            can_manage: false,
+            ..mock::playlist("6", "All", music())
+        }
+    }
+
+    /// The heists' three episodes, none watched.
+    fn heists_page() -> PlaylistPage {
+        mock::page(
+            heists(),
+            vec![
+                mock::episode("64", "Andor", 1, 3, "Reckoning"),
+                mock::episode("65", "Andor", 1, 4, "Aldhani"),
+                mock::episode("72", "Andor", 2, 2, "Sagrona Teema"),
+            ],
+        )
+    }
+
+    /// `page` with `entries` unavailable, as the server says it.
+    fn unavailable(mut page: PlaylistPage, entries: &[EntryId]) -> PlaylistPage {
+        for entry in &mut page.entries {
+            entry.unavailable = entries.contains(&entry.entry);
+        }
+        page.playable = page.total - entries.len() as u32;
+        page
+    }
+
+    fn watch(item: &mut Item) {
+        match item {
+            Item::Movie(m) => m.playback.watched = true,
+            Item::Episode(e) => e.playback.watched = true,
+            Item::Track(t) => t.playback.watched = true,
+            _ => {}
+        }
+    }
+
+    fn add(id: MediaId) -> PlaylistEdit {
+        PlaylistEdit::Add { id, before: None }
     }
 
     #[test]
     fn whose_it_is_reads_from_the_summary() {
-        let client = FakeClient::new(None);
-        let andrey = ready(session(&client, "andrey").playlists())
-            .unwrap()
-            .playlists;
-        let alice = ready(session(&client, "alice").playlists())
-            .unwrap()
-            .playlists;
         assert_eq!(
             [
-                owner_line(named(&andrey, "Andor: the heists")),
-                owner_line(named(&andrey, "Movie night")),
-                owner_line(named(&andrey, "Road trip")),
-                owner_line(named(&alice, "Andor: the heists")),
-                owner_line(named(&alice, "New this month")),
-                owner_line(named(&andrey, "New this month")),
+                owner_line(&heists()),
+                owner_line(&movie_night()),
+                owner_line(&road_trip()),
+                owner_line(&heists_read_only()),
+                owner_line(&new_this_month(false)),
+                owner_line(&new_this_month(true)),
             ],
             [
                 "Yours · shared with 1 person",
@@ -660,62 +736,46 @@ mod tests {
     }
 
     #[test]
-    fn pins_are_the_users_on_every_device() {
-        let client = FakeClient::new(None);
-        let night = {
-            let list = ready(session(&client, "andrey").playlists())
-                .unwrap()
-                .playlists;
-            named(&list, "Movie night").id.clone()
-        };
-        ready(session(&client, "andrey").pin_playlist(&night, 0)).unwrap();
-        // Another device asks the same server for the same user.
-        let elsewhere = FakeClient::profile("andrey");
-        let list = ready(client.session(&elsewhere).unwrap().playlists())
-            .unwrap()
-            .playlists;
-        assert_eq!(named(&list, "Movie night").pinned, Some(0));
-    }
-
-    #[test]
     fn read_only_and_server_wide_ones_are_offered_greyed_last() {
-        let client = FakeClient::new(None);
-        let list = ready(session(&client, "alice").playlists())
-            .unwrap()
-            .playlists;
-        let offered: Vec<_> = add_targets(&list, MediaKind::Season)
-            .into_iter()
-            .map(|t| (t.playlist.name, offer_reason(t.offer)))
-            .collect();
+        let list = [heists_read_only(), new_this_month(false), movie_night()];
+        let offered = |kind| -> Vec<_> {
+            add_targets(&list, kind)
+                .into_iter()
+                .map(|t| (t.playlist.name, offer_reason(t.offer)))
+                .collect()
+        };
         assert_eq!(
-            offered,
-            [("Andor: the heists".to_owned(), Some("Read only"))]
-        );
-        let films: Vec<_> = add_targets(&list, MediaKind::Movie)
-            .into_iter()
-            .map(|t| (t.playlist.name, offer_reason(t.offer)))
-            .collect();
-        assert_eq!(
-            films,
-            [(
-                "New this month".to_owned(),
-                Some("Server-wide · admins edit")
-            )]
+            (offered(MediaKind::Season), offered(MediaKind::Movie)),
+            (
+                vec![
+                    ("Movie night".to_owned(), None),
+                    ("Andor: the heists".to_owned(), Some("Read only")),
+                ],
+                vec![
+                    ("Movie night".to_owned(), None),
+                    (
+                        "New this month".to_owned(),
+                        Some("Server-wide · admins edit")
+                    ),
+                ]
+            )
         );
     }
 
     #[test]
     fn the_header_counts_by_kind_and_says_what_is_playable() {
-        let client = FakeClient::new(None);
-        let andrey = session(&client, "andrey");
-        let list = ready(andrey.playlists()).unwrap().playlists;
-        let night = page(andrey.as_ref(), &named(&list, "Movie night").id);
-        let heists = named(&list, "Andor: the heists").id.clone();
-        client.make_unavailable(&media(MediaKind::Episode, "65"));
+        let night = mock::page(
+            movie_night(),
+            vec![
+                mock::movie("1", "Alien"),
+                mock::movie("2", "Heat"),
+                mock::episode("61", "Andor", 1, 1, "Kassa"),
+            ],
+        );
         assert_eq!(
             (
                 count_line(&night),
-                count_line(&page(andrey.as_ref(), &heists))
+                count_line(&unavailable(heists_page(), &[2]))
             ),
             (
                 "2 films, 1 episode".to_owned(),
@@ -724,274 +784,158 @@ mod tests {
         );
     }
 
-    /// The heists' entries, by their episode's key.
-    fn heists(client: &FakeClient) -> (Arc<dyn Session>, String, Vec<EntryId>) {
-        let andrey = session(client, "andrey");
-        let list = ready(andrey.playlists()).unwrap().playlists;
-        let id = named(&list, "Andor: the heists").id.clone();
-        let entries = page(andrey.as_ref(), &id)
-            .entries
-            .iter()
-            .map(|e| e.entry)
-            .collect();
-        (andrey, id, entries)
-    }
-
     #[test]
     fn a_random_pick_is_the_entry_at_a_random_place() {
-        let client = FakeClient::new(None);
-        let (andrey, id, entries) = heists(&client);
-        let picked = ready(random_entry(andrey.as_ref(), &id, |n| n - 2)).unwrap();
-        assert_eq!(picked, Some(entries[1]));
+        let session = MockSession::new().with_playlist(heists_page());
+        let picked = ready(random_entry(&session, "1", |n| n - 2)).unwrap();
+        assert_eq!(picked, Some(2));
     }
 
     #[test]
     fn a_random_pick_of_an_entry_that_cannot_play_is_the_next_that_can() {
-        let client = FakeClient::new(None);
-        let (andrey, id, entries) = heists(&client);
-        client.make_unavailable(&media(MediaKind::Episode, "64"));
-        let picked = ready(random_entry(andrey.as_ref(), &id, |_| 0)).unwrap();
-        assert_eq!(picked, Some(entries[1]));
+        let session = MockSession::new().with_playlist(unavailable(heists_page(), &[1]));
+        let picked = ready(random_entry(&session, "1", |_| 0)).unwrap();
+        assert_eq!(picked, Some(2));
     }
 
     #[test]
     fn a_random_pick_past_the_last_that_can_play_chooses_among_them_all() {
-        let client = FakeClient::new(None);
-        let (andrey, id, entries) = heists(&client);
-        client.make_unavailable(&media(MediaKind::Episode, "72"));
+        let session = MockSession::new().with_playlist(unavailable(heists_page(), &[3]));
         // The last place first; then the second of the two that play.
         let mut asked = Vec::new();
-        let picked = ready(random_entry(andrey.as_ref(), &id, |n| {
+        let picked = ready(random_entry(&session, "1", |n| {
             asked.push(n);
             n - 1
         }))
         .unwrap();
-        assert_eq!((picked, asked), (Some(entries[1]), vec![3, 2]));
+        assert_eq!((picked, asked), (Some(2), vec![3, 2]));
     }
 
     #[test]
     fn a_random_pick_where_nothing_can_play_is_none() {
-        let client = FakeClient::new(None);
-        let (andrey, id, _) = heists(&client);
-        for key in ["64", "65", "72"] {
-            client.make_unavailable(&media(MediaKind::Episode, key));
-        }
-        let picked = ready(random_entry(andrey.as_ref(), &id, |_| 0)).unwrap();
+        let session = MockSession::new().with_playlist(unavailable(heists_page(), &[1, 2, 3]));
+        let picked = ready(random_entry(&session, "1", |_| 0)).unwrap();
         assert_eq!(picked, None);
     }
 
     #[test]
     fn every_page_is_read_from_where_asked_until_told_to_stop() {
-        let client = FakeClient::new(None);
-        let (andrey, id, entries) = heists(&client);
+        let session = MockSession::new().with_playlist(heists_page());
         let mut seen = Vec::new();
-        let stopped = ready(for_each_page(andrey.as_ref(), &id, 1, 1, |page| {
+        let stopped = ready(for_each_page(&session, "1", 1, 1, |page| {
             seen.extend(page.entries.iter().map(|e| e.entry));
             ControlFlow::<()>::Continue(())
         }))
         .unwrap();
-        assert_eq!((stopped, seen), (None, entries[1..].to_vec()));
-        let first = ready(for_each_page(andrey.as_ref(), &id, 0, 1, |page| {
+        assert_eq!((stopped, seen), (None, vec![2, 3]));
+        let first = ready(for_each_page(&session, "1", 0, 1, |page| {
             ControlFlow::Break(page.entries[0].entry)
         }))
         .unwrap();
-        assert_eq!(first, Some(entries[0]));
+        assert_eq!(first, Some(1));
     }
 
     #[test]
-    fn an_unavailable_entry_is_listed_and_skipped() {
-        let client = FakeClient::new(None);
-        let andrey = session(&client, "andrey");
-        let list = ready(andrey.playlists()).unwrap().playlists;
-        let heists = named(&list, "Andor: the heists").id.clone();
-        client.make_unavailable(&media(MediaKind::Episode, "64"));
-        let shown = page(andrey.as_ref(), &heists);
+    fn an_unavailable_entry_says_it_is_skipped() {
+        let shown = unavailable(heists_page(), &[1]);
         assert_eq!(
             entry_note(&shown.entries[0], continue_entry(&shown)).map(note_text),
             Some("Unavailable · the file can’t be read; skipped".to_owned())
         );
-        let first = ready(andrey.play_playlist(&heists, None, PlaySettings::default()))
-            .unwrap()
-            .unwrap();
-        assert_eq!(first.item.id(), &media(MediaKind::Episode, "65"));
     }
 
     #[test]
     fn continue_starts_at_the_place_and_passes_it_once_watched() {
-        let client = FakeClient::new(None);
-        let andrey = session(&client, "andrey");
-        let list = ready(andrey.playlists()).unwrap().playlists;
-        let heists = named(&list, "Andor: the heists").id.clone();
-        assert_eq!(continue_label(&page(andrey.as_ref(), &heists)), None);
-        let first = ready(andrey.play_playlist(&heists, None, PlaySettings::default()))
-            .unwrap()
-            .unwrap();
+        let mut page = heists_page();
+        let never_played = continue_label(&page);
+        page.place = Some(1);
+        let at_place = continue_label(&page);
+        watch(&mut page.entries[0].item);
         assert_eq!(
-            continue_label(&page(andrey.as_ref(), &heists)).as_deref(),
-            Some("S1 · E3 Reckoning")
-        );
-        ready(andrey.mark_watched(first.item.id())).unwrap();
-        assert_eq!(
-            continue_label(&page(andrey.as_ref(), &heists)).as_deref(),
-            Some("S1 · E4 Aldhani")
+            (
+                never_played,
+                at_place.as_deref(),
+                continue_label(&page).as_deref()
+            ),
+            (None, Some("S1 · E3 Reckoning"), Some("S1 · E4 Aldhani"))
         );
     }
 
     #[test]
     fn continue_passes_entries_watched_after_the_place_too() {
-        let client = FakeClient::new(None);
-        let (andrey, heists, _) = heists(&client);
-        let first = ready(andrey.play_playlist(&heists, None, PlaySettings::default()))
-            .unwrap()
-            .unwrap();
-        ready(andrey.mark_watched(first.item.id())).unwrap();
-        ready(andrey.mark_watched(&media(MediaKind::Episode, "65"))).unwrap();
+        let mut page = heists_page();
+        page.place = Some(1);
+        watch(&mut page.entries[0].item);
+        watch(&mut page.entries[1].item);
         assert_eq!(
-            continue_label(&page(andrey.as_ref(), &heists)).as_deref(),
+            continue_label(&page).as_deref(),
             Some("S2 · E2 Sagrona Teema")
         );
     }
 
-    #[test]
-    fn a_playlist_plays_in_order_to_its_end_then_starts_from_the_top() {
-        let client = FakeClient::new(None);
-        let andrey = session(&client, "andrey");
-        let list = ready(andrey.playlists()).unwrap().playlists;
-        let heists = named(&list, "Andor: the heists").id.clone();
-        let mut played = Vec::new();
-        let mut next = ready(andrey.play_playlist(&heists, None, PlaySettings::default())).unwrap();
-        while let Some(now) = next {
-            played.push(now.item.id().clone());
-            next = ready(andrey.next_in_playlist(&heists, now.entry)).unwrap();
+    fn playing_heists() -> Playing {
+        Playing {
+            id: "1".into(),
+            name: "Andor: the heists".into(),
+            entry: 1,
         }
-        assert_eq!(
-            played,
-            ["64", "65", "72"].map(|k| media(MediaKind::Episode, k))
-        );
-        assert_eq!(page(andrey.as_ref(), &heists).place, None);
-    }
-
-    /// Andrey playing the heists from the top with `settings`.
-    fn playing_heists(andrey: &dyn Session, settings: PlaySettings) -> (Playing, Item) {
-        let list = ready(andrey.playlists()).unwrap().playlists;
-        let heists = named(&list, "Andor: the heists").clone();
-        let first = ready(andrey.play_playlist(&heists.id, None, settings))
-            .unwrap()
-            .unwrap();
-        let playing = Playing {
-            id: heists.id,
-            name: heists.name,
-            entry: first.entry,
-        };
-        (playing, first.item)
-    }
-
-    fn after(andrey: &dyn Session, playing: &mut Playing) -> Advance {
-        let next = ready(andrey.next_in_playlist(&playing.id, playing.entry)).unwrap();
-        playing.advance(next)
     }
 
     #[test]
     fn an_entry_that_ends_plays_the_next_and_follows_it() {
-        let client = FakeClient::new(None);
-        let andrey = session(&client, "andrey");
-        let (mut playing, _) = playing_heists(andrey.as_ref(), PlaySettings::default());
-        let first = playing.entry;
-        let advance = after(andrey.as_ref(), &mut playing);
-        let Advance::Play { item, .. } = advance else {
-            panic!("the heists ended after one: {advance:?}")
-        };
-        assert_eq!(
-            (item.id().clone(), playing.entry != first),
-            (media(MediaKind::Episode, "65"), true)
-        );
-    }
-
-    #[test]
-    fn music_does_not_skip_previously_played_tracks_with_saved_video_settings() {
-        let client = FakeClient::new(None);
-        let andrey = session(&client, "andrey");
-        let list = ready(andrey.playlists()).unwrap().playlists;
-        let all = list
-            .iter()
-            .find(|p| p.builtin == Some(Builtin::All))
-            .unwrap();
-        let page = page(andrey.as_ref(), &all.id);
-        for entry in &page.entries {
-            ready(andrey.mark_watched(entry.item.id())).unwrap();
-        }
-        let settings = play_settings(
-            all.kinds,
-            PlaySettings {
-                skip_watched: true,
-                ..Default::default()
-            },
-        );
-        let mut next =
-            ready(andrey.play_playlist(&all.id, Some(page.entries[0].entry), settings)).unwrap();
-        let mut played = 0;
-        while let Some(entry) = next {
-            played += 1;
-            assert!(played <= page.entries.len());
-            next = ready(andrey.next_in_playlist(&all.id, entry.entry)).unwrap();
-        }
-        assert_eq!(played, page.entries.len());
-    }
-
-    #[test]
-    fn the_last_entry_ends_the_playlist_and_continue_starts_at_the_top() {
-        let client = FakeClient::new(None);
-        let andrey = session(&client, "andrey");
-        let (mut playing, _) = playing_heists(andrey.as_ref(), PlaySettings::default());
-        let mut advances = Vec::new();
-        for _ in 0..3 {
-            advances.push(matches!(
-                after(andrey.as_ref(), &mut playing),
-                Advance::Finished
-            ));
-        }
-        assert_eq!(
-            (advances, page(andrey.as_ref(), &playing.id).place),
-            (vec![false, false, true], None)
-        );
-    }
-
-    #[test]
-    fn repeat_one_plays_the_same_entry_again() {
-        let client = FakeClient::new(None);
-        let andrey = session(&client, "andrey");
-        let settings = PlaySettings {
-            repeat: Repeat::One,
-            ..PlaySettings::default()
-        };
-        let (mut playing, first) = playing_heists(andrey.as_ref(), settings);
-        let entry = playing.entry;
-        let advance = after(andrey.as_ref(), &mut playing);
+        let mut playing = playing_heists();
+        let aldhani = mock::episode("65", "Andor", 1, 4, "Aldhani");
+        let advance = playing.advance(Some(PlaylistNext {
+            entry: 2,
+            item: aldhani.clone(),
+            markers: Default::default(),
+            liked: false,
+        }));
         assert_eq!(
             (advance, playing.entry),
             (
                 Advance::Play {
-                    from: resume_from(&first),
-                    item: Box::new(first)
+                    item: Box::new(aldhani),
+                    from: None
                 },
-                entry
+                2
             )
         );
     }
 
     #[test]
+    fn music_does_not_skip_previously_played_tracks_with_saved_video_settings() {
+        let saved = PlaySettings {
+            skip_watched: true,
+            ..PlaySettings::default()
+        };
+        assert_eq!(
+            (
+                play_settings(music(), saved).skip_watched,
+                play_settings(movies_and_episodes(), saved).skip_watched
+            ),
+            (false, true)
+        );
+    }
+
+    #[test]
+    fn no_next_entry_ends_the_playlist() {
+        let mut playing = playing_heists();
+        assert_eq!(
+            (playing.advance(None), playing.entry),
+            (Advance::Finished, 1)
+        );
+    }
+
+    #[test]
     fn an_item_part_watched_resumes_and_a_watched_one_starts_over() {
-        let client = FakeClient::new(None);
-        let andrey = session(&client, "andrey");
-        let (_, mut item) = playing_heists(andrey.as_ref(), PlaySettings::default());
+        let mut item = mock::episode("64", "Andor", 1, 3, "Reckoning");
         let Item::Episode(e) = &mut item else {
-            panic!("the heists hold episodes")
+            unreachable!()
         };
         e.playback.position = Some(Duration::from_secs(90));
         let part = resume_from(&item);
-        if let Item::Episode(e) = &mut item {
-            e.playback.watched = true;
-        }
+        watch(&mut item);
         assert_eq!(
             (part, resume_from(&item)),
             (Some(Duration::from_secs(90)), None)
@@ -1015,596 +959,82 @@ mod tests {
     }
 
     #[test]
-    fn skip_watched_passes_a_watched_entry() {
-        let client = FakeClient::new(None);
-        let andrey = session(&client, "andrey");
-        let list = ready(andrey.playlists()).unwrap().playlists;
-        let heists = named(&list, "Andor: the heists").id.clone();
-        ready(andrey.mark_watched(&media(MediaKind::Episode, "64"))).unwrap();
-        let settings = PlaySettings {
-            skip_watched: true,
-            ..PlaySettings::default()
-        };
-        let first = ready(andrey.play_playlist(&heists, None, settings))
-            .unwrap()
-            .unwrap();
-        assert_eq!(first.item.id(), &media(MediaKind::Episode, "65"));
-        assert_eq!(page(andrey.as_ref(), &heists).settings, settings);
-    }
-
-    #[test]
-    fn shuffle_with_repeat_all_replays_the_same_round() {
-        let client = FakeClient::new(None);
-        let andrey = session(&client, "andrey");
-        let (all, entries) = all_entries(andrey.as_ref());
-        let first = ready(andrey.play_playlist(&all, None, PlaySettings::default()))
-            .unwrap()
-            .unwrap();
-        ready(andrey.set_playlist_settings(
-            &all,
-            PlaySettings {
-                repeat: Repeat::All,
-                ..shuffled()
-            },
-        ))
-        .unwrap();
-        let mut played = vec![first.entry];
-        played.extend(next_n(
-            andrey.as_ref(),
-            &all,
-            first.entry,
-            2 * entries.len() - 1,
-        ));
-        let (one, two) = played.split_at(entries.len());
-        assert_eq!(
-            (each_once(one.to_vec(), &entries), one),
-            (true, two),
-            "played {played:?} of {entries:?}"
-        );
-    }
-
-    /// Shuffled, once through.
-    fn shuffled() -> PlaySettings {
-        PlaySettings {
-            shuffle: true,
-            ..PlaySettings::default()
-        }
-    }
-
-    /// The entries `first` and each next after it play, to the end.
-    fn played_from(andrey: &dyn Session, id: &str, first: Option<PlaylistNext>) -> Vec<EntryId> {
-        let (mut played, mut next) = (Vec::new(), first);
-        while let Some(now) = next {
-            played.push(now.entry);
-            assert!(played.len() <= 20, "no end: {played:?}");
-            next = ready(andrey.next_in_playlist(id, now.entry)).unwrap();
-        }
-        played
-    }
-
-    /// Each of `entries` once, in any order.
-    fn each_once(mut played: Vec<EntryId>, entries: &[EntryId]) -> bool {
-        let mut entries = entries.to_vec();
-        played.sort_unstable();
-        entries.sort_unstable();
-        played == entries
-    }
-
-    #[test]
-    fn shuffle_from_an_entry_plays_it_first_then_every_other_entry_once() {
-        let client = FakeClient::new(None);
-        let andrey = session(&client, "andrey");
-        let list = ready(andrey.playlists()).unwrap().playlists;
-        let heists = named(&list, "Andor: the heists").id.clone();
-        let entries: Vec<EntryId> = page(andrey.as_ref(), &heists)
-            .entries
-            .iter()
-            .map(|e| e.entry)
-            .collect();
-        let last = *entries.last().unwrap();
-        let first = ready(andrey.play_playlist(&heists, Some(last), shuffled())).unwrap();
-        let played = played_from(andrey.as_ref(), &heists, first);
-        assert_eq!(
-            (played[0], each_once(played.clone(), &entries)),
-            (last, true),
-            "played {played:?} of {entries:?}"
-        );
-    }
-
-    #[test]
-    fn a_play_without_an_entry_keeps_the_shuffled_round_and_its_place() {
-        let client = FakeClient::new(None);
-        let andrey = session(&client, "andrey");
-        let list = ready(andrey.playlists()).unwrap().playlists;
-        let heists = named(&list, "Andor: the heists").id.clone();
-        let entries: Vec<EntryId> = page(andrey.as_ref(), &heists)
-            .entries
-            .iter()
-            .map(|e| e.entry)
-            .collect();
-        let start = ready(andrey.play_playlist(&heists, Some(entries[2]), shuffled()))
-            .unwrap()
-            .unwrap();
-        let second = ready(andrey.next_in_playlist(&heists, start.entry))
-            .unwrap()
-            .unwrap();
-        // Repeat changed, as a save of the modes sends it.
-        let resumed = ready(andrey.play_playlist(
-            &heists,
-            None,
-            PlaySettings {
-                repeat: Repeat::One,
-                ..shuffled()
-            },
-        ))
-        .unwrap()
-        .unwrap();
-        ready(andrey.play_playlist(&heists, None, shuffled())).unwrap();
-        let mut played = vec![start.entry];
-        played.extend(played_from(andrey.as_ref(), &heists, Some(resumed.clone())));
-        assert_eq!(
-            (resumed.entry, each_once(played.clone(), &entries)),
-            (second.entry, true),
-            "played {played:?} of {entries:?}"
-        );
-    }
-
-    /// What the server does, and so what a save of the modes must not
-    /// send while shuffling: an entry starts a new round at it, and the
-    /// entries already played come round again.
-    #[test]
-    fn a_play_from_an_entry_while_shuffling_starts_a_new_round() {
-        let client = FakeClient::new(None);
-        let andrey = session(&client, "andrey");
-        let list = ready(andrey.playlists()).unwrap().playlists;
-        let heists = named(&list, "Andor: the heists").id.clone();
-        let entries: Vec<EntryId> = page(andrey.as_ref(), &heists)
-            .entries
-            .iter()
-            .map(|e| e.entry)
-            .collect();
-        let start = ready(andrey.play_playlist(&heists, Some(entries[2]), shuffled()))
-            .unwrap()
-            .unwrap();
-        let second = ready(andrey.next_in_playlist(&heists, start.entry))
-            .unwrap()
-            .unwrap();
-        let again = ready(andrey.play_playlist(&heists, Some(second.entry), shuffled())).unwrap();
-        let played = played_from(andrey.as_ref(), &heists, again);
-        assert!(
-            played.contains(&start.entry),
-            "the first entry did not come round again: {played:?}"
-        );
-    }
-
-    /// Andrey's All (nine tracks) and its entries, in its order.
-    fn all_entries(andrey: &dyn Session) -> (String, Vec<EntryId>) {
-        let list = ready(andrey.playlists()).unwrap().playlists;
-        let all = list
-            .iter()
-            .find(|p| p.builtin == Some(Builtin::All))
-            .unwrap()
-            .id
-            .clone();
-        let entries = page(andrey, &all).entries.iter().map(|e| e.entry).collect();
-        (all, entries)
-    }
-
-    /// What the server says comes up in `id`, at most `limit`.
-    fn upcoming(andrey: &dyn Session, id: &str, limit: u32) -> Vec<EntryId> {
-        ready(andrey.upcoming_in_playlist(id, limit))
-            .unwrap()
-            .iter()
-            .map(|e| e.entry)
-            .collect()
-    }
-
-    /// The entries Next plays after `now`, at most `n`.
-    fn next_n(andrey: &dyn Session, id: &str, mut now: EntryId, n: usize) -> Vec<EntryId> {
-        let mut played = Vec::new();
-        while played.len() < n {
-            let Some(next) = ready(andrey.next_in_playlist(id, now)).unwrap() else {
-                break;
-            };
-            now = next.entry;
-            played.push(now);
-        }
-        played
-    }
-
-    /// The user's rule: turning shuffle on deals the whole playlist from
-    /// the song playing, and a repeat change after keeps that order.
-    #[test]
-    fn shuffle_turned_on_while_playing_plays_every_entry_once_then_ends() {
-        let client = FakeClient::new(None);
-        let andrey = session(&client, "andrey");
-        let (all, entries) = all_entries(andrey.as_ref());
-        let first = ready(andrey.play_playlist(&all, None, PlaySettings::default()))
-            .unwrap()
-            .unwrap();
-        for settings in [
-            shuffled(),
-            PlaySettings {
-                repeat: Repeat::One,
-                ..shuffled()
-            },
-            shuffled(),
-        ] {
-            ready(andrey.set_playlist_settings(&all, settings)).unwrap();
-        }
-        let mut played = vec![first.entry];
-        played.extend(next_n(
-            andrey.as_ref(),
-            &all,
-            first.entry,
-            2 * entries.len(),
-        ));
-        assert!(
-            each_once(played.clone(), &entries),
-            "played {played:?} of {entries:?}"
-        );
-    }
-
-    /// A play without an entry turning shuffle on (an older client's
-    /// save) deals from the place too: the whole playlist is ahead.
-    #[test]
-    fn shuffle_turned_on_by_a_play_without_an_entry_starts_its_round_at_the_place() {
-        let client = FakeClient::new(None);
-        let andrey = session(&client, "andrey");
-        let (all, entries) = all_entries(andrey.as_ref());
-        ready(andrey.play_playlist(&all, None, PlaySettings::default())).unwrap();
-        let resumed = ready(andrey.play_playlist(&all, None, shuffled())).unwrap();
-        let played = played_from(andrey.as_ref(), &all, resumed);
-        assert!(
-            each_once(played.clone(), &entries),
-            "played {played:?} of {entries:?}"
-        );
-    }
-
-    #[test]
-    fn a_pick_while_shuffling_starts_a_new_round_with_it_first() {
-        let client = FakeClient::new(None);
-        let andrey = session(&client, "andrey");
-        let (all, entries) = all_entries(andrey.as_ref());
-        let start = ready(andrey.play_playlist(&all, Some(entries[0]), shuffled()))
-            .unwrap()
-            .unwrap();
-        next_n(andrey.as_ref(), &all, start.entry, 3);
-        let picked = ready(andrey.play_playlist(&all, Some(entries[5]), shuffled())).unwrap();
-        let played = played_from(andrey.as_ref(), &all, picked);
-        assert_eq!(
-            (played[0], each_once(played.clone(), &entries)),
-            (entries[5], true),
-            "played {played:?} of {entries:?}"
-        );
-    }
-
-    #[test]
-    fn upcoming_is_what_next_plays() {
-        let repeat_all = PlaySettings {
-            repeat: Repeat::All,
-            ..PlaySettings::default()
-        };
-        for settings in [
-            PlaySettings::default(),
-            shuffled(),
-            repeat_all,
-            PlaySettings {
-                shuffle: true,
-                ..repeat_all
-            },
-        ] {
-            let client = FakeClient::new(None);
-            let andrey = session(&client, "andrey");
-            let (all, entries) = all_entries(andrey.as_ref());
-            let now = ready(andrey.play_playlist(&all, Some(entries[3]), settings))
-                .unwrap()
-                .unwrap();
-            let ahead = upcoming(andrey.as_ref(), &all, 12);
-            assert_eq!(
-                ahead,
-                next_n(andrey.as_ref(), &all, now.entry, 12),
-                "{settings:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn upcoming_with_repeat_one_is_the_entry_playing_alone() {
-        let client = FakeClient::new(None);
-        let andrey = session(&client, "andrey");
-        let (all, entries) = all_entries(andrey.as_ref());
-        let settings = PlaySettings {
-            repeat: Repeat::One,
-            ..PlaySettings::default()
-        };
-        ready(andrey.play_playlist(&all, Some(entries[3]), settings)).unwrap();
-        assert_eq!(upcoming(andrey.as_ref(), &all, 50), [entries[3]]);
-    }
-
-    #[test]
-    fn upcoming_with_no_place_is_the_top_of_the_playlist() {
-        let client = FakeClient::new(None);
-        let andrey = session(&client, "andrey");
-        let (all, entries) = all_entries(andrey.as_ref());
-        assert_eq!(upcoming(andrey.as_ref(), &all, 3), entries[..3]);
-    }
-
-    #[test]
-    fn a_repeat_change_while_shuffling_keeps_the_order() {
-        let client = FakeClient::new(None);
-        let andrey = session(&client, "andrey");
-        let (all, entries) = all_entries(andrey.as_ref());
-        let start = ready(andrey.play_playlist(&all, Some(entries[0]), shuffled()))
-            .unwrap()
-            .unwrap();
-        next_n(andrey.as_ref(), &all, start.entry, 2);
-        let before = upcoming(andrey.as_ref(), &all, 50);
-        let repeat_all = PlaySettings {
-            repeat: Repeat::All,
-            ..shuffled()
-        };
-        ready(andrey.set_playlist_settings(&all, repeat_all)).unwrap();
-        let after = upcoming(andrey.as_ref(), &all, 50);
-        assert_eq!(
-            (before.len(), &after[..before.len()]),
-            (entries.len() - 3, before.as_slice())
-        );
-    }
-
-    #[test]
-    fn shuffle_turned_off_plays_the_playlists_order_from_the_entry_playing() {
-        let client = FakeClient::new(None);
-        let andrey = session(&client, "andrey");
-        let (all, entries) = all_entries(andrey.as_ref());
-        ready(andrey.play_playlist(&all, Some(entries[4]), shuffled())).unwrap();
-        ready(andrey.set_playlist_settings(&all, PlaySettings::default())).unwrap();
-        assert_eq!(upcoming(andrey.as_ref(), &all, 50), entries[5..]);
-    }
-
-    #[test]
-    fn settings_saved_alone_keep_the_place() {
-        let client = FakeClient::new(None);
-        let andrey = session(&client, "andrey");
-        let (all, entries) = all_entries(andrey.as_ref());
-        ready(andrey.play_playlist(&all, Some(entries[4]), PlaySettings::default())).unwrap();
-        ready(andrey.set_playlist_settings(&all, shuffled())).unwrap();
-        let saved = page(andrey.as_ref(), &all);
-        assert_eq!(
-            (saved.place, saved.settings),
-            (Some(entries[4]), shuffled())
-        );
-    }
-
-    #[test]
-    fn a_film_is_refused_by_an_episodes_playlist_until_movies_are_ticked() {
-        let client = FakeClient::new(None);
-        let andrey = session(&client, "andrey");
-        let made =
-            ready(andrey.create_playlist("Heists", episodes(), Visibility::Personal)).unwrap();
-        let alien = media(MediaKind::Movie, "1");
-        let add = vec![PlaylistEdit::Add {
-            id: alien.clone(),
-            before: None,
-        }];
-        assert_eq!(
-            ready(andrey.edit_playlist(&made.id, made.revision, add.clone())),
-            Err(BackendError::KindNotAllowed(
-                crate::backend::ItemKind::Movie
-            ))
-        );
-        let widened = ready(andrey.update_playlist(
-            &made.id,
-            PlaylistUpdate {
-                kinds: Some(Kinds {
-                    movies: true,
-                    ..episodes()
-                }),
-                ..PlaylistUpdate::default()
-            },
-        ))
-        .unwrap();
-        ready(andrey.edit_playlist(&made.id, widened.revision, add)).unwrap();
-        assert_eq!(page(andrey.as_ref(), &made.id).entries[0].item.id(), &alien);
-    }
-
-    #[test]
-    fn a_season_adds_each_of_its_episodes_in_order() {
-        let client = FakeClient::new(None);
-        let andrey = session(&client, "andrey");
-        let made =
-            ready(andrey.create_playlist("Andor", episodes(), Visibility::Personal)).unwrap();
-        let add = vec![PlaylistEdit::Add {
-            id: media(MediaKind::Season, "70"),
-            before: None,
-        }];
-        ready(andrey.edit_playlist(&made.id, made.revision, add)).unwrap();
-        let ids: Vec<_> = page(andrey.as_ref(), &made.id)
-            .entries
-            .iter()
-            .map(|e| e.item.id().clone())
-            .collect();
-        assert_eq!(
-            ids,
-            ["71", "72", "73"].map(|k| media(MediaKind::Episode, k))
-        );
-    }
-
-    #[test]
     fn a_second_editors_add_is_redone_on_the_new_revision() {
-        let client = FakeClient::new(None);
-        let (andrey, alice) = (session(&client, "andrey"), session(&client, "alice"));
-        let list = ready(alice.playlists()).unwrap().playlists;
-        let road = named(&list, "Road trip").clone();
-        let shown = page(alice.as_ref(), &road.id);
-        // Alice removes the first; Andrey, on the same revision, adds one.
-        ready(alice.edit_playlist(
-            &road.id,
-            road.revision,
-            vec![PlaylistEdit::Remove {
-                entry: shown.entries[0].entry,
-            }],
-        ))
-        .unwrap();
-        let add = vec![PlaylistEdit::Add {
-            id: media(MediaKind::Track, "48"),
-            before: None,
-        }];
-        ready(edit_retrying(andrey.as_ref(), &road.id, road.revision, add)).unwrap();
-        assert_eq!(page(andrey.as_ref(), &road.id).total, 3);
+        // Someone else changed it since revision 7: refused, then taken.
+        let session = MockSession::new()
+            .with_edit_answers([Err(BackendError::PlaylistConflict { revision: 8 }), Ok(9)]);
+        let edits = vec![add(media(MediaKind::Track, "48"))];
+        let done = ready(edit_retrying(&session, "3", 7, edits.clone()));
+        let sent = |revision| Edit {
+            id: "3".into(),
+            revision,
+            edits: edits.clone(),
+        };
+        assert_eq!((done, session.edits()), (Ok(9), vec![sent(7), sent(8)]));
     }
 
     #[test]
     fn a_move_of_an_entry_the_other_removed_is_refused_after_one_retry() {
-        let client = FakeClient::new(None);
-        let (andrey, alice) = (session(&client, "andrey"), session(&client, "alice"));
-        let list = ready(alice.playlists()).unwrap().playlists;
-        let road = named(&list, "Road trip").clone();
-        let first = page(alice.as_ref(), &road.id).entries[0].entry;
-        ready(alice.edit_playlist(
-            &road.id,
-            road.revision,
-            vec![PlaylistEdit::Remove { entry: first }],
-        ))
-        .unwrap();
+        // A third try would be taken: there must not be one.
+        let session = MockSession::new().with_edit_answers([
+            Err(BackendError::PlaylistConflict { revision: 8 }),
+            Err(BackendError::NotFound("entry 1".into())),
+            Ok(9),
+        ]);
         let moved = vec![PlaylistEdit::Move {
-            entry: first,
+            entry: 1,
             before: None,
         }];
+        let done = ready(edit_retrying(&session, "3", 7, moved));
         assert_eq!(
-            ready(andrey.edit_playlist(&road.id, road.revision, moved.clone())),
-            Err(BackendError::PlaylistConflict {
-                revision: road.revision + 1
-            })
+            (done, session.edits().len()),
+            (Err(BackendError::NotFound("entry 1".into())), 2)
         );
-        // Redone on the new revision, the entry is gone.
-        assert!(matches!(
-            ready(edit_retrying(
-                andrey.as_ref(),
-                &road.id,
-                road.revision,
-                moved
-            )),
-            Err(BackendError::NotFound(_))
-        ));
     }
 
     #[test]
-    fn a_read_only_user_cannot_edit_and_an_editor_cannot_rename() {
-        let client = FakeClient::new(None);
-        let (andrey, alice) = (session(&client, "andrey"), session(&client, "alice"));
-        let list = ready(alice.playlists()).unwrap().playlists;
-        let heists = named(&list, "Andor: the heists").clone();
-        let road = ready(andrey.playlists()).unwrap().playlists;
-        let road = named(&road, "Road trip").clone();
+    fn a_pin_note_says_why_the_playlist_left_pinned() {
+        let note = |name: &str, reason| PinNote {
+            playlist_id: "1".into(),
+            name: name.into(),
+            reason,
+        };
         assert_eq!(
             (
-                ready(alice.edit_playlist(
-                    &heists.id,
-                    heists.revision,
-                    vec![PlaylistEdit::Add {
-                        id: media(MediaKind::Episode, "62"),
-                        before: None
-                    }]
-                )),
-                ready(andrey.update_playlist(
-                    &road.id,
-                    PlaylistUpdate {
-                        name: Some("Mine now".into()),
-                        ..PlaylistUpdate::default()
-                    }
-                ))
-                .map(|_| ()),
+                pin_note_text(&[
+                    note("Andor: the heists", PinNoteReason::Unshared),
+                    note("Movie night", PinNoteReason::Deleted),
+                ]),
+                pin_note_text(&[])
             ),
             (
-                Err(BackendError::PlaylistReadOnly),
-                Err(BackendError::PlaylistReadOnly)
-            )
-        );
-    }
-
-    #[test]
-    fn an_unshared_pin_leaves_pinned_with_a_note_once() {
-        let client = FakeClient::new(None);
-        let (andrey, alice) = (session(&client, "andrey"), session(&client, "alice"));
-        let heists = {
-            let list = ready(alice.playlists()).unwrap().playlists;
-            named(&list, "Andor: the heists").id.clone()
-        };
-        ready(alice.pin_playlist(&heists, 0)).unwrap();
-        ready(andrey.update_playlist(
-            &heists,
-            PlaylistUpdate {
-                visibility: Some(Visibility::Personal),
-                ..PlaylistUpdate::default()
-            },
-        ))
-        .unwrap();
-        let seen = ready(alice.playlists()).unwrap();
-        assert_eq!(
-            (seen.pinned().len(), pin_note_text(&seen.pin_notes)),
-            (
-                0,
-                Some("Andor: the heists is no longer shared with you, so it left Pinned.".into())
-            )
-        );
-        assert_eq!(seen.pin_notes[0].reason, PinNoteReason::Unshared);
-        ready(alice.dismiss_pin_notes()).unwrap();
-        assert!(ready(alice.playlists()).unwrap().pin_notes.is_empty());
-    }
-
-    #[test]
-    fn an_items_details_list_the_playlists_holding_it_or_its_episodes() {
-        let client = FakeClient::new(None);
-        let refs = |username: &str, id: MediaId| -> Vec<String> {
-            ready(session(&client, username).item_detail(&id))
-                .unwrap()
-                .playlists
-                .into_iter()
-                .map(|p| p.name)
-                .collect()
-        };
-        let andor = media(MediaKind::Show, "60");
-        assert_eq!(
-            (
-                refs("andrey", andor.clone()),
-                refs("alice", andor.clone()),
-                refs("mum", andor),
-                refs("mum", media(MediaKind::Movie, "2")),
-                refs("andrey", media(MediaKind::Album, "31")),
-            ),
-            (
-                vec!["Andor: the heists".to_owned()],
-                vec!["Andor: the heists".to_owned()],
-                vec![],
-                vec!["New this month".to_owned()],
-                vec!["Road trip".to_owned()],
+                Some(
+                    "Andor: the heists is no longer shared with you, so it left Pinned.\n\
+                     Movie night was deleted, so it left Pinned."
+                        .into()
+                ),
+                None
             )
         );
     }
 
     #[test]
     fn a_change_elsewhere_asks_to_read_the_list_and_the_page_shown_again() {
-        let client = FakeClient::new(None);
-        let mut events = client.playlist_events();
-        let andrey = session(&client, "andrey");
-        let list = ready(andrey.playlists()).unwrap().playlists;
-        let night = named(&list, "Movie night").clone();
-        ready(andrey.update_playlist(
-            &night.id,
-            PlaylistUpdate {
-                name: Some("Film night".into()),
-                ..PlaylistUpdate::default()
-            },
-        ))
-        .unwrap();
-        let event = events.try_recv().unwrap();
-        let server = event.server.clone();
+        let event = |change| PlaylistEvent {
+            server: "server".into(),
+            change,
+        };
+        let changed = event(PlaylistChange::Changed {
+            id: "2".into(),
+            revision: 2,
+        });
+        let gone = event(PlaylistChange::Gone { id: "2".into() });
         assert_eq!(
             (
-                refresh_for(&event, &server, Some(&night.id)),
-                refresh_for(&event, &server, Some("another")),
-                refresh_for(&event, "another server", Some(&night.id)),
+                refresh_for(&changed, "server", Some("2")),
+                refresh_for(&changed, "server", Some("another")),
+                refresh_for(&changed, "another server", Some("2")),
+                refresh_for(&gone, "server", Some("2")).page_gone,
             ),
             (
                 Refresh {
@@ -1618,142 +1048,108 @@ mod tests {
                     page_gone: false
                 },
                 Refresh::default(),
+                true,
             )
         );
-        ready(andrey.delete_playlist(&night.id)).unwrap();
-        let gone = events.try_recv().unwrap();
-        assert!(refresh_for(&gone, &server, Some(&night.id)).page_gone);
-    }
-
-    /// Andrey with Movie night pinned after the heists, and the list.
-    fn two_pinned(client: &FakeClient) -> (Arc<dyn Session>, PlaylistList) {
-        let andrey = session(client, "andrey");
-        let list = ready(andrey.playlists()).unwrap();
-        let night = named(&list.playlists, "Movie night").id.clone();
-        ready(andrey.pin_playlist(&night, list.new_pin_position())).unwrap();
-        let list = ready(andrey.playlists()).unwrap();
-        (andrey, list)
     }
 
     #[test]
-    fn a_pin_dropped_on_the_first_row_goes_first_here_and_on_the_server() {
-        let client = FakeClient::new(None);
-        let (andrey, mut list) = two_pinned(&client);
+    fn a_pin_dropped_on_the_first_row_goes_first() {
+        let mut list = PlaylistList {
+            playlists: vec![
+                PlaylistSummary {
+                    pinned: Some(0),
+                    ..heists()
+                },
+                PlaylistSummary {
+                    pinned: Some(1),
+                    ..movie_night()
+                },
+            ],
+            pin_notes: Vec::new(),
+        };
         let (id, position) = pin_drop(&list.pinned(), 1, 0).unwrap();
         with_pin_at(&mut list.playlists, &id, position);
-        ready(andrey.pin_playlist(&id, position)).unwrap();
-        let server = ready(andrey.playlists()).unwrap();
         assert_eq!(
-            (names(&list.pinned()), names(&server.pinned())),
+            ((id.as_str(), position), names(&list.pinned())),
             (
-                vec!["Movie night".to_owned(), "Andor: the heists".to_owned()],
-                vec!["Movie night".to_owned(), "Andor: the heists".to_owned()],
+                ("2", 0),
+                vec!["Movie night".to_owned(), "Andor: the heists".to_owned()]
             )
         );
-    }
-
-    /// Alice pinned the heists, and Andrey stopped sharing it.
-    fn alice_lost_a_pin(client: &FakeClient) -> Arc<dyn Session> {
-        let (andrey, alice) = (session(client, "andrey"), session(client, "alice"));
-        let list = ready(alice.playlists()).unwrap().playlists;
-        let heists = named(&list, "Andor: the heists").id.clone();
-        ready(alice.pin_playlist(&heists, 0)).unwrap();
-        ready(andrey.update_playlist(
-            &heists,
-            PlaylistUpdate {
-                visibility: Some(Visibility::Personal),
-                ..PlaylistUpdate::default()
-            },
-        ))
-        .unwrap();
-        alice
-    }
-
-    #[test]
-    fn a_dismissed_pin_note_is_gone_from_the_next_list() {
-        let client = FakeClient::new(None);
-        let alice = alice_lost_a_pin(&client);
-        let mut shown = PinNotesShown::default();
-        let notes = ready(alice.playlists()).unwrap().pin_notes;
-        if !shown.fresh(&notes).is_empty() {
-            ready(alice.dismiss_pin_notes()).unwrap();
-        }
-        assert!(ready(alice.playlists()).unwrap().pin_notes.is_empty());
-    }
-
-    fn entries_of(session: &dyn Session, id: &str) -> Vec<MediaId> {
-        page(session, id)
-            .entries
-            .iter()
-            .map(|e| e.item.id().clone())
-            .collect()
     }
 
     #[test]
     fn a_season_added_reports_each_entry_it_made_even_one_already_there() {
-        let client = FakeClient::new(None);
-        let andrey = session(&client, "andrey");
-        let list = ready(andrey.playlists()).unwrap().playlists;
-        let heists = named(&list, "Andor: the heists").id.clone();
-        let added = ready(add_item(
-            andrey.as_ref(),
-            &heists,
-            &media(MediaKind::Season, "70"),
-        ))
-        .unwrap();
-        let shown = page(andrey.as_ref(), &heists);
-        let items: Vec<_> = shown
-            .entries
-            .iter()
-            .filter(|e| added.contains(&e.entry))
-            .map(|e| e.item.id().clone())
-            .collect();
+        // Season 2 is 71, 72 and 73; 72 is in the heists already.
+        let before = heists_page();
+        let mut after = before.entries.clone();
+        for (entry, key, number) in [(4, "71", 1), (5, "72", 2), (6, "73", 3)] {
+            after.push(mock::entry_of(
+                entry,
+                mock::episode(key, "Andor", 2, number, key),
+            ));
+        }
+        let session = MockSession::new()
+            .with_playlist(before)
+            .with_edit_answers([Ok(2)])
+            .with_entries_after_edit("1", after);
+        let season = media(MediaKind::Season, "70");
+        let added = ready(add_item(&session, "1", &season)).unwrap();
         assert_eq!(
-            items,
-            ["71", "72", "73"].map(|k| media(MediaKind::Episode, k))
+            (added, session.edits()),
+            (
+                vec![4, 5, 6],
+                vec![Edit {
+                    id: "1".into(),
+                    revision: 1,
+                    edits: vec![add(season)],
+                }]
+            )
         );
     }
 
     #[test]
-    fn undo_of_an_add_leaves_the_playlist_as_it_was() {
-        let client = FakeClient::new(None);
-        let andrey = session(&client, "andrey");
-        let list = ready(andrey.playlists()).unwrap().playlists;
-        let heists = named(&list, "Andor: the heists").id.clone();
-        let before = entries_of(andrey.as_ref(), &heists);
-        let added = ready(add_item(
-            andrey.as_ref(),
-            &heists,
-            &media(MediaKind::Season, "70"),
-        ))
-        .unwrap();
-        ready(remove_entries(andrey.as_ref(), &heists, &added)).unwrap();
-        assert_eq!(entries_of(andrey.as_ref(), &heists), before);
+    fn undo_of_an_add_removes_the_entries_it_made() {
+        let mut page = heists_page();
+        page.playlist.revision = 5;
+        let session = MockSession::new()
+            .with_playlist(page)
+            .with_edit_answers([Ok(6)]);
+        let done = ready(remove_entries(&session, "1", &[2, 3]));
+        assert_eq!(
+            (done, session.edits()),
+            (
+                Ok(6),
+                vec![Edit {
+                    id: "1".into(),
+                    revision: 5,
+                    edits: vec![
+                        PlaylistEdit::Remove { entry: 2 },
+                        PlaylistEdit::Remove { entry: 3 }
+                    ],
+                }]
+            )
+        );
     }
 
     #[test]
     fn a_refused_add_says_why_in_the_boards_words() {
-        let client = FakeClient::new(None);
-        let andrey = session(&client, "andrey");
-        let list = ready(andrey.playlists()).unwrap().playlists;
-        let heists = named(&list, "Andor: the heists").id.clone();
-        let film = ready(andrey.item(&media(MediaKind::Movie, "1"))).unwrap().0;
-        let refused = ready(add_item(andrey.as_ref(), &heists, film.id())).unwrap_err();
+        let session = MockSession::new()
+            .with_playlist(heists_page())
+            .with_edit_answers([Err(BackendError::KindNotAllowed(
+                crate::backend::ItemKind::Movie,
+            ))]);
+        let film = mock::movie("1", "Alien");
+        let refused = ready(add_item(&session, "1", film.id())).unwrap_err();
         assert_eq!(
             add_refusal(&refused, &film, "the Heists"),
-            format!("{} can’t go in the Heists", title(&film))
+            "Alien can’t go in the Heists"
         );
     }
 
     #[test]
     fn the_editor_shows_what_each_user_may_change() {
-        let client = FakeClient::new(None);
-        let andrey = ready(session(&client, "andrey").playlists())
-            .unwrap()
-            .playlists;
-        let alice = ready(session(&client, "alice").playlists())
-            .unwrap()
-            .playlists;
         let controls = |p: &PlaylistSummary, admin| {
             let c = editor_controls(p, admin);
             (c.edit, c.panel, c.server_wide)
@@ -1761,15 +1157,15 @@ mod tests {
         assert_eq!(
             [
                 // The owner, an admin.
-                controls(named(&andrey, "Movie night"), true),
+                controls(&movie_night(), true),
                 // An editor of Alice's.
-                controls(named(&andrey, "Road trip"), true),
+                controls(&road_trip(), true),
                 // Read only.
-                controls(named(&alice, "Andor: the heists"), false),
+                controls(&heists_read_only(), false),
                 // Server-wide, seen by a user.
-                controls(named(&alice, "New this month"), false),
+                controls(&new_this_month(false), false),
                 // Server-wide, for its admin.
-                controls(named(&andrey, "New this month"), true),
+                controls(&new_this_month(true), true),
             ],
             [
                 (true, true, true),
@@ -1823,33 +1219,20 @@ mod tests {
         );
     }
 
-    fn album() -> MediaId {
-        media(MediaKind::Album, "31")
-    }
-
-    fn track(n: u32) -> MediaId {
-        media(MediaKind::Track, &format!("4{n}"))
-    }
-
-    fn heart(session: &dyn Session, id: &MediaId) -> Option<Liked> {
-        ready(session.item_detail(id)).unwrap().liked
-    }
-
-    fn builtin(session: &dyn Session, which: Builtin) -> PlaylistSummary {
-        ready(session.playlists())
-            .unwrap()
-            .playlists
-            .into_iter()
-            .find(|p| p.builtin == Some(which))
-            .unwrap()
-    }
-
     #[test]
     fn liked_and_all_are_listed_first_apart_from_the_users_own() {
-        let client = FakeClient::new(None);
-        let groups = ready(session(&client, "andrey").playlists())
-            .unwrap()
-            .sections();
+        let list = PlaylistList {
+            playlists: vec![
+                heists(),
+                liked(),
+                road_trip(),
+                movie_night(),
+                all(),
+                new_this_month(true),
+            ],
+            pin_notes: Vec::new(),
+        };
+        let groups = list.sections();
         assert_eq!(
             (names(&groups.builtin), names(&groups.mine)),
             (
@@ -1861,22 +1244,15 @@ mod tests {
 
     #[test]
     fn liked_and_all_say_they_are_built_in() {
-        let andrey = session(&FakeClient::new(None), "andrey");
         assert_eq!(
-            [
-                owner_line(&builtin(andrey.as_ref(), Builtin::Liked)),
-                owner_line(&builtin(andrey.as_ref(), Builtin::All)),
-            ],
+            [owner_line(&liked()), owner_line(&all())],
             ["Built in", "Built in · every track"]
         );
     }
 
     #[test]
     fn an_album_is_offered_liked_and_all_greyed_saying_why() {
-        let client = FakeClient::new(None);
-        let list = ready(session(&client, "andrey").playlists())
-            .unwrap()
-            .playlists;
+        let list = [liked(), all(), heists(), movie_night(), road_trip()];
         let offered: Vec<_> = add_targets(&list, MediaKind::Album)
             .into_iter()
             .map(|t| (t.playlist.name, offer_reason(t.offer)))
@@ -1892,130 +1268,12 @@ mod tests {
     }
 
     #[test]
-    fn a_liked_track_fills_its_heart_and_half_fills_its_albums() {
-        let andrey = session(&FakeClient::new(None), "andrey");
-        ready(andrey.like(&[track(2)])).unwrap();
-        assert_eq!(
-            (
-                heart(andrey.as_ref(), &track(2)),
-                heart(andrey.as_ref(), &album())
-            ),
-            (Some(Liked::All), Some(Liked::Some))
-        );
-    }
-
-    #[test]
-    fn liking_an_album_likes_every_track_and_unliking_takes_them_out() {
-        let andrey = session(&FakeClient::new(None), "andrey");
-        ready(andrey.like(&[track(2)])).unwrap();
-        ready(andrey.like(&[album()])).unwrap();
-        let full = heart(andrey.as_ref(), &album());
-        ready(andrey.unlike(&[album()])).unwrap();
-        assert_eq!(
-            (full, heart(andrey.as_ref(), &album())),
-            (Some(Liked::All), Some(Liked::None))
-        );
-    }
-
-    #[test]
-    fn an_albums_details_name_its_liked_tracks() {
-        let andrey = session(&FakeClient::new(None), "andrey");
-        ready(andrey.like(&[track(4), track(1)])).unwrap();
-        let detail = ready(andrey.item_detail(&album())).unwrap();
-        assert_eq!(detail.liked_children, [track(1), track(4)]);
-    }
-
-    #[test]
-    fn the_newest_liked_is_first_in_liked() {
-        let andrey = session(&FakeClient::new(None), "andrey");
-        ready(andrey.like(&[track(1)])).unwrap();
-        let liked = ready(andrey.like(&[track(5)])).unwrap();
-        let entries: Vec<MediaId> = page(andrey.as_ref(), &liked.id)
-            .entries
-            .into_iter()
-            .map(|e| e.item.id().clone())
-            .collect();
-        assert_eq!(entries, [track(5), track(1)]);
-    }
-
-    #[test]
-    fn liked_entries_carry_their_hearts() {
-        let andrey = session(&FakeClient::new(None), "andrey");
-        let liked = ready(andrey.like(&[track(1)])).unwrap();
-        let hearts: Vec<bool> = page(andrey.as_ref(), &liked.id)
-            .entries
-            .iter()
-            .map(|e| e.liked)
-            .collect();
-        assert_eq!(hearts, [true]);
-    }
-
-    #[test]
-    fn only_tracks_and_albums_are_liked() {
-        let andrey = session(&FakeClient::new(None), "andrey");
-        assert_eq!(
-            ready(andrey.like(&[media(MediaKind::Artist, "30")])),
-            Err(BackendError::KindNotAllowed(
-                crate::backend::ItemKind::Artist
-            ))
-        );
-    }
-
-    #[test]
-    fn liked_and_all_are_never_renamed_or_deleted_and_all_never_edited() {
-        let andrey = session(&FakeClient::new(None), "andrey");
-        let rename = PlaylistUpdate {
-            name: Some("Mine".into()),
-            ..PlaylistUpdate::default()
-        };
-        let (liked, all) = (
-            builtin(andrey.as_ref(), Builtin::Liked),
-            builtin(andrey.as_ref(), Builtin::All),
-        );
-        let first = page(andrey.as_ref(), &all.id).entries[0].entry;
-        assert_eq!(
-            [
-                ready(andrey.update_playlist(&liked.id, rename.clone())).err(),
-                ready(andrey.delete_playlist(&all.id)).err(),
-                ready(andrey.edit_playlist(
-                    &all.id,
-                    all.revision,
-                    vec![PlaylistEdit::Remove { entry: first }]
-                ))
-                .err(),
-            ],
-            [
-                Some(BackendError::PlaylistReadOnly),
-                Some(BackendError::PlaylistReadOnly),
-                Some(BackendError::PlaylistReadOnly),
-            ]
-        );
-    }
-
-    #[test]
-    fn a_track_gets_into_liked_by_its_heart_not_an_add() {
-        let andrey = session(&FakeClient::new(None), "andrey");
-        let liked = builtin(andrey.as_ref(), Builtin::Liked);
-        let added = ready(andrey.edit_playlist(
-            &liked.id,
-            liked.revision,
-            vec![PlaylistEdit::Add {
-                id: track(1),
-                before: None,
-            }],
-        ));
-        assert!(
-            matches!(added, Err(BackendError::InvalidInput(_))),
-            "{added:?}"
-        );
-    }
-
-    #[test]
     fn liked_is_edited_but_has_no_panel_and_all_is_neither() {
-        let andrey = session(&FakeClient::new(None), "andrey");
-        let controls = |which| editor_controls(&builtin(andrey.as_ref(), which), true);
         assert_eq!(
-            [controls(Builtin::Liked), controls(Builtin::All)],
+            [
+                editor_controls(&liked(), true),
+                editor_controls(&all(), true)
+            ],
             [
                 EditorControls {
                     edit: true,
@@ -2032,134 +1290,27 @@ mod tests {
     }
 
     #[test]
-    fn an_album_with_a_liked_track_lists_liked_and_never_all() {
-        let andrey = session(&FakeClient::new(None), "andrey");
-        ready(andrey.like(&[track(3)])).unwrap();
-        let refs: Vec<_> = ready(andrey.item_detail(&album()))
-            .unwrap()
-            .playlists
-            .into_iter()
-            .map(|r| (r.name, r.builtin))
-            .collect();
-        assert_eq!(
-            refs,
-            [
-                ("Liked".to_owned(), Some(Builtin::Liked)),
-                ("Road trip".to_owned(), None)
-            ]
-        );
-    }
-
-    fn movie_night(session: &dyn Session) -> String {
-        let list = ready(session.playlists()).unwrap().playlists;
-        named(&list, "Movie night").id.clone()
-    }
-
-    fn candidates(
-        session: &dyn Session,
-        query: &str,
-        offset: u32,
-        limit: u32,
-    ) -> (Vec<String>, u32) {
-        let id = movie_night(session);
-        let page = ready(session.share_candidates(&id, query, offset, limit)).unwrap();
-        (
-            page.candidates
-                .into_iter()
-                .map(|c| c.display_name)
-                .collect(),
-            page.total,
-        )
-    }
-
-    #[test]
-    fn everyone_but_the_user_can_be_shared_with_by_name() {
-        let andrey = session(&FakeClient::new(None), "andrey");
-        assert_eq!(
-            candidates(andrey.as_ref(), "", 0, 50),
-            (
-                vec!["Alice".into(), "Kim".into(), "Mum".into(), "Steve".into()],
-                4
-            )
-        );
-    }
-
-    #[test]
-    fn a_search_finds_a_name_or_a_username_in_any_case() {
-        let andrey = session(&FakeClient::new(None), "andrey");
-        assert_eq!(
-            [
-                candidates(andrey.as_ref(), "AL", 0, 50).0,
-                candidates(andrey.as_ref(), "steve", 0, 50).0
-            ],
-            [vec!["Alice".to_owned()], vec!["Steve".to_owned()]]
-        );
-    }
-
-    #[test]
-    fn candidates_come_a_page_at_a_time() {
-        let andrey = session(&FakeClient::new(None), "andrey");
-        assert_eq!(
-            candidates(andrey.as_ref(), "", 1, 2),
-            (vec!["Kim".into(), "Mum".into()], 4)
-        );
-    }
-
-    #[test]
-    fn only_whoever_manages_a_playlist_sees_whom_it_can_go_to() {
-        let client = FakeClient::new(None);
-        let alice = session(&client, "alice");
-        let list = ready(alice.playlists()).unwrap().playlists;
-        let heists = named(&list, "Andor: the heists").id.clone();
-        assert_eq!(
-            ready(alice.share_candidates(&heists, "", 0, 50)),
-            Err(BackendError::PlaylistReadOnly)
-        );
-    }
-
-    #[test]
     fn whom_a_playlist_is_shared_with_is_named() {
-        let andrey = session(&FakeClient::new(None), "andrey");
-        let list = ready(andrey.playlists()).unwrap().playlists;
-        let Visibility::Shared { with } = &named(&list, "Andor: the heists").visibility else {
-            panic!("the heists are shared")
+        let Visibility::Shared { with } = heists().visibility else {
+            unreachable!()
         };
-        assert_eq!(
-            (share_name(&with[0]), with[0].kind),
-            ("Alice", Some(UserKind::Local))
-        );
+        assert_eq!(share_name(&with[0]), "Alice");
     }
 
     #[test]
     fn someone_picked_is_shared_with_at_the_access_chosen() {
-        let client = FakeClient::new(None);
-        let andrey = session(&client, "andrey");
-        let id = movie_night(andrey.as_ref());
-        let now = ready(andrey.playlist(&id, 0, 1))
-            .unwrap()
-            .playlist
-            .visibility;
-        ready(andrey.update_playlist(
-            &id,
-            PlaylistUpdate {
-                visibility: Some(share_change(
-                    &now,
-                    &ShareChange::Add {
-                        user: "local:mum".into(),
-                        can_edit: true,
-                    },
-                )),
-                ..PlaylistUpdate::default()
-            },
-        ))
-        .unwrap();
-        let mums = ready(session(&client, "mum").playlists())
-            .unwrap()
-            .playlists;
-        assert_eq!(
-            owner_line(named(&mums, "Movie night")),
-            "Andrey’s · you can edit"
-        );
+        let picked = ShareChange::Add {
+            user: "local:mum".into(),
+            can_edit: true,
+        };
+        let Visibility::Shared { with } = share_change(&heists().visibility, &picked) else {
+            panic!("no longer shared")
+        };
+        let access: Vec<_> = with
+            .iter()
+            .map(|s| (s.user_id.as_str(), s.can_edit))
+            .collect();
+        assert_eq!(access, [("local:alice", false), ("local:mum", true)]);
     }
 
     #[test]

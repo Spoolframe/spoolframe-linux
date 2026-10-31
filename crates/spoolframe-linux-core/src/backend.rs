@@ -1,6 +1,6 @@
 //! What the UI talks to. `spoolframe-client-sdk` implements it, through
-//! the thin adapter in [`crate::sdk`]; tests use a fake server answering
-//! from fixed data (`fake`, behind the `testing` feature). The shapes
+//! the thin adapter in [`crate::sdk`]; tests give small mocks only the
+//! answers they need (`mock`, behind the `testing` feature). The shapes
 //! follow the SDK's API and use the protocol's own types, so the adapter
 //! only passes calls through.
 //!
@@ -730,23 +730,31 @@ pub struct Tie {
 /// This device: the servers it knows, and the users signed in on them.
 pub trait Client: Send + Sync {
     /// Servers on this network, and saved ones.
-    fn servers(&self) -> BoxFuture<'_, Result<Vec<Server>, BackendError>>;
+    fn servers(&self) -> BoxFuture<'_, Result<Vec<Server>, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("servers".into())) })
+    }
 
     /// Remembers an address for a server the network did not show, keyed by
     /// the server's key, which the first connect then pins.
     fn add_address<'a>(
         &'a self,
-        server: &'a ServerKey,
-        address: &'a str,
-    ) -> BoxFuture<'a, Result<Server, BackendError>>;
+        _server: &'a ServerKey,
+        _address: &'a str,
+    ) -> BoxFuture<'a, Result<Server, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("add_address".into())) })
+    }
 
     /// What invite `link` says (P6-01); nothing is sent or saved.
     /// [`BackendError::NotAnInvite`] for anything that is not one.
-    fn read_invite<'a>(&'a self, link: &'a str) -> BoxFuture<'a, Result<Invite, BackendError>>;
+    fn read_invite<'a>(&'a self, _link: &'a str) -> BoxFuture<'a, Result<Invite, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("read_invite".into())) })
+    }
 
     /// Connects to the server invite `link` names and says who answered,
     /// for "Is this the server you were invited to?". Nothing is saved.
-    fn connect_invite<'a>(&'a self, link: &'a str) -> BoxFuture<'a, Result<Server, BackendError>>;
+    fn connect_invite<'a>(&'a self, _link: &'a str) -> BoxFuture<'a, Result<Server, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("connect_invite".into())) })
+    }
 
     /// Connects as [`Client::connect_invite`] does and asks the server
     /// what invite `link`'s code is; nothing is saved or used up.
@@ -756,8 +764,10 @@ pub trait Client: Send + Sync {
     /// codes that match nothing.
     fn look_up_invite<'a>(
         &'a self,
-        link: &'a str,
-    ) -> BoxFuture<'a, Result<InviteLookup, BackendError>>;
+        _link: &'a str,
+    ) -> BoxFuture<'a, Result<InviteLookup, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("look_up_invite".into())) })
+    }
 
     /// The same for a code typed in, at `server`: a saved one, or one
     /// heard on this network or at `addresses`.
@@ -765,54 +775,68 @@ pub trait Client: Send + Sync {
     /// text that cannot be a code; else [`Client::look_up_invite`]'s.
     fn look_up_invite_code<'a>(
         &'a self,
-        server: &'a ServerKey,
-        addresses: &'a [String],
-        typed: &'a str,
-    ) -> BoxFuture<'a, Result<InviteLookup, BackendError>>;
+        _server: &'a ServerKey,
+        _addresses: &'a [String],
+        _typed: &'a str,
+    ) -> BoxFuture<'a, Result<InviteLookup, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("look_up_invite_code".into())) })
+    }
 
     /// What `server`, heard on this network, says of itself: connects,
     /// sends only `Hello`, and saves nothing.
     fn lan_server_info<'a>(
         &'a self,
-        server: &'a ServerKey,
-    ) -> BoxFuture<'a, Result<LanServerInfo, BackendError>>;
+        _server: &'a ServerKey,
+    ) -> BoxFuture<'a, Result<LanServerInfo, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("lan_server_info".into())) })
+    }
 
     /// This computer's portable identity side (P7-08): its key-rooted
     /// identity and the root actions.
-    fn identities(&self) -> crate::identity::Identities;
+    fn identities(&self) -> crate::identity::Identities {
+        unimplemented!("identities is not mocked")
+    }
 
     /// What this device knows of reaching server `key`: its addresses,
     /// relays, lookups, last dial and live paths. Never dials.
     /// [`BackendError::NotFound`] for a server it knows nothing of.
     fn reachability<'a>(
         &'a self,
-        key: &'a ServerKey,
-    ) -> BoxFuture<'a, Result<Reachability, BackendError>>;
+        _key: &'a ServerKey,
+    ) -> BoxFuture<'a, Result<Reachability, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("reachability".into())) })
+    }
 
     /// Whether saved server `key` is reached through relays: `Some` whatever
     /// the app's setting says, `None` as it says. Used from the next
     /// connection. [`BackendError::NotPinned`] for a server not saved.
     fn set_server_relays<'a>(
         &'a self,
-        key: &'a ServerKey,
-        relays: Option<bool>,
-    ) -> BoxFuture<'a, Result<(), BackendError>>;
+        _key: &'a ServerKey,
+        _relays: Option<bool>,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("set_server_relays".into())) })
+    }
 
     /// Saved server `key`'s relay list from now on, the user's own; empty
     /// gives it back to the server. [`BackendError::InvalidInput`] for one
     /// that is not an http(s) URL.
     fn set_server_relay_urls<'a>(
         &'a self,
-        key: &'a ServerKey,
-        relays: Vec<String>,
-    ) -> BoxFuture<'a, Result<(), BackendError>>;
+        _key: &'a ServerKey,
+        _relays: Vec<String>,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("set_server_relay_urls".into())) })
+    }
 
     /// Saves the server invite `link` names, its key pinned and verified:
     /// "Save server only", and what a link without a code does.
     fn save_invite_server<'a>(
         &'a self,
-        link: &'a str,
-    ) -> BoxFuture<'a, Result<Server, BackendError>>;
+        _link: &'a str,
+    ) -> BoxFuture<'a, Result<Server, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("save_invite_server".into())) })
+    }
 
     /// Makes an account with invite `link`'s code and signs it in, adding
     /// a profile; the server is saved with it. Refused with
@@ -821,74 +845,99 @@ pub trait Client: Send + Sync {
     /// [`BackendError::UsernameTaken`], saving nothing.
     fn redeem_invite<'a>(
         &'a self,
-        link: &'a str,
-        username: &'a str,
-        display_name: Option<&'a str>,
-        password: &'a str,
-    ) -> BoxFuture<'a, Result<Profile, BackendError>>;
+        _link: &'a str,
+        _username: &'a str,
+        _display_name: Option<&'a str>,
+        _password: &'a str,
+    ) -> BoxFuture<'a, Result<Profile, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("redeem_invite".into())) })
+    }
 
     /// Connects to `server` and says who it is, its fingerprint included,
     /// without saving anything (P1-21): the user checks it first.
-    fn connect<'a>(&'a self, server: &'a ServerKey) -> BoxFuture<'a, Result<Server, BackendError>>;
+    fn connect<'a>(
+        &'a self,
+        _server: &'a ServerKey,
+    ) -> BoxFuture<'a, Result<Server, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("connect".into())) })
+    }
 
     /// Saves `server` with its key pinned, verified or not; on a saved
     /// server, only marks it verified.
     fn pin<'a>(
         &'a self,
-        server: &'a ServerKey,
-        verified: bool,
-    ) -> BoxFuture<'a, Result<Server, BackendError>>;
+        _server: &'a ServerKey,
+        _verified: bool,
+    ) -> BoxFuture<'a, Result<Server, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("pin".into())) })
+    }
 
     /// Replaces saved server `saved`'s pin with `now`, which answered in its
     /// place, after the user checked it (P1-13). Its sessions are gone.
     fn trust_new_identity<'a>(
         &'a self,
-        saved: &'a ServerKey,
-        now: &'a ServerKey,
-    ) -> BoxFuture<'a, Result<Server, BackendError>>;
+        _saved: &'a ServerKey,
+        _now: &'a ServerKey,
+    ) -> BoxFuture<'a, Result<Server, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("trust_new_identity".into())) })
+    }
 
     /// Forgets saved server `server`: its pin, so its fingerprint is
     /// checked again if it is added back, and every session on it.
-    fn forget<'a>(&'a self, server: &'a ServerKey) -> BoxFuture<'a, Result<(), BackendError>>;
+    fn forget<'a>(&'a self, _server: &'a ServerKey) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("forget".into())) })
+    }
 
     /// Signs every user on `server` out, on the server and here; the
     /// server stays saved.
-    fn sign_out<'a>(&'a self, server: &'a ServerKey) -> BoxFuture<'a, Result<(), BackendError>>;
+    fn sign_out<'a>(&'a self, _server: &'a ServerKey) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("sign_out".into())) })
+    }
 
     /// How this device reaches `server` now, before any profile is
     /// chosen. Asks nothing and never dials.
-    fn connection_path(&self, server: &ServerKey) -> ConnectionPath;
+    fn connection_path(&self, _server: &ServerKey) -> ConnectionPath {
+        unimplemented!("connection_path is not mocked")
+    }
 
     /// Checks every open connection after the machine wakes or its network
     /// changes (P1-15): one that does not answer is dropped and dialled
     /// again, so the next request does not wait out its time limit. Never
     /// dials a server it has no connection to.
-    fn resume(&self) -> BoxFuture<'_, ()>;
+    fn resume(&self) -> BoxFuture<'_, ()> {
+        Box::pin(async {})
+    }
 
     /// Forgets a profile kept on this device for `server`: its session,
     /// if any, and its name.
     fn forget_profile<'a>(
         &'a self,
-        server: &'a ServerKey,
-        username: &'a str,
-    ) -> BoxFuture<'a, Result<(), BackendError>>;
+        _server: &'a ServerKey,
+        _username: &'a str,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("forget_profile".into())) })
+    }
 
     /// The users signed in on `server` from this device, and those whose
     /// session the server ended (to sign in again).
     fn profiles<'a>(
         &'a self,
-        server: &'a ServerKey,
-    ) -> BoxFuture<'a, Result<Vec<Profile>, BackendError>>;
+        _server: &'a ServerKey,
+    ) -> BoxFuture<'a, Result<Vec<Profile>, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("profiles".into())) })
+    }
 
     /// Signs a user in on `server` with a password (§22), adding a profile.
     /// `remember` asks to trust this device for the user (P4-01).
     fn sign_in<'a>(
         &'a self,
-        server: &'a ServerKey,
-        username: &'a str,
-        password: &'a str,
-        remember: bool,
-    ) -> BoxFuture<'a, Result<Profile, BackendError>>;
+        _server: &'a ServerKey,
+        _username: &'a str,
+        _password: &'a str,
+        _remember: bool,
+    ) -> BoxFuture<'a, Result<Profile, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("sign_in".into())) })
+    }
 
     /// Signs in on `server` as portable identity `identity` (P7-06,
     /// P7-08), with this device's sign-in for it from a pairing, adding a
@@ -898,16 +947,20 @@ pub trait Client: Send + Sync {
     /// live sign-in for it here.
     fn sign_in_portable<'a>(
         &'a self,
-        server: &'a ServerKey,
-        identity: spoolframe_protocol::portable::PortableUserId,
-    ) -> BoxFuture<'a, Result<Profile, BackendError>>;
+        _server: &'a ServerKey,
+        _identity: spoolframe_protocol::portable::PortableUserId,
+    ) -> BoxFuture<'a, Result<Profile, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("sign_in_portable".into())) })
+    }
 
     /// The profiles remembered on this device for `server` (P4-01), asked
     /// before any sign-in.
     fn trusted_profiles<'a>(
         &'a self,
-        server: &'a ServerKey,
-    ) -> BoxFuture<'a, Result<Vec<TrustedProfile>, BackendError>>;
+        _server: &'a ServerKey,
+    ) -> BoxFuture<'a, Result<Vec<TrustedProfile>, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("trusted_profiles".into())) })
+    }
 
     /// Opens a remembered profile without a password (P4-01): a session,
     /// locked if the PIN is required here. One the device is no longer
@@ -915,18 +968,22 @@ pub trait Client: Send + Sync {
     /// reason. Not a recent sign-in: sensitive actions still confirm.
     fn resume_profile<'a>(
         &'a self,
-        server: &'a ServerKey,
-        user_id: &'a str,
-    ) -> BoxFuture<'a, Result<Profile, BackendError>>;
+        _server: &'a ServerKey,
+        _user_id: &'a str,
+    ) -> BoxFuture<'a, Result<Profile, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("resume_profile".into())) })
+    }
 
     /// Begins a sign-in another device approves (P3-05, P3-07): what to
     /// show while it waits. A server holds at most three per device, so
     /// begin one per screen, not per redraw.
     fn begin_device_sign_in<'a>(
         &'a self,
-        server: &'a ServerKey,
-        remember: bool,
-    ) -> BoxFuture<'a, Result<DeviceSignIn, BackendError>>;
+        _server: &'a ServerKey,
+        _remember: bool,
+    ) -> BoxFuture<'a, Result<DeviceSignIn, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("begin_device_sign_in".into())) })
+    }
 
     /// Waits until `sign_in` is approved, adding its profile as a password
     /// sign-in does; [`BackendError::SignInDenied`] or
@@ -936,71 +993,93 @@ pub trait Client: Send + Sync {
     /// remembered (P4-01).
     fn await_device_sign_in<'a>(
         &'a self,
-        sign_in: &'a DeviceSignIn,
-    ) -> BoxFuture<'a, Result<(Profile, Option<bool>), BackendError>>;
+        _sign_in: &'a DeviceSignIn,
+    ) -> BoxFuture<'a, Result<(Profile, Option<bool>), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("await_device_sign_in".into())) })
+    }
 
     /// Begins a passkey sign-in on `server` (P3-19): what the passkey
     /// signs, for [`APP_RP_ID`]. With `username`, only that user's
     /// passkeys may answer; without, any of this server's on the key.
     fn begin_passkey_sign_in<'a>(
         &'a self,
-        server: &'a ServerKey,
-        username: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<PasskeyRequest, BackendError>>;
+        _server: &'a ServerKey,
+        _username: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<PasskeyRequest, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("begin_passkey_sign_in".into())) })
+    }
 
     /// Finishes it with what the passkey signed, adding a profile as a
     /// password sign-in does. A passkey that does not sign in is
     /// [`BackendError::WrongCredentials`].
     fn finish_passkey_sign_in<'a>(
         &'a self,
-        server: &'a ServerKey,
-        signed: FinishPasskeySignIn,
-        remember: bool,
-    ) -> BoxFuture<'a, Result<Profile, BackendError>>;
+        _server: &'a ServerKey,
+        _signed: FinishPasskeySignIn,
+        _remember: bool,
+    ) -> BoxFuture<'a, Result<Profile, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("finish_passkey_sign_in".into())) })
+    }
 
     /// The session behind a profile.
-    fn session(&self, profile: &Profile) -> Result<Arc<dyn Session>, BackendError>;
+    fn session(&self, _profile: &Profile) -> Result<Arc<dyn Session>, BackendError> {
+        Err(BackendError::Unsupported("session".into()))
+    }
 
     /// The state of the connection to `server`, as it changes.
-    fn connection(&self, server: &ServerKey) -> watch::Receiver<ConnectionState>;
+    fn connection(&self, _server: &ServerKey) -> watch::Receiver<ConnectionState> {
+        unimplemented!("connection is not mocked")
+    }
 
     /// Changes each time `server` signs this device out (its last session
     /// ended, a password changed elsewhere, PX-10): the stored sessions
     /// are gone by then, so the app goes back to "Who's watching".
-    fn signed_out(&self, server: &ServerKey) -> watch::Receiver<u64>;
+    fn signed_out(&self, _server: &ServerKey) -> watch::Receiver<u64> {
+        tokio::sync::watch::channel(Default::default()).1
+    }
 
     /// Changes when [`Client::servers`] would answer differently: a server
     /// heard, changed or gone on the LAN, an address added, a pin saved or
     /// forgotten. Discovery takes a moment after opening, so the first
     /// answer is often empty; list again on each change.
-    fn servers_changed(&self) -> watch::Receiver<()>;
+    fn servers_changed(&self) -> watch::Receiver<()> {
+        tokio::sync::watch::channel(()).1
+    }
 
     /// Playlist changes the servers tell this device of (PX-40), for any
     /// user signed in on them: read again what is shown. Changes made
     /// before subscribing, or while not connected, are not seen.
-    fn playlist_events(&self) -> tokio::sync::broadcast::Receiver<PlaylistEvent>;
+    fn playlist_events(&self) -> tokio::sync::broadcast::Receiver<PlaylistEvent> {
+        tokio::sync::broadcast::channel(1).1
+    }
 
     /// Every subtitle timing change a server this device is connected to
     /// tells of (PX-03): a track synced, set back to its original timing,
     /// or offset, by anyone. A player showing the track reads it again.
-    fn subtitle_timing_events(&self) -> tokio::sync::broadcast::Receiver<SubtitleTimingEvent>;
+    fn subtitle_timing_events(&self) -> tokio::sync::broadcast::Receiver<SubtitleTimingEvent> {
+        tokio::sync::broadcast::channel(1).1
+    }
 
     /// Watch state a signed-in user changed on another device, as a
     /// server with `spoolframe:watch-events` tells it: read again what
     /// shows it. Changes while not connected are not seen.
-    fn watch_events(&self) -> tokio::sync::broadcast::Receiver<WatchEvent>;
+    fn watch_events(&self) -> tokio::sync::broadcast::Receiver<WatchEvent> {
+        tokio::sync::broadcast::channel(1).1
+    }
 
     /// The app shows `server`'s `user_id` (PX-60): from now on the
     /// downloads, their events and their watch state are that profile's,
     /// and deleting one lets go of that profile's hold on it. Choosing
     /// another profile locks it on this device if its PIN is asked for
     /// here; choosing the same one again does not.
-    fn set_download_profile(&self, server: &str, user_id: &str);
+    fn set_download_profile(&self, _server: &str, _user_id: &str) {}
 
     /// The profile shown is locked on this device: its downloads are
     /// empty, and each key is [`BackendError::ProfileLocked`], until it is
     /// unlocked online or with [`Client::unlock_downloads_offline`].
-    fn download_profile_locked(&self) -> bool;
+    fn download_profile_locked(&self) -> bool {
+        false
+    }
 
     /// Unlocks the profile shown with `pin`, with no server: checked
     /// against the PIN that last unlocked it online here. A wrong one is
@@ -1012,91 +1091,123 @@ pub trait Client: Send + Sync {
     /// the same PIN, once reached.
     fn unlock_downloads_offline<'a>(
         &'a self,
-        pin: &'a str,
-    ) -> BoxFuture<'a, Result<(), BackendError>>;
+        _pin: &'a str,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("unlock_downloads_offline".into())) })
+    }
 
     /// Every film and episode downloaded on this device (PX-38) for the
     /// profile shown ([`Client::set_download_profile`]; every profile's
     /// before one is), oldest first. Read from disk: it needs no server,
     /// so it works offline and before anyone signs in. Empty for a locked
     /// profile, and without a downloads directory.
-    fn downloads(&self) -> BoxFuture<'_, Vec<LocalDownload>>;
+    fn downloads(&self) -> BoxFuture<'_, Vec<LocalDownload>> {
+        Box::pin(async { Vec::new() })
+    }
 
     /// Download `key`, from disk. [`BackendError::NotFound`] for a key
     /// this device does not have, or not the profile shown's.
-    fn download<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<LocalDownload, BackendError>>;
+    fn download<'a>(&'a self, _key: &'a str) -> BoxFuture<'a, Result<LocalDownload, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("download".into())) })
+    }
 
     /// Stops moving download `key` until [`Client::resume_download`]; what
     /// arrived is kept. [`BackendError::InvalidInput`] unless it is
     /// preparing or transferring.
     fn pause_download<'a>(
         &'a self,
-        key: &'a str,
-    ) -> BoxFuture<'a, Result<LocalDownload, BackendError>>;
+        _key: &'a str,
+    ) -> BoxFuture<'a, Result<LocalDownload, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("pause_download".into())) })
+    }
 
     /// Goes on with paused download `key`.
     fn resume_download<'a>(
         &'a self,
-        key: &'a str,
-    ) -> BoxFuture<'a, Result<LocalDownload, BackendError>>;
+        _key: &'a str,
+    ) -> BoxFuture<'a, Result<LocalDownload, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("resume_download".into())) })
+    }
 
     /// Tries failed download `key` again; one under way and waiting to try
     /// again tries now.
     fn retry_download<'a>(
         &'a self,
-        key: &'a str,
-    ) -> BoxFuture<'a, Result<LocalDownload, BackendError>>;
+        _key: &'a str,
+    ) -> BoxFuture<'a, Result<LocalDownload, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("retry_download".into())) })
+    }
 
     /// Stops download `key`, not finished, and takes it off this device.
     /// A finished one is refused with [`BackendError::InvalidInput`]:
     /// [`Client::delete_download`] it.
-    fn cancel_download<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), BackendError>>;
+    fn cancel_download<'a>(&'a self, _key: &'a str) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("cancel_download".into())) })
+    }
 
     /// Takes download `key` off this device, in any phase.
-    fn delete_download<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), BackendError>>;
+    fn delete_download<'a>(&'a self, _key: &'a str) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("delete_download".into())) })
+    }
 
     /// The room downloads have, and how much they take.
-    fn download_space(&self) -> BoxFuture<'_, Result<DownloadSpace, BackendError>>;
+    fn download_space(&self) -> BoxFuture<'_, Result<DownloadSpace, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("download_space".into())) })
+    }
 
     /// The user got to `position` in download `key`, playing it here; sent
     /// to the server at the next sync.
     fn record_download_position<'a>(
         &'a self,
-        key: &'a str,
-        position: Duration,
-    ) -> BoxFuture<'a, Result<LocalDownload, BackendError>>;
+        _key: &'a str,
+        _position: Duration,
+    ) -> BoxFuture<'a, Result<LocalDownload, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("record_download_position".into())) })
+    }
 
     /// The user marked download `key` watched or not, here. Unwatched
     /// starts it over.
     fn set_download_watched<'a>(
         &'a self,
-        key: &'a str,
-        watched: bool,
-    ) -> BoxFuture<'a, Result<LocalDownload, BackendError>>;
+        _key: &'a str,
+        _watched: bool,
+    ) -> BoxFuture<'a, Result<LocalDownload, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("set_download_watched".into())) })
+    }
 
     /// Each change of a download (PX-38) of the profile shown: its phase,
     /// its progress, its watch, or its removal. Made before subscribing,
     /// they are not seen: list the downloads first.
-    fn download_events(&self) -> tokio::sync::broadcast::Receiver<DownloadEvent>;
+    fn download_events(&self) -> tokio::sync::broadcast::Receiver<DownloadEvent> {
+        tokio::sync::broadcast::channel(1).1
+    }
 
     /// How many downloads are under way (preparing or transferring), every
     /// profile's and not only the one shown: what quitting would stop. Now,
     /// and on each change.
-    fn downloads_running(&self) -> tokio::sync::watch::Receiver<usize>;
+    fn downloads_running(&self) -> tokio::sync::watch::Receiver<usize> {
+        tokio::sync::watch::channel(Default::default()).1
+    }
 
     /// A server's libraries changed (P8-02): a paired server came online
     /// or went offline, or shared or stopped sharing a library. List them
     /// again ([`Session::libraries`]).
-    fn libraries_events(&self) -> tokio::sync::broadcast::Receiver<LibrariesChanged>;
+    fn libraries_events(&self) -> tokio::sync::broadcast::Receiver<LibrariesChanged> {
+        tokio::sync::broadcast::channel(1).1
+    }
 
     /// Changes to any signed-in user's profile on any server: removed, its
     /// PIN set or cleared, its session ended, a new password needed. Made
     /// before subscribing, they are not seen.
-    fn profile_events(&self) -> tokio::sync::broadcast::Receiver<ProfileEvent>;
+    fn profile_events(&self) -> tokio::sync::broadcast::Receiver<ProfileEvent> {
+        tokio::sync::broadcast::channel(1).1
+    }
 
     /// What the app keeps for `username` on `server` between starts.
     /// Nothing is read until asked.
-    fn profile_store(&self, server: &ServerKey, username: &str) -> Arc<dyn ProfileStore>;
+    fn profile_store(&self, _server: &ServerKey, _username: &str) -> Arc<dyn ProfileStore> {
+        unimplemented!("profile_store is not mocked")
+    }
 }
 
 /// One profile's values, by name (lowercase letters, digits, `-` and
@@ -1118,18 +1229,26 @@ pub trait ProfileStore: Send + Sync {
 /// and playback.
 pub trait Session: Send + Sync {
     /// Explicit foreground selection; background calls never select a profile.
-    fn activate(&self) -> BoxFuture<'_, Result<(), BackendError>>;
+    fn activate(&self) -> BoxFuture<'_, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("activate".into())) })
+    }
 
     /// Where a browser reaches the server's web UI, if it has a public
     /// address: for "open in the browser" links (P3-12's Plex account).
-    fn web_url(&self) -> Option<String>;
+    fn web_url(&self) -> Option<String> {
+        None
+    }
 
     /// How this device reaches the server now. Asks nothing.
-    fn connection_path(&self) -> ConnectionPath;
+    fn connection_path(&self) -> ConnectionPath {
+        unimplemented!("connection_path is not mocked")
+    }
 
     /// How fast the link to the server has carried direct reads lately,
     /// in bits per second (P6-06); `None` until something was read.
-    fn link_rate(&self) -> Option<u64>;
+    fn link_rate(&self) -> Option<u64> {
+        None
+    }
 
     /// Plans a playback again for a link that carries only
     /// `link_bitrate` bits per second, from `position` (P6-06): a direct
@@ -1137,28 +1256,38 @@ pub trait Session: Send + Sync {
     /// back unchanged when it fits already.
     fn limit_playback<'a>(
         &'a self,
-        handle: &'a PlaybackHandle,
-        link_bitrate: u64,
-        position: Duration,
-    ) -> BoxFuture<'a, Result<PlaybackChange, BackendError>>;
+        _handle: &'a PlaybackHandle,
+        _link_bitrate: u64,
+        _position: Duration,
+    ) -> BoxFuture<'a, Result<PlaybackChange, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("limit_playback".into())) })
+    }
 
     /// The item's preview frames for scrubbing (P3-13). Asking also puts
     /// the item first in the server's queue to make them.
-    fn previews<'a>(&'a self, id: &'a MediaId) -> BoxFuture<'a, Result<Previews, BackendError>>;
+    fn previews<'a>(&'a self, _id: &'a MediaId) -> BoxFuture<'a, Result<Previews, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("previews".into())) })
+    }
 
     /// Continue watching, next up and recently added, with the user's state.
-    fn home(&self) -> BoxFuture<'_, Result<HomeScreen, BackendError>>;
+    fn home(&self) -> BoxFuture<'_, Result<HomeScreen, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("home".into())) })
+    }
 
-    fn libraries(&self) -> BoxFuture<'_, Result<Vec<Library>, BackendError>>;
+    fn libraries(&self) -> BoxFuture<'_, Result<Vec<Library>, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("libraries".into())) })
+    }
 
     /// A page of a library's top-level items (movies, shows or artists), and
     /// how many there are in all.
     fn items<'a>(
         &'a self,
-        library: &'a LibraryId,
-        offset: u32,
-        limit: u32,
-    ) -> BoxFuture<'a, Result<(Vec<Item>, u32), BackendError>>;
+        _library: &'a LibraryId,
+        _offset: u32,
+        _limit: u32,
+    ) -> BoxFuture<'a, Result<(Vec<Item>, u32), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("items".into())) })
+    }
 
     /// [`Session::items`] in `sort`'s order (title A to Z when `None`),
     /// only those `filter` keeps, and how many it keeps in all. Items
@@ -1169,63 +1298,79 @@ pub trait Session: Send + Sync {
     /// [`ItemFilterValues::refuses`] before asking.
     fn items_sorted<'a>(
         &'a self,
-        library: &'a LibraryId,
-        offset: u32,
-        limit: u32,
-        sort: Option<ItemSort>,
-        filter: Option<&'a ItemFilter>,
-    ) -> BoxFuture<'a, Result<(Vec<Item>, u32), BackendError>>;
+        _library: &'a LibraryId,
+        _offset: u32,
+        _limit: u32,
+        _sort: Option<ItemSort>,
+        _filter: Option<&'a ItemFilter>,
+    ) -> BoxFuture<'a, Result<(Vec<Item>, u32), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("items_sorted".into())) })
+    }
 
     /// What a library can be sorted and filtered by, and the values its
     /// items have, with how many have each: what the controls are built
     /// from.
     fn item_filter_values<'a>(
         &'a self,
-        library: &'a LibraryId,
-    ) -> BoxFuture<'a, Result<ItemFilterValues, BackendError>>;
+        _library: &'a LibraryId,
+    ) -> BoxFuture<'a, Result<ItemFilterValues, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("item_filter_values".into())) })
+    }
 
     /// An item and its children: a show's seasons, a season's episodes, an
     /// artist's albums, an album's tracks.
     fn item<'a>(
         &'a self,
-        id: &'a MediaId,
-    ) -> BoxFuture<'a, Result<(Item, Vec<Item>), BackendError>>;
+        _id: &'a MediaId,
+    ) -> BoxFuture<'a, Result<(Item, Vec<Item>), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("item".into())) })
+    }
 
     /// [`Session::item`] with the playlists the user sees that hold the
     /// item (PX-40): a movie, episode or track itself, any of a season's
     /// or show's episodes, any of an album's or artist's tracks.
     fn item_detail<'a>(
         &'a self,
-        id: &'a MediaId,
-    ) -> BoxFuture<'a, Result<ItemDetail, BackendError>>;
+        _id: &'a MediaId,
+    ) -> BoxFuture<'a, Result<ItemDetail, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("item_detail".into())) })
+    }
 
     /// A search (P3-09): in a scope, or one group for "See all"; the top
     /// match, then groups of shows, movies, people, artists, albums,
     /// tracks and episodes, with counts per scope.
     fn search<'a>(
         &'a self,
-        request: &'a SearchRequest,
-    ) -> BoxFuture<'a, Result<SearchResults, BackendError>>;
+        _request: &'a SearchRequest,
+    ) -> BoxFuture<'a, Result<SearchResults, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("search".into())) })
+    }
 
     /// A page of the items a person a search found is in, and how many
     /// there are in all.
     fn person_items<'a>(
         &'a self,
-        person: &'a PersonId,
-        offset: u32,
-        limit: u32,
-    ) -> BoxFuture<'a, Result<(Vec<Item>, u32), BackendError>>;
+        _person: &'a PersonId,
+        _offset: u32,
+        _limit: u32,
+    ) -> BoxFuture<'a, Result<(Vec<Item>, u32), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("person_items".into())) })
+    }
 
     /// The item's audio and subtitle tracks, for the pickers.
-    fn tracks<'a>(&'a self, id: &'a MediaId) -> BoxFuture<'a, Result<MediaTracks, BackendError>>;
+    fn tracks<'a>(&'a self, _id: &'a MediaId) -> BoxFuture<'a, Result<MediaTracks, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("tracks".into())) })
+    }
 
     /// How the server would play `id` with these tracks, or with the ones
     /// it would choose (`None`), and which it chose and why (P1-20).
     fn playback_plan<'a>(
         &'a self,
-        id: &'a MediaId,
-        selection: Option<Selection>,
-    ) -> BoxFuture<'a, Result<(PlaybackPlan, Option<ChosenTracks>), BackendError>>;
+        _id: &'a MediaId,
+        _selection: Option<Selection>,
+    ) -> BoxFuture<'a, Result<(PlaybackPlan, Option<ChosenTracks>), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("playback_plan".into())) })
+    }
 
     /// Starts playback with these tracks, or with the server's choice from
     /// the user's preferences and series override (`None`). A converted
@@ -1236,20 +1381,24 @@ pub trait Session: Send + Sync {
     /// of what the client said as it connected.
     fn start_playback<'a>(
         &'a self,
-        id: &'a MediaId,
-        selection: Option<Selection>,
-        options: PlaybackOptions,
-    ) -> BoxFuture<'a, Result<PlaybackStart, BackendError>>;
+        _id: &'a MediaId,
+        _selection: Option<Selection>,
+        _options: PlaybackOptions,
+    ) -> BoxFuture<'a, Result<PlaybackStart, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("start_playback".into())) })
+    }
 
     /// Plans a playing playback again for the quality the viewer chose
     /// now, from `position` (P6-06): the new plan, size and epoch, as a
     /// subtitle change gives them.
     fn change_quality<'a>(
         &'a self,
-        handle: &'a PlaybackHandle,
-        quality: PlaybackQuality,
-        position: Duration,
-    ) -> BoxFuture<'a, Result<PlaybackChange, BackendError>>;
+        _handle: &'a PlaybackHandle,
+        _quality: PlaybackQuality,
+        _position: Duration,
+    ) -> BoxFuture<'a, Result<PlaybackChange, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("change_quality".into())) })
+    }
 
     /// Up to `length` bytes of a converted playback's output from
     /// `offset`, for its `epoch` (P2-04). A read past what is encoded
@@ -1258,48 +1407,60 @@ pub trait Session: Send + Sync {
     /// seek replaced `epoch`.
     fn read_chunk<'a>(
         &'a self,
-        handle: &'a PlaybackHandle,
-        epoch: u32,
-        offset: u64,
-        length: u64,
-    ) -> BoxFuture<'a, Result<Chunk, BackendError>>;
+        _handle: &'a PlaybackHandle,
+        _epoch: u32,
+        _offset: u64,
+        _length: u64,
+    ) -> BoxFuture<'a, Result<Chunk, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("read_chunk".into())) })
+    }
 
     /// Restarts a converted playback's encode at `position`; reads go on
     /// with the returned epoch, from offset 0.
     fn seek_playback<'a>(
         &'a self,
-        handle: &'a PlaybackHandle,
-        position: Duration,
-    ) -> BoxFuture<'a, Result<u32, BackendError>>;
+        _handle: &'a PlaybackHandle,
+        _position: Duration,
+    ) -> BoxFuture<'a, Result<u32, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("seek_playback".into())) })
+    }
 
     /// Ends a playback now, and its encode. Otherwise it ends when it has
     /// not been read for a while.
     fn stop_playback<'a>(
         &'a self,
-        handle: &'a PlaybackHandle,
-    ) -> BoxFuture<'a, Result<(), BackendError>>;
+        _handle: &'a PlaybackHandle,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("stop_playback".into())) })
+    }
 
     /// Up to [`MAX_READ`] bytes of a playback's file from `offset`; fewer
     /// only at the end of the file.
     fn read<'a>(
         &'a self,
-        handle: &'a PlaybackHandle,
-        offset: u64,
-        length: u64,
-    ) -> BoxFuture<'a, Result<Vec<u8>, BackendError>>;
+        _handle: &'a PlaybackHandle,
+        _offset: u64,
+        _length: u64,
+    ) -> BoxFuture<'a, Result<Vec<u8>, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("read".into())) })
+    }
 
     /// The playback's selected external subtitle, whole.
     fn read_subtitle<'a>(
         &'a self,
-        handle: &'a PlaybackHandle,
-    ) -> BoxFuture<'a, Result<(SubtitleFormat, Vec<u8>), BackendError>>;
+        _handle: &'a PlaybackHandle,
+    ) -> BoxFuture<'a, Result<(SubtitleFormat, Vec<u8>), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("read_subtitle".into())) })
+    }
 
     /// An image, at the smallest size that covers what is drawn.
     fn artwork<'a>(
         &'a self,
-        id: &'a ArtworkId,
-        size: ArtworkSize,
-    ) -> BoxFuture<'a, Result<Vec<u8>, BackendError>>;
+        _id: &'a ArtworkId,
+        _size: ArtworkSize,
+    ) -> BoxFuture<'a, Result<Vec<u8>, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("artwork".into())) })
+    }
 
     /// A backdrop, and where the faces in it are (PX-64, experimental
     /// smart crop): `None` until the server has looked, or on a server
@@ -1325,67 +1486,92 @@ pub trait Session: Send + Sync {
     }
 
     /// The episode after `episode` in its show (P2-10); `None` after the
-    /// last. A session whose server cannot say walks the show's seasons.
+    /// last. A server that cannot say has no Next episode: the client
+    /// does not work it out itself.
     fn next_episode<'a>(
         &'a self,
-        episode: &'a spoolframe_types::Episode,
+        _episode: &'a spoolframe_types::Episode,
     ) -> BoxFuture<'a, Result<Option<Item>, BackendError>> {
-        Box::pin(crate::next_episode::walk(self, episode))
+        Box::pin(async { Err(BackendError::Unsupported("NextEpisode".into())) })
     }
 
     fn update_progress<'a>(
         &'a self,
-        handle: &'a PlaybackHandle,
-        position: Duration,
-    ) -> BoxFuture<'a, Result<(), BackendError>>;
+        _handle: &'a PlaybackHandle,
+        _position: Duration,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("update_progress".into())) })
+    }
 
-    fn mark_watched<'a>(&'a self, id: &'a MediaId) -> BoxFuture<'a, Result<(), BackendError>>;
+    fn mark_watched<'a>(&'a self, _id: &'a MediaId) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("mark_watched".into())) })
+    }
 
-    fn mark_unwatched<'a>(&'a self, id: &'a MediaId) -> BoxFuture<'a, Result<(), BackendError>>;
+    fn mark_unwatched<'a>(&'a self, _id: &'a MediaId) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("mark_unwatched".into())) })
+    }
 
     /// Takes `id` out of Continue watching and Next up for this user, its
     /// progress kept (P1-22); an episode takes its whole show. It comes
     /// back with its next progress or mark.
-    fn hide_from_continue<'a>(&'a self, id: &'a MediaId)
-    -> BoxFuture<'a, Result<(), BackendError>>;
+    fn hide_from_continue<'a>(
+        &'a self,
+        _id: &'a MediaId,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("hide_from_continue".into())) })
+    }
 
     /// Undoes [`Session::hide_from_continue`].
     fn unhide_from_continue<'a>(
         &'a self,
-        id: &'a MediaId,
-    ) -> BoxFuture<'a, Result<(), BackendError>>;
+        _id: &'a MediaId,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("unhide_from_continue".into())) })
+    }
 
     /// The user's audio and subtitle preferences, and whether the server
     /// reads picture subtitles as text (PX-13).
-    fn track_preferences(&self) -> BoxFuture<'_, Result<TrackPreferencesInfo, BackendError>>;
+    fn track_preferences(&self) -> BoxFuture<'_, Result<TrackPreferencesInfo, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("track_preferences".into())) })
+    }
 
     fn set_track_preferences<'a>(
         &'a self,
-        preferences: &'a TrackPreferences,
-    ) -> BoxFuture<'a, Result<(), BackendError>>;
+        _preferences: &'a TrackPreferences,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("set_track_preferences".into())) })
+    }
 
     /// Remembers these tracks for the item: for an episode, for its whole
     /// series (as language and role, so other episodes match).
     fn set_track_override<'a>(
         &'a self,
-        id: &'a MediaId,
-        selection: Selection,
-    ) -> BoxFuture<'a, Result<(), BackendError>>;
+        _id: &'a MediaId,
+        _selection: Selection,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("set_track_override".into())) })
+    }
 
     /// Forgets the item's (or its series') tracks: back to the preferences.
     fn clear_track_override<'a>(
         &'a self,
-        id: &'a MediaId,
-    ) -> BoxFuture<'a, Result<(), BackendError>>;
+        _id: &'a MediaId,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("clear_track_override".into())) })
+    }
 
     /// Unlocks this profile on this device with its PIN (P2-08). A wrong
     /// PIN is [`BackendError::WrongCredentials`], too many in a while
     /// [`BackendError::RateLimited`]; the tenth wrong in a row ends the
     /// session here ([`BackendError::SignInRequired`]).
-    fn unlock<'a>(&'a self, pin: &'a str) -> BoxFuture<'a, Result<(), BackendError>>;
+    fn unlock<'a>(&'a self, _pin: &'a str) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("unlock".into())) })
+    }
 
     /// Whether the user has a PIN, and how many digits; `None` for none.
-    fn pin(&self) -> BoxFuture<'_, Result<Option<PinState>, BackendError>>;
+    fn pin(&self) -> BoxFuture<'_, Result<Option<PinState>, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("pin".into())) })
+    }
 
     /// Sets or changes the user's PIN, 4 to 8 digits. The first PIN takes no
     /// proof; changing one takes the current PIN or the account password.
@@ -1394,53 +1580,81 @@ pub trait Session: Send + Sync {
     /// [`BackendError::WrongCredentials`].
     fn set_pin<'a>(
         &'a self,
-        pin: &'a str,
-        proof: Option<PinProof>,
-    ) -> BoxFuture<'a, Result<(), BackendError>>;
+        _pin: &'a str,
+        _proof: Option<PinProof>,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("set_pin".into())) })
+    }
 
     /// Removes the user's PIN, and with it every device's requirement, on
     /// the current PIN or the account password.
-    fn clear_pin(&self, proof: PinProof) -> BoxFuture<'_, Result<(), BackendError>>;
+    fn clear_pin(&self, _proof: PinProof) -> BoxFuture<'_, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("clear_pin".into())) })
+    }
 
     /// The user's Plex account link, if any (P3-12); linking is the web
     /// UI's.
-    fn plex_link(&self) -> BoxFuture<'_, Result<Option<PlexLink>, BackendError>>;
+    fn plex_link(&self) -> BoxFuture<'_, Result<Option<PlexLink>, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("plex_link".into())) })
+    }
 
     /// The devices the user has signed in from, and where the PIN is
     /// asked for.
-    fn devices(&self) -> BoxFuture<'_, Result<Vec<DeviceInfo>, BackendError>>;
+    fn devices(&self) -> BoxFuture<'_, Result<Vec<DeviceInfo>, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("devices".into())) })
+    }
 
     /// Begins making a passkey for this user (P3-19). Only soon after
     /// signing in: [`BackendError::RecentSignInRequired`] otherwise.
-    fn begin_passkey_registration(&self) -> BoxFuture<'_, Result<PasskeyCreation, BackendError>>;
+    fn begin_passkey_registration(&self) -> BoxFuture<'_, Result<PasskeyCreation, BackendError>> {
+        Box::pin(async {
+            Err(BackendError::Unsupported(
+                "begin_passkey_registration".into(),
+            ))
+        })
+    }
 
     /// Keeps the passkey made for it, named for this device (1 to 64
     /// characters).
     fn finish_passkey_registration(
         &self,
-        made: FinishPasskeyRegistration,
-    ) -> BoxFuture<'_, Result<(), BackendError>>;
+        _made: FinishPasskeyRegistration,
+    ) -> BoxFuture<'_, Result<(), BackendError>> {
+        Box::pin(async {
+            Err(BackendError::Unsupported(
+                "finish_passkey_registration".into(),
+            ))
+        })
+    }
 
     /// This user's passkeys, the web UI's too, oldest first.
-    fn passkeys(&self) -> BoxFuture<'_, Result<Vec<PasskeyInfo>, BackendError>>;
+    fn passkeys(&self) -> BoxFuture<'_, Result<Vec<PasskeyInfo>, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("passkeys".into())) })
+    }
 
     fn rename_passkey<'a>(
         &'a self,
-        id: &'a str,
-        name: &'a str,
-    ) -> BoxFuture<'a, Result<(), BackendError>>;
+        _id: &'a str,
+        _name: &'a str,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("rename_passkey".into())) })
+    }
 
     /// Removes one; [`BackendError::RecentSignInRequired`] as for adding,
     /// [`BackendError::LastSignInMethod`] for their only way in.
-    fn remove_passkey<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), BackendError>>;
+    fn remove_passkey<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("remove_passkey".into())) })
+    }
 
     /// Asks for the PIN on `device` (an endpoint id from
     /// [`Session::devices`]; this device for `None`), or stops asking.
     fn set_pin_required<'a>(
         &'a self,
-        device: Option<&'a str>,
-        required: bool,
-    ) -> BoxFuture<'a, Result<(), BackendError>>;
+        _device: Option<&'a str>,
+        _required: bool,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("set_pin_required".into())) })
+    }
 
     /// The device asking to be signed in with `code` (P3-07), normalized:
     /// what it calls itself and when it asked. A code that is not pending
@@ -1448,8 +1662,10 @@ pub trait Session: Send + Sync {
     /// [`BackendError::RateLimited`].
     fn lookup_device_sign_in<'a>(
         &'a self,
-        code: &'a str,
-    ) -> BoxFuture<'a, Result<DeviceSignInRequest, BackendError>>;
+        _code: &'a str,
+    ) -> BoxFuture<'a, Result<DeviceSignInRequest, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("lookup_device_sign_in".into())) })
+    }
 
     /// Signs that device in as this user. Approving the device that shows
     /// the code is [`BackendError::InvalidInput`].
@@ -1457,15 +1673,19 @@ pub trait Session: Send + Sync {
     /// remembered only if it asked and this says yes (P4-01).
     fn approve_device_sign_in<'a>(
         &'a self,
-        code: &'a str,
-        remember: bool,
-    ) -> BoxFuture<'a, Result<(), BackendError>>;
+        _code: &'a str,
+        _remember: bool,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("approve_device_sign_in".into())) })
+    }
 
     /// Deletes another of this user's devices (P4-03): its sessions for
     /// this user end, its trust goes, and it shows up as new if it signs
     /// in again. Always needs a recent sign-in; this device is
     /// [`BackendError::InvalidInput`] (sign out instead).
-    fn forget_device<'a>(&'a self, device: &'a str) -> BoxFuture<'a, Result<(), BackendError>>;
+    fn forget_device<'a>(&'a self, _device: &'a str) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("forget_device".into())) })
+    }
 
     /// Trusts a device for this user, or stops (P4-01); `None` is this
     /// one. Turning trust or auto-login on is for this device only, and
@@ -1475,17 +1695,26 @@ pub trait Session: Send + Sync {
     /// it on turns the PIN off here.
     fn set_device_trust<'a>(
         &'a self,
-        device: Option<&'a str>,
-        trusted: bool,
-        auto_login: bool,
-    ) -> BoxFuture<'a, Result<(), BackendError>>;
+        _device: Option<&'a str>,
+        _trusted: bool,
+        _auto_login: bool,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("set_device_trust".into())) })
+    }
 
     /// Signs this profile out here: the session ends and the device is no
     /// longer trusted for it (P4-01); the next time is a full sign-in.
-    fn sign_out(&self) -> BoxFuture<'_, Result<(), BackendError>>;
+    fn sign_out(&self) -> BoxFuture<'_, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("sign_out".into())) })
+    }
 
     /// Refuses it: the device is told so.
-    fn deny_device_sign_in<'a>(&'a self, code: &'a str) -> BoxFuture<'a, Result<(), BackendError>>;
+    fn deny_device_sign_in<'a>(
+        &'a self,
+        _code: &'a str,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("deny_device_sign_in".into())) })
+    }
 
     /// "Confirm it's you" with the password: refreshes this session's
     /// sign-in time, for the actions that need one in the last 10 minutes
@@ -1493,32 +1722,46 @@ pub trait Session: Send + Sync {
     /// requiring the PIN). A wrong one is [`BackendError::WrongCredentials`]
     /// (then [`BackendError::RateLimited`]); an account without a password
     /// is [`BackendError::NoPassword`]. The PIN does not confirm it.
-    fn confirm_password<'a>(&'a self, password: &'a str)
-    -> BoxFuture<'a, Result<(), BackendError>>;
+    fn confirm_password<'a>(
+        &'a self,
+        _password: &'a str,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("confirm_password".into())) })
+    }
 
     /// Begins confirming with one of this user's app passkeys: what the
     /// key or phone signs. A user with none is [`BackendError::NotFound`].
-    fn begin_confirm_passkey(&self) -> BoxFuture<'_, Result<PasskeyRequest, BackendError>>;
+    fn begin_confirm_passkey(&self) -> BoxFuture<'_, Result<PasskeyRequest, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("begin_confirm_passkey".into())) })
+    }
 
     /// Finishes it with what the passkey signed.
     fn finish_confirm_passkey(
         &self,
-        signed: FinishPasskeySignIn,
-    ) -> BoxFuture<'_, Result<(), BackendError>>;
+        _signed: FinishPasskeySignIn,
+    ) -> BoxFuture<'_, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("finish_confirm_passkey".into())) })
+    }
 
     /// The user is the server's admin (P2-09): the app offers its admin
     /// pages.
-    fn is_admin(&self) -> bool;
+    fn is_admin(&self) -> bool {
+        false
+    }
 
     /// The server's id for the user, which [`Client::set_download_profile`]
     /// takes.
-    fn user_id(&self) -> String;
+    fn user_id(&self) -> String {
+        String::new()
+    }
 
     /// This session signed in with a one-time password an admin set
     /// (c86e6d3a): it must choose a new one before anything else. A
     /// session found again says so only by refusing its first request
     /// with [`BackendError::PasswordChangeRequired`].
-    fn password_change_required(&self) -> bool;
+    fn password_change_required(&self) -> bool {
+        false
+    }
 
     /// Changes the user's password from `current` to `new`. A wrong
     /// `current` is [`BackendError::WrongCredentials`]; a `new` the server
@@ -1526,28 +1769,43 @@ pub trait Session: Send + Sync {
     /// [`BackendError::InvalidInput`].
     fn change_password<'a>(
         &'a self,
-        current: &'a str,
-        new: &'a str,
-    ) -> BoxFuture<'a, Result<(), BackendError>>;
+        _current: &'a str,
+        _new: &'a str,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("change_password".into())) })
+    }
 
     /// Makes an invite (PX-44). Admins only, after a recent confirmation
     /// (`RecentSignInRequired` asks for one).
-    fn create_invite(&self, spec: InviteSpec) -> BoxFuture<'_, Result<MintedInvite, BackendError>>;
+    fn create_invite(
+        &self,
+        _spec: InviteSpec,
+    ) -> BoxFuture<'_, Result<MintedInvite, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("create_invite".into())) })
+    }
 
     /// The server's invites, newest first; revoked ones too. Admins only.
-    fn invites(&self) -> BoxFuture<'_, Result<Vec<InviteSummary>, BackendError>>;
+    fn invites(&self) -> BoxFuture<'_, Result<Vec<InviteSummary>, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("invites".into())) })
+    }
 
     /// Stops an invite working. Admins only, after a recent confirmation.
-    fn revoke_invite<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), BackendError>>;
+    fn revoke_invite<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("revoke_invite".into())) })
+    }
 
     /// The portable identity this session is a guest with (P7-06): it
     /// signed in as the identity itself, and has no account here. `None`
     /// for an account, tied to an identity or not. Asks nothing.
-    fn guest_identity(&self) -> Option<spoolframe_protocol::portable::PortableUserId>;
+    fn guest_identity(&self) -> Option<spoolframe_protocol::portable::PortableUserId> {
+        None
+    }
 
     /// The portable identities this account is tied to (P7-04, P7-09), as
     /// the server says now, the oldest tie first.
-    fn tie_info(&self) -> BoxFuture<'_, Result<Vec<Tie>, BackendError>>;
+    fn tie_info(&self) -> BoxFuture<'_, Result<Vec<Tie>, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("tie_info".into())) })
+    }
 
     /// Ties this account to portable identity `identity` (P7-04): devices
     /// that sign in with the identity open the account. This device proves
@@ -1558,8 +1816,10 @@ pub trait Session: Send + Sync {
     /// nothing, and one tied to another account here is refused.
     fn tie(
         &self,
-        identity: spoolframe_protocol::portable::PortableUserId,
-    ) -> BoxFuture<'_, Result<(), BackendError>>;
+        _identity: spoolframe_protocol::portable::PortableUserId,
+    ) -> BoxFuture<'_, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("tie".into())) })
+    }
 
     /// Severs the account's tie to `identity` (P7-04, P7-09); its other
     /// ties, its password, its sessions and its history stay. Only soon
@@ -1567,8 +1827,10 @@ pub trait Session: Send + Sync {
     /// [`BackendError::NotFound`].
     fn untie(
         &self,
-        identity: spoolframe_protocol::portable::PortableUserId,
-    ) -> BoxFuture<'_, Result<(), BackendError>>;
+        _identity: spoolframe_protocol::portable::PortableUserId,
+    ) -> BoxFuture<'_, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("untie".into())) })
+    }
 
     /// Leaves the server (PX-47): a local account is disabled (its owner
     /// can restore it), a guest's access ends for good. Once it has, this
@@ -1578,16 +1840,22 @@ pub trait Session: Send + Sync {
     /// ([`BackendError::RecentSignInRequired`]); the server's last admin
     /// is refused with [`BackendError::LastAdmin`]. A refused leave changes
     /// nothing.
-    fn leave_server(&self) -> BoxFuture<'_, Result<(), BackendError>>;
+    fn leave_server(&self) -> BoxFuture<'_, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("leave_server".into())) })
+    }
 
     /// Whether the user may leave the server, as it said when this
     /// session was made: false only for its last admin. An older server
     /// that does not say reads as true; [`Session::leave_server`]'s
     /// refusal is the backstop.
-    fn can_leave(&self) -> bool;
+    fn can_leave(&self) -> bool {
+        false
+    }
 
     /// [`Session::can_leave`], asked of the server again.
-    fn can_leave_now(&self) -> BoxFuture<'_, Result<bool, BackendError>>;
+    fn can_leave_now(&self) -> BoxFuture<'_, Result<bool, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("can_leave_now".into())) })
+    }
 
     /// Likes tracks or albums (PX-43): those not liked yet go to the top
     /// of the user's Liked, an album's tracks in order. 1 to 100 at a
@@ -1595,14 +1863,18 @@ pub trait Session: Send + Sync {
     /// Liked as it is after.
     fn like<'a>(
         &'a self,
-        items: &'a [MediaId],
-    ) -> BoxFuture<'a, Result<PlaylistSummary, BackendError>>;
+        _items: &'a [MediaId],
+    ) -> BoxFuture<'a, Result<PlaylistSummary, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("like".into())) })
+    }
 
     /// Takes tracks, or every track of albums, out of the user's Liked.
     fn unlike<'a>(
         &'a self,
-        items: &'a [MediaId],
-    ) -> BoxFuture<'a, Result<PlaylistSummary, BackendError>>;
+        _items: &'a [MediaId],
+    ) -> BoxFuture<'a, Result<PlaylistSummary, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("unlike".into())) })
+    }
 
     /// Whom playlist `id` can be shared with:
     /// a page from `offset` of at most `limit` (200), by display name,
@@ -1611,11 +1883,13 @@ pub trait Session: Send + Sync {
     /// the playlist may ask ([`BackendError::PlaylistReadOnly`]).
     fn share_candidates<'a>(
         &'a self,
-        id: &'a str,
-        query: &'a str,
-        offset: u32,
-        limit: u32,
-    ) -> BoxFuture<'a, Result<ShareCandidatePage, BackendError>>;
+        _id: &'a str,
+        _query: &'a str,
+        _offset: u32,
+        _limit: u32,
+    ) -> BoxFuture<'a, Result<ShareCandidatePage, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("share_candidates".into())) })
+    }
 
     /// What the server's subtitle sites have for item `id` (PX-02), in
     /// `language` (`en`, `pt-BR`) or, with `None`, the languages the
@@ -1625,9 +1899,11 @@ pub trait Session: Send + Sync {
     /// up.
     fn search_subtitles<'a>(
         &'a self,
-        id: &'a MediaId,
-        language: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<SubtitleSearch, BackendError>>;
+        _id: &'a MediaId,
+        _language: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<SubtitleSearch, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("search_subtitles".into())) })
+    }
 
     /// Downloads search result `result` (its `SubtitleResult::id`) as a
     /// track of item `id`, for everyone: its place in the item's
@@ -1636,26 +1912,36 @@ pub trait Session: Send + Sync {
     /// [`BackendError::QuotaExhausted`] when the downloads are used up.
     fn download_subtitle<'a>(
         &'a self,
-        id: &'a MediaId,
-        result: &'a str,
-    ) -> BoxFuture<'a, Result<SubtitleDownloaded, BackendError>>;
+        _id: &'a MediaId,
+        _result: &'a str,
+    ) -> BoxFuture<'a, Result<SubtitleDownloaded, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("download_subtitle".into())) })
+    }
 
     /// Syncs item `id`'s external text subtitle `track` to the file, in
     /// the background (PX-03): its timing now, `Syncing`; the outcome
     /// comes as a [`SubtitleTimingEvent`].
     fn sync_subtitle<'a>(
         &'a self,
-        id: &'a MediaId,
-        track: u32,
-    ) -> BoxFuture<'a, Result<SubtitleTiming, BackendError>>;
+        _id: &'a MediaId,
+        _track: u32,
+    ) -> BoxFuture<'a, Result<SubtitleTiming, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("sync_subtitle".into())) })
+    }
 
     /// Serves item `id`'s subtitle `track` with its original timing
     /// again, for everyone; its offset stays.
     fn use_original_subtitle_timing<'a>(
         &'a self,
-        id: &'a MediaId,
-        track: u32,
-    ) -> BoxFuture<'a, Result<SubtitleTiming, BackendError>>;
+        _id: &'a MediaId,
+        _track: u32,
+    ) -> BoxFuture<'a, Result<SubtitleTiming, BackendError>> {
+        Box::pin(async {
+            Err(BackendError::Unsupported(
+                "use_original_subtitle_timing".into(),
+            ))
+        })
+    }
 
     /// Moves item `id`'s subtitle `track` by `offset_ms` (positive:
     /// later), for everyone; 0 resets it. At most
@@ -1663,19 +1949,23 @@ pub trait Session: Send + Sync {
     /// it already: a player never adds it itself.
     fn set_subtitle_offset<'a>(
         &'a self,
-        id: &'a MediaId,
-        track: u32,
-        offset_ms: i64,
-    ) -> BoxFuture<'a, Result<SubtitleTiming, BackendError>>;
+        _id: &'a MediaId,
+        _track: u32,
+        _offset_ms: i64,
+    ) -> BoxFuture<'a, Result<SubtitleTiming, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("set_subtitle_offset".into())) })
+    }
 
     /// Removes item `id`'s downloaded track `download`
     /// (`SubtitleDownload::id`), for everyone: its downloader or an admin
     /// may.
     fn remove_subtitle_download<'a>(
         &'a self,
-        id: &'a MediaId,
-        download: &'a str,
-    ) -> BoxFuture<'a, Result<(), BackendError>>;
+        _id: &'a MediaId,
+        _download: &'a str,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("remove_subtitle_download".into())) })
+    }
 
     /// What the user played lately, from any device (PX-52): each item
     /// once, by its latest counted play, newest first, a page of at most
@@ -1684,50 +1974,64 @@ pub trait Session: Send + Sync {
     /// state has its play count and when it was last played.
     fn recently_played(
         &self,
-        kinds: Option<Kinds>,
-        offset: u32,
-        limit: u32,
-    ) -> BoxFuture<'_, Result<(Vec<Item>, u32), BackendError>>;
+        _kinds: Option<Kinds>,
+        _offset: u32,
+        _limit: u32,
+    ) -> BoxFuture<'_, Result<(Vec<Item>, u32), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("recently_played".into())) })
+    }
 
     /// Every playlist the user sees, with whether and where each is
     /// pinned, and the notes of pins that left their Pinned.
-    fn playlists(&self) -> BoxFuture<'_, Result<PlaylistList, BackendError>>;
+    fn playlists(&self) -> BoxFuture<'_, Result<PlaylistList, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("playlists".into())) })
+    }
 
     /// A playlist and a page of its entries (at most 200), with the
     /// user's place and play settings.
     fn playlist<'a>(
         &'a self,
-        id: &'a str,
-        offset: u32,
-        limit: u32,
-    ) -> BoxFuture<'a, Result<PlaylistPage, BackendError>>;
+        _id: &'a str,
+        _offset: u32,
+        _limit: u32,
+    ) -> BoxFuture<'a, Result<PlaylistPage, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("playlist".into())) })
+    }
 
     /// Makes a playlist the user owns. Server-wide is an admin's.
     fn create_playlist<'a>(
         &'a self,
-        name: &'a str,
-        kinds: Kinds,
-        visibility: Visibility,
-    ) -> BoxFuture<'a, Result<PlaylistSummary, BackendError>>;
+        _name: &'a str,
+        _kinds: Kinds,
+        _visibility: Visibility,
+    ) -> BoxFuture<'a, Result<PlaylistSummary, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("create_playlist".into())) })
+    }
 
     /// Renames a playlist, widens its kinds or changes who sees it: its
     /// owner's, or an admin's for a server-wide one.
     fn update_playlist<'a>(
         &'a self,
-        id: &'a str,
-        update: PlaylistUpdate,
-    ) -> BoxFuture<'a, Result<PlaylistSummary, BackendError>>;
+        _id: &'a str,
+        _update: PlaylistUpdate,
+    ) -> BoxFuture<'a, Result<PlaylistSummary, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("update_playlist".into())) })
+    }
 
     /// Changes a playlist's entries as seen at `revision`: its new
     /// revision, or [`BackendError::PlaylistConflict`].
     fn edit_playlist<'a>(
         &'a self,
-        id: &'a str,
-        revision: u64,
-        edits: Vec<PlaylistEdit>,
-    ) -> BoxFuture<'a, Result<u64, BackendError>>;
+        _id: &'a str,
+        _revision: u64,
+        _edits: Vec<PlaylistEdit>,
+    ) -> BoxFuture<'a, Result<u64, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("edit_playlist".into())) })
+    }
 
-    fn delete_playlist<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), BackendError>>;
+    fn delete_playlist<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("delete_playlist".into())) })
+    }
 
     /// Gives playlist `id` the picture in `bytes` as its cover (PX-53): a
     /// JPEG, PNG, WebP or HEIC of at most [`MAX_ART_BYTES`] and
@@ -1737,49 +2041,63 @@ pub trait Session: Send + Sync {
     /// the server cannot read [`BackendError::ImageUnreadable`].
     fn set_playlist_art<'a>(
         &'a self,
-        id: &'a str,
-        bytes: Vec<u8>,
-    ) -> BoxFuture<'a, Result<ArtworkId, BackendError>>;
+        _id: &'a str,
+        _bytes: Vec<u8>,
+    ) -> BoxFuture<'a, Result<ArtworkId, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("set_playlist_art".into())) })
+    }
 
     /// Takes playlist `id`'s uploaded cover away (PX-53): the playlist
     /// after, its `artwork` the mosaic again. Who may is as for
     /// [`Session::set_playlist_art`].
     fn remove_playlist_art<'a>(
         &'a self,
-        id: &'a str,
-    ) -> BoxFuture<'a, Result<PlaylistSummary, BackendError>>;
+        _id: &'a str,
+    ) -> BoxFuture<'a, Result<PlaylistSummary, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("remove_playlist_art".into())) })
+    }
 
     /// Pins a playlist at `position` in the user's Pinned (0 first), or
     /// moves it there.
     fn pin_playlist<'a>(
         &'a self,
-        id: &'a str,
-        position: u32,
-    ) -> BoxFuture<'a, Result<(), BackendError>>;
+        _id: &'a str,
+        _position: u32,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("pin_playlist".into())) })
+    }
 
-    fn unpin_playlist<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), BackendError>>;
+    fn unpin_playlist<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("unpin_playlist".into())) })
+    }
 
     /// Forgets the pin notes [`Session::playlists`] gave, on every device:
     /// they were shown.
-    fn dismiss_pin_notes(&self) -> BoxFuture<'_, Result<(), BackendError>>;
+    fn dismiss_pin_notes(&self) -> BoxFuture<'_, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("dismiss_pin_notes".into())) })
+    }
 
     /// Starts or goes on playing a playlist: the entry to play, from
     /// `from` or else the user's place, or `None` when nothing is left.
     fn play_playlist<'a>(
         &'a self,
-        id: &'a str,
-        from: Option<EntryId>,
-        settings: PlaySettings,
-    ) -> BoxFuture<'a, Result<Option<PlaylistNext>, BackendError>>;
+        _id: &'a str,
+        _from: Option<EntryId>,
+        _settings: PlaySettings,
+    ) -> BoxFuture<'a, Result<Option<PlaylistNext>, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("play_playlist".into())) })
+    }
 
     /// What plays after entry `after` ended or was skipped; `None` at the
     /// end, when the server clears the place so the next play starts at
     /// the top.
     fn next_in_playlist<'a>(
         &'a self,
-        id: &'a str,
-        after: EntryId,
-    ) -> BoxFuture<'a, Result<Option<PlaylistNext>, BackendError>>;
+        _id: &'a str,
+        _after: EntryId,
+    ) -> BoxFuture<'a, Result<Option<PlaylistNext>, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("next_in_playlist".into())) })
+    }
 
     /// What plays next in playlist `id`, without playing it: at most
     /// `limit` ([`MAX_UPCOMING`]) entries after the user's place, each the
@@ -1791,9 +2109,11 @@ pub trait Session: Send + Sync {
     /// from the top.
     fn upcoming_in_playlist<'a>(
         &'a self,
-        id: &'a str,
-        limit: u32,
-    ) -> BoxFuture<'a, Result<Vec<PlaylistEntry>, BackendError>>;
+        _id: &'a str,
+        _limit: u32,
+    ) -> BoxFuture<'a, Result<Vec<PlaylistEntry>, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("upcoming_in_playlist".into())) })
+    }
 
     /// Keeps `settings` as how the user plays playlist `id`, playing
     /// nothing: the place and the shuffled round stay. Shuffle turned on
@@ -1801,17 +2121,21 @@ pub trait Session: Send + Sync {
     /// turned off, the playlist's order from the place.
     fn set_playlist_settings<'a>(
         &'a self,
-        id: &'a str,
-        settings: PlaySettings,
-    ) -> BoxFuture<'a, Result<(), BackendError>>;
+        _id: &'a str,
+        _settings: PlaySettings,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("set_playlist_settings".into())) })
+    }
 
     /// What may be downloaded of film or episode `id`: its tracks, the
     /// choice to tick first, the optimized profiles, what original
     /// quality would be, and the subtitles a download would leave out.
     fn download_options<'a>(
         &'a self,
-        id: &'a MediaId,
-    ) -> BoxFuture<'a, Result<DownloadOptionsInfo, BackendError>>;
+        _id: &'a MediaId,
+    ) -> BoxFuture<'a, Result<DownloadOptionsInfo, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("download_options".into())) })
+    }
 
     /// Downloads `id` with `tracks` from `source` as this session's user:
     /// the server prepares it now (a refusal is this call's error), and
@@ -1820,21 +2144,27 @@ pub trait Session: Send + Sync {
     /// before.
     fn start_download<'a>(
         &'a self,
-        id: &'a MediaId,
-        source: DownloadSource,
-        tracks: DownloadTracks,
-    ) -> BoxFuture<'a, Result<LocalDownload, BackendError>>;
+        _id: &'a MediaId,
+        _source: DownloadSource,
+        _tracks: DownloadTracks,
+    ) -> BoxFuture<'a, Result<LocalDownload, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("start_download".into())) })
+    }
 
     /// Sends what this user watched offline to the server, for every
     /// download of theirs there: what became of each item. One the server
     /// has newer takes the server's state on the download.
-    fn sync_download_watch(&self) -> BoxFuture<'_, Result<Vec<SyncedWatch>, BackendError>>;
+    fn sync_download_watch(&self) -> BoxFuture<'_, Result<Vec<SyncedWatch>, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("sync_download_watch".into())) })
+    }
 
     /// Whether the server turned federation (P8) on for this session: its
     /// paired servers' libraries, Home rows and search hits. On does not
     /// mean there is anything: a portable account (a guest with a portable
     /// identity) sees nothing federated, and `NotFound` for a `fed:` id.
-    fn federation(&self) -> bool;
+    fn federation(&self) -> bool {
+        false
+    }
 
     /// [`Session::search`] over this server and what its paired servers
     /// share (P8-05): a title on several servers once, with where it is
@@ -1842,8 +2172,10 @@ pub trait Session: Send + Sync {
     /// this server's own items, each a hit of its own.
     fn search_hits<'a>(
         &'a self,
-        request: &'a SearchRequest,
-    ) -> BoxFuture<'a, Result<SearchResults<SearchHit>, BackendError>>;
+        _request: &'a SearchRequest,
+    ) -> BoxFuture<'a, Result<SearchResults<SearchHit>, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("search_hits".into())) })
+    }
 
     /// Plays the title `title` (any copy's id) from paired server `from`,
     /// or from this server with `None` (P8-05), for every copy of it, while
@@ -1851,27 +2183,30 @@ pub trait Session: Send + Sync {
     /// one server only.
     fn set_play_from<'a>(
         &'a self,
-        title: &'a MediaId,
-        from: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<(), BackendError>>;
+        _title: &'a MediaId,
+        _from: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<(), BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("set_play_from".into())) })
+    }
 
-    /// How a playback started here plays (P8-04): from a paired server
-    /// directly, or through this server; `None` for this server's own
-    /// item, or a handle that is not playing. Asks nothing.
-    ///
-    /// A `fed:` item's [`Session::start_playback`] plays it from its
-    /// server when this device reaches it in a few seconds, else through
-    /// this one; [`BackendError::OriginOffline`] when that server is
-    /// offline. The playback's reads, seeks and stop go to whichever plays
-    /// it, and its progress to this server, by the `fed:` id.
-    fn remote_mode(&self, handle: &PlaybackHandle) -> Option<RemoteMode>;
+    /// The SDK's player session over the real server: it opens each item
+    /// with `open_any_playback`, so a paired server's item takes its own
+    /// route, and the playback's link meter, uplink shares, subtitle
+    /// timing changes and route come from the SDK. `None` for a session
+    /// with no server (a test's mock), whose playbacks go through
+    /// [`crate::playback::backend`].
+    fn player_session(&self) -> Option<spoolframe_client_sdk::PlayerSession> {
+        None
+    }
 
     /// This session's kept catalog reads whose re-read behind what was
     /// shown came back different: the page showing one reads it again.
     /// Kept reads are answered at once; a change made through the session,
     /// or a server's playlist, heart, library or watch event, forgets what
     /// it touches first.
-    fn catalog_changes(&self) -> CatalogChanges;
+    fn catalog_changes(&self) -> CatalogChanges {
+        CatalogChanges::new(futures::stream::empty())
+    }
 }
 
 #[cfg(test)]

@@ -1280,16 +1280,94 @@ fn grid(pages: &Rc<Pages>, cards: Rc<Cards>) -> gtk::GridView {
 
 #[cfg(test)]
 mod tests {
-    use spoolframe_linux_core::backend::{Client, WatchedState};
-    use spoolframe_linux_core::fake::FakeClient;
+    use spoolframe_linux_core::backend::{Resolution, WatchedState};
+    use spoolframe_linux_core::mock::shell::{self, MockCatalog};
+    use spoolframe_linux_core::mock::{movie, track};
     use spoolframe_types::LibraryKind;
 
     use super::*;
 
+    fn counted<T>(values: &[T]) -> Vec<Counted<T>>
+    where
+        T: Clone,
+    {
+        values
+            .iter()
+            .map(|value| Counted {
+                value: value.clone(),
+                count: None,
+            })
+            .collect()
+    }
+
+    fn films() -> Vec<Item> {
+        (1..=8)
+            .map(|n| movie(&n.to_string(), &format!("Film {n}")))
+            .collect()
+    }
+
+    /// Eight films, in the Movies library, sorted and filtered by most
+    /// of what a server offers; a TV library that cannot be sorted by
+    /// duration; and a music library filtered by genre only.
+    fn catalog() -> MockCatalog {
+        use FilterPart::*;
+        use SortKey::*;
+        let genres = counted(&[
+            "Drama".to_owned(),
+            "Horror".into(),
+            "Science Fiction".into(),
+        ]);
+        let movies = ItemFilterValues {
+            genres: genres.clone(),
+            resolutions: counted(&[Resolution::FullHd, Resolution::Uhd]),
+            sorts: vec![Title, Released, Added, Rating, Duration],
+            filters: vec![Watched, Genres, Years, ContentRatings, Resolutions],
+            ..ItemFilterValues::default()
+        };
+        let shows = ItemFilterValues {
+            genres: genres.clone(),
+            sorts: vec![Title, Released, Added, Rating],
+            filters: vec![Watched, Genres],
+            ..ItemFilterValues::default()
+        };
+        let music = ItemFilterValues {
+            genres: counted(&["Jazz".to_owned()]),
+            sorts: vec![Title, Added],
+            filters: vec![Genres],
+            ..ItemFilterValues::default()
+        };
+        MockCatalog::new()
+            .with_library(
+                shell::library("1", LibraryKind::Movies, "Movies"),
+                films(),
+                movies,
+            )
+            .with_library(
+                shell::library("2", LibraryKind::Shows, "TV"),
+                Vec::new(),
+                shows,
+            )
+            .with_library(
+                shell::library("3", LibraryKind::Music, "Music"),
+                vec![track("1", "So What")],
+                music,
+            )
+            .with_sorted(|_, _, filter| {
+                let all = films();
+                let filter = filter.cloned().unwrap_or_default();
+                // No film is 4K; 4 are dramas.
+                Ok(if filter.resolutions.contains(&Resolution::Uhd) {
+                    Vec::new()
+                } else if filter.genres.iter().any(|g| g == "Drama") {
+                    all.into_iter().take(4).collect()
+                } else {
+                    all
+                })
+            })
+    }
+
     fn pages() -> Pages {
-        let client = FakeClient::new(None);
-        let profile = FakeClient::profile("andrey");
-        let session = client.session(&profile).unwrap();
+        let session: Arc<dyn Session> = Arc::new(catalog());
         // A context of its own: tests run on parallel threads.
         let library = glib::MainContext::new()
             .block_on(session.libraries())
@@ -1318,22 +1396,19 @@ mod tests {
         }
     }
 
-    /// The fake's library of `kind` opened in fresh slots, once its page
-    /// shows; the cache, the view and the scroller.
+    /// The catalog's library of `kind` opened in fresh slots, once its
+    /// page shows; the cache, the view and the scroller.
     fn opened(kind: LibraryKind) -> (Rc<Cache>, Rc<View>, gtk::ScrolledWindow) {
         let cache = cache(SavedChoices::default());
         let (view, scroller) = open_in(&cache, kind);
         (cache, view, scroller)
     }
 
-    /// A cache over the fake's session, with `choices`.
+    /// A cache over the catalog, with `choices`.
     fn cache(choices: SavedChoices) -> Rc<Cache> {
         gtk::init().unwrap();
         adw::init().unwrap();
-        let session = FakeClient::new(None)
-            .session(&FakeClient::profile("andrey"))
-            .unwrap();
-        Cache::new(session, choices)
+        Cache::new(Arc::new(catalog()), choices)
     }
 
     fn library_of(cache: &Cache, kind: LibraryKind) -> Library {
@@ -1411,8 +1486,9 @@ mod tests {
     #[test]
     #[ignore = "needs a display; run on its own"]
     fn a_library_keeps_its_sort_in_the_next_session() {
-        use spoolframe_linux_core::backend::Client as _;
-        let (client, andrey) = (FakeClient::new(None), FakeClient::profile("andrey"));
+        use spoolframe_linux_core::backend::{Client as _, ServerKey};
+        let client = shell::MockClient::new();
+        let andrey = shell::profile(&ServerKey("h0me".repeat(6)), "andrey");
         let saved = || {
             let store = client.profile_store(&andrey.server, &andrey.username);
             spoolframe_linux_core::testing::runtime()

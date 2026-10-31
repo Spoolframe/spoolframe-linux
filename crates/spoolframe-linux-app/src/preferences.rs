@@ -1383,9 +1383,7 @@ fn track_groups(info: TrackPreferencesInfo, set_tracks: SetTracks) -> [adw::Pref
         .build();
     let audio = adw::PreferencesGroup::builder()
         .title("Audio")
-        .description(
-            "Preferred languages in order, such as “original, eng”: the first one a file has is picked.",
-        )
+        .description(languages_help(crate::device_language().as_deref()).escaped())
         .build();
     audio.add(&audio_languages);
     audio.add(&avoid_description);
@@ -1423,7 +1421,7 @@ fn track_groups(info: TrackPreferencesInfo, set_tracks: SetTracks) -> [adw::Pref
         .build();
     let subtitles = adw::PreferencesGroup::builder()
         .title("Subtitles")
-        .description("Empty languages: the audio's language.")
+        .description("Languages as for audio; empty: the audio's language.")
         .build();
     // How picture subtitles (PGS, VobSub, DVB) show (PX-13). Without OCR
     // on the server they can only be pictures: the row says so and keeps
@@ -1483,11 +1481,33 @@ fn track_groups(info: TrackPreferencesInfo, set_tracks: SetTracks) -> [adw::Pref
     [section, audio, subtitles]
 }
 
+/// How a languages field reads: codes in order, and the two the server
+/// resolves, "original" and "device", the latter named as it is here
+/// (`device`, as [`crate::device_language`] gives it).
+fn languages_help(device: Option<&str>) -> crate::markup::Markup {
+    crate::markup::markup!(
+        "Preferred languages in order, such as “original, device, eng”: the first one a \
+         file has is picked. “original”: the film's own language. “device”: {}.",
+        format::device_language(device)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use crate::reachability::tests::{cabin, now};
+
+    #[test]
+    fn the_languages_help_names_this_devices_language() {
+        let help = languages_help(Some("de-DE"));
+        let named = crate::markup::plain(&format::device_language(Some("de-DE")));
+        assert!(
+            help.escaped().ends_with(&format!("“device”: {named}.")) && named.contains("(German)"),
+            "{}",
+            help.escaped()
+        );
+    }
 
     #[test]
     fn only_sdh_is_offered_and_saved_as_it_is() {
@@ -1533,29 +1553,48 @@ mod tests {
 
     #[test]
     fn downloads_are_totalled_by_the_name_of_their_server() {
-        use spoolframe_linux_core::backend::{DownloadSource, DownloadTracks};
-        use spoolframe_linux_core::fake::FakeClient;
-        use spoolframe_linux_core::testing::ready;
-        let client = FakeClient::new(None);
-        let session = client.session(&FakeClient::profile("andrey")).unwrap();
-        let alien = "plex:movie:1".parse().unwrap();
-        let key =
-            ready(session.start_download(&alien, DownloadSource::Original, DownloadTracks::All))
-                .unwrap()
-                .key;
-        client.advance_download(&key, 31_000_000_000);
-        let servers = ready(client.servers()).unwrap();
-        let home = servers
-            .iter()
-            .find(|s| s.key == FakeClient::profile("andrey").server)
-            .unwrap();
+        use spoolframe_linux_core::backend::{
+            DownloadPhase, DownloadSource, DownloadTracks, LocalWatch,
+        };
+        let cabin = cabin_server();
+        // Two films part way down from Cabin.
+        let download = |key: &str, received| LocalDownload {
+            key: key.into(),
+            server: cabin.key.0.clone(),
+            user_id: "andrey".into(),
+            username: "andrey".into(),
+            item: spoolframe_linux_core::mock::movie(key, "Alien"),
+            show: None,
+            season: None,
+            markers: Vec::new(),
+            artwork: Vec::new(),
+            tracks: Default::default(),
+            source: DownloadSource::Original,
+            chosen: DownloadTracks::All,
+            file: None,
+            phase: DownloadPhase::Transferring,
+            received,
+            size: None,
+            expected_size: None,
+            file_path: None,
+            file_url: None,
+            watch: LocalWatch {
+                position: None,
+                watched: None,
+                at: std::time::UNIX_EPOCH,
+                pending: false,
+            },
+            note: None,
+            created_at: std::time::UNIX_EPOCH,
+        };
+        let downloads = [download("1", 30_000_000_000), download("2", 1_000_000_000)];
         assert_eq!(
             (
-                by_server_line(&ready(client.downloads()), &servers),
-                by_server_line(&ready(client.downloads()), &[])
+                by_server_line(&downloads, std::slice::from_ref(&cabin)),
+                by_server_line(&downloads, &[])
             ),
             (
-                format!("{} 31.0 GB", home.name),
+                "Cabin 31.0 GB".to_owned(),
                 "Another server 31.0 GB".to_owned()
             )
         );

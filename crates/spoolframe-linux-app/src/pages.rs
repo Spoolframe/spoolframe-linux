@@ -1758,13 +1758,22 @@ mod tests {
         MediaId::new(Namespace::Plex, kind, key).unwrap()
     }
 
+    /// A film's tracks with English and French subtitles.
     fn alien_tracks() -> MediaTracks {
-        use spoolframe_linux_core::backend::Client;
-        let client = spoolframe_linux_core::fake::FakeClient::new(None);
-        let session = client
-            .session(&spoolframe_linux_core::fake::FakeClient::profile("andrey"))
-            .unwrap();
-        spoolframe_linux_core::testing::ready(session.tracks(&id(MediaKind::Movie, "1"))).unwrap()
+        let subtitle = |language: &str| spoolframe_types::SubtitleTrack {
+            language: Some(language.into()),
+            title: None,
+            forced: false,
+            default: false,
+            external: false,
+            role: spoolframe_types::SubtitleRole::default(),
+            timing: None,
+            download: None,
+        };
+        MediaTracks {
+            subtitles: vec![subtitle("eng"), subtitle("fre")],
+            ..MediaTracks::default()
+        }
     }
 
     #[test]

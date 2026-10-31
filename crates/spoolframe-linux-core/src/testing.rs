@@ -1,7 +1,7 @@
 //! What tests here and the app's share, behind the `testing` feature: a
 //! test's own directory (spoolframe-test-dir, tmpdir's random name,
-//! removed when dropped), media files, and driving the fake backend's
-//! futures without a runtime.
+//! removed when dropped), media files, and driving a mock's futures
+//! without a runtime.
 
 use std::future::Future;
 use std::io::Write;
@@ -25,12 +25,11 @@ impl crate::security_key::PinPrompt for NoPrompt {
     fn touch(&self, _key: &str) {}
 }
 
-/// The value of a future that is ready at once, as the fake backend's
-/// are.
+/// The value of a future that is ready at once, as a mock's are.
 pub fn ready<T>(future: impl Future<Output = T>) -> T {
     match pin!(future).poll(&mut Context::from_waker(Waker::noop())) {
         Poll::Ready(value) => value,
-        Poll::Pending => panic!("the fake backend never waits"),
+        Poll::Pending => panic!("a mock never waits"),
     }
 }
 
@@ -75,25 +74,4 @@ pub fn file_with(name: &str, bytes: &[u8]) -> (TestDir, PathBuf) {
         .write_all(bytes)
         .unwrap();
     (dir, path)
-}
-
-/// The fake's Andrey, signed in.
-pub fn andrey(client: &crate::fake::FakeClient) -> Arc<dyn crate::backend::Session> {
-    use crate::backend::Client as _;
-    client
-        .session(&crate::fake::FakeClient::profile("andrey"))
-        .unwrap()
-}
-
-/// The first movie of `session`'s catalog.
-pub async fn first_movie_id(
-    session: &Arc<dyn crate::backend::Session>,
-) -> spoolframe_types::MediaId {
-    let libraries = session.libraries().await.expect("the libraries");
-    let movies = libraries
-        .iter()
-        .find(|l| l.kind == spoolframe_types::LibraryKind::Movies)
-        .expect("a movie library");
-    let (items, _) = session.items(&movies.id, 0, 1).await.expect("its movies");
-    items.first().expect("a movie").id().clone()
 }

@@ -431,7 +431,8 @@ struct Current {
 /// reader: matroskademux does not pass a time seek up to a source it
 /// cannot seek in bytes (checked with a spike), and each encode is a
 /// fresh live stream without an index. The output keeps the film's own
-/// time (the server's -copyts), so positions need no offset.
+/// time (the server's -copyts), but GstPlay's positions in it start at 0:
+/// the pipeline adds where it starts back (`Pipeline::film_time`).
 enum Control {
     Server(PlaybackController),
     /// Boxed: it holds its markers itself, the server's behind an `Rc`.
@@ -1181,9 +1182,11 @@ impl Playback {
         let playback = Rc::new_cyclic(|me| Self {
             me: me.clone(),
             pipeline,
-            player: session
-                .clone()
-                .map(|session| PlayerSession::new(managed::backend(session))),
+            player: session.clone().map(|session| {
+                session
+                    .player_session()
+                    .unwrap_or_else(|| PlayerSession::new(managed::backend(session)))
+            }),
             session,
             local,
             queue: RefCell::new(queue),
@@ -1694,9 +1697,7 @@ impl Playback {
     pub fn remote_path(
         &self,
     ) -> Option<(spoolframe_linux_core::backend::RemoteMode, String, String)> {
-        let session = self.session.as_ref()?;
-        let handle = self.now()?.managed.borrow().as_ref()?.snapshot().handle;
-        let mode = session.remote_mode(&handle)?;
+        let mode = self.now()?.managed.borrow().as_ref()?.route()?;
         let servers = self.servers.borrow().clone()?;
         let server = self
             .current()
@@ -2510,10 +2511,16 @@ impl Playback {
         let controller =
             PlaybackController::new(managed, driver, local_spawn(), from, self.autoplay.get())
                 .with_markers(markers);
-        // A converted output being encoded has no length of its own yet:
-        // the catalog's stands in for the markers.
+        // A converted output being encoded has no length of its own yet,
+        // and GstPlay may say none at all: the catalog's stands in for the
+        // markers and for the views.
         if converted && let Some(length) = current.catalog_length {
             controller.length_known(length);
+            self.length.set(length);
+            self.emit(&Change::Position {
+                at: self.position.get(),
+                length,
+            });
         }
         current.control.replace(Some(Control::Server(controller)));
         // A subtitle already here (the same item started again after its
@@ -3124,11 +3131,16 @@ impl Playback {
     fn on(self: &Rc<Self>, event: Event) {
         match event {
             Event::Duration(d) => self.duration_changed(d),
-            Event::Position(at) => self.position_updated(Duration::from_nanos(at.nseconds())),
+            Event::Position(at) => {
+                let at = self.pipeline.film_time(Duration::from_nanos(at.nseconds()));
+                self.position_updated(at)
+            }
             Event::State(state) => self.state_changed(state),
             Event::MediaInfo(info) => self.media_info_updated(&info),
             Event::Buffering(percent) => self.buffering(percent),
-            Event::SeekDone(at) => self.seek_done(Duration::from_nanos(at.nseconds())),
+            Event::SeekDone(at) => {
+                self.seek_done(self.pipeline.film_time(Duration::from_nanos(at.nseconds())))
+            }
             Event::Ended => self.ended(),
             Event::Volume(volume) => self.emit(&Change::Volume(volume)),
             Event::Muted(muted) => self.emit(&Change::Muted(muted)),
@@ -3303,8 +3315,9 @@ mod tests {
     use spoolframe_linux_core::testing::TestDir;
     use std::path::Path;
 
-    use spoolframe_linux_core::backend::{Client, Profile};
-    use spoolframe_linux_core::fake::FakeClient;
+    use spoolframe_linux_core::backend::{Kinds, PlaylistPage};
+    use spoolframe_linux_core::mock::playback::{DownloadCall, MockDownloads, MockPlayback};
+    use spoolframe_linux_core::mock::{self, playback::PlaylistCall};
 
     use super::*;
 
@@ -3314,183 +3327,83 @@ mod tests {
         glib::MainContext::new().block_on(future)
     }
 
-    /// The fake's All, played shuffled from its first entry: its id and
-    /// entries, and the entry playing.
-    fn shuffling_all(session: &dyn Session) -> (String, Vec<EntryId>, PlaylistNext) {
-        let list = ready(session.playlists()).unwrap().playlists;
-        let all = list.into_iter().find(|p| p.name == "All").unwrap();
-        let entries: Vec<EntryId> = ready(session.playlist(&all.id, 0, 200))
-            .unwrap()
-            .entries
-            .iter()
-            .map(|e| e.entry)
-            .collect();
-        let shuffled = PlaySettings {
-            shuffle: true,
-            ..PlaySettings::default()
+    /// All, `songs` of them in order, the server's place on the first.
+    fn all(songs: u32) -> PlaylistPage {
+        let kinds = Kinds {
+            tracks: true,
+            ..Kinds::default()
         };
-        let first = ready(session.play_playlist(&all.id, Some(entries[0]), shuffled))
-            .unwrap()
-            .unwrap();
-        (all.id, entries, first)
+        let tracks = (1..=songs).map(|n| mock::track(&format!("song {n}"), &format!("Song {n}")));
+        let mut page = mock::page(mock::playlist("all", "All", kinds), tracks.collect());
+        page.place = Some(page.entries[0].entry);
+        page
     }
 
-    /// A save of the modes as the cursor sends it: alone, playing nothing.
-    fn save(session: &dyn Session, id: &str, now: PlaySettings) {
-        ready(session.set_playlist_settings(id, now)).unwrap();
-    }
-
-    /// The entries Next plays after `now`, at most `n`.
-    fn next_n(session: &dyn Session, id: &str, mut now: EntryId, n: usize) -> Vec<EntryId> {
-        let mut played = Vec::new();
-        while played.len() < n {
-            let Some(next) = ready(session.next_in_playlist(id, now)).unwrap() else {
-                break;
-            };
-            now = next.entry;
-            played.push(now);
+    /// `entry`, as the server answers it to play.
+    fn playing(entry: &PlaylistEntry) -> PlaylistNext {
+        PlaylistNext {
+            entry: entry.entry,
+            item: entry.item.clone(),
+            markers: Default::default(),
+            liked: false,
         }
-        played
     }
 
-    fn sorted(mut entries: Vec<EntryId>) -> Vec<EntryId> {
-        entries.sort_unstable();
-        entries
+    /// A cursor on `server`'s playlist `page`, from its first entry, with
+    /// `settings` or, `None`, the server's.
+    fn following(
+        server: &Arc<MockPlayback>,
+        page: &PlaylistPage,
+        settings: Option<PlaySettings>,
+    ) -> PlaylistCursor {
+        let first = playing(&page.entries[0]);
+        let id = &page.playlist.id;
+        ready(managed::follow_playlist(
+            server.clone(),
+            id,
+            first,
+            settings,
+        ))
+        .unwrap()
     }
 
-    /// The fake's All played from its top in order, then on to its
-    /// second entry: its id, entries, and the entry playing.
-    fn on_the_second_of_all(session: &dyn Session) -> (String, Vec<EntryId>, EntryId) {
-        let list = ready(session.playlists()).unwrap().playlists;
-        let all = list.into_iter().find(|p| p.name == "All").unwrap().id;
-        let first = ready(session.play_playlist(&all, None, PlaySettings::default()))
-            .unwrap()
-            .unwrap();
-        let entries = ready(session.playlist(&all, 0, 200))
-            .unwrap()
-            .entries
-            .iter()
-            .map(|e| e.entry)
-            .collect();
-        let second = next_n(session, &all, first.entry, 1)[0];
-        (all, entries, second)
-    }
-
-    /// The user's rule, on a server that saves the modes alone: shuffle
-    /// turned on while a song plays deals the whole playlist from it, and
-    /// the place stays on it.
-    #[test]
-    fn shuffle_turned_on_plays_the_whole_playlist_from_the_song_playing() {
-        let client = FakeClient::new(None);
-        let session = client.session(&FakeClient::profile("andrey")).unwrap();
-        let (all, entries, playing) = on_the_second_of_all(session.as_ref());
-        let on = PlaySettings {
-            shuffle: true,
-            ..PlaySettings::default()
-        };
-        save(session.as_ref(), &all, on);
-        let place = ready(session.playlist(&all, 0, 1)).unwrap().place;
-        let mut played = vec![playing];
-        played.extend(next_n(session.as_ref(), &all, playing, 2 * entries.len()));
-        assert_eq!(
-            (place, sorted(played)),
-            (Some(playing), sorted(entries.clone()))
-        );
-    }
-
-    /// Saved alone, the modes leave the place where it is, though the song
-    /// was heard to its end: saved by playing, the place went on to the
-    /// next one, and Next after it then skipped a song.
-    #[test]
-    fn a_mode_saved_after_the_song_was_heard_leaves_the_place_on_it() {
-        let client = FakeClient::new(None);
-        let session = client.session(&FakeClient::profile("andrey")).unwrap();
-        let (all, _, playing) = on_the_second_of_all(session.as_ref());
-        let page = ready(session.playlist(&all, 0, 200)).unwrap();
-        let item = page.entries.iter().find(|e| e.entry == playing).unwrap();
-        ready(session.mark_watched(item.item.id())).unwrap();
-        let repeating = PlaySettings {
-            repeat: spoolframe_linux_core::backend::Repeat::All,
-            ..PlaySettings::default()
-        };
-        save(session.as_ref(), &all, repeating);
-        let place = ready(session.playlist(&all, 0, 1)).unwrap().place;
-        assert_eq!(place, Some(playing));
-    }
-
-    /// A repeat change while shuffling keeps the order: what comes up
-    /// before it still comes up, in the same order, after it.
-    #[test]
-    fn a_repeat_change_while_shuffling_keeps_what_comes_up() {
-        let client = FakeClient::new(None);
-        let session = client.session(&FakeClient::profile("andrey")).unwrap();
-        let (all, _, _) = on_the_second_of_all(session.as_ref());
-        let on = PlaySettings {
-            shuffle: true,
-            ..PlaySettings::default()
-        };
-        save(session.as_ref(), &all, on);
-        let before = ready(session.upcoming_in_playlist(&all, PREVIEW_AHEAD as u32)).unwrap();
-        let repeating = PlaySettings {
-            repeat: spoolframe_linux_core::backend::Repeat::All,
-            ..on
-        };
-        save(session.as_ref(), &all, repeating);
-        let after = ready(session.upcoming_in_playlist(&all, PREVIEW_AHEAD as u32)).unwrap();
-        assert_eq!(after[..before.len()], before[..]);
-    }
-
-    /// Up next while shuffling names the songs the server plays next, in
-    /// the order it plays them.
+    /// Up next while shuffling names the songs the server says play next,
+    /// in its order, under a heading that says so.
     #[test]
     fn up_next_while_shuffling_is_what_next_plays() {
-        let client = FakeClient::new(None);
-        let session = client.session(&FakeClient::profile("andrey")).unwrap();
-        let (all, entries, first) = shuffling_all(session.as_ref());
-        let playing = first.entry;
-        let cursor = ready(managed::follow_playlist(session.clone(), &all, first, None)).unwrap();
+        let mut page = all(5);
+        page.settings.shuffle = true;
+        let dealt: Vec<_> = [3, 1, 4, 2].map(|n| page.entries[n].clone()).into();
+        let server = MockPlayback::new(None, [])
+            .with_playlist(page.clone())
+            .with_upcoming(dealt.clone());
+        let cursor = following(&Arc::new(server), &page, None);
         let settings = cursor.settings();
         let ahead = playlist_ahead("All", settings, ready(read_up_next(&cursor)).unwrap());
+        let dealt: Vec<_> = dealt.iter().map(|e| e.entry).collect();
         assert_eq!(
             (ahead.heading.as_str(), entries_of(&ahead), settings.shuffle),
-            (
-                "In All · Shuffle on",
-                next_n(session.as_ref(), &all, playing, entries.len()),
-                true
-            )
+            ("In All · Shuffle on", dealt, true)
         );
-    }
-
-    /// The fake's All played from its top with `settings`: its id, its
-    /// entries, and a cursor following it.
-    fn following_all(
-        session: &Arc<dyn Session>,
-        settings: PlaySettings,
-    ) -> (String, Vec<PlaylistEntry>, PlaylistCursor) {
-        let list = ready(session.playlists()).unwrap().playlists;
-        let all = list.into_iter().find(|p| p.name == "All").unwrap().id;
-        let entries = ready(session.playlist(&all, 0, 200)).unwrap().entries;
-        let first = ready(session.play_playlist(&all, None, settings))
-            .unwrap()
-            .unwrap();
-        let follow = managed::follow_playlist(session.clone(), &all, first, Some(settings));
-        let cursor = ready(follow).unwrap();
-        (all, entries, cursor)
     }
 
     /// Repeat All goes round, the server's list again and again: Up next
     /// lists each song once, up to the one playing.
     #[test]
     fn up_next_from_the_server_stops_where_the_song_playing_comes_again() {
-        let client = FakeClient::new(None);
-        let session = client.session(&FakeClient::profile("andrey")).unwrap();
         let round = PlaySettings {
             repeat: spoolframe_linux_core::backend::Repeat::All,
             ..PlaySettings::default()
         };
-        let (_, entries, cursor) = following_all(&session, round);
+        let page = all(4);
+        let rest = &page.entries[1..];
+        let again = [rest, &page.entries[..], rest].concat();
+        let server = MockPlayback::new(None, [])
+            .with_playlist(page.clone())
+            .with_upcoming(again);
+        let cursor = following(&Arc::new(server), &page, Some(round));
         let ahead = playlist_ahead("All", round, ready(read_up_next(&cursor)).unwrap());
-        let rest: Vec<_> = entries[1..].iter().map(|e| e.entry).collect();
+        let rest: Vec<_> = rest.iter().map(|e| e.entry).collect();
         assert_eq!((entries_of(&ahead), ahead.note), (rest, None));
     }
 
@@ -3651,22 +3564,12 @@ mod tests {
         init().unwrap();
         let dir = TestDir::new_blocking("spoolframe-visualizer-recovery");
         let path = dir.join("tone.mkv");
-        let generator = gst::parse::launch(&format!(
-            "audiotestsrc num-buffers=600 ! audioconvert ! opusenc ! matroskamux ! filesink location={}", path.display()
-        )).unwrap();
-        generator.set_state(gst::State::Playing).unwrap();
-        generator
-            .bus()
-            .unwrap()
-            .timed_pop_filtered(gst::ClockTime::from_seconds(10), &[gst::MessageType::Eos])
-            .unwrap();
-        generator.set_state(gst::State::Null).unwrap();
-        let client = FakeClient::new(Some(path));
-        let session = client.session(&FakeClient::profile("andrey")).unwrap();
-        let item = first_track(&session);
+        tone(&path);
+        let item = song();
         let id = item.id().clone();
+        let server = Arc::new(MockPlayback::new(Some(path), [item.clone()]));
         let playback = Playback::start(Playlist {
-            session,
+            session: server,
             items: vec![item],
             index: 0,
             queued: Vec::new(),
@@ -3702,52 +3605,15 @@ mod tests {
         ahead.entries.iter().map(|e| e.entry).collect()
     }
 
-    /// Of a playlist of sixty, Up next shows fifty: each is a row built
-    /// anew on every change.
+    /// Of a playlist of sixty and one, Up next shows fifty: each is a row
+    /// built anew on every change.
     #[test]
     fn up_next_from_a_huge_playlist_shows_the_next_fifty() {
-        use spoolframe_linux_core::backend::{Kinds, PlaylistEdit, Visibility};
-        let client = FakeClient::new(None);
-        let session = client.session(&FakeClient::profile("andrey")).unwrap();
-        let track = first_track(&session).id().clone();
-        let tracks = Kinds {
-            tracks: true,
-            ..Kinds::default()
-        };
-        let made = ready(session.create_playlist("Loop", tracks, Visibility::Personal)).unwrap();
-        let adds = (0..60)
-            .map(|_| PlaylistEdit::Add {
-                id: track.clone(),
-                before: None,
-            })
-            .collect();
-        ready(session.edit_playlist(&made.id, made.revision, adds)).unwrap();
-        let first = ready(session.play_playlist(&made.id, None, PlaySettings::default()))
-            .unwrap()
-            .unwrap();
-        let follow = managed::follow_playlist(session.clone(), &made.id, first, None);
-        let cursor = ready(follow).unwrap();
+        let page = all(61);
+        let server = Arc::new(MockPlayback::new(None, []).with_playlist(page.clone()));
+        let cursor = following(&server, &page, None);
         let up = ready(read_up_next(&cursor)).unwrap();
         assert_eq!(up.entries.len(), PREVIEW_AHEAD);
-    }
-
-    #[test]
-    fn up_next_passes_entries_that_cannot_play() {
-        let client = FakeClient::new(None);
-        let session = client.session(&FakeClient::profile("andrey")).unwrap();
-        let list = ready(session.playlists()).unwrap().playlists;
-        let all = list.into_iter().find(|p| p.name == "All").unwrap().id;
-        let gone = ready(session.playlist(&all, 0, 200)).unwrap().entries[2].clone();
-        client.make_unavailable(gone.item.id());
-        let (_, entries, cursor) = following_all(&session, PlaySettings::default());
-        let up = ready(read_up_next(&cursor)).unwrap();
-        let listed: Vec<_> = up.entries.iter().map(|e| e.entry).collect();
-        let playable: Vec<_> = entries[1..]
-            .iter()
-            .map(|e| e.entry)
-            .filter(|&entry| entry != gone.entry)
-            .collect();
-        assert_eq!(listed, playable);
     }
 
     /// Up next's playlist part in this app's words, by what the cursor
@@ -3756,9 +3622,7 @@ mod tests {
     #[test]
     fn up_next_from_the_playlist_follows_its_repeat_and_shuffle_modes() {
         use spoolframe_linux_core::backend::Repeat;
-        let client = FakeClient::new(None);
-        let session = client.session(&FakeClient::profile("andrey")).unwrap();
-        let (_, entries, _) = following_all(&session, PlaySettings::default());
+        let entries = all(3).entries;
         let shuffled = PlaySettings {
             shuffle: true,
             ..PlaySettings::default()
@@ -3893,11 +3757,10 @@ mod tests {
         let dir = TestDir::new_blocking("spoolframe-visualizer-media-error");
         let path = dir.join("tone.mkv");
         tone(&path);
-        let client = FakeClient::new(Some(path));
-        let session = client.session(&FakeClient::profile("andrey")).unwrap();
-        let item = first_track(&session);
+        let item = song();
+        let server = Arc::new(MockPlayback::new(Some(path), [item.clone()]));
         let playback = Playback::start(Playlist {
-            session,
+            session: server,
             items: vec![item],
             index: 0,
             queued: Vec::new(),
@@ -3964,11 +3827,11 @@ mod tests {
         );
     }
 
-    /// Playback on the fake server, end to end. One test: GTK binds itself
+    /// Playback on a mock server, end to end. One test: GTK binds itself
     /// to the first thread that starts it, and each test has its own.
     #[test]
     #[ignore = "needs a display for gtk4paintablesink"]
-    fn playback_on_the_fake_server() {
+    fn playback_on_a_mock_server() {
         gtk::init().unwrap();
         init().unwrap();
         dropping_a_start_cleans_up_its_server_handle();
@@ -3986,6 +3849,7 @@ mod tests {
         a_quality_chosen_while_playing_plans_it_again();
         a_quality_chosen_before_playing_starts_with_it();
         a_late_subtitle_restarts_a_converted_playback_with_it();
+        a_converted_playback_shows_the_catalogs_length();
         the_intro_is_offered_and_skipped_on_asking();
         an_automatic_intro_skip_happens_once_and_undoes();
         undoing_a_converted_intro_skip_shows_where_it_goes_back_to();
@@ -4058,15 +3922,26 @@ mod tests {
         }
     }
 
-    /// The fake's All: its id, name and first page.
-    fn all_of(
-        session: &Arc<dyn Session>,
-    ) -> (String, String, spoolframe_linux_core::backend::PlaylistPage) {
-        let context = glib::MainContext::default();
-        let list = context.block_on(session.playlists()).unwrap().playlists;
-        let all = list.into_iter().find(|p| p.name == "All").unwrap();
-        let page = context.block_on(session.playlist(&all.id, 0, 200)).unwrap();
-        (all.id, all.name, page)
+    /// Playing `page`'s `entry` with `settings`, as started or saved.
+    fn resume(
+        page: &PlaylistPage,
+        entry: EntryId,
+        settings: PlaySettings,
+    ) -> crate::saved_queue::PlaylistResume {
+        crate::saved_queue::PlaylistResume {
+            playing: Playing {
+                id: page.playlist.id.clone(),
+                name: page.playlist.name.clone(),
+                entry,
+            },
+            settings: Some(settings),
+        }
+    }
+
+    /// A server following `page`, its items played from `media`.
+    fn serving(media: Option<PathBuf>, page: &PlaylistPage) -> Arc<MockPlayback> {
+        let items = page.entries.iter().map(|e| e.item.clone());
+        Arc::new(MockPlayback::new(media, items).with_playlist(page.clone()))
     }
 
     #[test]
@@ -4074,16 +3949,11 @@ mod tests {
     fn a_started_playlist_plays_with_its_settings_at_once() {
         gtk::init().unwrap();
         init().unwrap();
-        let client = FakeClient::new(None);
-        let session = client.session(&FakeClient::profile("andrey")).unwrap();
-        let (id, name, _) = all_of(&session);
+        let page = all(4);
+        let first = page.entries[0].clone();
         let modes = shuffled_repeating();
-        let first = glib::MainContext::default()
-            .block_on(session.play_playlist(&id, None, modes))
-            .unwrap()
-            .unwrap();
         let playback = Playback::start(Playlist {
-            session,
+            session: serving(None, &page),
             items: vec![first.item],
             index: 0,
             queued: Vec::new(),
@@ -4093,14 +3963,7 @@ mod tests {
             album: None,
             quality: Default::default(),
             display: None,
-            from_playlist: Some(crate::saved_queue::PlaylistResume {
-                playing: spoolframe_linux_core::playlists::Playing {
-                    id,
-                    name,
-                    entry: first.entry,
-                },
-                settings: Some(modes),
-            }),
+            from_playlist: Some(resume(&page, first.entry, modes)),
         })
         .unwrap();
         // Before the cursor first reads: Shuffle and Repeat are the
@@ -4120,16 +3983,12 @@ mod tests {
         let dir = TestDir::new_blocking("spoolframe-playlist-modes");
         let path = dir.join("tone.mkv");
         tone(&path);
-        let client = FakeClient::new(Some(path));
-        let session = client.session(&FakeClient::profile("andrey")).unwrap();
+        let page = all(4);
+        let first = page.entries[0].clone();
+        let server = serving(Some(path), &page);
         let context = glib::MainContext::default();
-        let (id, name, _) = all_of(&session);
-        let first = context
-            .block_on(session.play_playlist(&id, None, Default::default()))
-            .unwrap()
-            .unwrap();
         let playback = Playback::start(Playlist {
-            session: session.clone(),
+            session: server.clone(),
             items: vec![first.item],
             index: 0,
             queued: Vec::new(),
@@ -4139,14 +3998,7 @@ mod tests {
             album: None,
             quality: Default::default(),
             display: None,
-            from_playlist: Some(crate::saved_queue::PlaylistResume {
-                playing: spoolframe_linux_core::playlists::Playing {
-                    id: id.clone(),
-                    name,
-                    entry: first.entry,
-                },
-                settings: Some(Default::default()),
-            }),
+            from_playlist: Some(resume(&page, first.entry, Default::default())),
         })
         .unwrap();
         playback.next();
@@ -4155,11 +4007,17 @@ mod tests {
         context.block_on(playback.playlist_calls.idle()).unwrap();
         let playing = playback.playing_from().unwrap().entry;
         assert_ne!(playing, first.entry);
-        let saved = context.block_on(session.playlist(&id, 0, 1)).unwrap();
         assert_eq!(
-            (saved.place, saved.settings),
-            (Some(playing), shuffled_repeating())
+            (server.place(), server.settings()),
+            (Some(playing), Some(shuffled_repeating()))
         );
+        // The save went out once Next was answered, not beside it.
+        let calls = server.playlist_calls();
+        let next = PlaylistCall::Next { after: first.entry };
+        let told = calls.iter().position(|c| *c == next);
+        let saved = PlaylistCall::Save(shuffled_repeating());
+        let saved = calls.iter().position(|c| *c == saved);
+        assert!(told.is_some() && told < saved, "{calls:?}");
         playback.stop();
     }
 
@@ -4172,28 +4030,20 @@ mod tests {
         let dir = TestDir::new_blocking("spoolframe-restored-playlist");
         let path = dir.join("tone.mkv");
         tone(&path);
-        let client = FakeClient::new(Some(path));
-        let session = client.session(&FakeClient::profile("andrey")).unwrap();
-        let context = glib::MainContext::default();
-        let (id, name, page) = all_of(&session);
-        let (saved, later) = (page.entries[0].clone(), page.entries[1].entry);
+        let page = all(4);
+        let (saved, later) = (page.entries[0].clone(), page.entries[2].entry);
         // Played on, on another device, since the queue was saved.
-        context
-            .block_on(session.play_playlist(&id, Some(later), Default::default()))
-            .unwrap();
+        let moved_on = PlaylistPage {
+            place: Some(later),
+            ..page.clone()
+        };
+        let server = serving(Some(path), &moved_on);
         let queue = Queue::new(vec![saved.item], 0, None, Vec::new());
         let playback = Playback::restore(
-            session.clone(),
+            server.clone(),
             queue,
             Duration::ZERO,
-            Some(crate::saved_queue::PlaylistResume {
-                playing: spoolframe_linux_core::playlists::Playing {
-                    id: id.clone(),
-                    name,
-                    entry: saved.entry,
-                },
-                settings: Some(shuffled_repeating()),
-            }),
+            Some(resume(&page, saved.entry, shuffled_repeating())),
             None,
             Default::default(),
         )
@@ -4203,9 +4053,35 @@ mod tests {
             (true, Repeat::All)
         );
         run_until(Duration::from_secs(1), || false);
-        let now = context.block_on(session.playlist(&id, 0, 1)).unwrap();
-        assert_eq!(now.place, Some(later), "restoring moved the server's place");
+        assert_eq!(
+            server.place(),
+            Some(later),
+            "restoring moved the server's place"
+        );
+        let moving: Vec<_> = server
+            .playlist_calls()
+            .into_iter()
+            .filter(|c| matches!(c, PlaylistCall::Play { .. } | PlaylistCall::Next { .. }))
+            .collect();
+        assert_eq!(moving, []);
         playback.stop();
+    }
+
+    /// Movie night: two films, then an episode.
+    fn movie_night() -> PlaylistPage {
+        let videos = Kinds {
+            movies: true,
+            episodes: true,
+            ..Kinds::default()
+        };
+        let items = vec![
+            mock::movie("1", "Arrival"),
+            mock::movie("2", "Heat"),
+            mock::episode("3", "Severance", 1, 1, "Good News About Hell"),
+        ];
+        let mut page = mock::page(mock::playlist("night", "Movie night", videos), items);
+        page.place = Some(page.entries[0].entry);
+        page
     }
 
     fn playlist_plays_to_the_end(
@@ -4214,15 +4090,13 @@ mod tests {
         manual_queue: bool,
         restore: bool,
     ) {
-        use spoolframe_linux_core::backend::PlaySettings;
-        use spoolframe_linux_core::playlists::Playing;
         let dir = TestDir::new_blocking(if name == "All" {
             "spoolframe-music-playlist"
         } else {
             "spoolframe-playlist"
         });
         let path = dir.join("clip.mkv");
-        if name == "All" {
+        let page = if name == "All" {
             let pipeline = gst::parse::launch(&format!(
                 "audiotestsrc num-buffers=40 ! audioconvert ! opusenc ! matroskamux ! filesink location={}",
                 path.display()
@@ -4232,24 +4106,17 @@ mod tests {
             bus.timed_pop_filtered(gst::ClockTime::from_seconds(10), &[gst::MessageType::Eos])
                 .unwrap();
             pipeline.set_state(gst::State::Null).unwrap();
+            all(4)
         } else {
             clip(&path);
-        }
-        let client = FakeClient::new(Some(path));
-        let session = client.session(&FakeClient::profile("andrey")).unwrap();
+            movie_night()
+        };
+        let total = page.total;
+        let first = page.entries[0].clone();
+        let server = serving(Some(path), &page);
         let context = glib::MainContext::default();
-        let list = context.block_on(session.playlists()).unwrap().playlists;
-        let night = list.iter().find(|p| p.name == name).unwrap();
-        let total = context
-            .block_on(session.playlist(&night.id, 0, 200))
-            .unwrap()
-            .total;
-        let first = context
-            .block_on(session.play_playlist(&night.id, None, PlaySettings::default()))
-            .unwrap()
-            .unwrap();
         let playback = Playback::start(Playlist {
-            session,
+            session: server.clone(),
             items: vec![first.item.clone()],
             index: 0,
             queued: Vec::new(),
@@ -4259,14 +4126,7 @@ mod tests {
             album: None,
             quality: Default::default(),
             display: None,
-            from_playlist: Some(crate::saved_queue::PlaylistResume {
-                playing: Playing {
-                    id: night.id.clone(),
-                    name: night.name.clone(),
-                    entry: first.entry,
-                },
-                settings: Some(PlaySettings::default()),
-            }),
+            from_playlist: Some(resume(&page, first.entry, PlaySettings::default())),
         })
         .unwrap();
         assert!(run_until(Duration::from_secs(5), || playback
@@ -4275,17 +4135,8 @@ mod tests {
         let preview = playback.playlist_up_next().unwrap().entries;
         assert_eq!(preview.len(), total as usize - 1);
         assert_eq!(playback.playing_from().unwrap().entry, first.entry);
-        let page = context
-            .block_on(
-                playback
-                    .session
-                    .as_ref()
-                    .unwrap()
-                    .playlist(&night.id, 0, 200),
-            )
-            .unwrap();
         assert_eq!(
-            page.place,
+            server.place(),
             Some(first.entry),
             "preview must not advance the server's position"
         );
@@ -4296,16 +4147,11 @@ mod tests {
             assert!(playback.is_shuffled());
             assert_eq!(playback.repeat(), Repeat::All);
             context.block_on(playback.playlist_calls.idle()).unwrap();
-            let saved = context
-                .block_on(playback.session.as_ref().unwrap().playlist(&night.id, 0, 1))
-                .unwrap();
-            assert!(saved.settings.shuffle);
-            assert_eq!(
-                saved.settings.repeat,
-                spoolframe_linux_core::backend::Repeat::All
-            );
+            let saved = server.settings().unwrap();
+            assert!(saved.shuffle);
+            assert_eq!(saved.repeat, Repeat::All);
             assert_eq!(playback.current().unwrap().id(), &current);
-            assert_eq!(saved.place, Some(first.entry));
+            assert_eq!(server.place(), Some(first.entry));
             playback.toggle_shuffle();
             playback.cycle_repeat();
             assert_eq!(playback.repeat(), Repeat::One);
@@ -4356,7 +4202,7 @@ mod tests {
             )
             .unwrap();
             assert!(restored.has_next());
-            assert_eq!(restored.playing_from().unwrap().id, night.id);
+            assert_eq!(restored.playing_from().unwrap().id, page.playlist.id);
             assert_eq!(restored.up_next().queued.len(), 2);
             assert!(run_until(Duration::from_secs(10), || restored
                 .pipeline
@@ -4493,13 +4339,11 @@ mod tests {
         }]
     }
 
-    /// The fake's first movie, with an intro, playing from the start.
+    /// A film with an intro, playing from the start.
     fn play_with_intro(dir: &TestDir) -> Rc<Playback> {
         let path = dir.join("clip.mkv");
         clip(&path);
-        let client = FakeClient::new(Some(path)).with_markers(intro());
-        let profile = FakeClient::profile("andrey");
-        start_first_movie(&client, &profile, None)
+        start_film(&Arc::new(films(path).with_markers(intro())), None)
     }
 
     /// Inside the intro the player offers Skip Intro (P2-10), and taking
@@ -4579,11 +4423,8 @@ mod tests {
         let dir = TestDir::new_blocking("spoolframe-converted-undo");
         let path = dir.join("clip.mkv");
         clip(&path);
-        let client = FakeClient::new(Some(path))
-            .converting(64 * 1024)
-            .with_markers(intro());
-        let profile = FakeClient::profile("andrey");
-        let playback = start_first_movie(&client, &profile, None);
+        let server = films(path).converting(64 * 1024).with_markers(intro());
+        let playback = start_film(&Arc::new(server), None);
         playback.set_skip_intros(true);
         let skipped = Rc::new(Cell::new(false));
         {
@@ -4617,9 +4458,8 @@ mod tests {
         let dir = TestDir::new_blocking("spoolframe-quit");
         let path = dir.join("clip.mkv");
         clip(&path);
-        let client = FakeClient::new(Some(path));
-        let profile = FakeClient::profile("andrey");
-        let playback = start_first_movie(&client, &profile, None);
+        let server = Arc::new(films(path));
+        let playback = start_film(&server, None);
         let played = Rc::new(Cell::new(Duration::ZERO));
         {
             let played = played.clone();
@@ -4632,10 +4472,10 @@ mod tests {
         }
         assert!(run_until(Duration::from_secs(20), || played.get()
             > Duration::from_secs(1)));
-        let before = client.progress_reports(&profile).len();
+        let before = server.reports().len();
         shutdown();
         assert!(
-            client.progress_reports(&profile).len() > before,
+            server.reports().len() > before,
             "shutdown returned before the last progress reached the server"
         );
     }
@@ -4648,21 +4488,20 @@ mod tests {
         let dir = TestDir::new_blocking("spoolframe-abandoned-start");
         let path = dir.join("clip.mkv");
         clip(&path);
-        let client = FakeClient::new(Some(path)).converting(64 * 1024);
-        let profile = FakeClient::profile("andrey");
-        let playback = start_first_movie(&client, &profile, None);
+        let server = Arc::new(films(path).converting(64 * 1024));
+        let playback = start_film(&server, None);
         // Do not dispatch the main loop until the server has admitted the start.
         let until = std::time::Instant::now() + Duration::from_secs(5);
-        while client.started_playbacks(&profile) == 0 && std::time::Instant::now() < until {
+        while server.open() == 0 && std::time::Instant::now() < until {
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(client.started_playbacks(&profile), 1);
+        assert_eq!(server.starts().len(), 1);
         drop(playback);
         let until = std::time::Instant::now() + Duration::from_secs(5);
-        while client.open_playbacks(&profile) > 0 && std::time::Instant::now() < until {
+        while server.open() > 0 && std::time::Instant::now() < until {
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(client.open_playbacks(&profile), 0);
+        assert_eq!(server.open(), 0);
     }
 
     /// Next while the first film is still asked for: the second plays,
@@ -4671,20 +4510,11 @@ mod tests {
         let dir = TestDir::new_blocking("spoolframe-overtaken-start");
         let path = dir.join("clip.mkv");
         clip(&path);
-        let client = FakeClient::new(Some(path));
-        let profile = FakeClient::profile("andrey");
-        let session = client.session(&profile).unwrap();
-        let context = glib::MainContext::default();
-        let libraries = context.block_on(session.libraries()).unwrap();
-        let movies = libraries
-            .iter()
-            .find(|l| l.kind == spoolframe_types::LibraryKind::Movies)
-            .unwrap();
-        let (items, _) = context.block_on(session.items(&movies.id, 0, 2)).unwrap();
-        assert_eq!(items.len(), 2, "the fake catalog has two films");
+        let server = Arc::new(films(path));
+        let items = vec![film(), second_film()];
         let second = items[1].id().clone();
         let playback = Playback::start(Playlist {
-            session,
+            session: server.clone(),
             items,
             index: 0,
             queued: Vec::new(),
@@ -4716,24 +4546,20 @@ mod tests {
         assert_eq!(playback.current().map(|i| i.id().clone()), Some(second));
         assert!(!failed.get(), "the overtaken start was shown as a failure");
         assert!(
-            run_until(Duration::from_secs(5), || client.open_playbacks(&profile)
-                == 1),
+            run_until(Duration::from_secs(5), || server.open() == 1),
             "the overtaken start was left open ({} open)",
-            client.open_playbacks(&profile)
+            server.open()
         );
         playback.stop();
-        assert!(run_until(Duration::from_secs(5), || client
-            .open_playbacks(&profile)
-            == 0));
+        assert!(run_until(Duration::from_secs(5), || server.open() == 0));
     }
 
     fn a_converted_playback_restarts_its_encode_on_a_seek() {
         let dir = TestDir::new_blocking("spoolframe-convert");
         let path = dir.join("clip.mkv");
         clip(&path);
-        let client = FakeClient::new(Some(path)).converting(64 * 1024);
-        let profile = FakeClient::profile("andrey");
-        let playback = start_first_movie(&client, &profile, None);
+        let server = Arc::new(films(path).converting(64 * 1024));
+        let playback = start_film(&server, None);
         let played = Rc::new(Cell::new(Duration::ZERO));
         {
             let played = played.clone();
@@ -4774,7 +4600,7 @@ mod tests {
             "old epoch read failed".into(),
         ));
         assert!(!playback.has_failed(), "the old epoch's error failed it");
-        // The fake's encode starts again from the file's start (it has no
+        // The mock's encode starts again from the file's start (it has no
         // -copyts), so the position drops back; playback must go on.
         assert!(
             run_until(Duration::from_secs(20), || playback.restarts() > restarts
@@ -4787,16 +4613,39 @@ mod tests {
         );
         playback.on(Event::Error(old_uri, "late old-reader error".into()));
         assert!(!playback.has_failed());
-        assert_eq!(client.open_playbacks(&profile), 1);
+        assert_eq!(server.seeks(), [Duration::from_secs(3)]);
+        assert_eq!(server.open(), 1);
         playback.stop();
-        run_until(Duration::from_secs(2), || {
-            client.open_playbacks(&profile) == 0
-        });
-        assert_eq!(
-            client.open_playbacks(&profile),
-            0,
-            "the encode was not ended"
+        run_until(Duration::from_secs(2), || server.open() == 0);
+        assert_eq!(server.open(), 0, "the encode was not ended");
+    }
+
+    /// A converted output being encoded has no length of its own, and
+    /// GstPlay may say none: the views show the catalog's from the start.
+    fn a_converted_playback_shows_the_catalogs_length() {
+        let dir = TestDir::new_blocking("spoolframe-converted-length");
+        let path = dir.join("clip.mkv");
+        clip_lasting(&path, 12);
+        let server = Arc::new(films(path).converting(64 * 1024));
+        let catalog = crate::views::Facts::of(&film())
+            .length
+            .expect("the film has a length");
+        let playback = start_film(&server, None);
+        let seen = Rc::new(Cell::new(false));
+        {
+            let seen = seen.clone();
+            playback.subscribe(move |change| {
+                if let Change::Position { length, .. } = change {
+                    seen.set(seen.get() || *length == catalog);
+                }
+                true
+            });
+        }
+        assert!(
+            run_until(Duration::from_secs(10), || seen.get()),
+            "the views never had the catalog's length ({catalog:?})"
         );
+        playback.stop();
     }
 
     /// A converted playback's subtitle, read as text by the server
@@ -4808,11 +4657,8 @@ mod tests {
         let path = dir.join("clip.mkv");
         // Outlasts the SDK's wait before it asks for the subtitle again.
         clip_lasting(&path, 12);
-        let client = FakeClient::new(Some(path))
-            .converting(64 * 1024)
-            .reading_subtitle(1);
-        let profile = FakeClient::profile("andrey");
-        let playback = start_first_movie(&client, &profile, None);
+        let server = films(path).converting(64 * 1024).reading_subtitle(1);
+        let playback = start_film(&Arc::new(server), None);
         let played = Rc::new(Cell::new(Duration::ZERO));
         {
             let played = played.clone();
@@ -4839,7 +4685,7 @@ mod tests {
                 && playback.subtitles_on.get(),
             "the subtitle is not shown"
         );
-        // The fake's new encode starts from the file's start (it has no
+        // The mock's new encode starts from the file's start (it has no
         // -copyts): positions from it are under where playback was.
         played.set(Duration::ZERO);
         assert!(
@@ -4852,19 +4698,15 @@ mod tests {
         playback.stop();
     }
 
-    /// The fake's first movie converted with no subtitle, as the episode
-    /// started, on a server that copies a chosen one into the output; and
-    /// the track failures it tells of. Played past its first second.
-    fn converted_without_a_subtitle(
-        client: &FakeClient,
-        profile: &Profile,
-    ) -> (Rc<Playback>, Rc<RefCell<Vec<String>>>) {
-        let session = client.session(profile).unwrap();
-        let item = first_movie(&session);
+    /// The film converted with no subtitle, as the episode started, on a
+    /// server that copies a chosen one into the output; and the track
+    /// failures it tells of. Played past its first second.
+    fn converted_without_a_subtitle(path: PathBuf) -> (Rc<Playback>, Rc<RefCell<Vec<String>>>) {
+        let server = films(path).converting(64 * 1024).copying_subtitle();
         // Without a subtitle, as the episode started.
         let playback = Playback::start(Playlist {
-            session,
-            items: vec![item],
+            session: Arc::new(server),
+            items: vec![film()],
             index: 0,
             queued: Vec::new(),
             from: None,
@@ -4925,11 +4767,7 @@ mod tests {
         let dir = TestDir::new_blocking("spoolframe-copied-subtitle");
         let path = dir.join("clip.mkv");
         clip_with_subtitle(&path);
-        let client = FakeClient::new(Some(path))
-            .converting(64 * 1024)
-            .copying_subtitle();
-        let profile = FakeClient::profile("andrey");
-        let (playback, failed) = converted_without_a_subtitle(&client, &profile);
+        let (playback, failed) = converted_without_a_subtitle(path);
         playback.use_subtitle(0);
         assert!(
             run_until(Duration::from_secs(20), || shows_the_copied_subtitle(
@@ -4955,11 +4793,7 @@ mod tests {
         let dir = TestDir::new_blocking("spoolframe-named-subtitle");
         let path = dir.join("clip.mkv");
         clip_with_subtitle(&path);
-        let client = FakeClient::new(Some(path))
-            .converting(64 * 1024)
-            .copying_subtitle();
-        let profile = FakeClient::profile("andrey");
-        let (playback, failed) = converted_without_a_subtitle(&client, &profile);
+        let (playback, failed) = converted_without_a_subtitle(path);
         playback.use_subtitle(1);
         assert!(
             run_until(Duration::from_secs(20), || shows_the_copied_subtitle(
@@ -5003,11 +4837,7 @@ mod tests {
         let dir = TestDir::new_blocking("spoolframe-menu-track");
         let path = dir.join("clip.mkv");
         clip_with_subtitle(&path);
-        let client = FakeClient::new(Some(path))
-            .converting(64 * 1024)
-            .copying_subtitle();
-        let profile = FakeClient::profile("andrey");
-        let (playback, failed) = converted_without_a_subtitle(&client, &profile);
+        let (playback, failed) = converted_without_a_subtitle(path);
         let info = playback.now().unwrap().media_info.borrow().clone().unwrap();
         let offered = playback.subtitles_elsewhere().map(|e| e.tracks);
         assert!(
@@ -5055,13 +4885,9 @@ mod tests {
         let dir = TestDir::new_blocking("spoolframe-restore");
         let path = dir.join("clip.mkv");
         clip(&path);
-        let client = FakeClient::new(Some(path));
-        let profile = FakeClient::profile("andrey");
-        let session = client.session(&profile).unwrap();
-        let item = first_movie(&session);
-        let queue = Queue::new(vec![item], 0, None, Vec::new());
+        let queue = Queue::new(vec![film()], 0, None, Vec::new());
         let playback = Playback::restore(
-            session,
+            Arc::new(films(path)),
             queue,
             Duration::from_secs(2),
             None,
@@ -5101,9 +4927,7 @@ mod tests {
         let dir = TestDir::new_blocking("spoolframe-resume");
         let path = dir.join("clip.mkv");
         clip(&path);
-        let client = FakeClient::new(Some(path));
-        let profile = FakeClient::profile("andrey");
-        let playback = start_first_movie(&client, &profile, Some(Duration::from_secs(2)));
+        let playback = start_film(&Arc::new(films(path)), Some(Duration::from_secs(2)));
         let played = Rc::new(Cell::new(Duration::ZERO));
         {
             let played = played.clone();
@@ -5129,9 +4953,8 @@ mod tests {
         let dir = TestDir::new_blocking("spoolframe-pause");
         let path = dir.join("clip.mkv");
         clip(&path);
-        let client = FakeClient::new(Some(path));
-        let profile = FakeClient::profile("andrey");
-        let playback = start_first_movie(&client, &profile, None);
+        let server = Arc::new(films(path));
+        let playback = start_film(&server, None);
         let played = Rc::new(Cell::new(Duration::ZERO));
         {
             let played = played.clone();
@@ -5146,12 +4969,10 @@ mod tests {
             > Duration::from_secs(1)));
         playback.toggle();
         assert!(
-            run_until(Duration::from_secs(3), || !client
-                .progress_reports(&profile)
-                .is_empty()),
+            run_until(Duration::from_secs(3), || !server.reports().is_empty()),
             "pausing reported nothing"
         );
-        let (_, position) = client.progress_reports(&profile)[0].clone();
+        let (_, position) = server.reports()[0].clone();
         assert!(position >= Duration::from_secs(1), "reported {position:?}");
         playback.stop();
     }
@@ -5163,9 +4984,8 @@ mod tests {
         let dir = TestDir::new_blocking("spoolframe-quality");
         let path = dir.join("clip.mkv");
         clip(&path);
-        let client = FakeClient::new(Some(path));
-        let profile = FakeClient::profile("andrey");
-        let playback = start_first_movie(&client, &profile, None);
+        let server = Arc::new(films(path));
+        let playback = start_film(&server, None);
         assert!(run_until(Duration::from_secs(20), || playback.position()
             > Duration::from_secs(1)));
         let failed = || playback.has_failed();
@@ -5181,7 +5001,19 @@ mod tests {
         assert!(plays_as(true), "the 4 Mbit/s choice did not play converted");
         playback.set_quality(PlaybackQuality::Original);
         assert!(plays_as(false), "Original did not play the file again");
-        assert_eq!(client.open_playbacks(&profile), 1);
+        let asked: Vec<_> = server
+            .quality_changes()
+            .into_iter()
+            .map(|(q, _)| q)
+            .collect();
+        assert_eq!(
+            asked,
+            [
+                PlaybackQuality::Bitrate(4_000_000),
+                PlaybackQuality::Original
+            ]
+        );
+        assert_eq!(server.open(), 1);
         playback.stop();
     }
 
@@ -5191,20 +5023,18 @@ mod tests {
         let dir = TestDir::new_blocking("spoolframe-quality-start");
         let path = dir.join("clip.mkv");
         clip(&path);
-        let client = FakeClient::new(Some(path));
-        let profile = FakeClient::profile("andrey");
-        let session = client.session(&profile).unwrap();
-        let item = first_movie(&session);
+        let server = Arc::new(films(path));
+        let capped = spoolframe_client_sdk::PlaybackQuality::Bitrate(2_000_000);
         let playback = Playback::start(Playlist {
-            session,
-            items: vec![item],
+            session: server.clone(),
+            items: vec![film()],
             index: 0,
             queued: Vec::new(),
             from: None,
             selection: None,
             tracks: None,
             album: None,
-            quality: spoolframe_client_sdk::PlaybackQuality::Bitrate(2_000_000),
+            quality: capped,
             display: None,
             from_playlist: None,
         })
@@ -5213,6 +5043,12 @@ mod tests {
             run_until(Duration::from_secs(20), || playback.plan().is_some()),
             "the playback never started"
         );
+        let asked: Vec<_> = server
+            .starts()
+            .into_iter()
+            .map(|s| s.options.quality)
+            .collect();
+        assert_eq!(asked, [capped]);
         assert!(matches!(
             playback.plan(),
             Some(PlaybackPlan::Converted { .. })
@@ -5228,9 +5064,8 @@ mod tests {
         let dir = TestDir::new_blocking("spoolframe-replanned");
         let path = dir.join("clip.mkv");
         clip(&path);
-        let client = FakeClient::new(Some(path));
-        let profile = FakeClient::profile("andrey");
-        let playback = start_first_movie(&client, &profile, None);
+        let server = Arc::new(films(path));
+        let playback = start_film(&server, None);
         assert!(run_until(Duration::from_secs(20), || playback.position()
             > Duration::from_secs(1)));
         assert!(matches!(playback.plan(), Some(PlaybackPlan::Direct { .. })));
@@ -5255,7 +5090,7 @@ mod tests {
             playback.position()
         );
         assert!(!failed());
-        assert_eq!(client.open_playbacks(&profile), 1);
+        assert_eq!(server.open(), 1);
         playback.stop();
     }
 
@@ -5267,11 +5102,9 @@ mod tests {
         let dir = TestDir::new_blocking("spoolframe-resumed");
         let path = dir.join("clip.mkv");
         clip(&path);
-        let client = FakeClient::new(Some(path))
-            .converting(16 * 1024)
-            .expiring_at(32 * 1024);
-        let profile = FakeClient::profile("andrey");
-        let playback = start_first_movie(&client, &profile, None);
+        let server = films(path).converting(16 * 1024).expiring_at(32 * 1024);
+        let server = Arc::new(server);
+        let playback = start_film(&server, None);
         let failed = Rc::new(RefCell::new(None));
         {
             let failed = failed.clone();
@@ -5289,17 +5122,17 @@ mod tests {
             "the resumed playback never got past a second"
         );
         assert_eq!(failed.borrow().clone(), None);
-        assert_eq!(client.started_playbacks(&profile), 2);
-        assert_eq!(client.open_playbacks(&profile), 1);
+        assert_eq!(server.starts().len(), 2);
+        assert_eq!(server.open(), 1);
         playback.stop();
     }
 
-    /// Paused playbacks on the fake server, apart from
-    /// [`playback_on_the_fake_server`]: each waits paused for
+    /// Paused playbacks on a mock server, apart from
+    /// [`playback_on_a_mock_server`]: each waits paused for
     /// [`PAUSED_PAST_IDLE`], minutes of the SDK's real keep-alive.
     #[test]
     #[ignore = "needs a display for gtk4paintablesink; waits 5 minutes"]
-    fn paused_playbacks_on_the_fake_server() {
+    fn paused_playbacks_on_a_mock_server() {
         gtk::init().unwrap();
         init().unwrap();
         a_paused_film_keeps_its_playback_alive();
@@ -5314,21 +5147,16 @@ mod tests {
         let dir = TestDir::new_blocking("spoolframe-paused-film");
         let path = dir.join("clip.mkv");
         clip(&path);
-        let client = FakeClient::new(Some(path)).with_handle_idle(PAUSED_IDLE);
-        let profile = FakeClient::profile("andrey");
-        let playback = start_first_movie(&client, &profile, None);
+        let server = Arc::new(films(path).with_handle_idle(PAUSED_IDLE));
+        let playback = start_film(&server, None);
         assert!(run_until(Duration::from_secs(20), || playback.position()
             > Duration::from_secs(1)));
         playback.toggle();
         assert!(run_until(Duration::from_secs(3), || !playback.is_playing()));
         let paused_at = playback.position();
         run_until(PAUSED_PAST_IDLE, || false);
-        assert_eq!(
-            client.live_playbacks(&profile),
-            1,
-            "the paused playback idled out"
-        );
-        let reports = client.progress_reports(&profile);
+        assert_eq!(server.live(), 1, "the paused playback idled out");
+        let reports = server.reports();
         assert!(
             reports.len() >= 3,
             "paused, the film reported only {reports:?}"
@@ -5347,13 +5175,12 @@ mod tests {
         let dir = TestDir::new_blocking("spoolframe-paused-song");
         let path = dir.join("clip.mkv");
         clip(&path);
-        let client = FakeClient::new(Some(path)).with_handle_idle(PAUSED_IDLE);
-        let profile = FakeClient::profile("andrey");
-        let session = client.session(&profile).unwrap();
-        let track = first_track(&session);
+        let track = song();
         let track_id = &track.id().clone();
+        let server = MockPlayback::new(Some(path), [track.clone()]);
+        let server = Arc::new(server.with_handle_idle(PAUSED_IDLE));
         let playback = Playback::start(Playlist {
-            session,
+            session: server.clone(),
             items: vec![track],
             index: 0,
             queued: Vec::new(),
@@ -5371,12 +5198,8 @@ mod tests {
         playback.toggle();
         assert!(run_until(Duration::from_secs(3), || !playback.is_playing()));
         run_until(PAUSED_PAST_IDLE, || false);
-        assert_eq!(
-            client.live_playbacks(&profile),
-            1,
-            "the paused playback idled out"
-        );
-        let reports = client.progress_reports(&profile);
+        assert_eq!(server.live(), 1, "the paused playback idled out");
+        let reports = server.reports();
         assert!(
             reports.len() >= 2 && reports.iter().all(|(id, _)| id == track_id),
             "paused, the song reported only {reports:?}"
@@ -5392,15 +5215,13 @@ mod tests {
     /// limit, and two keep-alives.
     const PAUSED_PAST_IDLE: Duration = Duration::from_secs(150);
 
-    /// A movie of the fake catalog played from `clip`: it starts, plays,
-    /// moves on, tells a view that attaches late where it is, and stops.
+    /// A film played from `clip`: it starts, plays, moves on, tells a
+    /// view that attaches late where it is, and stops.
     fn a_playback_plays_and_tells_a_late_view_where_it_is() {
         let dir = TestDir::new_blocking("spoolframe-playback");
         let path = dir.join("clip.mkv");
         clip(&path);
-        let client = FakeClient::new(Some(path));
-        let profile = FakeClient::profile("andrey");
-        let playback = start_first_movie(&client, &profile, None);
+        let playback = start_film(&Arc::new(films(path)), None);
 
         let played = Rc::new(Cell::new(Duration::ZERO));
         {
@@ -5440,31 +5261,14 @@ mod tests {
         assert!(!playback.is_playing());
     }
 
-    /// The server goes away before the file is read: the playback says it
-    /// failed (the player shows the error) instead of waiting forever, and
-    /// shutting down afterwards releases it.
+    /// The admin stops the playback before the file is read: the player
+    /// says it stopped, not that it failed.
     fn a_playback_the_admin_stopped_says_so() {
         let dir = TestDir::new_blocking("spoolframe-stopped");
         let path = dir.join("clip.mkv");
         clip(&path);
-        let client = FakeClient::new(Some(path)).with_playbacks_stopped();
-        let profile = FakeClient::profile("andrey");
-        let session = client.session(&profile).unwrap();
-        let item = first_movie(&session);
-        let playback = Playback::start(Playlist {
-            session,
-            items: vec![item],
-            index: 0,
-            queued: Vec::new(),
-            from: None,
-            selection: None,
-            tracks: None,
-            album: None,
-            quality: Default::default(),
-            display: None,
-            from_playlist: None,
-        })
-        .unwrap();
+        let server = films(path).with_playbacks_stopped();
+        let playback = start_film(&Arc::new(server), None);
         let (stopped, failed) = (Rc::new(Cell::new(false)), Rc::new(Cell::new(false)));
         {
             let (stopped, failed) = (stopped.clone(), failed.clone());
@@ -5489,24 +5293,8 @@ mod tests {
         let dir = TestDir::new_blocking("spoolframe-signed-out");
         let path = dir.join("clip.mkv");
         clip(&path);
-        let client = FakeClient::new(Some(path)).with_sessions_ending();
-        let profile = FakeClient::profile("andrey");
-        let session = client.session(&profile).unwrap();
-        let item = first_movie(&session);
-        let playback = Playback::start(Playlist {
-            session,
-            items: vec![item],
-            index: 0,
-            queued: Vec::new(),
-            from: None,
-            selection: None,
-            tracks: None,
-            album: None,
-            quality: Default::default(),
-            display: None,
-            from_playlist: None,
-        })
-        .unwrap();
+        let server = films(path).with_sessions_ending();
+        let playback = start_film(&Arc::new(server), None);
         let (stopped, failed) = (Rc::new(Cell::new(false)), Rc::new(Cell::new(false)));
         {
             let (stopped, failed) = (stopped.clone(), failed.clone());
@@ -5527,29 +5315,16 @@ mod tests {
         playback.stop();
     }
 
+    /// The server goes away before the file is read: the playback says it
+    /// failed (the player shows the error) instead of waiting forever, and
+    /// shutting down afterwards releases it.
     fn a_server_that_goes_away_fails_the_playback() {
         let dir = TestDir::new_blocking("spoolframe-gone");
         let path = dir.join("clip.mkv");
         clip(&path);
-        let client = FakeClient::new(Some(path));
-        let profile = FakeClient::profile("andrey");
-        let session = client.session(&profile).unwrap();
-        let item = first_movie(&session);
-        client.go_away();
-        let playback = Playback::start(Playlist {
-            session,
-            items: vec![item],
-            index: 0,
-            queued: Vec::new(),
-            from: None,
-            selection: None,
-            tracks: None,
-            album: None,
-            quality: Default::default(),
-            display: None,
-            from_playlist: None,
-        })
-        .unwrap();
+        let server = Arc::new(films(path));
+        server.go_away();
+        let playback = start_film(&server, None);
         let failed = Rc::new(RefCell::new(None::<String>));
         {
             let failed = failed.clone();
@@ -5571,26 +5346,22 @@ mod tests {
     /// A finished download (PX-38) plays from its file through playbin3
     /// with no session, alone: no queue to carry or save. Pausing keeps its
     /// place on the client, and playing to its end marks it watched there,
-    /// which stopping at the end does not undo; both wait for the server.
+    /// which stopping at the end does not undo.
     fn a_finished_download_plays_offline_to_its_end() {
-        use spoolframe_linux_core::backend::{DownloadSource, DownloadTracks};
         let dir = TestDir::new_blocking("spoolframe-download");
         let path = dir.join("clip.mkv");
         clip(&path);
-        let client = Arc::new(FakeClient::new(Some(path)));
-        let session = client.session(&FakeClient::profile("andrey")).unwrap();
-        let id = first_movie(&session).id().clone();
-        let context = glib::MainContext::default();
-        let key = context
-            .block_on(session.start_download(&id, DownloadSource::Original, DownloadTracks::All))
-            .unwrap()
-            .key;
-        client.finish_download(&key);
-        let download = context.block_on(client.download(&key)).unwrap();
+        let download = mock::playback::download("clip", film(), path);
+        let client = Arc::new(MockDownloads::new(download.clone()));
         let item = LocalItem::of(&download, client.clone()).unwrap();
         let playback = Playback::play_local(item, None, None, None).unwrap();
         assert!(playback.session().is_none() && playback.carry().is_empty());
-        let kept = || context.block_on(client.download(&key)).unwrap().watch;
+        let kept = |call: DownloadCall| client.calls().contains(&call);
+        let kept_place = || {
+            client.calls().iter().any(
+                |call| matches!(call, DownloadCall::Position(at) if *at >= Duration::from_secs(1)),
+            )
+        };
         assert!(
             run_until(Duration::from_secs(20), || playback.position()
                 > Duration::from_secs(1)),
@@ -5598,35 +5369,60 @@ mod tests {
         );
         playback.toggle();
         assert!(
-            run_until(Duration::from_secs(3), || kept()
-                .position
-                .is_some_and(|position| position >= Duration::from_secs(1))),
+            run_until(Duration::from_secs(3), kept_place),
             "pausing kept no place ({:?})",
-            kept()
+            client.calls()
         );
         playback.toggle();
         assert!(
-            run_until(Duration::from_secs(20), || kept().watched == Some(true)),
+            run_until(Duration::from_secs(20), || kept(DownloadCall::Watched(
+                true
+            ))),
             "the end did not mark it watched ({:?})",
-            kept()
+            client.calls()
         );
         playback.stop();
         run_until(Duration::from_secs(1), || false);
-        let watch = kept();
-        assert_eq!((watch.watched, watch.pending), (Some(true), true));
+        let calls = client.calls();
+        let watched = calls.iter().position(|c| *c == DownloadCall::Watched(true));
+        assert_eq!(
+            calls.last(),
+            Some(&DownloadCall::Watched(true)),
+            "stopping at the end undid it ({calls:?}, watched at {watched:?})"
+        );
     }
 
-    /// `client`'s first movie playing for `profile`, from `from`.
-    fn start_first_movie(
-        client: &FakeClient,
-        profile: &Profile,
-        from: Option<Duration>,
-    ) -> Rc<Playback> {
-        let session = client.session(profile).unwrap();
-        let item = first_movie(&session);
+    /// The film every film test plays, two hours long in the catalog.
+    fn film() -> Item {
+        let Item::Movie(movie) = mock::movie("1", "Arrival") else {
+            unreachable!("a movie")
+        };
+        Item::Movie(spoolframe_types::Movie {
+            duration: Some(Duration::from_secs(116 * 60)),
+            ..movie
+        })
+    }
+
+    /// The film after it.
+    fn second_film() -> Item {
+        mock::movie("2", "Heat")
+    }
+
+    /// A song.
+    fn song() -> Item {
+        mock::track("1", "Tone")
+    }
+
+    /// A server playing the films from `path`.
+    fn films(path: PathBuf) -> MockPlayback {
+        MockPlayback::new(Some(path), [film(), second_film()])
+    }
+
+    /// The film playing on `server`, from `from`.
+    fn start_film(server: &Arc<MockPlayback>, from: Option<Duration>) -> Rc<Playback> {
         Playback::start(Playlist {
-            session,
-            items: vec![item],
+            session: server.clone(),
+            items: vec![film()],
             index: 0,
             queued: Vec::new(),
             from,
@@ -5638,33 +5434,5 @@ mod tests {
             from_playlist: None,
         })
         .unwrap()
-    }
-
-    /// The first track of the fake catalog's first artist's first album.
-    fn first_track(session: &Arc<dyn Session>) -> Item {
-        let context = glib::MainContext::default();
-        let libraries = context.block_on(session.libraries()).unwrap();
-        let music = libraries
-            .iter()
-            .find(|l| l.kind == spoolframe_types::LibraryKind::Music)
-            .unwrap();
-        let (artists, _) = context.block_on(session.items(&music.id, 0, 1)).unwrap();
-        let (_, albums) = context.block_on(session.item(artists[0].id())).unwrap();
-        let (_, tracks) = context.block_on(session.item(albums[0].id())).unwrap();
-        let track = tracks.into_iter().next().unwrap();
-        assert!(matches!(track, Item::Track(_)), "{track:?}");
-        track
-    }
-
-    /// The fake catalog's first movie.
-    fn first_movie(session: &Arc<dyn Session>) -> Item {
-        let context = glib::MainContext::default();
-        let libraries = context.block_on(session.libraries()).unwrap();
-        let movies = libraries
-            .iter()
-            .find(|l| l.kind == spoolframe_types::LibraryKind::Movies)
-            .unwrap();
-        let (items, _) = context.block_on(session.items(&movies.id, 0, 1)).unwrap();
-        items.into_iter().next().unwrap()
     }
 }

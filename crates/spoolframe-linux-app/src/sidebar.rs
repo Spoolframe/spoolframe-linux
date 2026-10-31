@@ -464,9 +464,7 @@ fn pinned_row(
 
 #[cfg(test)]
 mod tests {
-    use spoolframe_linux_core::backend::Client;
-    use spoolframe_linux_core::fake::FakeClient;
-    use spoolframe_linux_core::testing::ready;
+    use spoolframe_linux_core::backend::Kinds;
 
     use super::*;
 
@@ -500,9 +498,25 @@ mod tests {
         ]
     }
 
-    fn listed(client: &FakeClient) -> PlaylistList {
-        let session = client.session(&FakeClient::profile("andrey")).unwrap();
-        ready(session.playlists()).unwrap()
+    /// Playlist `name`, pinned at `pinned`.
+    fn playlist(name: &str, pinned: Option<u32>) -> PlaylistSummary {
+        PlaylistSummary {
+            pinned,
+            ..spoolframe_linux_core::mock::playlist(name, name, Kinds::default())
+        }
+    }
+
+    /// Three playlists, two pinned: Heists first, then Movie night, though
+    /// the list has them the other way round.
+    fn listed() -> PlaylistList {
+        PlaylistList {
+            playlists: vec![
+                playlist("Movie night", Some(1)),
+                playlist("Road trip", None),
+                playlist("Heists", Some(0)),
+            ],
+            pin_notes: Vec::new(),
+        }
     }
 
     #[test]
@@ -515,15 +529,7 @@ mod tests {
 
     #[test]
     fn playlists_follow_the_libraries_with_the_pinned_ones_under_them() {
-        let client = FakeClient::new(None);
-        let list = listed(&client);
-        let heists = list
-            .playlists
-            .iter()
-            .find(|p| p.pinned.is_some())
-            .unwrap()
-            .id
-            .clone();
+        let list = listed();
         assert_eq!(
             rows(&own(1), &Folds::default(), Playlists::Listed(&list), false),
             [
@@ -531,40 +537,27 @@ mod tests {
                 Row::Search,
                 Row::Library(0),
                 Row::Playlists,
-                Row::Pinned(heists)
+                Row::Pinned("Heists".into()),
+                Row::Pinned("Movie night".into())
             ]
         );
     }
 
     #[test]
     fn pinned_rows_are_in_the_users_order() {
-        let client = FakeClient::new(None);
-        let session = client.session(&FakeClient::profile("andrey")).unwrap();
-        let list = listed(&client);
-        let night = list
-            .playlists
-            .iter()
-            .find(|p| p.name == "Movie night")
-            .unwrap();
-        ready(session.pin_playlist(&night.id, 0)).unwrap();
-        let list = listed(&client);
-        let pinned: Vec<_> = rows(&[], &Folds::default(), Playlists::Listed(&list), false)
+        let pinned: Vec<_> = rows(&[], &Folds::default(), Playlists::Listed(&listed()), false)
             .into_iter()
             .filter_map(|row| match row {
-                Row::Pinned(id) => list
-                    .playlists
-                    .iter()
-                    .find(|p| p.id == id)
-                    .map(|p| p.name.clone()),
+                Row::Pinned(id) => Some(id),
                 _ => None,
             })
             .collect();
-        assert_eq!(pinned, ["Movie night", "Andor: the heists"]);
+        assert_eq!(pinned, ["Heists", "Movie night"]);
     }
 
     #[test]
     fn nothing_pinned_shows_the_hint_in_its_place() {
-        let mut list = listed(&FakeClient::new(None));
+        let mut list = listed();
         for playlist in &mut list.playlists {
             playlist.pinned = None;
         }
@@ -619,7 +612,7 @@ mod tests {
 
     #[test]
     fn downloads_follow_playlists_and_come_before_pinned() {
-        let list = listed(&FakeClient::new(None));
+        let list = listed();
         let rows = rows(&[], &Folds::default(), Playlists::Listed(&list), true);
         assert_eq!(
             (rows[2..4].to_vec(), header(&rows, 3), header(&rows, 4)),

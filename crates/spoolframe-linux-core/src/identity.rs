@@ -600,7 +600,7 @@ impl Labels {
 }
 
 /// The SDK's software key, shared by every action, as one physical key
-/// is: for tests, and for the fake.
+/// is: for tests.
 pub struct SharedSoftKey(pub Arc<spoolframe_client_sdk::SoftSecurityKey>);
 
 #[async_trait]
@@ -624,8 +624,8 @@ impl SecurityKey for SharedSoftKey {
     }
 }
 
-/// An `Identities` over memory with one software key, for tests and the
-/// fake: every action uses the same key.
+/// An `Identities` over memory with one software key, for tests: every
+/// action uses the same key.
 pub fn in_memory() -> Identities {
     let soft = Arc::new(spoolframe_client_sdk::SoftSecurityKey::default());
     Identities::new(

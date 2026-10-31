@@ -501,18 +501,74 @@ pub fn present(parent: &impl IsA<gtk::Widget>, picker: Picker) {
 
 #[cfg(test)]
 mod tests {
-    use spoolframe_linux_core::backend::{Client, LeftOutSubtitle};
-    use spoolframe_linux_core::fake::FakeClient;
-    use spoolframe_linux_core::testing::ready;
-    use spoolframe_types::{MediaId, MediaKind, Namespace};
+    use spoolframe_linux_core::backend::LeftOutSubtitle;
+    use spoolframe_types::{AudioRole, AudioTrack, MediaTracks, SubtitleRole, SubtitleTrack};
 
     use super::*;
 
+    /// Alien's options as a server answers them: three audio tracks and
+    /// three subtitles, the first audio and every subtitle ticked, two
+    /// profiles, and a size for every version but the last.
     fn options() -> DownloadOptionsInfo {
-        let client = FakeClient::new(None);
-        let session = client.session(&FakeClient::profile("andrey")).unwrap();
-        let alien = MediaId::new(Namespace::Plex, MediaKind::Movie, "1").unwrap();
-        ready(session.download_options(&alien)).unwrap()
+        let audio = |title: Option<&str>, default| AudioTrack {
+            language: Some("eng".into()),
+            title: title.map(str::to_owned),
+            channels: Some(2),
+            default,
+            role: AudioRole::Main,
+        };
+        let subtitle = |title: Option<&str>, role| SubtitleTrack {
+            language: Some("eng".into()),
+            title: title.map(str::to_owned),
+            forced: role == SubtitleRole::Forced,
+            default: false,
+            external: false,
+            role,
+            timing: None,
+            download: None,
+        };
+        let profile = |name: &str| DownloadSource::Profile { name: name.into() };
+        let estimate = |source, size_bytes, readiness| DownloadEstimate {
+            source,
+            size_bytes,
+            readiness,
+        };
+        DownloadOptionsInfo {
+            tracks: MediaTracks {
+                audio: vec![
+                    audio(None, true),
+                    audio(Some("Commentary"), false),
+                    audio(Some("Audio Description"), false),
+                ],
+                subtitles: vec![
+                    subtitle(None, SubtitleRole::Full),
+                    subtitle(Some("Forced"), SubtitleRole::Forced),
+                    subtitle(Some("SDH"), SubtitleRole::Sdh),
+                ],
+                ..MediaTracks::default()
+            },
+            preferred: DownloadTracks::Chosen {
+                audio: vec![0],
+                subtitles: vec![0, 1, 2],
+            },
+            profiles: vec!["Mobile".into(), "Mobile (H.264)".into()],
+            original: OriginalDownload::AsIs,
+            left_out: Vec::new(),
+            // Original first, then each profile in order.
+            estimates: vec![
+                estimate(
+                    DownloadSource::Original,
+                    Some(38_400_000_000),
+                    DownloadReadiness::Ready,
+                ),
+                estimate(
+                    profile("Mobile"),
+                    Some(3_600_000_000),
+                    DownloadReadiness::ConvertsFirst,
+                ),
+                estimate(profile("Mobile (H.264)"), None, DownloadReadiness::Ready),
+            ],
+        }
     }
 
     /// Alien's options with its second subtitle left out, as an Apple

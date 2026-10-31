@@ -183,7 +183,7 @@ pub(crate) fn written() {
 #[cfg(test)]
 mod tests {
     use spoolframe_linux_core::backend::ServerKey;
-    use spoolframe_linux_core::fake::FakeClient;
+    use spoolframe_linux_core::mock::shell::MockClient;
     use spoolframe_linux_core::testing::{TestDir, runtime};
     use spoolframe_types::{Item, MediaId, MediaKind, Namespace, PlaybackState, Track};
 
@@ -227,12 +227,12 @@ mod tests {
 
     /// `username`'s saved queue in `client`'s store, with no files from
     /// before it.
-    fn saved(client: &FakeClient, username: &str) -> SavedQueue {
+    fn saved(client: &MockClient, username: &str) -> SavedQueue {
         SavedQueue::for_test(client, None, username)
     }
 
     impl SavedQueue {
-        fn for_test(client: &FakeClient, legacy: Option<DataStore>, username: &str) -> Self {
+        fn for_test(client: &MockClient, legacy: Option<DataStore>, username: &str) -> Self {
             let profile = profile(username);
             Self::in_store(
                 client.profile_store(&profile.server, &profile.username),
@@ -261,7 +261,7 @@ mod tests {
 
     #[test]
     fn a_saved_queue_and_position_come_back() {
-        let client = FakeClient::new(None);
+        let client = MockClient::new();
         let saved = saved(&client, "Andrey");
         let mut queue = Queue::new(vec![song("a"), song("b")], 1, None, Vec::new());
         queue.add(vec![song("x")], None);
@@ -277,7 +277,7 @@ mod tests {
 
     #[test]
     fn the_last_of_saves_in_a_row_is_the_one_kept() {
-        let client = FakeClient::new(None);
+        let client = MockClient::new();
         let saved = saved(&client, "andrey");
         for n in 1..=5 {
             let queue = Queue::new(vec![song(&n.to_string())], 0, None, Vec::new());
@@ -289,7 +289,7 @@ mod tests {
 
     #[test]
     fn a_playlist_context_and_modes_survive_restarting_and_old_saves_still_load() {
-        let client = FakeClient::new(None);
+        let client = MockClient::new();
         let saved = saved(&client, "andrey");
         let queue = Queue::new(vec![song("a")], 0, None, Vec::new());
         let playlist = PlaylistResume {
@@ -322,7 +322,7 @@ mod tests {
 
     #[test]
     fn each_profile_has_its_own_queue() {
-        let client = FakeClient::new(None);
+        let client = MockClient::new();
         saved(&client, "andrey").save(
             &Queue::new(vec![song("a")], 0, None, Vec::new()),
             Duration::ZERO,
@@ -334,7 +334,7 @@ mod tests {
 
     #[test]
     fn an_unreadable_value_is_no_queue() {
-        let client = FakeClient::new(None);
+        let client = MockClient::new();
         let saved = saved(&client, "andrey");
         write(saved.store.clone(), QUEUE, Some(b"not json".to_vec()));
         written();
@@ -343,7 +343,7 @@ mod tests {
 
     #[test]
     fn a_queue_file_from_before_is_deleted_and_not_loaded() {
-        let (client, data) = (FakeClient::new(None), dir("legacy"));
+        let (client, data) = (MockClient::new(), dir("legacy"));
         let key = profile_key("queues", &profile("andrey"));
         let old = Saved {
             queue: Queue::new(vec![song("a")], 0, None, Vec::new()),

@@ -785,6 +785,8 @@ impl Adding {
 
 #[cfg(test)]
 mod tests {
+    use spoolframe_linux_core::mock::accounts::MockAccount;
+
     use super::*;
 
     fn passkey(app: bool, last_used_at: Option<SystemTime>) -> PasskeyInfo {
@@ -868,7 +870,7 @@ mod tests {
     /// One test: GTK binds itself to the first thread that starts it.
     #[test]
     #[ignore = "needs a display; run on its own"]
-    fn passkeys_on_the_fake_server() {
+    fn passkeys_on_a_display() {
         gtk::init().unwrap();
         adw::init().unwrap();
         a_web_ui_passkey_is_listed();
@@ -876,37 +878,33 @@ mod tests {
         a_refused_name_is_said_in_the_dialog();
     }
 
-    /// A view of the fake's Home Media for andrey, and his session.
-    fn fake_view() -> (Rc<View>, Arc<dyn Session>) {
-        use spoolframe_linux_core::backend::Client;
-        use spoolframe_linux_core::fake::FakeClient;
-        let client: Arc<dyn Client> = Arc::new(FakeClient::new(None));
-        let profile = FakeClient::profile("andrey");
-        let session = client.session(&profile).unwrap();
-        let view = Rc::new(View {
-            server: Server {
-                key: profile.server.clone(),
-                name: "Home Media".into(),
-                addresses: Vec::new(),
-                pinned: true,
-                fingerprint: String::new(),
-                verified: true,
-                on_network: true,
-                verified_at: None,
-                last_connected_at: None,
-                server_id: None,
-                advertised: Vec::new(),
-                relays: Vec::new(),
-                advertised_at: None,
-                use_relays: None,
-                relays_edited: false,
-            },
-            session: RefCell::new(session.clone()),
+    /// Home Media, as the passkeys' page has it.
+    fn home_media() -> Server {
+        spoolframe_linux_core::mock::accounts::server(
+            spoolframe_linux_core::mock::accounts::home(),
+            "Home Media",
+        )
+    }
+
+    /// A view of Home Media on `account`.
+    fn view_on(account: Arc<MockAccount>) -> Rc<View> {
+        Rc::new(View {
+            server: home_media(),
+            session: RefCell::new(account),
             toasts: adw::ToastOverlay::new().downgrade(),
             group: adw::PreferencesGroup::new(),
             rows: RefCell::new(Vec::new()),
-        });
-        (view, session)
+        })
+    }
+
+    /// What the key made in these tests.
+    fn made() -> FinishPasskeyRegistration {
+        FinishPasskeyRegistration {
+            credential_id: vec![7; 16],
+            attestation_object: vec![1],
+            client_data_json: vec![1],
+            name: FIRST_NAME.to_owned(),
+        }
     }
 
     /// Add a passkey…, shown in a window, with the key done: step 3.
@@ -918,12 +916,7 @@ mod tests {
         window.present();
         let adding = Adding::new(view);
         adding.dialog.present(Some(&window));
-        adding.save(FinishPasskeyRegistration {
-            credential_id: vec![7; 16],
-            attestation_object: vec![1],
-            client_data_json: vec![1],
-            name: FIRST_NAME.to_owned(),
-        });
+        adding.save(made());
         assert!(
             run_until(std::time::Duration::from_secs(5), || adding
                 .stack
@@ -935,32 +928,37 @@ mod tests {
         adding
     }
 
-    fn names(session: &Arc<dyn Session>) -> Vec<String> {
-        spoolframe_linux_core::testing::ready(session.passkeys())
-            .unwrap()
-            .into_iter()
-            .map(|p| p.name)
-            .collect()
-    }
-
     fn a_name_typed_at_step_three_sticks_however_the_dialog_closes() {
-        let (view, session) = fake_view();
+        let account = Arc::new(
+            MockAccount::new()
+                .with_passkey_saves([Ok(())])
+                .with_rename_answers([Ok(())]),
+        );
+        // The dialog holds the view weakly: it is kept here.
+        let view = view_on(account.clone());
         let adding = at_step_three(&view);
         adding.name.set_text("thumb");
         // Escape, or the window closing: not Done.
         adding.dialog.close();
+        let id = spoolframe_linux_core::passkey::passkey_id(&made().credential_id);
         assert!(
-            run_until(std::time::Duration::from_secs(5), || names(&session)
-                .contains(&"thumb".to_owned())),
-            "names: {:?}",
-            names(&session)
+            run_until(std::time::Duration::from_secs(5), || account.renamed()
+                == [(id.clone(), "thumb".to_owned())]),
+            "renamed: {:?}",
+            account.renamed()
         );
     }
 
     fn a_refused_name_is_said_in_the_dialog() {
-        let (view, _) = fake_view();
+        let account = Arc::new(
+            MockAccount::new()
+                .with_passkey_saves([Ok(())])
+                .with_rename_answers([Err(BackendError::InvalidInput(
+                    "a passkey's name is 1 to 64 characters".into(),
+                ))]),
+        );
+        let view = view_on(account);
         let adding = at_step_three(&view);
-        // Longer than the 64 characters a name may have.
         adding.name.set_text(&"t".repeat(65));
         adding.name.emit_activate();
         assert!(
@@ -974,30 +972,19 @@ mod tests {
     }
 
     fn a_web_ui_passkey_is_listed() {
-        use spoolframe_linux_core::backend::Client;
-        use spoolframe_linux_core::fake::FakeClient;
-        let client: Arc<dyn Client> = Arc::new(FakeClient::new(None));
-        let profile = FakeClient::profile("andrey");
-        let session = client.session(&profile).unwrap();
-        let server = Server {
-            key: profile.server.clone(),
-            name: "Home Media".into(),
-            addresses: Vec::new(),
-            pinned: true,
-            fingerprint: String::new(),
-            verified: true,
-            on_network: true,
-            verified_at: None,
-            last_connected_at: None,
-            server_id: None,
-            advertised: Vec::new(),
-            relays: Vec::new(),
-            advertised_at: None,
-            use_relays: None,
-            relays_edited: false,
+        let firefox = PasskeyInfo {
+            name: "Firefox on nimble".into(),
+            ..passkey(false, None)
         };
+        let account = Arc::new(MockAccount::new().with_passkeys([vec![firefox]]));
         let toasts = adw::ToastOverlay::new();
-        let group = group(Needs { server, session }, &toasts);
+        let group = group(
+            Needs {
+                server: home_media(),
+                session: account,
+            },
+            &toasts,
+        );
         let titles = || {
             let mut titles = Vec::new();
             let mut child = group.first_child();

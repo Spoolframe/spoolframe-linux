@@ -14,6 +14,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use gst::prelude::*;
@@ -328,10 +329,17 @@ impl Pipeline {
             .seek(gst::ClockTime::from_nseconds(to.as_nanos() as u64));
     }
 
+    /// Where GstPlay is in the film, as [`Self::film_time`] gives it.
     pub fn position(&self) -> Option<Duration> {
         self.play()
             .position()
-            .map(|p| Duration::from_nanos(p.nseconds()))
+            .map(|p| self.film_time(Duration::from_nanos(p.nseconds())))
+    }
+
+    /// A position GstPlay gives, in the film's time: a converted encode's
+    /// are behind by where it starts ([`StreamOffset`]).
+    pub fn film_time(&self, at: Duration) -> Duration {
+        at + self.video.offset.get()
     }
 
     pub fn duration(&self) -> Option<Duration> {
@@ -562,6 +570,8 @@ fn mark_up_srt(pad: &gst::Pad) {
 pub struct VideoSink {
     pub gtk: gst::Element,
     pub outer: gst::Element,
+    /// How far the positions of the stream it shows are behind the film.
+    pub offset: StreamOffset,
 }
 
 impl VideoSink {
@@ -585,8 +595,73 @@ impl VideoSink {
                 .build()?,
             false => gtk.clone(),
         };
-        Ok(Self { gtk, outer })
+        let pad = outer.static_pad("sink").expect("a sink has a sink pad");
+        drop_gaps_before_segment(&pad);
+        let offset = StreamOffset::default();
+        offset.follow(&pad);
+        Ok(Self { gtk, outer, offset })
     }
+}
+
+/// How far GstPlay's positions are behind the film: the last segment's
+/// start less its stream time. A converted encode keeps the film's
+/// timestamps (the server's -copyts), but matroskademux, reading it as a
+/// stream, starts its stream time at 0 from the first, so a resume or a
+/// seek's encode reports positions from 0. A file's is 0.
+#[derive(Clone, Default)]
+pub struct StreamOffset(Arc<std::sync::atomic::AtomicU64>);
+
+impl StreamOffset {
+    pub fn get(&self) -> Duration {
+        Duration::from_nanos(self.0.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Follows the segments on `pad`. The last one's stands until the next
+    /// stream's comes: a restart's positions are the controller's until
+    /// then, and dropping to 0 would read as a move back.
+    fn follow(&self, pad: &gst::Pad) {
+        let offset = self.0.clone();
+        pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
+            let Some(gst::PadProbeData::Event(event)) = &info.data else {
+                return gst::PadProbeReturn::Ok;
+            };
+            if let gst::EventView::Segment(segment) = event.view()
+                && let Some(segment) = segment.segment().downcast_ref::<gst::ClockTime>()
+            {
+                let start = segment.start().map_or(0, |t| t.nseconds());
+                let time = segment.time().map_or(0, |t| t.nseconds());
+                offset.store(
+                    start.saturating_sub(time),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            gst::PadProbeReturn::Ok
+        });
+    }
+}
+
+/// Drops a gap that reaches `pad` before its stream's segment. A converted
+/// encode that starts late in the film (-copyts, a resume or a seek) has
+/// its audio ahead of its first video block: matroskademux fills the video
+/// with gaps from 0, and the decoder, with no frame yet, passes them on
+/// with default caps playsink's converter cannot take, so the caps and
+/// segment stop there and the gap goes on alone. The sink then syncs it
+/// against no segment and holds the video until the clock reaches it.
+fn drop_gaps_before_segment(pad: &gst::Pad) {
+    let segment = std::sync::atomic::AtomicBool::new(false);
+    pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(gst::PadProbeData::Event(event)) = &info.data else {
+            return gst::PadProbeReturn::Ok;
+        };
+        match event.view() {
+            gst::EventView::StreamStart(_) => segment.store(false, Relaxed),
+            gst::EventView::Segment(_) => segment.store(true, Relaxed),
+            gst::EventView::Gap(_) if !segment.load(Relaxed) => return gst::PadProbeReturn::Drop,
+            _ => {}
+        }
+        gst::PadProbeReturn::Ok
+    });
 }
 
 #[cfg(test)]
@@ -594,6 +669,148 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+
+    /// The events that pass the gap guard on a sink's pad, by type.
+    fn passed_on_a_guarded_sink(events: Vec<gst::Event>) -> Vec<gst::EventType> {
+        let sink = gst::ElementFactory::make("fakesink")
+            .property("async", false)
+            .build()
+            .unwrap();
+        sink.set_state(gst::State::Playing).unwrap();
+        let pad = sink.static_pad("sink").unwrap();
+        drop_gaps_before_segment(&pad);
+        let passed = Arc::new(Mutex::new(Vec::new()));
+        let seen = passed.clone();
+        pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
+            if let Some(gst::PadProbeData::Event(event)) = &info.data {
+                seen.lock().unwrap().push(event.type_());
+            }
+            gst::PadProbeReturn::Ok
+        });
+        let src = gst::Pad::builder(gst::PadDirection::Src).build();
+        src.set_active(true).unwrap();
+        src.link(&pad).unwrap();
+        for event in events {
+            src.push_event(event);
+        }
+        sink.set_state(gst::State::Null).unwrap();
+        passed.lock().unwrap().clone()
+    }
+
+    fn stream_start(id: &str) -> gst::Event {
+        gst::init().unwrap();
+        gst::event::StreamStart::new(id)
+    }
+
+    fn gap_at(seconds: u64) -> gst::Event {
+        gst::event::Gap::new(
+            gst::ClockTime::from_seconds(seconds),
+            gst::ClockTime::from_mseconds(32),
+        )
+    }
+
+    fn time_segment() -> gst::Event {
+        gst::event::Segment::new(&gst::FormattedSegment::<gst::ClockTime>::new())
+    }
+
+    /// matroskademux fills a stream with no block yet with gaps from 0,
+    /// and a decoder with no frame yet passes them on with caps nothing
+    /// downstream takes: the gap comes ahead of the segment, and the sink
+    /// waits for the clock to reach it, minutes on a stream that starts
+    /// late in the film (-copyts).
+    #[test]
+    fn a_gap_before_its_streams_segment_does_not_reach_the_sink() {
+        let passed = passed_on_a_guarded_sink(vec![stream_start("video"), gap_at(95)]);
+        assert_eq!(passed, [gst::EventType::StreamStart]);
+    }
+
+    #[test]
+    fn a_gap_after_its_streams_segment_reaches_the_sink() {
+        let passed =
+            passed_on_a_guarded_sink(vec![stream_start("video"), time_segment(), gap_at(95)]);
+        assert_eq!(
+            passed,
+            [
+                gst::EventType::StreamStart,
+                gst::EventType::Segment,
+                gst::EventType::Gap
+            ]
+        );
+    }
+
+    /// A new stream (the next encode's reader) waits for its own segment.
+    #[test]
+    fn a_new_stream_waits_for_its_own_segment() {
+        let passed = passed_on_a_guarded_sink(vec![
+            stream_start("video"),
+            time_segment(),
+            stream_start("video-again"),
+            gap_at(95),
+        ]);
+        assert_eq!(
+            passed,
+            [
+                gst::EventType::StreamStart,
+                gst::EventType::Segment,
+                gst::EventType::StreamStart
+            ]
+        );
+    }
+
+    /// The offset a sink's pad follows after `events`.
+    fn offset_after(events: Vec<gst::Event>) -> Duration {
+        let sink = gst::ElementFactory::make("fakesink")
+            .property("async", false)
+            .build()
+            .unwrap();
+        sink.set_state(gst::State::Playing).unwrap();
+        let pad = sink.static_pad("sink").unwrap();
+        let offset = StreamOffset::default();
+        offset.follow(&pad);
+        let src = gst::Pad::builder(gst::PadDirection::Src).build();
+        src.set_active(true).unwrap();
+        src.link(&pad).unwrap();
+        for event in events {
+            src.push_event(event);
+        }
+        sink.set_state(gst::State::Null).unwrap();
+        offset.get()
+    }
+
+    fn segment_from(start: u64, time: u64) -> gst::Event {
+        let mut segment = gst::FormattedSegment::<gst::ClockTime>::new();
+        segment.set_start(gst::ClockTime::from_seconds(start));
+        segment.set_time(gst::ClockTime::from_seconds(time));
+        gst::event::Segment::new(&segment)
+    }
+
+    /// The server's encode keeps the film's timestamps (-copyts), and
+    /// matroskademux starts its stream time at 0 from the first: GstPlay's
+    /// positions are behind the film by where the encode starts.
+    #[test]
+    fn a_converted_encode_is_behind_the_film_by_where_it_starts() {
+        let offset = offset_after(vec![stream_start("video"), segment_from(110, 0)]);
+        assert_eq!(offset, Duration::from_secs(110));
+    }
+
+    /// A file's seek keeps its stream time at its start: no offset.
+    #[test]
+    fn a_files_segment_is_not_behind() {
+        let offset = offset_after(vec![stream_start("video"), segment_from(110, 110)]);
+        assert_eq!(offset, Duration::ZERO);
+    }
+
+    /// A restart's new encode is behind by its own start.
+    #[test]
+    fn the_next_encode_sets_its_own_offset() {
+        let offset = offset_after(vec![
+            stream_start("video"),
+            segment_from(110, 0),
+            stream_start("video-again"),
+            segment_from(40, 0),
+        ]);
+        assert_eq!(offset, Duration::from_secs(40));
+    }
 
     #[test]
     fn an_errors_element_path_is_what_comes_before_its_text() {

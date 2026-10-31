@@ -1186,7 +1186,7 @@ mod tests {
         gtk::init().unwrap();
         adw::init().unwrap();
         let client: Arc<dyn spoolframe_linux_core::backend::Client> =
-            Arc::new(spoolframe_linux_core::fake::FakeClient::new(None));
+            Arc::new(spoolframe_linux_core::mock::accounts::MockClient::new());
         let page = page(client, &adw::ToastOverlay::new());
         assert!(crate::ui_test::spin_until(
             std::time::Duration::from_secs(2),

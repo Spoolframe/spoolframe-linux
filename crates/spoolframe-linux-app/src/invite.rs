@@ -1235,11 +1235,59 @@ fn hinted(label: &str, entry: &impl IsA<gtk::Widget>, error: &gtk::Label, hint: 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spoolframe_linux_core::backend::{Client, ServerKey};
-    use spoolframe_linux_core::fake::{
-        EXPIRED_INVITE_CODE, FakeClient, INVITE_CODE, REVOKED_INVITE_CODE,
-    };
+    use spoolframe_linux_core::backend::ServerKey;
+    use spoolframe_linux_core::mock::accounts;
     use std::time::Duration;
+
+    fn cabin_key() -> ServerKey {
+        ServerKey("c4b1".repeat(16))
+    }
+
+    /// Cabin, as an invite finds it: not saved, with a server id for its
+    /// passkeys.
+    fn cabin() -> Server {
+        Server {
+            addresses: vec!["203.0.113.24:41641".into()],
+            pinned: false,
+            fingerprint: "K6EQ-ZXKC-HT6H-AJ4F".into(),
+            verified: false,
+            server_id: Some("k7f3q2m4x6pq5z2a".into()),
+            ..accounts::server(cabin_key(), "Cabin")
+        }
+    }
+
+    /// An invite link to Cabin with `code`.
+    fn cabin_link(code: &str) -> String {
+        spoolframe_protocol::invite::Invite {
+            server: cabin_key().0,
+            name: Some("Cabin".into()),
+            addrs: vec!["203.0.113.24:41641".parse().expect("an address")],
+            relays: vec!["https://relay.cabin.example".into()],
+            code: Some(code.into()),
+            expires_at: None,
+            role: Some(Role::Consumer),
+            kind: spoolframe_protocol::invite::InviteLinkKind::CreateUser,
+            lookup: None,
+        }
+        .link()
+    }
+
+    /// What reading Cabin's link with a code says.
+    fn cabin_invite() -> Invite {
+        Invite {
+            key: cabin_key(),
+            name: Some("Cabin".into()),
+            ..invite(true)
+        }
+    }
+
+    /// Cabin's answer for `outcome`.
+    fn at_cabin(outcome: InviteOutcome) -> InviteLookup {
+        InviteLookup {
+            server: cabin(),
+            outcome,
+        }
+    }
 
     fn invite(has_code: bool) -> Invite {
         Invite {
@@ -1467,11 +1515,7 @@ mod tests {
         )
     }
 
-    fn ready<T>(future: impl std::future::Future<Output = T>) -> T {
-        gtk::glib::MainContext::default().block_on(future)
-    }
-
-    /// The flow through each state of the boards, with the fake's
+    /// The flow through each state of the boards, with a server's
     /// answers: a bad paste, the summary, the fingerprint, a taken name,
     /// an expired code and Save server only, and the saved server.
     #[test]
@@ -1479,21 +1523,20 @@ mod tests {
     fn the_invite_dialog_walks_the_boards_states() {
         gtk::init().unwrap();
         adw::init().unwrap();
-        let client = FakeClient::new(None);
         let asked = Rc::new(Asked::default());
         let dialog = dialog(&asked);
 
         // 1 · Not an invite.
         let pasted = "https://home-media.example/admin/invites";
         dialog.set_link(pasted);
-        dialog.read(pasted, ready(client.read_invite(pasted)));
+        dialog.read(pasted, Err(BackendError::NotAnInvite));
         assert!(dialog.link_error.is_visible());
         assert!(!dialog.proceed.is_sensitive());
 
         // The summary, then who answers.
-        let link = FakeClient::invite_link(Some(INVITE_CODE));
+        let link = cabin_link("QW7K2MFPXR4T");
         dialog.set_link(&link);
-        dialog.read(&link, ready(client.read_invite(&link)));
+        dialog.read(&link, Ok(cabin_invite()));
         assert!(dialog.summary.is_visible() && dialog.summary_account.is_visible());
         assert_eq!(dialog.summary_name.label(), "Cabin");
         // Continue waits for the server to say what the code is.
@@ -1504,7 +1547,14 @@ mod tests {
             ),
             ("Checking the invite…", false)
         );
-        dialog.looked_up(&link, ready(client.look_up_invite(&link)));
+        dialog.looked_up(
+            &link,
+            Ok(at_cabin(valid(
+                Some("Andrey"),
+                InviteKind::CreateUser,
+                Role::Consumer,
+            ))),
+        );
         assert!(
             dialog
                 .summary_outcome
@@ -1513,7 +1563,7 @@ mod tests {
         );
         assert!(dialog.proceed.is_sensitive());
         dialog.proceed.emit_clicked();
-        dialog.connected(ready(client.connect_invite(&link)));
+        dialog.connected(Ok(cabin()));
         assert_eq!(dialog.page(), "check");
         assert!(dialog.check_site.is_visible());
 
@@ -1521,8 +1571,7 @@ mod tests {
         dialog.connect.emit_clicked();
         assert_eq!(dialog.page(), "join");
         assert_eq!(dialog.dialog.title(), "Join Cabin");
-        let taken = ready(client.redeem_invite(&link, "alice", None, "long enough"));
-        dialog.join_refused(&taken.unwrap_err(), "alice");
+        dialog.join_refused(&BackendError::UsernameTaken, "alice");
         assert_eq!(dialog.page(), "join");
         assert_eq!(
             dialog.username_error.label(),
@@ -1530,13 +1579,14 @@ mod tests {
         );
 
         // An expired code: Save server only, then saved.
-        let expired = FakeClient::invite_link(Some(EXPIRED_INVITE_CODE));
-        let refused = ready(client.redeem_invite(&expired, "mum", None, "long enough"));
-        dialog.join_refused(&refused.unwrap_err(), "mum");
+        dialog.join_refused(&BackendError::InviteExpired, "mum");
         assert_eq!(dialog.page(), "refused");
         assert_eq!(dialog.refusal_title.label(), "This invite has expired");
         dialog.save_only.emit_clicked();
-        dialog.saved(ready(client.save_invite_server(&expired)));
+        dialog.saved(Ok(Server {
+            pinned: true,
+            ..cabin()
+        }));
         assert_eq!(dialog.page(), "saved");
         assert_eq!(dialog.saved_title.label(), "Cabin is saved");
         assert_eq!(dialog.dialog.title(), "Cabin added");
@@ -1562,26 +1612,24 @@ mod tests {
     fn a_code_typed_at_a_server_is_looked_up_before_joining() {
         gtk::init().unwrap();
         adw::init().unwrap();
-        let client = FakeClient::new(None).with_cabin_nearby();
-        let cabin = ready(client.servers())
-            .unwrap()
-            .into_iter()
-            .find(|s| s.name == "Cabin")
-            .unwrap();
+        let nearby = Server {
+            addresses: vec!["192.168.1.40:7430".into()],
+            ..cabin()
+        };
         let asked = Rc::new(Asked::default());
-        let dialog = dialog_at(&asked, Some(cabin.clone()));
+        let dialog = dialog_at(&asked, Some(nearby));
         assert_eq!(dialog.dialog.title(), "Use an invite");
 
-        let look = |typed: &str| {
+        let look = |typed: &str, outcome: InviteOutcome| {
             dialog.set_link(typed);
             let link = dialog.state.borrow().link.clone();
-            dialog.read(&link, ready(client.read_invite(&link)));
-            dialog.looked_up(
-                &link,
-                ready(client.look_up_invite_code(&cabin.key, &cabin.addresses, typed)),
-            );
+            dialog.read(&link, Ok(cabin_invite()));
+            dialog.looked_up(&link, Ok(at_cabin(outcome)));
         };
-        look("qw7k-2mfp-xr4t");
+        look(
+            "qw7k-2mfp-xr4t",
+            valid(Some("Andrey"), InviteKind::CreateUser, Role::Consumer),
+        );
         assert_eq!(dialog.summary_name.label(), "Cabin");
         assert!(
             dialog
@@ -1591,7 +1639,7 @@ mod tests {
         );
         assert!(dialog.proceed.is_sensitive());
 
-        look(REVOKED_INVITE_CODE);
+        look("RVKDRVKDRVKD", InviteOutcome::Revoked);
         assert_eq!(
             (
                 dialog.summary_outcome.label().as_str(),
@@ -1602,7 +1650,7 @@ mod tests {
         );
 
         dialog.set_link("hello");
-        dialog.read("hello", ready(client.read_invite("hello")));
+        dialog.read("hello", Err(BackendError::NotAnInvite));
         assert_eq!(
             dialog.link_error.label(),
             "That isn’t an invite code. A code is 12 letters and digits, like QW7K-2MFP-XR4T."

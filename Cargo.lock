@@ -5973,9 +5973,9 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-client-sdk"
-version = "0.17.0-beta.6.g5ef5a07"
-source = "sparse+https://cargo.coldsteel.casa/api/v1/crates/"
-checksum = "36c77a43308a74eb4844d716919f0551c4f2bd7ee22c2163130eed1fb2a92419"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f0c38cb0078399837c26da1b510a762c50538625d4944eb5bdbb87a9ad0fdf5"
 dependencies = [
  "argon2 0.6.0",
  "async-trait",
@@ -6073,9 +6073,9 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-policy"
-version = "0.17.0-beta.6.g5ef5a07"
-source = "sparse+https://cargo.coldsteel.casa/api/v1/crates/"
-checksum = "61ebb3bb49bbf64a663245f240b0ea9d7ae8dea2daa497e380ead1668c07f587"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e00c01a9e7119bf29c81a3256e996b0c53e50b6f57251a112fb479f1a88b71fb"
 dependencies = [
  "serde",
  "spoolframe-protocol",
@@ -6084,9 +6084,9 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-protocol"
-version = "0.17.0-beta.6.g5ef5a07"
-source = "sparse+https://cargo.coldsteel.casa/api/v1/crates/"
-checksum = "a9d7a596ec2a44563f8e7334a6f1dc417079a99a4d838a17d1c654c6bcfe1bac"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f9e4e6046f53b69e49ba8cffb4a6e665d528233962313d5446fdd5e76c32839"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -6105,9 +6105,9 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-test-dir"
-version = "0.17.0-beta.2"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d2b2edb56d35f13e6634c43e1178970da6fffbcd62f15239fbc51ec38d2b2aa"
+checksum = "d7badcf91d24832015fd45bcc8bb06de1f6c938450c905fd088c9fdb9407cf7d"
 dependencies = [
  "tmpdir",
  "tokio",
@@ -6115,9 +6115,9 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-types"
-version = "0.17.0-beta.6.g5ef5a07"
-source = "sparse+https://cargo.coldsteel.casa/api/v1/crates/"
-checksum = "265b0607be8e3f335a1b234f005c21b052f947d0efeb7180c6c6840eb17ed799"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bcf69fd330ac255966a3e8883485bf01eb84bf9f9d31afaa0f56b19f21ba7af7"
 dependencies = [
  "serde",
  "serde_json",
@@ -6512,7 +6512,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

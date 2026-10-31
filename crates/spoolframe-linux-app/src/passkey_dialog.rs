@@ -1190,12 +1190,10 @@ mod tests {
     }
 
     fn sign_in_opens_on_which_kind() {
-        use spoolframe_linux_core::fake::FakeClient;
-        let client: Arc<dyn Client> = Arc::new(FakeClient::new(None));
-        let server = first_server(&client);
+        use spoolframe_linux_core::mock::accounts::{MockClient, home, server};
         let screen = PasskeySignIn::new(
-            client,
-            &server,
+            Arc::new(MockClient::new()),
+            &server(home(), "Home Media"),
             None,
             true,
             Ends {
@@ -1207,18 +1205,5 @@ mod tests {
             screen.remember.is_active(),
             "the sign-in form's Remember this device was not carried over"
         );
-    }
-
-    /// The fake's first server, without a runtime: its list is ready.
-    fn first_server(client: &Arc<dyn Client>) -> Server {
-        let mut servers = client.servers();
-        let waker = std::task::Waker::noop();
-        match servers
-            .as_mut()
-            .poll(&mut std::task::Context::from_waker(waker))
-        {
-            std::task::Poll::Ready(Ok(servers)) => servers.into_iter().next().unwrap(),
-            _ => panic!("the fake lists its servers at once"),
-        }
     }
 }
