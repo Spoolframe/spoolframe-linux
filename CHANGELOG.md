@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+Built with the Spoolframe SDK crates 0.17.2, for the server's 0.17.
+
+- The player's link line and Now playing's chip say LAN or internet as
+  the server counts the play. They went by the address, so a WireGuard
+  address, private to this computer, said LAN while the server counted
+  the play as away. With a server older than 0.17.1 the address
+  decides, as before.
+
 ## 0.6.2 — 2026-10-28
 
 Built with the Spoolframe SDK crates 0.17.0, for the server's 0.17.

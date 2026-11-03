@@ -1521,6 +1521,16 @@ impl Playback {
         self.session.clone()
     }
 
+    /// Whether the server counts this play off its LAN, as of its start
+    /// or last re-plan; `None` for a download or an older server.
+    pub fn wan(&self) -> Option<bool> {
+        self.now()?
+            .managed
+            .borrow()
+            .as_ref()
+            .and_then(|m| m.snapshot().wan)
+    }
+
     /// The video frames, for any number of pictures.
     pub fn paintable(&self) -> &gtk::gdk::Paintable {
         self.pipeline.paintable()

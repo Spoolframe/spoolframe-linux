@@ -307,12 +307,37 @@ pub fn path_chip(path: crate::backend::ConnectionPath) -> Option<&'static str> {
     })
 }
 
+/// The chip for a playback: as [`path_chip`], but a direct path is LAN or
+/// internet as the server counts it (`wan`, from 0.17.1). The address
+/// only says what is private to this device: a WireGuard one is, and the
+/// server may count it off its LAN. With no verdict (an older server) the
+/// address decides, as for a server's chip.
+pub fn playback_path_chip(
+    path: crate::backend::ConnectionPath,
+    wan: Option<bool>,
+) -> Option<&'static str> {
+    use crate::backend::ConnectionPath;
+    match (path, wan) {
+        (ConnectionPath::Lan { .. } | ConnectionPath::Direct { .. }, Some(true)) => {
+            Some("Direct · internet")
+        }
+        (ConnectionPath::Lan { .. } | ConnectionPath::Direct { .. }, Some(false)) => {
+            Some("Direct · LAN")
+        }
+        _ => path_chip(path),
+    }
+}
+
 /// The path and how fast the link has carried media lately, for the
 /// player (P6-06): "Direct · LAN · 48 Mbit/s", "Relayed · 6.2 Mbit/s";
 /// the path alone before anything was measured, and `None` while not
-/// connected.
-pub fn link_line(path: crate::backend::ConnectionPath, rate: Option<u64>) -> Option<String> {
-    let path = path_chip(path)?;
+/// connected. `wan` is the server's verdict, as [`playback_path_chip`].
+pub fn link_line(
+    path: crate::backend::ConnectionPath,
+    wan: Option<bool>,
+    rate: Option<u64>,
+) -> Option<String> {
+    let path = playback_path_chip(path, wan)?;
     Some(match rate {
         Some(bits) => format!("{path} · {}", link_rate(bits)),
         None => path.to_owned(),
@@ -349,7 +374,7 @@ mod tests {
     fn a_relayed_link_says_so_and_how_fast_it_is() {
         use crate::backend::ConnectionPath;
         assert_eq!(
-            link_line(ConnectionPath::Relay, Some(6_200_000)).as_deref(),
+            link_line(ConnectionPath::Relay, None, Some(6_200_000)).as_deref(),
             Some("Relayed · 6.2 Mbit/s")
         );
     }
@@ -361,11 +386,34 @@ mod tests {
             addr: ([10, 10, 0, 6], 7431).into(),
         };
         assert_eq!(
-            link_line(lan, Some(48_400_000)).as_deref(),
+            link_line(lan, None, Some(48_400_000)).as_deref(),
             Some("Direct · LAN · 48 Mbit/s")
         );
-        assert_eq!(link_line(lan, None).as_deref(), Some("Direct · LAN"));
-        assert_eq!(link_line(ConnectionPath::Unknown, Some(1)), None);
+        assert_eq!(link_line(lan, None, None).as_deref(), Some("Direct · LAN"));
+        assert_eq!(link_line(ConnectionPath::Unknown, None, Some(1)), None);
+    }
+
+    #[test]
+    fn a_playback_says_lan_or_internet_as_the_server_counts_it() {
+        use crate::backend::ConnectionPath;
+        // A WireGuard address is private to this device, and the server
+        // may count it off its LAN.
+        let private = ConnectionPath::Lan {
+            addr: ([10, 10, 0, 6], 7431).into(),
+        };
+        let public = ConnectionPath::Direct {
+            addr: ([203, 0, 113, 9], 7431).into(),
+        };
+        for (path, wan, chip) in [
+            (private, Some(true), Some("Direct · internet")),
+            (public, Some(false), Some("Direct · LAN")),
+            (private, None, Some("Direct · LAN")),
+            (public, None, Some("Direct · internet")),
+            (ConnectionPath::Relay, Some(false), Some("Relayed")),
+            (ConnectionPath::Unknown, Some(true), None),
+        ] {
+            assert_eq!(playback_path_chip(path, wan), chip, "{path:?} {wan:?}");
+        }
     }
 
     #[test]

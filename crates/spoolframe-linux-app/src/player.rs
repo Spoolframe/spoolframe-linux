@@ -185,9 +185,9 @@ pub fn page(playback: &Rc<Playback>, actions: Actions) -> adw::NavigationPage {
                         None => path,
                     })
                 }
-                _ => session
-                    .as_ref()
-                    .and_then(|s| format::link_line(s.connection_path(), s.link_rate())),
+                _ => session.as_ref().and_then(|s| {
+                    format::link_line(s.connection_path(), playback.wan(), s.link_rate())
+                }),
             };
             view.controls.show_link(line);
             view.controls.link.set_tooltip_text(

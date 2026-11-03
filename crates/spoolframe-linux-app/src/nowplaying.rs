@@ -687,7 +687,8 @@ fn show_path(chip: &gtk::Label, playback: &Playback) {
         chip.set_visible(false);
         return;
     };
-    let Some(label) = spoolframe_linux_core::format::path_chip(path) else {
+    let Some(label) = spoolframe_linux_core::format::playback_path_chip(path, playback.wan())
+    else {
         chip.set_visible(false);
         return;
     };
