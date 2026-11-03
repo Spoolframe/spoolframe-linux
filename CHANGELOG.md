@@ -2,7 +2,7 @@
 
 ## 0.6.2 — 2026-10-28
 
-Built with the Spoolframe SDK crates 0.16.3, for the server's 0.16.
+Built with the Spoolframe SDK crates 0.17.0, for the server's 0.17.
 
 - A film the server converts no longer stalls into buffering over and
   over: after running dry, playback waits for 10 seconds of the stream
@@ -237,6 +237,48 @@ Built with the Spoolframe SDK crates 0.16.3, for the server's 0.16.
   searched and filtered by license, each with its license text to read
   and copy. The list is made from Cargo.lock and the Flatpak manifest by
   `scripts/gen-licenses.py`; CI fails when it is out of date.
+
+### Also in this build
+
+- Playback, profiles, playlists and the catalog now run on the SDK's
+  own logic, so the Linux app behaves as the other clients do: track
+  and quality choices, the play queue, a playlist's next item, "Who's
+  watching", likes and the catalog's cache are the SDK's.
+- A paired server's items play through the SDK's route, and the player
+  shows its link meter and uplink shares.
+- A converted stream that starts late in the film, on a resume or a
+  seek, shows its picture at once, and its position and resume point
+  are right. It used to show no picture for minutes.
+- A converted stream no longer shows -0:00 as its length.
+- Settings lists saved servers at once and fills in each as it answers.
+  A dead server used to hold the list for a minute.
+- Library choices move into the profile's SDK store on first run, and
+  the old queue file is deleted.
+- The system's language is sent to the server, and Settings names it in
+  track preferences.
+- A feature the server lacks now shows as unavailable: the app has no
+  fallbacks for older servers.
+- The subtitle menu names each stream by the server's track and turns
+  on the one picked; a subtitle from search used to show as "SubRip",
+  and picking it could turn on another. A retimed subtitle shows from
+  where playback is, and the menu no longer shifts sideways.
+- An item page lists a subtitle downloaded while its player was open.
+- Next shows near an episode's end when it has no credits marker: such
+  an episode used to go on to the next with no Next offered.
+- A wide hero keeps the faces in its backdrop, and an item page's hero
+  is taller.
+- Widening the window no longer opens an empty Filters pane.
+- Quitting no longer panics, so the SDK and the artwork cache close
+  cleanly.
+- A cancelled confirmation or passkey sign-in does nothing when the
+  server answers late; it used to go on and remove the passkey or
+  approve the device.
+- Closing the window counts every profile's downloads before it asks
+  whether to stop them, and Keep in background no longer keeps the app
+  open after the last download ends.
+- A switched profile's download rows go at once.
+- The keyring keeps a secret it has just saved; it used to remove it
+  with the older copies.
 
 ## 0.6.1 — 2026-10-10
 
