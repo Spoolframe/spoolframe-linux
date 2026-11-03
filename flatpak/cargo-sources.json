@@ -7137,66 +7137,66 @@
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/spoolframe-client-sdk/spoolframe-client-sdk-0.17.0.crate",
-        "sha256": "1f0c38cb0078399837c26da1b510a762c50538625d4944eb5bdbb87a9ad0fdf5",
-        "dest": "cargo/vendor/spoolframe-client-sdk-0.17.0"
+        "url": "https://static.crates.io/crates/spoolframe-client-sdk/spoolframe-client-sdk-0.17.2.crate",
+        "sha256": "39f2596788d2968c3fc1795e01711bd733891e25fdb949c589c58eaa7fdc12cc",
+        "dest": "cargo/vendor/spoolframe-client-sdk-0.17.2"
     },
     {
         "type": "inline",
-        "contents": "{\"package\": \"1f0c38cb0078399837c26da1b510a762c50538625d4944eb5bdbb87a9ad0fdf5\", \"files\": {}}",
-        "dest": "cargo/vendor/spoolframe-client-sdk-0.17.0",
+        "contents": "{\"package\": \"39f2596788d2968c3fc1795e01711bd733891e25fdb949c589c58eaa7fdc12cc\", \"files\": {}}",
+        "dest": "cargo/vendor/spoolframe-client-sdk-0.17.2",
         "dest-filename": ".cargo-checksum.json"
     },
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/spoolframe-policy/spoolframe-policy-0.17.0.crate",
-        "sha256": "e00c01a9e7119bf29c81a3256e996b0c53e50b6f57251a112fb479f1a88b71fb",
-        "dest": "cargo/vendor/spoolframe-policy-0.17.0"
+        "url": "https://static.crates.io/crates/spoolframe-policy/spoolframe-policy-0.17.2.crate",
+        "sha256": "666bd01a02f55364623abd875bac8b2eb8603a3f4670eb2c623895f896e8db16",
+        "dest": "cargo/vendor/spoolframe-policy-0.17.2"
     },
     {
         "type": "inline",
-        "contents": "{\"package\": \"e00c01a9e7119bf29c81a3256e996b0c53e50b6f57251a112fb479f1a88b71fb\", \"files\": {}}",
-        "dest": "cargo/vendor/spoolframe-policy-0.17.0",
+        "contents": "{\"package\": \"666bd01a02f55364623abd875bac8b2eb8603a3f4670eb2c623895f896e8db16\", \"files\": {}}",
+        "dest": "cargo/vendor/spoolframe-policy-0.17.2",
         "dest-filename": ".cargo-checksum.json"
     },
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/spoolframe-protocol/spoolframe-protocol-0.17.0.crate",
-        "sha256": "9f9e4e6046f53b69e49ba8cffb4a6e665d528233962313d5446fdd5e76c32839",
-        "dest": "cargo/vendor/spoolframe-protocol-0.17.0"
+        "url": "https://static.crates.io/crates/spoolframe-protocol/spoolframe-protocol-0.17.2.crate",
+        "sha256": "0d2f94bf1a08d477f1237d32ebc2ce2ae112c98f7839848290134e12b23d3372",
+        "dest": "cargo/vendor/spoolframe-protocol-0.17.2"
     },
     {
         "type": "inline",
-        "contents": "{\"package\": \"9f9e4e6046f53b69e49ba8cffb4a6e665d528233962313d5446fdd5e76c32839\", \"files\": {}}",
-        "dest": "cargo/vendor/spoolframe-protocol-0.17.0",
+        "contents": "{\"package\": \"0d2f94bf1a08d477f1237d32ebc2ce2ae112c98f7839848290134e12b23d3372\", \"files\": {}}",
+        "dest": "cargo/vendor/spoolframe-protocol-0.17.2",
         "dest-filename": ".cargo-checksum.json"
     },
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/spoolframe-test-dir/spoolframe-test-dir-0.17.0.crate",
-        "sha256": "d7badcf91d24832015fd45bcc8bb06de1f6c938450c905fd088c9fdb9407cf7d",
-        "dest": "cargo/vendor/spoolframe-test-dir-0.17.0"
+        "url": "https://static.crates.io/crates/spoolframe-test-dir/spoolframe-test-dir-0.17.2.crate",
+        "sha256": "94f06eb5da9895bff38b0e8ac79e7662f1a01efb55d96c865d10aaa5539f03a5",
+        "dest": "cargo/vendor/spoolframe-test-dir-0.17.2"
     },
     {
         "type": "inline",
-        "contents": "{\"package\": \"d7badcf91d24832015fd45bcc8bb06de1f6c938450c905fd088c9fdb9407cf7d\", \"files\": {}}",
-        "dest": "cargo/vendor/spoolframe-test-dir-0.17.0",
+        "contents": "{\"package\": \"94f06eb5da9895bff38b0e8ac79e7662f1a01efb55d96c865d10aaa5539f03a5\", \"files\": {}}",
+        "dest": "cargo/vendor/spoolframe-test-dir-0.17.2",
         "dest-filename": ".cargo-checksum.json"
     },
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/spoolframe-types/spoolframe-types-0.17.0.crate",
-        "sha256": "bcf69fd330ac255966a3e8883485bf01eb84bf9f9d31afaa0f56b19f21ba7af7",
-        "dest": "cargo/vendor/spoolframe-types-0.17.0"
+        "url": "https://static.crates.io/crates/spoolframe-types/spoolframe-types-0.17.2.crate",
+        "sha256": "6771d3ef4edb4cd26a313be1100b292b69ccb34a42f90a5992261c3672e413fa",
+        "dest": "cargo/vendor/spoolframe-types-0.17.2"
     },
     {
         "type": "inline",
-        "contents": "{\"package\": \"bcf69fd330ac255966a3e8883485bf01eb84bf9f9d31afaa0f56b19f21ba7af7\", \"files\": {}}",
-        "dest": "cargo/vendor/spoolframe-types-0.17.0",
+        "contents": "{\"package\": \"6771d3ef4edb4cd26a313be1100b292b69ccb34a42f90a5992261c3672e413fa\", \"files\": {}}",
+        "dest": "cargo/vendor/spoolframe-types-0.17.2",
         "dest-filename": ".cargo-checksum.json"
     },
     {

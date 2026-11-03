@@ -369,11 +369,13 @@ impl MockPlayback {
                 plan: converted_plan(item, selection, None),
                 size: 0,
                 epoch,
+                wan: None,
             },
             false => PlaybackChange {
                 plan: direct_plan(item, &tracks_of(item), selection),
                 size: self.media_size()?,
                 epoch,
+                wan: None,
             },
         })
     }
@@ -581,6 +583,8 @@ impl Session for MockPlayback {
                 epoch: 0,
                 markers: self.markers.clone(),
                 duration: length_of(item),
+                // A server older than 0.17.1 gives no verdict.
+                wan: None,
             })
         })
     }

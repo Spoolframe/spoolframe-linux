@@ -5973,9 +5973,9 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-client-sdk"
-version = "0.17.0"
+version = "0.17.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f0c38cb0078399837c26da1b510a762c50538625d4944eb5bdbb87a9ad0fdf5"
+checksum = "39f2596788d2968c3fc1795e01711bd733891e25fdb949c589c58eaa7fdc12cc"
 dependencies = [
  "argon2 0.6.0",
  "async-trait",
@@ -6073,9 +6073,9 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-policy"
-version = "0.17.0"
+version = "0.17.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e00c01a9e7119bf29c81a3256e996b0c53e50b6f57251a112fb479f1a88b71fb"
+checksum = "666bd01a02f55364623abd875bac8b2eb8603a3f4670eb2c623895f896e8db16"
 dependencies = [
  "serde",
  "spoolframe-protocol",
@@ -6084,9 +6084,9 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-protocol"
-version = "0.17.0"
+version = "0.17.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f9e4e6046f53b69e49ba8cffb4a6e665d528233962313d5446fdd5e76c32839"
+checksum = "0d2f94bf1a08d477f1237d32ebc2ce2ae112c98f7839848290134e12b23d3372"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -6105,9 +6105,9 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-test-dir"
-version = "0.17.0"
+version = "0.17.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7badcf91d24832015fd45bcc8bb06de1f6c938450c905fd088c9fdb9407cf7d"
+checksum = "94f06eb5da9895bff38b0e8ac79e7662f1a01efb55d96c865d10aaa5539f03a5"
 dependencies = [
  "tmpdir",
  "tokio",
@@ -6115,9 +6115,9 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-types"
-version = "0.17.0"
+version = "0.17.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bcf69fd330ac255966a3e8883485bf01eb84bf9f9d31afaa0f56b19f21ba7af7"
+checksum = "6771d3ef4edb4cd26a313be1100b292b69ccb34a42f90a5992261c3672e413fa"
 dependencies = [
  "serde",
  "serde_json",
