@@ -151,6 +151,7 @@ pub fn movie(key: &str, title: &str) -> Item {
         cast: Vec::new(),
         artwork: Vec::new(),
         playback: PlaybackState::default(),
+        merge: Default::default(),
     })
 }
 
@@ -172,6 +173,7 @@ pub fn episode(key: &str, show: &str, season: u32, number: u32, title: &str) -> 
         cast: Vec::new(),
         artwork: Vec::new(),
         playback: PlaybackState::default(),
+        merge: Default::default(),
     })
 }
 
@@ -193,6 +195,7 @@ pub fn track(key: &str, title: &str) -> Item {
         duration: None,
         artwork: Vec::new(),
         playback: PlaybackState::default(),
+        merge: Default::default(),
     })
 }
 

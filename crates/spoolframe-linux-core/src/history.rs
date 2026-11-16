@@ -31,6 +31,9 @@ pub fn recent_albums(played: &[Item], limit: usize) -> Vec<Album> {
             track_count: track.album_track_count,
             // The server gives a track its album's cover.
             artwork: track.artwork.clone(),
+            // A track carries none of its album's merge facts; opening the
+            // album reads them.
+            merge: Default::default(),
         });
     }
     albums
@@ -62,6 +65,7 @@ mod tests {
             duration: None,
             artwork: Vec::new(),
             playback: PlaybackState::default(),
+            merge: Default::default(),
         })
     }
 

@@ -597,6 +597,7 @@ pub fn show_of(episode: &Episode) -> Item {
         season_count: None,
         cast: Vec::new(),
         last_aired: None,
+        merge: Default::default(),
     })
 }
 
@@ -644,6 +645,7 @@ pub fn artist_of(track: &Track) -> Item {
         name: String::new(),
         summary: None,
         artwork: Vec::new(),
+        merge: Default::default(),
     })
 }
 
@@ -657,6 +659,7 @@ pub fn album_of(track: &Track) -> Item {
         year: None,
         artwork: Vec::new(),
         track_count: None,
+        merge: Default::default(),
     })
 }
 
@@ -1084,6 +1087,7 @@ mod tests {
             year: None,
             air_date: None,
             cast: Vec::new(),
+            merge: Default::default(),
         })
     }
 
@@ -1128,6 +1132,7 @@ mod tests {
             artist_name: artist.map(Into::into),
             album_title: album.map(Into::into),
             artwork: Vec::new(),
+            merge: Default::default(),
         })
     }
 

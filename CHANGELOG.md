@@ -2,7 +2,7 @@
 
 ## 0.6.3 — 2026-11-03
 
-Built with the Spoolframe SDK crates 0.17.2, for the server's 0.17.
+Built with the Spoolframe SDK crates 0.17.4, for the server's 0.17.
 
 - The player's link line and Now playing's chip say LAN or internet as
   the server counts the play. They went by the address, so a WireGuard

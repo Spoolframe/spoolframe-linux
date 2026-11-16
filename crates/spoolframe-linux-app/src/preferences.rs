@@ -1586,6 +1586,7 @@ mod tests {
             },
             note: None,
             created_at: std::time::UNIX_EPOCH,
+            addons: Vec::new(),
         };
         let downloads = [download("1", 30_000_000_000), download("2", 1_000_000_000)];
         assert_eq!(

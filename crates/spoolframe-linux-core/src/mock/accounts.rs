@@ -641,5 +641,6 @@ pub fn local_download(key: &str, item: Item) -> LocalDownload {
         watch: LocalWatch::default(),
         note: None,
         created_at: UNIX_EPOCH,
+        addons: Vec::new(),
     }
 }

@@ -986,5 +986,6 @@ pub fn download(key: &str, item: Item, path: PathBuf) -> LocalDownload {
         watch: Default::default(),
         note: None,
         created_at: SystemTime::UNIX_EPOCH,
+        addons: Vec::new(),
     }
 }

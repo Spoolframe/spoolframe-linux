@@ -613,6 +613,7 @@ mod tests {
             cast: Vec::new(),
             artwork: Vec::new(),
             playback: Default::default(),
+            merge: Default::default(),
         });
         let copy = playing_copy(&item, Some(&heat_copies(bobs("17"))));
         assert_eq!(copy.id(), &bobs("17"));
@@ -639,6 +640,7 @@ mod tests {
             cast: Vec::new(),
             artwork: Vec::new(),
             playback: Default::default(),
+            merge: Default::default(),
         });
         let hits = SearchResults {
             without_year: vec![SearchHit::new(item, heat_copies(movie("3")))],
@@ -722,6 +724,7 @@ mod tests {
             cast: Vec::new(),
             artwork: Vec::new(),
             playback: Default::default(),
+            merge: Default::default(),
         });
         assert_eq!(library_of(&item, &libraries), Some("Films"));
     }

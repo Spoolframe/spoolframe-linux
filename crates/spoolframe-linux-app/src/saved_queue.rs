@@ -207,6 +207,7 @@ mod tests {
             artist_name: None,
             album_title: None,
             artwork: Vec::new(),
+            merge: Default::default(),
         })
     }
 

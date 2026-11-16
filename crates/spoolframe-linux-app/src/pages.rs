@@ -1564,6 +1564,7 @@ pub fn album(
                 name: artist.to_owned(),
                 summary: None,
                 artwork: Vec::new(),
+                merge: Default::default(),
             }),
         );
         artist_link.connect_clicked(move |_| open(item.clone()));
@@ -1829,6 +1830,7 @@ mod tests {
             year: None,
             air_date: None,
             cast: Vec::new(),
+            merge: Default::default(),
         })
     }
 

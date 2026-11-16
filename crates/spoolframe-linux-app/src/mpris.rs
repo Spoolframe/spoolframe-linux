@@ -878,6 +878,7 @@ mod tests {
             artist_name: None,
             album_title: None,
             artwork: Vec::new(),
+            merge: Default::default(),
         });
         let album = Album {
             id: id(MediaKind::Album, "5"),
@@ -887,6 +888,7 @@ mod tests {
             year: Some(1998),
             artwork: Vec::new(),
             track_count: None,
+            merge: Default::default(),
         };
         (track, album)
     }
@@ -908,6 +910,7 @@ mod tests {
             year: None,
             air_date: None,
             cast: Vec::new(),
+            merge: Default::default(),
         })
     }
 
@@ -923,6 +926,7 @@ mod tests {
             content_rating: None,
             cast: Vec::new(),
             release_date: None,
+            merge: Default::default(),
         })
     }
 
