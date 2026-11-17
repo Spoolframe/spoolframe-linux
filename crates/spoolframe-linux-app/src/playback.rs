@@ -2396,6 +2396,12 @@ impl Playback {
         let (id, requested) = (current.item.id().clone(), current.requested);
         let quality = self.quality.get();
         let display = self.display.borrow().clone();
+        let playlist = self
+            .playlist
+            .borrow()
+            .as_ref()
+            .map(|p| p.playing.id.clone());
+        let source = crate::queue::play_source(&mut self.queue.borrow_mut(), playlist);
         // The session numbers the start here, as it is called: it keeps its
         // place among the starts and ends asked, however the tasks run.
         let opening = player.start(
@@ -2405,6 +2411,7 @@ impl Playback {
                 start: from,
                 quality,
                 display,
+                source,
                 ..Default::default()
             },
         );
