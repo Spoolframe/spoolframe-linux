@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use adw::prelude::*;
 use gtk::glib;
-use spoolframe_client_sdk::{HeldPairing, Pairing, RelayAnswer, RelayPairing, SdkError};
+use spoolframe_client_sdk::{HeldPairing, HoldEnd, Pairing, RelayAnswer, RelayPairing, SdkError};
 use spoolframe_linux_core::identity::{Identities, IdentityView};
 use spoolframe_protocol::portable::PortableUserId;
 
@@ -41,6 +41,16 @@ const KEY_APPROVED: &str =
 pub fn phone_approved_line(phone: Option<&str>) -> String {
     let phone = phone.unwrap_or("Your iPhone");
     format!("{phone} approved this computer. Check it shows this before accepting:")
+}
+
+/// Why the compare page closed on its own: a phone's hold ended before
+/// Accept or Not mine. The page offers a new code under it.
+fn hold_end_line(end: HoldEnd) -> &'static str {
+    match end {
+        HoldEnd::PhoneLeft => "The phone left before you accepted. Get a new code and try again.",
+        HoldEnd::TimedOut => "Nobody accepted in 2 minutes. Get a new code and try again.",
+        HoldEnd::CodeEnded => "The pairing stopped. Get a new code and try again.",
+    }
 }
 
 /// What is waiting on Accept: the code's answer, or the pairing a phone
@@ -97,6 +107,11 @@ struct View {
     /// The pairing by QR running beside the code; cancelled when the code
     /// is, or the dialog goes.
     local: RefCell<Option<Arc<Pairing>>>,
+    /// Waits on a held QR pairing's end with no answer here (the phone
+    /// left, two minutes passed, the code stopped). Aborted once it is
+    /// answered or let go: it holds the pairing too, and a pairing
+    /// rejects only as its last holder drops it.
+    hold_watch: RefCell<Option<tokio::task::AbortHandle>>,
     /// Bumped by each new code and on close: an older poll stops.
     round: Cell<u64>,
 }
@@ -258,6 +273,7 @@ pub fn open(parent: &impl IsA<gtk::Widget>, needs: Needs) {
         qr,
         scan,
         local: RefCell::new(None),
+        hold_watch: RefCell::new(None),
         round: Cell::new(0),
     });
     {
@@ -501,6 +517,7 @@ impl View {
         if let Some(pairing) = self.local.borrow_mut().take() {
             pairing.cancel();
         }
+        self.stop_hold_watch();
         // A phone's pairing still held is rejected as it is dropped.
         if matches!(*self.approved.borrow(), Some(Approved::Qr(_))) {
             self.approved.borrow_mut().take();
@@ -523,16 +540,48 @@ impl View {
     /// for Accept (or Not mine, or closing, which reject it). The code
     /// stops: one way is enough. The QR's pairing stays in `local` until
     /// then: it carries what Accept confirms.
-    fn compare_qr(&self, held: HeldPairing) {
-        self.next_round();
+    fn compare_qr(self: &Rc<Self>, held: HeldPairing) {
+        let round = self.next_round();
         self.approved_by
             .set_text(&phone_approved_line(held.phone_name()));
         self.identity.set_text(held.fingerprint());
         self.qr.set_visible(false);
         self.scan.set_visible(false);
-        *self.approved.borrow_mut() = Some(Approved::Qr(Arc::new(held)));
+        let held = Arc::new(held);
+        *self.approved.borrow_mut() = Some(Approved::Qr(held.clone()));
+        self.watch_hold(held, round);
         self.stack.set_visible_child_name("compare");
         self.accept.grab_focus();
+    }
+
+    /// Closes the compare page if the phone's hold ends with no answer
+    /// here. `ended` never resolves once this page answered; an end that
+    /// still comes after Accept took the pairing is left to Accept, whose
+    /// confirm then fails with the reason.
+    fn watch_hold(self: &Rc<Self>, held: Arc<HeldPairing>, round: u64) {
+        let watching = relm4::spawn(async move { held.ended().await });
+        self.stop_hold_watch();
+        *self.hold_watch.borrow_mut() = Some(watching.abort_handle());
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let Ok(end) = watching.await else { return };
+            let Some(view) = weak.upgrade() else { return };
+            let held_here = matches!(*view.approved.borrow(), Some(Approved::Qr(_)));
+            if !view.is_current(round) || !held_here {
+                return;
+            }
+            view.hold_watch.take();
+            view.approved.borrow_mut().take();
+            view.stop_local();
+            view.trouble.set_text(hold_end_line(end));
+            view.stack.set_visible_child_name("expired");
+        });
+    }
+
+    fn stop_hold_watch(&self) {
+        if let Some(watching) = self.hold_watch.borrow_mut().take() {
+            watching.abort();
+        }
     }
 
     /// Accept: this computer becomes one of the identity's devices.
@@ -540,6 +589,8 @@ impl View {
         let Some(approved) = self.approved.borrow_mut().take() else {
             return;
         };
+        // Answered here: the hold's end is no longer this page's to show.
+        self.stop_hold_watch();
         self.accept.set_sensitive(false);
         let (identities, weak) = (self.needs.identities.clone(), Rc::downgrade(self));
         glib::spawn_future_local(async move {
@@ -627,6 +678,15 @@ mod tests {
             std::time::Duration::from_secs(2),
             || chose.get()
         ));
+    }
+
+    #[test]
+    fn each_way_a_phone_s_hold_ends_is_told_apart() {
+        let lines: std::collections::HashSet<_> =
+            [HoldEnd::PhoneLeft, HoldEnd::TimedOut, HoldEnd::CodeEnded]
+                .map(hold_end_line)
+                .into();
+        assert_eq!(lines.len(), 3);
     }
 
     #[test]
