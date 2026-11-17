@@ -287,6 +287,40 @@ pub fn audio_format(
     })
 }
 
+/// An item's ratings as its page lists them, critics' first: whose each
+/// is and how much, "Rotten Tomatoes 92%", "IMDb 7.9". Rotten Tomatoes
+/// rates both ways, so its audience score says so. A rating whose source
+/// the server does not say (one without `spoolframe:rating-sources`)
+/// reads out of 10, as the catalog keeps it: "Rated 7.9".
+pub fn ratings(merge: &spoolframe_types::MergeFacts) -> Vec<String> {
+    [
+        (merge.rating_tenths, merge.rating_source.as_ref(), false),
+        (
+            merge.audience_rating_tenths,
+            merge.audience_rating_source.as_ref(),
+            true,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(tenths, source, audience)| Some(rating(tenths?, source, audience)))
+    .collect()
+}
+
+fn rating(tenths: u16, source: Option<&spoolframe_types::RatingSource>, audience: bool) -> String {
+    use spoolframe_types::RatingProvider;
+    let Some(source) = source else {
+        return format!("Rated {}.{}", tenths / 10, tenths % 10);
+    };
+    let value = source.display(tenths);
+    match source.provider {
+        RatingProvider::RottenTomatoes if audience => format!("Rotten Tomatoes audience {value}"),
+        RatingProvider::RottenTomatoes => format!("Rotten Tomatoes {value}"),
+        RatingProvider::Imdb => format!("IMDb {value}"),
+        RatingProvider::Tmdb => format!("TMDB {value}"),
+        RatingProvider::Unknown => format!("Rated {value}"),
+    }
+}
+
 /// "1 season", "2 seasons".
 pub fn seasons(n: u32) -> String {
     match n {
@@ -425,6 +459,50 @@ mod tests {
             }),
             Some("Direct · internet")
         );
+    }
+
+    fn source(image: &str) -> spoolframe_types::RatingSource {
+        spoolframe_types::RatingSource::from_image(image).expect("a known image")
+    }
+
+    #[test]
+    fn a_rating_says_whose_it_is_on_its_own_scale() {
+        let merge = spoolframe_types::MergeFacts {
+            rating_tenths: Some(92),
+            rating_source: Some(source("rottentomatoes://image.rating.ripe")),
+            audience_rating_tenths: Some(79),
+            audience_rating_source: Some(source("imdb://image.rating")),
+            ..Default::default()
+        };
+        assert_eq!(ratings(&merge), ["Rotten Tomatoes 92%", "IMDb 7.9"]);
+    }
+
+    #[test]
+    fn rotten_tomatoes_audience_score_is_named_as_the_audience_s() {
+        let merge = spoolframe_types::MergeFacts {
+            audience_rating_tenths: Some(85),
+            audience_rating_source: Some(source("rottentomatoes://image.rating.upright")),
+            ..Default::default()
+        };
+        assert_eq!(ratings(&merge), ["Rotten Tomatoes audience 85%"]);
+    }
+
+    #[test]
+    fn a_rating_with_no_source_reads_out_of_ten() {
+        let merge = spoolframe_types::MergeFacts {
+            rating_tenths: Some(79),
+            ..Default::default()
+        };
+        assert_eq!(ratings(&merge), ["Rated 7.9"]);
+    }
+
+    #[test]
+    fn a_source_with_no_rating_says_nothing() {
+        let merge = spoolframe_types::MergeFacts {
+            rating_source: Some(source("imdb://image.rating")),
+            ..Default::default()
+        };
+        assert!(ratings(&merge).is_empty());
     }
 
     #[test]

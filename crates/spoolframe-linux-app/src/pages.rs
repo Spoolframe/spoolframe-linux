@@ -183,7 +183,7 @@ pub fn playable(
             .or_else(|| e.year.map(|y| y.to_string())),
         _ => None,
     };
-    let meta: Vec<String> = [
+    let mut meta: Vec<String> = [
         facts.detail.clone(),
         aired,
         facts.length.map(format::length),
@@ -191,6 +191,8 @@ pub fn playable(
     .into_iter()
     .flatten()
     .collect();
+    // Whose each rating is, as the server says (rating sources, 0.17.5).
+    meta.extend(item.merge().map(format::ratings).unwrap_or_default());
     // The facts as separate spans, as designed, not joined by dots.
     if !meta.is_empty() {
         let row = gtk::Box::builder()
