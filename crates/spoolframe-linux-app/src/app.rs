@@ -19,8 +19,8 @@ use spoolframe_linux_core::backend::{
     BackendError, ChosenTracks, Client, ConnectionState, EntryId, HomeScreen, Invite, InviteLookup,
     ItemDetail, Kinds, LanServerInfo, Liked, Person, PlaySettings, PlaylistEdit, PlaylistEvent,
     PlaylistList, PlaylistNext, PlaylistPage, PlaylistRef, PlaylistSummary, PlaylistUpdate,
-    Profile, ProfileChange, ProfileEvent, ProfileSignIn, SearchScope, Selection, Server, ServerKey,
-    Session, TrackPreferencesInfo, Visibility,
+    Profile, ProfileChange, ProfileEvent, ProfileSignIn, RecentlyPlayedPreferences, SearchScope,
+    Selection, Server, ServerKey, Session, TrackPreferencesInfo, Visibility,
 };
 use spoolframe_linux_core::backend::{
     DownloadEvent, DownloadOptionsInfo, DownloadSource, DownloadSpace, DownloadTracks,
@@ -563,6 +563,8 @@ pub enum Msg {
     /// Forget them, and reopen the item's page with the server's choice.
     ForgetTracks(Box<Item>),
     SetTrackPreferences(Box<TrackPreferences>),
+    /// Save what Home's Recently played row shows, then show Home again.
+    SetRecentlyPlayedPreferences(RecentlyPlayedPreferences),
     ConnectionChanged(ConnectionState),
     /// The client's server list changed (a server heard on the LAN).
     ServersChanged,
@@ -725,11 +727,15 @@ pub enum Loaded {
     /// A change the user does not need to hear about unless it failed.
     Saved(Result<(), BackendError>),
     TracksForgotten(Box<Item>, Result<(), BackendError>),
-    /// The user's track preferences, for Settings opening on `Open`.
+    /// The user's track preferences, for Settings opening on `Open`, and
+    /// what the Recently played row shows, from a server with the row.
     Preferences(
         crate::settings_window::Open,
         Result<TrackPreferencesInfo, BackendError>,
+        Option<RecentlyPlayedPreferences>,
     ),
+    /// The Recently played row's preferences, saved.
+    RowPreferencesSaved(Result<(), BackendError>),
     /// What the server said to the PIN typed for a locked profile.
     Unlocked(Box<Profile>, Result<(), BackendError>),
     Activated(u64, Box<Profile>, Result<(), BackendError>),
@@ -828,7 +834,8 @@ impl Loaded {
             | Loaded::Enqueued(_, Err(e))
             | Loaded::Saved(Err(e))
             | Loaded::TracksForgotten(_, Err(e))
-            | Loaded::Preferences(_, Err(e))
+            | Loaded::Preferences(_, Err(e), _)
+            | Loaded::RowPreferencesSaved(Err(e))
             | Loaded::Playlists(Err(e))
             | Loaded::PlaylistPage(_, _, Err(e))
             | Loaded::PlaylistMore(_, Err(e))
@@ -2632,6 +2639,16 @@ impl Component for App {
                     Loaded::Saved(session.set_track_preferences(&preferences).await)
                 });
             }
+            Msg::SetRecentlyPlayedPreferences(preferences) => {
+                let Some(session) = self.session.clone() else {
+                    return;
+                };
+                self.command(&sender, async move {
+                    Loaded::RowPreferencesSaved(
+                        session.set_recently_played_preferences(preferences).await,
+                    )
+                });
+            }
             Msg::OpenServerSettings => {
                 let open = match &self.server {
                     Some(server) => crate::settings_window::Open::Server(server.key.clone()),
@@ -2644,12 +2661,16 @@ impl Component for App {
                     return window.present();
                 }
                 match self.session.clone() {
-                    // The server's page shows the user's track preferences,
-                    // from the server.
+                    // The server's page shows the user's track preferences
+                    // and the Recently played row's, from the server.
                     Some(session) => self.command(&sender, async move {
-                        Loaded::Preferences(open, session.track_preferences().await)
+                        let (tracks, recent) = tokio::join!(
+                            session.track_preferences(),
+                            row_preferences(session.as_ref())
+                        );
+                        Loaded::Preferences(open, tracks, recent)
                     }),
-                    None => self.open_settings(None, open, &sender, root),
+                    None => self.open_settings(None, None, open, &sender, root),
                 }
             }
             Msg::SetTheme(theme) => {
@@ -3844,13 +3865,20 @@ impl Component for App {
             }
             // The bar's heart stays empty; the track plays on.
             Loaded::Heart(_, Err(e)) => tracing::debug!(error = %e, "no heart for the bar"),
-            Loaded::Preferences(open, result) => {
+            Loaded::Preferences(open, result, recent) => {
                 // Without the server's preferences, Settings still opens.
                 let tracks = result
                     .inspect_err(|e| tracing::warn!(error = %e, "no track preferences"))
                     .ok();
-                self.open_settings(tracks, open, &sender, root);
+                self.open_settings(tracks, recent, open, &sender, root);
             }
+            // Home shows the row as it now is, if it is what is on screen.
+            Loaded::RowPreferencesSaved(Ok(())) => {
+                if self.on_home(widgets) {
+                    self.load_home(&sender);
+                }
+            }
+            Loaded::RowPreferencesSaved(Err(e)) => toast(widgets, &e),
         }
     }
 }
@@ -3860,6 +3888,7 @@ impl App {
     fn open_settings(
         &mut self,
         tracks: Option<TrackPreferencesInfo>,
+        recent: Option<RecentlyPlayedPreferences>,
         open: crate::settings_window::Open,
         sender: &ComponentSender<Self>,
         root: &adw::ApplicationWindow,
@@ -3871,6 +3900,10 @@ impl App {
         let set_tracks: preferences::SetTracks = {
             let sender = sender.clone();
             Rc::new(move |p| sender.input(Msg::SetTrackPreferences(Box::new(p))))
+        };
+        let set_recent: preferences::SetRecent = {
+            let sender = sender.clone();
+            Rc::new(move |p| sender.input(Msg::SetRecentlyPlayedPreferences(p)))
         };
         let servers = preferences::Servers {
             client: self.client.clone(),
@@ -3921,6 +3954,7 @@ impl App {
         let signed = self.signed(sender).map(|profile| preferences::Signed {
             profile,
             tracks: tracks.map(|tracks| (tracks, set_tracks)),
+            recent: recent.map(|recent| (recent, set_recent)),
         });
         let window = crate::settings_window::window(
             root,
@@ -5893,6 +5927,20 @@ async fn recently_played(session: &dyn Session) -> Recent {
     }
 }
 
+/// What the Recently played row shows, for Settings: none from a server
+/// without the row, or, said in the log, one that could not say. Settings
+/// then leaves the group out.
+async fn row_preferences(session: &dyn Session) -> Option<RecentlyPlayedPreferences> {
+    match session.recently_played_preferences().await {
+        Ok(preferences) => Some(preferences),
+        Err(BackendError::Unsupported(_)) => None,
+        Err(e) => {
+            tracing::warn!(error = %e, "no recently played preferences");
+            None
+        }
+    }
+}
+
 /// The albums of the tracks played lately, for Home (PX-52): none, said
 /// in the log, when the server could not say. The row is a convenience; Home opens without it.
 async fn recent_albums(session: &dyn Session) -> Vec<Album> {
@@ -6896,6 +6944,25 @@ mod tests {
         let recent = spoolframe_linux_core::testing::ready(recently_played(&session));
         assert!(
             matches!(&recent, Recent::Row(cards) if cards[..] == [RowCard::Item(Box::new(Item::Movie(movie)))])
+        );
+    }
+
+    #[test]
+    fn settings_gets_the_row_s_preferences_from_a_server_with_the_row() {
+        let session = spoolframe_linux_core::mock::shell::MockCatalog::new()
+            .with_recently_played_row(Vec::new());
+        assert_eq!(
+            spoolframe_linux_core::testing::ready(row_preferences(&session)),
+            Some(RecentlyPlayedPreferences::default())
+        );
+    }
+
+    #[test]
+    fn settings_gets_no_row_preferences_from_a_server_without_the_row() {
+        let session = spoolframe_linux_core::mock::shell::MockCatalog::new();
+        assert_eq!(
+            spoolframe_linux_core::testing::ready(row_preferences(&session)),
+            None
         );
     }
 

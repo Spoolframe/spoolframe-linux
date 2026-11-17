@@ -10,6 +10,9 @@ use std::sync::Arc;
 use adw::prelude::*;
 use spoolframe_linux_core::backend::TrackPreferencesInfo;
 use spoolframe_linux_core::backend::{Client, LocalDownload, Reachability, Server, ServerKey};
+use spoolframe_linux_core::backend::{
+    RecentMoviesMode, RecentMusicMode, RecentShowsMode, RecentlyPlayedPreferences,
+};
 use spoolframe_linux_core::format;
 use spoolframe_linux_core::theme::Theme;
 use spoolframe_types::{
@@ -42,6 +45,51 @@ const FORCED: [(ForcedPreference, &str); 4] = [
     (ForcedPreference::Avoid, "Avoid forced"),
     (ForcedPreference::Only, "Only forced"),
 ];
+
+/// How music shows in Home's Recently played row.
+const RECENT_MUSIC: [(RecentMusicMode, &str); 4] = [
+    (RecentMusicMode::Sources, "Where it was played from"),
+    (RecentMusicMode::Tracks, "Each track"),
+    (RecentMusicMode::Albums, "Albums"),
+    (RecentMusicMode::Hidden, "Hidden"),
+];
+
+/// How shows show in Home's Recently played row.
+const RECENT_SHOWS: [(RecentShowsMode, &str); 4] = [
+    (RecentShowsMode::Show, "Shows"),
+    (RecentShowsMode::Season, "Seasons"),
+    (RecentShowsMode::Episode, "Episodes"),
+    (RecentShowsMode::Hidden, "Hidden"),
+];
+
+/// How films show in Home's Recently played row.
+const RECENT_MOVIES: [(RecentMoviesMode, &str); 2] = [
+    (RecentMoviesMode::Movie, "Movies"),
+    (RecentMoviesMode::Hidden, "Hidden"),
+];
+
+/// The Recently played combo rows' choices for `p`, music, shows and
+/// movies: a mode this build does not know shows as the SDK reads it,
+/// its kind's default, not as the first choice listed.
+fn shown_recent(p: RecentlyPlayedPreferences) -> [u32; 3] {
+    let music = match p.music {
+        RecentMusicMode::Unknown => RecentMusicMode::default(),
+        known => known,
+    };
+    let shows = match p.shows {
+        RecentShowsMode::Unknown => RecentShowsMode::default(),
+        known => known,
+    };
+    let movies = match p.movies {
+        RecentMoviesMode::Unknown => RecentMoviesMode::default(),
+        known => known,
+    };
+    [
+        shown_choice(&RECENT_MUSIC, &music),
+        shown_choice(&RECENT_SHOWS, &shows),
+        shown_choice(&RECENT_MOVIES, &movies),
+    ]
+}
 
 /// Which of `choices` a combo row shows for `value`: the first, for one
 /// it does not list.
@@ -409,6 +457,9 @@ pub type SetQuality = Rc<dyn Fn(spoolframe_client_sdk::PlaybackQuality)>;
 
 /// Saves the user's track preferences on the server.
 pub type SetTracks = Rc<dyn Fn(TrackPreferences)>;
+
+/// Saves what Home's Recently played row shows, on the server.
+pub type SetRecent = Rc<dyn Fn(RecentlyPlayedPreferences)>;
 
 /// Turns skipping intros on or off.
 pub type SetSkipIntros = Rc<dyn Fn(bool)>;
@@ -949,6 +1000,8 @@ pub(crate) fn about(open_licenses: impl Fn() + 'static) -> adw::PreferencesPage 
 pub(crate) struct Signed {
     pub profile: crate::profile_page::Signed,
     pub tracks: Option<(TrackPreferencesInfo, SetTracks)>,
+    /// What the Recently played row shows; none from a server without it.
+    pub recent: Option<(RecentlyPlayedPreferences, SetRecent)>,
 }
 
 /// How a server can be reached now, from its reachability report.
@@ -1245,6 +1298,9 @@ pub(crate) fn server_page(
                     page.add(&group);
                 }
             }
+            if let Some((preferences, set_recent)) = signed.recent {
+                page.add(&recent_group(preferences, set_recent));
+            }
             for group in parts.security.iter().chain(&parts.plex) {
                 page.add(group);
             }
@@ -1481,6 +1537,67 @@ fn track_groups(info: TrackPreferencesInfo, set_tracks: SetTracks) -> [adw::Pref
     [section, audio, subtitles]
 }
 
+/// "Recently played": how each kind shows in Home's row, kept on the
+/// server. A change saves the row's three modes, the other two as the
+/// server gave them, so a mode this build does not know is kept.
+fn recent_group(
+    preferences: RecentlyPlayedPreferences,
+    set_recent: SetRecent,
+) -> adw::PreferencesGroup {
+    let [music, shows, movies] = shown_recent(preferences);
+    let combo = |title: &str, names: &[&str], selected: u32| {
+        let row = adw::ComboRow::builder()
+            .use_markup(false)
+            .model(&gtk::StringList::new(names))
+            .selected(selected)
+            .build();
+        row.set_title(title);
+        row
+    };
+    let music_row = combo("Music", &RECENT_MUSIC.map(|(_, n)| n), music);
+    let shows_row = combo("Shows", &RECENT_SHOWS.map(|(_, n)| n), shows);
+    let movies_row = combo("Movies", &RECENT_MOVIES.map(|(_, n)| n), movies);
+    let current = Rc::new(std::cell::Cell::new(preferences));
+    let save = move |change: &dyn Fn(&mut RecentlyPlayedPreferences)| {
+        let mut p = current.get();
+        change(&mut p);
+        current.set(p);
+        set_recent(p);
+    };
+    let save = Rc::new(save);
+    {
+        let save = save.clone();
+        music_row.connect_selected_notify(move |row| {
+            if let Some(m) = picked_choice(&RECENT_MUSIC, row.selected()) {
+                save(&|p| p.music = m);
+            }
+        });
+    }
+    {
+        let save = save.clone();
+        shows_row.connect_selected_notify(move |row| {
+            if let Some(s) = picked_choice(&RECENT_SHOWS, row.selected()) {
+                save(&|p| p.shows = s);
+            }
+        });
+    }
+    movies_row.connect_selected_notify(move |row| {
+        if let Some(m) = picked_choice(&RECENT_MOVIES, row.selected()) {
+            save(&|p| p.movies = m);
+        }
+    });
+    let group = adw::PreferencesGroup::builder()
+        .title("Recently played")
+        .description(
+            "What Home's Recently played row shows. Kept on the server for all your devices.",
+        )
+        .build();
+    group.add(&music_row);
+    group.add(&shows_row);
+    group.add(&movies_row);
+    group
+}
+
 /// How a languages field reads: codes in order, and the two the server
 /// resolves, "original" and "device", the latter named as it is here
 /// (`device`, as [`crate::device_language`] gives it).
@@ -1497,6 +1614,27 @@ mod tests {
     use super::*;
 
     use crate::reachability::tests::{cabin, now};
+
+    #[test]
+    fn a_new_user_s_row_shows_music_by_source_shows_by_episode_and_movies() {
+        assert_eq!(
+            shown_recent(RecentlyPlayedPreferences::default()),
+            [0, 2, 0]
+        );
+    }
+
+    #[test]
+    fn a_row_mode_this_build_does_not_know_shows_as_its_kind_s_default() {
+        let unknown = RecentlyPlayedPreferences {
+            music: RecentMusicMode::Unknown,
+            shows: RecentShowsMode::Unknown,
+            movies: RecentMoviesMode::Unknown,
+        };
+        assert_eq!(
+            shown_recent(unknown),
+            shown_recent(RecentlyPlayedPreferences::default())
+        );
+    }
 
     #[test]
     fn the_languages_help_names_this_devices_language() {
