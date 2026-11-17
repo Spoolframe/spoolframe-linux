@@ -828,12 +828,15 @@ impl Playback {
             quality: playlist.quality,
             display: playlist.display,
         };
-        let playback = Self::build(Some(playlist.session), None, queue, start, true)?;
         tracing::info!(playlist = ?playlist.from_playlist, "starting playback context");
-        if let Some(from) = playlist.from_playlist {
-            playback.play_from(from);
-        }
-        Ok(playback)
+        Self::build(
+            Some(playlist.session),
+            None,
+            queue,
+            start,
+            true,
+            playlist.from_playlist,
+        )
     }
 
     /// Plays download `item` from its file (PX-38), from `from`, with the
@@ -856,26 +859,12 @@ impl Playback {
             display,
         };
         tracing::info!(download = %item.key, "playing a download");
-        Self::build(None, Some(item), queue, start, true)
+        Self::build(None, Some(item), queue, start, true, None)
     }
 
     /// Whether a download plays, from this computer.
     pub fn is_local(&self) -> bool {
         self.local.is_some()
-    }
-
-    /// Plays on from the server's playlist `from`, with the settings it
-    /// was started (or last saved) with. They are taken as they are, not
-    /// written: saving them would ask the server to play from the entry
-    /// given, moving the user's place (see [`Self::set_playlist_settings`]).
-    fn play_from(self: &Rc<Self>, from: crate::saved_queue::PlaylistResume) {
-        self.playlist.replace(Some(PlaylistContext {
-            playing: from.playing,
-            modes: from.settings,
-            cursor: None,
-            up_next: None,
-        }));
-        self.follow_ahead();
     }
 
     /// The server's playlist being played, if one is.
@@ -1159,11 +1148,7 @@ impl Playback {
             quality,
             display,
         };
-        let playback = Self::build(Some(session), None, queue, start, false)?;
-        if let Some(playlist) = playlist {
-            playback.play_from(playlist);
-        }
-        Ok(playback)
+        Self::build(Some(session), None, queue, start, false, playlist)
     }
 
     /// The queue as it stands, to save.
@@ -1177,8 +1162,21 @@ impl Playback {
         queue: Queue,
         start: Start,
         autoplay: bool,
+        playlist: Option<crate::saved_queue::PlaylistResume>,
     ) -> anyhow::Result<Rc<Self>> {
         let pipeline = Pipeline::new()?;
+        // Playing on from the server's playlist, with the settings it was
+        // started (or last saved) with. They are taken as they are, not
+        // written: saving them would ask the server to play from the entry
+        // given, moving the user's place (see [`Self::set_playlist_settings`]).
+        // Set before the first start is asked, which names the playlist as
+        // where the play was started.
+        let playlist = playlist.map(|from| PlaylistContext {
+            playing: from.playing,
+            modes: from.settings,
+            cursor: None,
+            up_next: None,
+        });
         let playback = Rc::new_cyclic(|me| Self {
             me: me.clone(),
             pipeline,
@@ -1202,7 +1200,7 @@ impl Playback {
             length: Cell::new(Duration::ZERO),
             stopped: Cell::new(false),
             listeners: RefCell::new(Vec::new()),
-            playlist: RefCell::new(None),
+            playlist: RefCell::new(playlist),
             asking_playlist: Cell::new(false),
             upcoming_reads: Latest::default(),
             playlist_calls: Serial::default(),
@@ -1246,6 +1244,9 @@ impl Playback {
             });
         }
         playback.begin(Some(start));
+        if playback.in_playlist() {
+            playback.follow_ahead();
+        }
         Ok(playback)
     }
 
@@ -3991,6 +3992,45 @@ mod tests {
         assert_eq!(
             (playback.is_shuffled(), playback.repeat()),
             (true, Repeat::All)
+        );
+        playback.stop();
+    }
+
+    /// The Recently played row shows the playlist a track was played
+    /// from: the first track's start says so too, not only the ones after.
+    #[test]
+    #[ignore = "needs a display for gtk4paintablesink"]
+    fn a_playlist_s_first_track_is_started_from_the_playlist() {
+        gtk::init().unwrap();
+        init().unwrap();
+        let dir = TestDir::new_blocking("spoolframe-playlist-source");
+        let path = dir.join("tone.mkv");
+        tone(&path);
+        let page = all(4);
+        let first = page.entries[0].clone();
+        let server = serving(Some(path), &page);
+        let playback = Playback::start(Playlist {
+            session: server.clone(),
+            items: vec![first.item],
+            index: 0,
+            queued: Vec::new(),
+            from: None,
+            selection: None,
+            tracks: None,
+            album: None,
+            quality: Default::default(),
+            display: None,
+            from_playlist: Some(resume(&page, first.entry, Default::default())),
+        })
+        .unwrap();
+        assert!(
+            run_until(Duration::from_secs(20), || !server.starts().is_empty()),
+            "the playback never started"
+        );
+        let id = playback.playing_from().unwrap().id;
+        assert_eq!(
+            server.starts()[0].options.source,
+            Some(spoolframe_client_sdk::PlaySource::Playlist { id })
         );
         playback.stop();
     }
