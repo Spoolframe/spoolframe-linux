@@ -99,7 +99,7 @@ webauthn-rs-proto = "=0.6.1-dev"
 serde_cbor_2 = "0.13"
 # Wraps each security key the library finds (passkey::Discoverable).
 futures = "0.3"
-tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros", "signal"] }
 
 # Where config, data and cache live, by each platform's rules.
 directories = "6"

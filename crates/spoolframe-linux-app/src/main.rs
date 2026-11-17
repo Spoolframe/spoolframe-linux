@@ -193,6 +193,7 @@ fn main() -> Result<()> {
     // The SDK's runtime: its tasks (discovery, reconnecting) run here for
     // as long as the app does. Kept in scope until the app returns.
     let runtime = tokio::runtime::Runtime::new().context("cannot start the async runtime")?;
+    quit_on_signals(&runtime)?;
     let sdk = Arc::new(open_sdk(&runtime)?);
     let client: Arc<dyn Client> = sdk.clone();
 
@@ -213,6 +214,35 @@ fn main() -> Result<()> {
         runtime.block_on(cache.close());
     }
     drop(runtime);
+    Ok(())
+}
+
+/// SIGTERM (a logout, a service stop, `kill`) and SIGINT (Ctrl+C in a
+/// terminal) quit as closing the window does: the main loop returns, so
+/// `main`'s shutdown runs. Killed outright instead, the process left its
+/// playback open on the server until the server reaped it, and the last
+/// progress and the saved queue were lost. A second signal while quitting
+/// asks again; quitting twice is harmless.
+fn quit_on_signals(runtime: &tokio::runtime::Runtime) -> Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let _entered = runtime.enter();
+    let mut term = signal(SignalKind::terminate()).context("cannot watch for SIGTERM")?;
+    let mut int = signal(SignalKind::interrupt()).context("cannot watch for SIGINT")?;
+    runtime.spawn(async move {
+        loop {
+            let name = tokio::select! {
+                Some(()) = term.recv() => "SIGTERM",
+                Some(()) = int.recv() => "SIGINT",
+                else => return,
+            };
+            tracing::info!(signal = name, "quitting on a signal");
+            // The application lives on the main thread: quit it there.
+            gtk::glib::MainContext::default().invoke(|| {
+                use gtk::gio::prelude::ApplicationExt;
+                relm4::main_application().quit();
+            });
+        }
+    });
     Ok(())
 }
 
