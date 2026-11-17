@@ -14,8 +14,8 @@ use spoolframe_types::{
 };
 
 use crate::backend::{
-    BackendError, BoxFuture, Client, Copies, ItemDetail, Kinds, Profile, ProfileStore, SearchHit,
-    SearchRequest, SearchResults, Server, ServerKey, Session,
+    BackendError, BoxFuture, Client, Copies, ItemDetail, Kinds, Profile, ProfileStore, RecentCard,
+    RecentlyPlayedPreferences, SearchHit, SearchRequest, SearchResults, Server, ServerKey, Session,
 };
 use crate::identity::Identities;
 
@@ -158,6 +158,9 @@ pub struct MockCatalog {
     details: HashMap<MediaId, ItemDetail>,
     played: Vec<Item>,
     played_asked: Mutex<Vec<Option<Kinds>>>,
+    /// The Recently played row's cards; `None`: a server without it.
+    row: Option<Vec<RecentCard>>,
+    row_preferences: Mutex<RecentlyPlayedPreferences>,
 }
 
 impl MockCatalog {
@@ -232,6 +235,19 @@ impl MockCatalog {
     /// The kinds of every `recently_played` sent, in order.
     pub fn recently_played_asked(&self) -> Vec<Option<Kinds>> {
         self.played_asked.lock().unwrap().clone()
+    }
+
+    /// A server with the Recently played row, answering `cards`, with
+    /// the default preferences until set. Without it, the row and its
+    /// preferences are `Unsupported`.
+    pub fn with_recently_played_row(mut self, cards: Vec<RecentCard>) -> Self {
+        self.row = Some(cards);
+        self
+    }
+
+    /// The row's preferences as last set.
+    pub fn recently_played_preferences_set(&self) -> RecentlyPlayedPreferences {
+        *self.row_preferences.lock().unwrap()
     }
 }
 
@@ -341,6 +357,45 @@ impl Session for MockCatalog {
         self.played_asked.lock().unwrap().push(kinds);
         let answer = slice(self.played.clone(), offset, limit);
         Box::pin(async move { Ok(answer) })
+    }
+
+    fn recently_played_row(
+        &self,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<Vec<RecentCard>, BackendError>> {
+        let answer = match &self.row {
+            Some(cards) => Ok(cards.iter().take(limit as usize).cloned().collect()),
+            None => Err(BackendError::Unsupported("recently_played_row".into())),
+        };
+        Box::pin(async move { answer })
+    }
+
+    fn recently_played_preferences(
+        &self,
+    ) -> BoxFuture<'_, Result<RecentlyPlayedPreferences, BackendError>> {
+        let answer = match &self.row {
+            Some(_) => Ok(*self.row_preferences.lock().unwrap()),
+            None => Err(BackendError::Unsupported(
+                "recently_played_preferences".into(),
+            )),
+        };
+        Box::pin(async move { answer })
+    }
+
+    fn set_recently_played_preferences(
+        &self,
+        preferences: RecentlyPlayedPreferences,
+    ) -> BoxFuture<'_, Result<(), BackendError>> {
+        let answer = match &self.row {
+            Some(_) => {
+                *self.row_preferences.lock().unwrap() = preferences;
+                Ok(())
+            }
+            None => Err(BackendError::Unsupported(
+                "set_recently_played_preferences".into(),
+            )),
+        };
+        Box::pin(async move { answer })
     }
 }
 

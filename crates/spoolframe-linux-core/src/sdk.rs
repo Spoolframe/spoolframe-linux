@@ -1731,6 +1731,38 @@ impl Session for SdkSession {
         }))
     }
 
+    fn recently_played_row(
+        &self,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<Vec<crate::backend::RecentCard>, BackendError>> {
+        Box::pin(self.call(move |s| async move {
+            s.feature::<sdk::gate::RecentlyPlayedRow>()?
+                .recently_played_row(limit)
+                .await
+        }))
+    }
+
+    fn recently_played_preferences(
+        &self,
+    ) -> BoxFuture<'_, Result<crate::backend::RecentlyPlayedPreferences, BackendError>> {
+        Box::pin(self.call(|s| async move {
+            s.feature::<sdk::gate::RecentlyPlayedRow>()?
+                .recently_played_preferences()
+                .await
+        }))
+    }
+
+    fn set_recently_played_preferences(
+        &self,
+        preferences: crate::backend::RecentlyPlayedPreferences,
+    ) -> BoxFuture<'_, Result<(), BackendError>> {
+        Box::pin(self.call(move |s| async move {
+            s.feature::<sdk::gate::RecentlyPlayedRow>()?
+                .set_recently_played_preferences(preferences)
+                .await
+        }))
+    }
+
     fn playlists(&self) -> BoxFuture<'_, Result<PlaylistList, BackendError>> {
         Box::pin(self.call(|s| async move { s.playlists().await }))
     }

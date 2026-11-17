@@ -266,8 +266,8 @@ pub fn section(
 }
 
 /// A playlist's card: its mosaic, name, and whose it is; right-click for
-/// Play, Shuffle and its pin.
-fn card(
+/// Play, Shuffle and its pin. Home's Recently played row has them too.
+pub fn card(
     playlist: &PlaylistSummary,
     actions: &Rc<ListActions>,
     art: Option<&Rc<crate::artwork::Art>>,

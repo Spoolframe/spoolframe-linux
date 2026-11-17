@@ -1,7 +1,41 @@
-//! Play history (PX-52) as the app shows it, GTK-free: Home's "Recently
-//! played music" from the tracks the server lists by their latest play.
+//! Play history (PX-52) as the app shows it, GTK-free: Home's Recently
+//! played row from the server's cards (SDK 0.17.5), or, from a server
+//! without it, "Recently played music" from the tracks the server lists
+//! by their latest play.
 
 use spoolframe_types::{Album, Item};
+
+use crate::backend::{PlaylistSummary, RecentCard};
+
+/// A card of Home's Recently played row, as the app draws it: an item,
+/// opened as any card is, or a playlist, opened on its page.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RowCard {
+    // Boxed: an Item is several times a playlist's size.
+    Item(Box<Item>),
+    Playlist(PlaylistSummary),
+}
+
+/// The row's cards, in the server's order; a kind this build does not
+/// know is left out.
+pub fn row_cards(cards: Vec<RecentCard>) -> Vec<RowCard> {
+    cards
+        .into_iter()
+        .filter_map(|card| {
+            let item = match card {
+                RecentCard::Movie { movie } => Item::Movie(movie),
+                RecentCard::Show { show } => Item::Show(show),
+                RecentCard::Season { season } => Item::Season(season),
+                RecentCard::Episode { episode } => Item::Episode(episode),
+                RecentCard::Album { album } => Item::Album(album),
+                RecentCard::Track { track } => Item::Track(track),
+                RecentCard::Playlist { playlist } => return Some(RowCard::Playlist(playlist)),
+                RecentCard::Unknown => return None,
+            };
+            Some(RowCard::Item(Box::new(item)))
+        })
+        .collect()
+}
 
 /// The albums of `played`, the tracks [`crate::backend::Session::recently_played`]
 /// lists newest first: each album once, where its latest-played track
@@ -46,6 +80,37 @@ mod tests {
 
     fn id(kind: MediaKind, key: &str) -> MediaId {
         MediaId::new(Namespace::Plex, kind, key).expect("test keys are not empty")
+    }
+
+    #[test]
+    fn the_row_keeps_the_server_s_order_and_leaves_out_unknown_cards() {
+        let Item::Movie(movie) = crate::mock::movie("m", "Heat") else {
+            unreachable!()
+        };
+        let Item::Track(song) = crate::mock::track("t", "Song") else {
+            unreachable!()
+        };
+        let mix = crate::mock::playlist("p", "Mix", crate::backend::Kinds::default());
+        let cards = vec![
+            RecentCard::Track {
+                track: song.clone(),
+            },
+            RecentCard::Unknown,
+            RecentCard::Playlist {
+                playlist: mix.clone(),
+            },
+            RecentCard::Movie {
+                movie: movie.clone(),
+            },
+        ];
+        assert_eq!(
+            row_cards(cards),
+            [
+                RowCard::Item(Box::new(Item::Track(song))),
+                RowCard::Playlist(mix),
+                RowCard::Item(Box::new(Item::Movie(movie))),
+            ]
+        );
     }
 
     fn track(key: &str, album: &str, album_title: Option<&str>) -> Item {

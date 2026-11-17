@@ -52,6 +52,9 @@ use crate::{
 };
 use spoolframe_linux_core::artcache::ArtworkCache;
 use spoolframe_linux_core::backend::CatalogKey;
+#[cfg(test)]
+use spoolframe_linux_core::backend::RecentCard;
+use spoolframe_linux_core::history::RowCard;
 
 /// A password or PIN in a message. Msg derives Debug, and Relm4 records
 /// each message in a tracing span: this keeps them out of logs.
@@ -678,9 +681,9 @@ pub enum Loaded {
     /// to send as the current one.
     MustChangePassword(Box<Profile>, Option<Secret>),
     Libraries(Result<Vec<Library>, BackendError>),
-    /// Home, with the albums of what was played lately (PX-52): none
-    /// without play history, or when they could not be had.
-    Home(Result<(HomeScreen, Vec<Album>), BackendError>),
+    /// Home, with what was played lately: the server's row, or the albums
+    /// of the tracks played (PX-52); none when it could not be had.
+    Home(Result<(HomeScreen, Recent), BackendError>),
     Person(Box<Person>, Result<(Vec<Item>, u32), BackendError>),
     /// A movie or episode, what it belongs to (an episode's show), and its
     /// tracks for the pickers; the playlists holding it, and where it is
@@ -3263,15 +3266,32 @@ impl Component for App {
                         row.items.iter().map(|i| views::poster_card(i, cards)),
                     ));
                 }
-                // Albums, as the board has the row: a track card would
-                // only play that one track.
-                if !recent.is_empty() {
-                    rows.push(views::row(
-                        "Recently played music",
-                        recent
-                            .into_iter()
-                            .map(|a| views::poster_card(&Item::Album(a), cards)),
-                    ));
+                match recent {
+                    // The server's row (SDK 0.17.5), as the user has it
+                    // show music, shows and films; empty, it is left out.
+                    Recent::Row(row) if !row.is_empty() => {
+                        let actions = playlist_list_actions(&sender);
+                        rows.push(views::row(
+                            "Recently played",
+                            row.into_iter().map(|card| match card {
+                                RowCard::Item(item) => views::poster_card(&item, cards),
+                                RowCard::Playlist(playlist) => {
+                                    playlists::card(&playlist, &actions, cards.art.as_ref())
+                                }
+                            }),
+                        ));
+                    }
+                    // From a server without it: albums, as the board has
+                    // the row; a track card would only play that one track.
+                    Recent::Albums(albums) if !albums.is_empty() => {
+                        rows.push(views::row(
+                            "Recently played music",
+                            albums
+                                .into_iter()
+                                .map(|a| views::poster_card(&Item::Album(a), cards)),
+                        ));
+                    }
+                    _ => {}
                 }
                 if !home.recently_added.is_empty() {
                     rows.push(views::row(
@@ -4554,22 +4574,7 @@ impl App {
         browse: bool,
     ) {
         let Some(list) = &self.playlists else { return };
-        let actions = Rc::new(playlists::ListActions {
-            open: {
-                let sender = sender.clone();
-                Rc::new(move |id| sender.input(Msg::OpenPlaylist(id)))
-            },
-            play: {
-                let sender = sender.clone();
-                Rc::new(move |id, shuffle| {
-                    sender.input(Msg::PlayPlaylist(id, PlaylistPlay::Menu { shuffle }))
-                })
-            },
-            pin: {
-                let sender = sender.clone();
-                Rc::new(move |id, pin| sender.input(Msg::PinPlaylist(id, pin)))
-            },
-        });
+        let actions = playlist_list_actions(sender);
         if browse {
             let browser = playlists::browse(&list.playlists, &actions, self.cards.art.as_ref());
             let body = &browser.widget;
@@ -5356,7 +5361,7 @@ impl App {
             return;
         };
         self.load_root(sender, async move {
-            let (home, recent) = tokio::join!(session.home(), recent_albums(session.as_ref()));
+            let (home, recent) = tokio::join!(session.home(), recently_played(session.as_ref()));
             Loaded::Home(home.map(|home| (home, recent)))
         });
     }
@@ -5857,6 +5862,37 @@ fn capitalized(text: &str) -> String {
 const RECENT_ALBUMS: usize = 12;
 const RECENT_TRACKS: u32 = 100;
 
+/// How many cards Home's Recently played row asks for (the server gives
+/// at most 50).
+const RECENT_ROW: u32 = 20;
+
+/// Home's row of what was played lately.
+#[derive(Debug)]
+pub enum Recent {
+    /// The server's Recently played row (SDK 0.17.5): films, shows,
+    /// episodes, music and playlists, as the user's preferences say.
+    /// Empty, it is not shown.
+    Row(Vec<RowCard>),
+    /// From a server without the row: the albums of the tracks played
+    /// (PX-52), as "Recently played music".
+    Albums(Vec<Album>),
+}
+
+/// What Home shows of what was played lately: the server's row where it
+/// has one, else the albums of the tracks played. Nothing, said in the
+/// log, when the server could not say: the row is a convenience, and
+/// Home opens without it.
+async fn recently_played(session: &dyn Session) -> Recent {
+    match session.recently_played_row(RECENT_ROW).await {
+        Ok(cards) => Recent::Row(spoolframe_linux_core::history::row_cards(cards)),
+        Err(BackendError::Unsupported(_)) => Recent::Albums(recent_albums(session).await),
+        Err(e) => {
+            tracing::warn!(error = %e, "no recently played row");
+            Recent::Row(Vec::new())
+        }
+    }
+}
+
 /// The albums of the tracks played lately, for Home (PX-52): none, said
 /// in the log, when the server could not say. The row is a convenience; Home opens without it.
 async fn recent_albums(session: &dyn Session) -> Vec<Album> {
@@ -5874,6 +5910,27 @@ async fn recent_albums(session: &dyn Session) -> Vec<Album> {
             Vec::new()
         }
     }
+}
+
+/// What a playlist's card does, wherever it shows (the Playlists section,
+/// Home's Recently played row): opens its page, plays it, pins it.
+fn playlist_list_actions(sender: &ComponentSender<App>) -> Rc<playlists::ListActions> {
+    Rc::new(playlists::ListActions {
+        open: {
+            let sender = sender.clone();
+            Rc::new(move |id| sender.input(Msg::OpenPlaylist(id)))
+        },
+        play: {
+            let sender = sender.clone();
+            Rc::new(move |id, shuffle| {
+                sender.input(Msg::PlayPlaylist(id, PlaylistPlay::Menu { shuffle }))
+            })
+        },
+        pin: {
+            let sender = sender.clone();
+            Rc::new(move |id, pin| sender.input(Msg::PinPlaylist(id, pin)))
+        },
+    })
 }
 
 /// What playlist `id`'s page does: its buttons, pin and Show more.
@@ -6824,6 +6881,36 @@ mod tests {
             .map(|a| a.title)
             .collect();
         assert_eq!(albums, ["Low Tide", "Arrival"]);
+    }
+
+    #[test]
+    fn home_shows_the_server_s_recently_played_row_where_it_has_one() {
+        let Item::Movie(movie) = spoolframe_linux_core::mock::movie("m", "Heat") else {
+            unreachable!()
+        };
+        let session = spoolframe_linux_core::mock::shell::MockCatalog::new()
+            .with_recently_played(played())
+            .with_recently_played_row(vec![RecentCard::Movie {
+                movie: movie.clone(),
+            }]);
+        let recent = spoolframe_linux_core::testing::ready(recently_played(&session));
+        assert!(
+            matches!(&recent, Recent::Row(cards) if cards[..] == [RowCard::Item(Box::new(Item::Movie(movie)))])
+        );
+    }
+
+    #[test]
+    fn a_server_without_the_row_gets_the_albums_of_the_tracks_played() {
+        let session =
+            spoolframe_linux_core::mock::shell::MockCatalog::new().with_recently_played(played());
+        let recent = spoolframe_linux_core::testing::ready(recently_played(&session));
+        let Recent::Albums(albums) = recent else {
+            panic!("the row, from a server without it: {recent:?}")
+        };
+        assert_eq!(
+            albums.into_iter().map(|a| a.title).collect::<Vec<_>>(),
+            ["Low Tide", "Arrival"]
+        );
     }
 
     #[test]

@@ -524,6 +524,11 @@ pub use spoolframe_client_sdk::{ProfileChange, ProfileEvent, SessionEndReason};
 
 /// Playlists (PX-40), in the protocol's and the SDK's own types.
 pub use spoolframe_client_sdk::{PlaylistChange, PlaylistEvent, PlaylistList, PlaylistUpdate};
+/// Home's Recently played row (SDK 0.17.5, `spoolframe:recently-played-row`)
+/// and what each user has it show.
+pub use spoolframe_client_sdk::{
+    RecentCard, RecentMoviesMode, RecentMusicMode, RecentShowsMode, RecentlyPlayedPreferences,
+};
 pub use spoolframe_protocol::MAX_READ;
 pub use spoolframe_protocol::playlists::{
     Builtin, EntryId, ItemKind, Kinds, Liked, PinNote, PinNoteReason, PlaySettings, PlaylistEdit,
@@ -1979,6 +1984,41 @@ pub trait Session: Send + Sync {
         _limit: u32,
     ) -> BoxFuture<'_, Result<(Vec<Item>, u32), BackendError>> {
         Box::pin(async { Err(BackendError::Unsupported("recently_played".into())) })
+    }
+
+    /// Home's Recently played row: at most `limit` (50) cards, newest
+    /// first, each once at its latest play, as the user's
+    /// [`RecentlyPlayedPreferences`] say. Empty when they hide every
+    /// kind: the row is then not shown. `Unsupported` from a server
+    /// without the feature.
+    fn recently_played_row(
+        &self,
+        _limit: u32,
+    ) -> BoxFuture<'_, Result<Vec<RecentCard>, BackendError>> {
+        Box::pin(async { Err(BackendError::Unsupported("recently_played_row".into())) })
+    }
+
+    /// What the row shows of music, shows and movies, for this user on
+    /// every device; the defaults when none were set.
+    fn recently_played_preferences(
+        &self,
+    ) -> BoxFuture<'_, Result<RecentlyPlayedPreferences, BackendError>> {
+        Box::pin(async {
+            Err(BackendError::Unsupported(
+                "recently_played_preferences".into(),
+            ))
+        })
+    }
+
+    fn set_recently_played_preferences(
+        &self,
+        _preferences: RecentlyPlayedPreferences,
+    ) -> BoxFuture<'_, Result<(), BackendError>> {
+        Box::pin(async {
+            Err(BackendError::Unsupported(
+                "set_recently_played_preferences".into(),
+            ))
+        })
     }
 
     /// Every playlist the user sees, with whether and where each is
