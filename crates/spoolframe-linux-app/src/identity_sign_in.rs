@@ -514,13 +514,48 @@ impl View {
     }
 
     fn stop_local(&self) {
-        if let Some(pairing) = self.local.borrow_mut().take() {
-            pairing.cancel();
-        }
+        let local = self.local.borrow_mut().take();
         self.stop_hold_watch();
-        // A phone's pairing still held is rejected as it is dropped.
-        if matches!(*self.approved.borrow(), Some(Approved::Qr(_))) {
-            self.approved.borrow_mut().take();
+        let held = {
+            let mut approved = self.approved.borrow_mut();
+            match approved.take() {
+                Some(Approved::Qr(held)) => Some(held),
+                other => {
+                    *approved = other;
+                    None
+                }
+            }
+        };
+        match held {
+            // Not mine, or closing, with a phone's pairing held: the phone
+            // is told no first, and only once it has been are the pairing
+            // and its code let go. Dropped first, the code's stop could
+            // cut the phone off before it heard.
+            Some(held) => {
+                let identities = self.needs.identities.clone();
+                glib::spawn_future_local(async move {
+                    let told = identities
+                        .run(move |_| {
+                            Box::pin(async move {
+                                let told = held.reject().await;
+                                drop(held);
+                                if let Some(pairing) = local {
+                                    pairing.cancel();
+                                }
+                                told
+                            })
+                        })
+                        .await;
+                    if let Err(e) = told {
+                        tracing::info!(error = %e, "the phone did not hear no");
+                    }
+                });
+            }
+            None => {
+                if let Some(pairing) = local {
+                    pairing.cancel();
+                }
+            }
         }
         self.qr.set_visible(false);
         self.scan.set_visible(false);
