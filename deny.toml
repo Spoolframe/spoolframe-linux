@@ -31,6 +31,12 @@ ignore = [
   # (through foyer and iroh's netlink-packet-core); none of it is in the
   # binary.
   { id = "RUSTSEC-2024-0436", reason = "paste is an unmaintained build-time proc-macro; no code of it runs in the client" },
+  # chrono: unmaintained (every version), not vulnerable. Nothing here uses
+  # it. It comes through gst-plugin-version-helper, a build script of
+  # gst-plugin-gtk4 that stamps the plugin's release date, and through wmi,
+  # netwatch's Windows-only dependency under iroh. Neither puts it in the
+  # Linux binary.
+  { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained; it reaches the client only as gst-plugin-gtk4's build-time version helper and iroh's Windows-only wmi" },
   # crypto-bigint 0.5: constant-time operations could branch on secrets,
   # fixed only in 0.7.6. It comes through elliptic-curve 0.13, from our
   # vendored crypto-glue 0.1.15 under webauthn-rs, where caBLE's P-256

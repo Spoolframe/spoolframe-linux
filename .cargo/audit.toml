@@ -5,6 +5,9 @@
 ignore = [
   # paste: unmaintained build-time proc-macro; none of it runs.
   "RUSTSEC-2024-0436",
+  # chrono: unmaintained; only gst-plugin-gtk4's build-time version helper
+  # and iroh's Windows-only wmi use it. deny.toml says more.
+  "RUSTSEC-2026-0543",
   # crypto-bigint 0.5 through elliptic-curve 0.13, from vendored
   # crypto-glue 0.1 (webauthn caBLE's ECDH): accepted until webauthn-rs
   # moves to crypto-glue 0.2.
