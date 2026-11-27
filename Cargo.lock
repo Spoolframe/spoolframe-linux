@@ -6030,7 +6030,7 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-linux-app"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -6065,7 +6065,7 @@ dependencies = [
 
 [[package]]
 name = "spoolframe-linux-core"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "anyhow",
  "async-trait",

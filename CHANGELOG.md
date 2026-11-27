@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.4 — 2026-11-27
 
 Built with the Spoolframe SDK crates 0.18.1, for the server's 0.18.
 
