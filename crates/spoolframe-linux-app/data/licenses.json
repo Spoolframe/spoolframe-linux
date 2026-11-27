@@ -419,7 +419,7 @@
 "texts": {
 "CC0-1.0": 16
 },
-"version": "2.2.2"
+"version": "3.0.0"
 },
 {
 "copyright": [
@@ -1209,7 +1209,7 @@
 "Copyright 2024 Jacob Pratt et al.",
 "Copyright (c) 2024 Jacob Pratt et al."
 ],
-"group": "sdk",
+"group": "app",
 "license": "MIT OR Apache-2.0",
 "name": "deranged",
 "texts": {
@@ -1669,7 +1669,7 @@
 "Apache-2.0": 6,
 "MIT": 1
 },
-"version": "1.2.2"
+"version": "1.2.3"
 },
 {
 "copyright": [
@@ -2888,7 +2888,7 @@
 "Apache-2.0": 0,
 "MIT": 1
 },
-"version": "1.4.1"
+"version": "1.5.0"
 },
 {
 "copyright": [
@@ -2901,7 +2901,7 @@
 "Apache-2.0": 0,
 "MIT": 1
 },
-"version": "1.4.1"
+"version": "1.5.0"
 },
 {
 "copyright": [
@@ -2914,7 +2914,7 @@
 "Apache-2.0": 0,
 "MIT": 1
 },
-"version": "1.4.1"
+"version": "1.5.0"
 },
 {
 "copyright": [
@@ -2954,7 +2954,7 @@
 "Apache-2.0": 0,
 "MIT": 1
 },
-"version": "1.4.1"
+"version": "1.5.0"
 },
 {
 "copyright": [
@@ -3199,6 +3199,19 @@
 },
 {
 "copyright": [
+"Copyright (c) 2016 The Rust Project Developers"
+],
+"group": "sdk",
+"license": "MIT OR Apache-2.0",
+"name": "lock_api",
+"texts": {
+"Apache-2.0": 6,
+"MIT": 1
+},
+"version": "0.5.0"
+},
+{
+"copyright": [
 "Copyright (c) 2014 The Rust Project Developers"
 ],
 "group": "sdk",
@@ -3221,6 +3234,18 @@
 "MIT": 79
 },
 "version": "0.18.5"
+},
+{
+"copyright": [
+"Copyright (c) 2016 Jerome Froelich"
+],
+"group": "sdk",
+"license": "MIT",
+"name": "lru",
+"texts": {
+"MIT": 79
+},
+"version": "0.19.2"
 },
 {
 "copyright": [
@@ -3437,19 +3462,7 @@
 "texts": {
 "MIT": 93
 },
-"version": "0.46.3"
-},
-{
-"copyright": [
-"Copyright (c) Corentin Henry"
-],
-"group": "sdk",
-"license": "MIT",
-"name": "netlink-packet-core",
-"texts": {
-"MIT": 94
-},
-"version": "0.8.2"
+"version": "0.47.0"
 },
 {
 "copyright": [
@@ -3473,18 +3486,6 @@
 "texts": {
 "MIT": 95
 },
-"version": "0.31.0"
-},
-{
-"copyright": [
-"Copyright (c) Corentin Henry"
-],
-"group": "sdk",
-"license": "MIT",
-"name": "netlink-packet-route",
-"texts": {
-"MIT": 95
-},
 "version": "0.33.0"
 },
 {
@@ -3497,19 +3498,7 @@
 "texts": {
 "MIT": 94
 },
-"version": "0.12.2"
-},
-{
-"copyright": [
-"Copyright (c) Corentin Henry"
-],
-"group": "sdk",
-"license": "MIT",
-"name": "netlink-sys",
-"texts": {
-"MIT": 94
-},
-"version": "0.8.8"
+"version": "0.13.0"
 },
 {
 "copyright": [
@@ -3534,7 +3523,7 @@
 "Apache-2.0": 0,
 "MIT": 1
 },
-"version": "0.19.3"
+"version": "0.20.2"
 },
 {
 "copyright": [
@@ -3574,7 +3563,7 @@
 "Apache-2.0": 97,
 "MIT": 98
 },
-"version": "1.4.0"
+"version": "1.5.0"
 },
 {
 "copyright": [
@@ -3606,7 +3595,7 @@
 "Apache-2.0": 97,
 "MIT": 98
 },
-"version": "1.4.0"
+"version": "1.5.0"
 },
 {
 "copyright": [
@@ -3651,7 +3640,7 @@
 "copyright": [
 "Copyright (c) Jacob Pratt"
 ],
-"group": "sdk",
+"group": "app",
 "license": "MIT OR Apache-2.0",
 "name": "num-conv",
 "texts": {
@@ -3947,6 +3936,32 @@
 ],
 "group": "sdk",
 "license": "MIT OR Apache-2.0",
+"name": "parking_lot",
+"texts": {
+"Apache-2.0": 6,
+"MIT": 1
+},
+"version": "0.13.0"
+},
+{
+"copyright": [
+"Copyright (c) 2016 The Rust Project Developers"
+],
+"group": "sdk",
+"license": "MIT OR Apache-2.0",
+"name": "parking_lot_core",
+"texts": {
+"Apache-2.0": 6,
+"MIT": 1
+},
+"version": "0.10.0"
+},
+{
+"copyright": [
+"Copyright (c) 2016 The Rust Project Developers"
+],
+"group": "sdk",
+"license": "MIT OR Apache-2.0",
 "name": "parking_lot_core",
 "texts": {
 "Apache-2.0": 6,
@@ -4161,7 +4176,7 @@
 "Copyright 2023 Jacob Pratt et al.",
 "Copyright (c) 2023 Jacob Pratt et al."
 ],
-"group": "sdk",
+"group": "app",
 "license": "MIT OR Apache-2.0",
 "name": "powerfmt",
 "texts": {
@@ -4970,6 +4985,18 @@
 },
 {
 "copyright": [
+"Copyright (c) 2021 Ilson Roberto Balliego Junior"
+],
+"group": "sdk",
+"license": "MIT",
+"name": "simple-dns",
+"texts": {
+"MIT": 121
+},
+"version": "0.13.1"
+},
+{
+"copyright": [
 "Copyright (c) 2019 Carl Lerche"
 ],
 "group": "sdk",
@@ -5130,7 +5157,7 @@
 "Apache-2.0": 8,
 "MIT": 125
 },
-"version": "0.17.4"
+"version": "0.18.1"
 },
 {
 "copyright": [
@@ -5167,7 +5194,7 @@
 "Apache-2.0": 8,
 "MIT": 125
 },
-"version": "0.17.4"
+"version": "0.18.1"
 },
 {
 "copyright": [
@@ -5180,7 +5207,7 @@
 "Apache-2.0": 8,
 "MIT": 125
 },
-"version": "0.17.4"
+"version": "0.18.1"
 },
 {
 "copyright": [
@@ -5546,7 +5573,7 @@
 "copyright": [
 "Copyright (c) Jacob Pratt et al."
 ],
-"group": "sdk",
+"group": "app",
 "license": "MIT OR Apache-2.0",
 "name": "time",
 "texts": {
@@ -5559,7 +5586,7 @@
 "copyright": [
 "Copyright (c) Jacob Pratt et al."
 ],
-"group": "sdk",
+"group": "app",
 "license": "MIT OR Apache-2.0",
 "name": "time-core",
 "texts": {
@@ -5907,7 +5934,7 @@
 "Apache-2.0": 6,
 "MIT": 1
 },
-"version": "2.5.8"
+"version": "2.5.9"
 },
 {
 "copyright": [

@@ -2566,7 +2566,10 @@ impl Playback {
         glib::spawn_future_local(async move {
             let Ok(answer) = found.await else { return };
             if let Some(playback) = weak.upgrade() {
-                playback.on(Event::NextEpisode { current, answer });
+                playback.on(Event::NextEpisode {
+                    current,
+                    answer: Box::new(answer),
+                });
             }
         });
     }
@@ -3133,7 +3136,7 @@ enum Event {
     },
     NextEpisode {
         current: Weak<Current>,
-        answer: Result<Option<Item>, BackendError>,
+        answer: Box<Result<Option<Item>, BackendError>>,
     },
 }
 
@@ -3203,7 +3206,7 @@ impl Playback {
                 answer,
             } => self.started(current, from, answer),
             Event::Subtitle { current, answer } => self.subtitle_arrived(current, answer),
-            Event::NextEpisode { current, answer } => self.next_episode_found(current, answer),
+            Event::NextEpisode { current, answer } => self.next_episode_found(current, *answer),
         }
     }
 }

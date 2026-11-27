@@ -270,10 +270,11 @@ impl Identities {
             .collect())
     }
 
-    /// Signs guest `id` out of this computer only: the server keeps its
-    /// access.
+    /// Signs guest `id` out of this computer: its pairing here goes, and
+    /// its sessions are ended on the saved servers as far as they can be
+    /// reached. The servers stay saved and keep its account.
     pub async fn forget_guest(&self, id: PortableUserId) -> Result<(), SdkError> {
-        self.portable.forget_guest(id).await
+        self.client()?.forget_guest(id).await
     }
 
     /// A key for one root action, asking through `prompt`.

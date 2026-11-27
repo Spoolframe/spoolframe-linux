@@ -2139,6 +2139,7 @@ mod tests {
             pin_digits: None,
             auto_login: false,
             last: false,
+            admin: false,
         }
     }
 

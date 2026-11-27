@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use adw::prelude::*;
 use gtk::glib;
-use spoolframe_client_sdk::{Pairing, RelayAnswer, RelayPairing, SdkError};
+use spoolframe_client_sdk::{HeldPairing, Pairing, RelayAnswer, RelayPairing, SdkError};
 use spoolframe_linux_core::identity::{Identities, IdentityView};
 use spoolframe_protocol::portable::PortableUserId;
 
@@ -30,6 +30,25 @@ pub const SCAN: &str = "Or scan it with your iPhone.";
 /// Once the iPhone connected: "Check your phone shows K7QX-3MPA-9TRD-WF2H".
 pub fn check_line(fingerprint: &str) -> String {
     format!("Check your phone shows {fingerprint}")
+}
+
+/// Above the fingerprint to compare when the code was answered.
+const KEY_APPROVED: &str =
+    "Your key approved this computer. Check this is your identity before accepting:";
+
+/// Above the fingerprint to compare when a phone that scanned the QR
+/// answered: by the name it gave, "Steve's iPhone", or "Your iPhone".
+pub fn phone_approved_line(phone: Option<&str>) -> String {
+    let phone = phone.unwrap_or("Your iPhone");
+    format!("{phone} approved this computer. Check it shows this before accepting:")
+}
+
+/// What is waiting on Accept: the code's answer, or the pairing a phone
+/// made by the QR, which the SDK holds until this computer says (0.17.5)
+/// and rejects if dropped undecided.
+enum Approved {
+    Code(Box<RelayAnswer>),
+    Qr(Arc<HeldPairing>),
 }
 
 /// How often the device asks whether the code was answered.
@@ -67,9 +86,11 @@ struct View {
     device_key: gtk::Label,
     waiting: gtk::Label,
     identity: gtk::Label,
+    /// Above `identity`: who approved this computer.
+    approved_by: gtk::Label,
     trouble: gtk::Label,
     accept: gtk::Button,
-    answer: RefCell<Option<RelayAnswer>>,
+    approved: RefCell<Option<Approved>>,
     /// The QR beside the code, and what it says under it.
     qr: gtk::Picture,
     scan: gtk::Label,
@@ -183,9 +204,8 @@ pub fn open(parent: &impl IsA<gtk::Widget>, needs: Needs) {
 
     // 8 · Compare, then accept.
     let compare = column();
-    compare.append(&dim(
-        "Your key approved this computer. Check this is your identity before accepting:",
-    ));
+    let approved_by = dim(KEY_APPROVED);
+    compare.append(&approved_by);
     let identity = gtk::Label::builder()
         .selectable(true)
         .css_classes(["title-2", "monospace", "invite-identity"])
@@ -231,9 +251,10 @@ pub fn open(parent: &impl IsA<gtk::Widget>, needs: Needs) {
         device_key,
         waiting,
         identity,
+        approved_by,
         trouble,
         accept,
-        answer: RefCell::new(None),
+        approved: RefCell::new(None),
         qr,
         scan,
         local: RefCell::new(None),
@@ -465,7 +486,7 @@ impl View {
                 return;
             }
             match paired {
-                Ok(paired) => view.done(paired.identity),
+                Ok(held) => view.compare_qr(held),
                 // The code still works: the QR goes.
                 Err(e) => {
                     tracing::info!(error = %e, "the pairing by QR ended");
@@ -480,29 +501,57 @@ impl View {
         if let Some(pairing) = self.local.borrow_mut().take() {
             pairing.cancel();
         }
+        // A phone's pairing still held is rejected as it is dropped.
+        if matches!(*self.approved.borrow(), Some(Approved::Qr(_))) {
+            self.approved.borrow_mut().take();
+        }
         self.qr.set_visible(false);
         self.scan.set_visible(false);
     }
 
     /// 8 · The identity the key that answered is a root of.
     fn compare(&self, answer: RelayAnswer) {
+        self.approved_by.set_text(KEY_APPROVED);
         self.identity
             .set_text(&format!("Identity {}", answer.identity_fingerprint()));
-        *self.answer.borrow_mut() = Some(answer);
+        *self.approved.borrow_mut() = Some(Approved::Code(Box::new(answer)));
+        self.stack.set_visible_child_name("compare");
+        self.accept.grab_focus();
+    }
+
+    /// 8 · The phone that scanned the QR made the pairing; it waits here
+    /// for Accept (or Not mine, or closing, which reject it). The code
+    /// stops: one way is enough. The QR's pairing stays in `local` until
+    /// then: it carries what Accept confirms.
+    fn compare_qr(&self, held: HeldPairing) {
+        self.next_round();
+        self.approved_by
+            .set_text(&phone_approved_line(held.phone_name()));
+        self.identity.set_text(held.fingerprint());
+        self.qr.set_visible(false);
+        self.scan.set_visible(false);
+        *self.approved.borrow_mut() = Some(Approved::Qr(Arc::new(held)));
         self.stack.set_visible_child_name("compare");
         self.accept.grab_focus();
     }
 
     /// Accept: this computer becomes one of the identity's devices.
     fn take(self: &Rc<Self>) {
-        let Some(answer) = self.answer.borrow_mut().take() else {
+        let Some(approved) = self.approved.borrow_mut().take() else {
             return;
         };
         self.accept.set_sensitive(false);
         let (identities, weak) = (self.needs.identities.clone(), Rc::downgrade(self));
         glib::spawn_future_local(async move {
             let accepted = identities
-                .run(move |ids| Box::pin(async move { ids.accept_pairing(answer).await }))
+                .run(move |ids| {
+                    Box::pin(async move {
+                        match approved {
+                            Approved::Code(answer) => ids.accept_pairing(*answer).await,
+                            Approved::Qr(held) => held.confirm().await.map(|p| p.identity),
+                        }
+                    })
+                })
                 .await;
             let Some(view) = weak.upgrade() else { return };
             view.accept.set_sensitive(true);
@@ -585,6 +634,18 @@ mod tests {
         assert_eq!(
             check_line("K7QX-3MPA-9TRD-WF2H"),
             "Check your phone shows K7QX-3MPA-9TRD-WF2H"
+        );
+    }
+
+    #[test]
+    fn a_phone_that_approved_is_named_as_it_said_or_as_your_iphone() {
+        assert_eq!(
+            phone_approved_line(Some("Steve's iPhone")),
+            "Steve's iPhone approved this computer. Check it shows this before accepting:"
+        );
+        assert_eq!(
+            phone_approved_line(None),
+            "Your iPhone approved this computer. Check it shows this before accepting:"
         );
     }
 
