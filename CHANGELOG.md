@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+Built with the Spoolframe SDK crates 0.18.1, for the server's 0.18.
+
+- Home's Recently played row comes from the server: the films, shows,
+  episodes, albums, tracks and playlists played lately, newest first.
+  A server older than 0.17.5 still gets "Recently played music".
+- Settings, on a server's page, sets what the row shows, kept on the
+  server for all your devices: music by where it was played from, each
+  track, albums, or hidden; shows by show, season or episode, or
+  hidden; films, or hidden.
+- Each play tells the server where it was started (a playlist, an album
+  or the queue), so the row shows a playlist played from as the
+  playlist. The first track of a playlist says so too.
+- An item page names the source of each rating: "Rotten Tomatoes 87%",
+  "Rotten Tomatoes audience 85%", "IMDb 7.9".
+- Pairing by QR: once the phone approves, this computer shows the
+  phone's name and the fingerprint to compare, and waits for Accept or
+  Not mine. If the phone leaves, or nobody answers in 2 minutes, the
+  page closes and says why. Not mine tells the phone no.
+- SIGTERM or Ctrl+C (a logout, `kill`) quits as closing the window does:
+  the server hears that the playback stopped, and the queue is saved.
+  Before, the playback stayed open on the server for 10 minutes.
+
 ## 0.6.3 — 2026-11-03
 
 Built with the Spoolframe SDK crates 0.17.4, for the server's 0.17.
